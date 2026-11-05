@@ -229,6 +229,7 @@ impl LaunchDevices {
             pid,
             destination,
             Stat {
+                links: 1,
                 inode: if dir { 0x1_0000_0000 } else { 0x1_0000_0001 },
                 mode: if dir { 0o40555 } else { 0o20666 },
                 size: 0,

@@ -262,13 +262,19 @@ while open; their handles retain metadata but cannot create new children.
 Minimal assignment roots remain busy; overlapping assignments merely seed
 ordinary nested directories. Normal fchmod/chmod accept full st_mode values
 while special permission bits remain unsupported.
-Relative paths without a directory fd use the calling process's image cwd.
+Relative paths without a directory fd use the calling process's current directory.
+Owned chdir/fchdir retain directory identity across rename and exec; fork copies
+the reference and threads share cwd. Removed cwd returns ENOENT rather than
+entering the immutable image directory underneath it.
 Owned symlink/symlinkat, readlink/readlinkat and nofollow metadata are supported.
 Resolution expands links before processing parent components, bounds link chains,
 and rechecks storage assignment boundaries. Unlink and rename act on the final
 link itself; exclusive create and O_NOFOLLOW retain their distinct semantics.
 Cross-image/owned traversal, native-image relative directory-fd access, image
-subtree mutation, hardlinks and owned-directory chdir remain unsupported.
+subtree mutation remain unsupported.
+Owned regular-file link/linkat names share inode, bytes, permissions and link
+counts. Unlink removes a name; remaining links, open handles and executable
+pins keep its data alive. Capacity failure leaves existing names unchanged.
 Owned execution and private file mappings are described below.
 This is not a complete unified image/overlay filesystem. IO is bounded to 4096 bytes per call. Metadata supports
 4096 objects (including seeded directories) and 64 independently opened file
@@ -353,8 +359,8 @@ references until their last alias or pending IO reference is released. A blocked
 owned read/write pins its original object when another thread closes/reuses the
 public number. Native descriptor mutations settle before a fork snapshot; peers
 cannot change the table until the kernel confirms the child birth. Thread exit
-leaves peer handles intact, including after the process leader exits. Getcwd is
-mediated against the bootstrapped chroot workdir; runtime chdir is unsupported.
+leaves peer handles intact, including after the process leader exits. Getcwd
+reports the owned or immutable-image cwd selected by chdir/fchdir.
 
 Wait4 supports a positive virtual child ID or -1, with options 0 or WNOHANG and
 no rusage buffer. An invalid status pointer does not consume the child. Orphans
@@ -549,7 +555,9 @@ little-endian u64 zero status. Malformed requests, peer loss, and capture failur
 stop the domain. Partial requests are buffered within the fixed frame bound.
 The coordinator owns request deadlines, directory durability, matching runtime
 state, and workload acknowledgement. Snapshot capture serializes with all owned
-filesystem mutations; writable shared mappings/native backing descriptors are
+filesystem mutations. Archives currently fail explicitly when live hardlinks
+would lose identity; hardlink archive records are not implemented.
+Writable shared mappings/native backing descriptors are
 not exposed. This captures filesystem contents, not process memory or live
 handles. Complete coordinator state pairing and recovery are separate capabilities.
 

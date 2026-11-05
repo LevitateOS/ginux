@@ -252,6 +252,9 @@ impl LaunchFs {
     ) -> Result<(), &'static [u8]> {
         for slot in 0..OBJECTS {
             if let Some((path, metadata)) = self.fs.overlay_entry(slot) {
+                if metadata.links > 1 {
+                    return Err(b"hardlink archive identity is not implemented");
+                }
                 archive.entry(path, metadata, |offset, buffer| {
                     self.fs
                         .read_overlay(slot, offset, buffer)
@@ -626,6 +629,9 @@ impl LaunchFs {
         if !self.enabled() {
             return None;
         }
+        if matches!(r.orig_rax, 86 | 265) {
+            return Some(self.hard_link(pid, r).unwrap_or_else(|error| error));
+        }
         if matches!(r.orig_rax, 82 | 264 | 316) {
             return Some(self.rename(pid, r).unwrap_or_else(|error| error));
         }
@@ -872,6 +878,34 @@ impl LaunchFs {
             && !self.prefixes[..self.count]
                 .iter()
                 .any(|p| p.as_bytes() != path && within(path, p.as_bytes()))
+    }
+
+    fn hard_link(&mut self, pid: usize, r: &UserRegs) -> Result<i64, i64> {
+        let (source, destination, flags) = if r.orig_rax == 86 {
+            (
+                self.path(pid, r.rdi, (-100i64) as u64)?,
+                self.path(pid, r.rsi, (-100i64) as u64)?,
+                0,
+            )
+        } else {
+            (
+                self.path(pid, r.rsi, r.rdi)?,
+                self.path(pid, r.r10, r.rdx)?,
+                r.r8,
+            )
+        };
+        if flags & !0x400 != 0 {
+            return Err(-95);
+        }
+        if !self.owns_path(source.as_bytes()) || !self.owns_path(destination.as_bytes()) {
+            return Err(-18);
+        }
+        let source = self.owned_path(source.as_bytes(), flags & 0x400 != 0, false)?;
+        let destination = self.mutation_path(destination.as_bytes(), true)?;
+        self.fs
+            .hard_link(source.as_bytes(), destination.as_bytes(), false)
+            .map(|_| 0)
+            .map_err(errno)
     }
 
     fn rename(&mut self, pid: usize, r: &UserRegs) -> Result<i64, i64> {
@@ -1135,6 +1169,7 @@ fn copy_metadata(
         address,
         crate::tracee_io::Stat {
             inode: metadata.inode,
+            links: metadata.links,
             mode: metadata.mode
                 | match metadata.kind {
                     NodeKind::Directory => 0o40000,

@@ -469,6 +469,7 @@ impl LaunchChannels {
             pid,
             address,
             Stat {
+                links: 1,
                 inode: 0x2_0000_0000 + pipe as u64,
                 mode: if socket { 0o140600 } else { 0o10600 },
                 size: 0,

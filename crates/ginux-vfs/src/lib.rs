@@ -314,6 +314,7 @@ pub struct FileMetadata {
     pub kind: NodeKind,
     pub mode: u32,
     pub size: u64,
+    pub links: u64,
 }
 
 /// A VFS-owned executable reference. Retain/release explicitly when process
@@ -362,6 +363,9 @@ struct OverlayFile {
     mode: u32,
     len: usize,
     executions: usize,
+    links: u64,
+    // A hardlink names this canonical data/metadata slot; ordinary entries own themselves.
+    object: Option<usize>,
 }
 
 impl OverlayFile {
@@ -372,6 +376,8 @@ impl OverlayFile {
             mode: 0,
             len: 0,
             executions: 0,
+            links: 0,
+            object: None,
         }
     }
 }
@@ -559,6 +565,7 @@ impl<
             // Exclusive creation never follows a final link.
             Some(index) if self.overlay[index].state == 4 => return Err(VfsError::SymlinkLoop),
             Some(index) => {
+                let index = self.object(index);
                 if writable && self.overlay[index].executions != 0 {
                     return Err(VfsError::TextBusy);
                 }
@@ -740,13 +747,13 @@ impl<
             } else {
                 let object = ordinal - self.index.len();
                 let entry = &self.overlay[object];
-                if !matches!(entry.state, 1 | 3 | 4) {
+                if !matches!(entry.state, 1 | 3 | 4 | 5) {
                     continue;
                 }
                 if let Some(name) = child_name(path, entry.path.as_bytes()) {
                     return Ok(Some(DirectoryEntry {
                         name,
-                        inode: (self.index.len() + object + 1) as u64,
+                        inode: (self.index.len() + self.object(object) + 1) as u64,
                         kind: match entry.state {
                             3 => NodeKind::Directory,
                             4 => NodeKind::Symlink,
@@ -853,8 +860,29 @@ impl<
         }
     }
 
-    fn release_unlinked(&mut self, object: usize) {
+    fn object(&self, slot: usize) -> usize {
+        self.overlay[slot].object.unwrap_or(slot)
+    }
+
+    fn link_count(&self, object: usize) -> u64 {
+        self.overlay[object].links
+    }
+
+    fn remove_name(&mut self, slot: usize) {
+        let object = self.object(slot);
+        self.overlay[object].links -= 1;
+        self.overlay[slot].state = 2;
+        self.release_unlinked(slot);
+    }
+
+    fn release_unlinked(&mut self, slot: usize) {
+        let object = self.object(slot);
+        if object != slot && self.overlay[slot].state == 2 {
+            // The alias never owned backing. Keep its whiteout if necessary.
+            self.overlay[slot].object = None;
+        }
         if self.overlay[object].state == 2
+            && self.link_count(object) == 0
             && self.overlay[object].executions == 0
             && !self
                 .descriptors
@@ -889,8 +917,7 @@ impl<
             if self.overlay[index].state == 3 {
                 return Err(VfsError::IsDirectory);
             }
-            self.overlay[index].state = 2;
-            self.release_unlinked(index);
+            self.remove_name(index);
             // Open descriptors still own the removed object's bytes.
             return Ok(());
         }
@@ -899,8 +926,11 @@ impl<
             return Err(VfsError::IsDirectory);
         }
         let index = self.allocate_overlay()?;
-        self.overlay[index].state = 2;
-        self.overlay[index].path = path;
+        self.overlay[index] = OverlayFile {
+            state: 2,
+            path,
+            ..OverlayFile::empty()
+        };
         Ok(())
     }
 
@@ -913,7 +943,7 @@ impl<
         let object = self
             .find_overlay(path.as_bytes())
             .ok_or(VfsError::PermissionDenied)?;
-        self.pin_object(object)
+        self.pin_object(self.object(object))
     }
 
     pub fn pin_executable_fd(&mut self, descriptor: i32) -> Result<Executable, VfsError> {
@@ -1023,22 +1053,26 @@ impl<
     /// Slots are opaque and stable only until the next filesystem mutation.
     pub fn overlay_entry(&self, slot: usize) -> Option<(&[u8], FileMetadata)> {
         let entry = self.overlay.get(slot)?;
-        if !matches!(entry.state, 1 | 3 | 4) {
+        if !matches!(entry.state, 1 | 3 | 4 | 5) {
             return None;
         }
-        Some((
-            entry.path.as_bytes(),
-            FileMetadata {
-                inode: (self.index.len() + slot + 1) as u64,
-                kind: match entry.state {
-                    3 => NodeKind::Directory,
-                    4 => NodeKind::Symlink,
-                    _ => NodeKind::File,
-                },
-                mode: entry.mode,
-                size: entry.len as u64,
+        Some((entry.path.as_bytes(), self.overlay_metadata(slot)))
+    }
+
+    fn overlay_metadata(&self, slot: usize) -> FileMetadata {
+        let object = self.object(slot);
+        let entry = &self.overlay[object];
+        FileMetadata {
+            inode: (self.index.len() + object + 1) as u64,
+            kind: match self.overlay[slot].state {
+                3 => NodeKind::Directory,
+                4 => NodeKind::Symlink,
+                _ => NodeKind::File,
             },
-        ))
+            mode: entry.mode,
+            size: entry.len as u64,
+            links: self.link_count(object),
+        }
     }
 
     /// Read live file or symlink bytes without allocating a guest descriptor.
@@ -1049,21 +1083,25 @@ impl<
         output: &mut [u8],
     ) -> Result<(), VfsError> {
         let entry = self.overlay.get(slot).ok_or(VfsError::NotFound)?;
-        if !matches!(entry.state, 1 | 4) {
+        if !matches!(entry.state, 1 | 4 | 5) {
             return Err(VfsError::NotFound);
         }
+        let object = self.object(slot);
         if offset
             .checked_add(output.len())
-            .filter(|end| *end <= entry.len)
+            .filter(|end| *end <= self.overlay[object].len)
             .is_none()
         {
             return Err(VfsError::Io);
         }
-        self.storage.read(slot, offset, output)
+        self.storage.read(object, offset, output)
     }
 
     pub fn overlay_files(&self) -> usize {
-        self.overlay.iter().filter(|entry| entry.state == 1).count()
+        self.overlay
+            .iter()
+            .filter(|entry| matches!(entry.state, 1 | 5))
+            .count()
     }
 
     /// Resolve the merged namespace without opening a descriptor. The adapter
@@ -1175,6 +1213,44 @@ impl<
             mode: 0o777,
             len: target.len(),
             executions: 0,
+            links: 1,
+            object: None,
+        };
+        Ok(())
+    }
+
+    /// Add a name for an existing owned regular-file inode. Capacity and the
+    /// target parent are checked before the namespace is changed.
+    pub fn hard_link(
+        &mut self,
+        source: &[u8],
+        destination: &[u8],
+        follow: bool,
+    ) -> Result<(), VfsError> {
+        let source = self.resolved_path(source, follow, false)?;
+        let metadata = self.metadata_no_follow(source.as_bytes())?;
+        if metadata.kind != NodeKind::File {
+            return Err(VfsError::PermissionDenied);
+        }
+        let object = self
+            .find_overlay(source.as_bytes())
+            .map(|slot| self.object(slot))
+            .ok_or(VfsError::PermissionDenied)?;
+        let destination = self.namespace_path(destination, true)?;
+        match self.metadata_no_follow(destination.as_bytes()) {
+            Ok(_) => return Err(VfsError::AlreadyExists),
+            Err(VfsError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        self.require_parent(destination.as_bytes())?;
+        let slot = self.allocate_overlay()?;
+        self.storage.clear(slot);
+        self.overlay[object].links += 1;
+        self.overlay[slot] = OverlayFile {
+            state: 5,
+            path: destination,
+            object: Some(object),
+            ..OverlayFile::empty()
         };
         Ok(())
     }
@@ -1220,16 +1296,7 @@ impl<
             if file.state == 2 {
                 return Err(VfsError::NotFound);
             }
-            return Ok(FileMetadata {
-                inode: (self.index.len() + index + 1) as u64,
-                kind: match file.state {
-                    3 => NodeKind::Directory,
-                    4 => NodeKind::Symlink,
-                    _ => NodeKind::File,
-                },
-                mode: file.mode,
-                size: file.len as u64,
-            });
+            return Ok(self.overlay_metadata(index));
         }
         let entry = self.index.lookup_exact(path)?;
         Ok(FileMetadata {
@@ -1239,6 +1306,7 @@ impl<
                 + 1) as u64,
             kind: entry.kind,
             mode: entry.mode,
+            links: 1,
             size: if entry.kind == NodeKind::Symlink {
                 entry.link.len() as u64
             } else {
@@ -1260,6 +1328,7 @@ impl<
                 },
                 mode: file.mode,
                 size: file.len as u64,
+                links: self.link_count(descriptor.object),
             })
         } else {
             let entry = self.index.entry(descriptor.object)?;
@@ -1268,6 +1337,7 @@ impl<
                 kind: entry.kind,
                 mode: entry.mode,
                 size: entry.size,
+                links: 1,
             })
         }
     }
@@ -1282,16 +1352,20 @@ impl<
         self.require_parent(path.as_bytes())?;
         let slot = self.allocate_overlay()?;
         self.storage.clear(slot);
-        self.overlay[slot].state = 3;
-        self.overlay[slot].path = path;
-        self.overlay[slot].mode = mode & 0o777;
-        self.overlay[slot].len = 0;
+        self.overlay[slot] = OverlayFile {
+            state: 3,
+            path,
+            mode: mode & 0o777,
+            links: 1,
+            ..OverlayFile::empty()
+        };
         Ok(())
     }
 
     fn has_children(&self, path: &[u8]) -> Result<bool, VfsError> {
         if self.overlay.iter().any(|entry| {
-            matches!(entry.state, 1 | 3 | 4) && child_name(path, entry.path.as_bytes()).is_some()
+            matches!(entry.state, 1 | 3 | 4 | 5)
+                && child_name(path, entry.path.as_bytes()).is_some()
         }) {
             return Ok(true);
         }
@@ -1323,8 +1397,7 @@ impl<
         if self.has_children(path.as_bytes())? {
             return Err(VfsError::DirectoryNotEmpty);
         }
-        self.overlay[slot].state = 2;
-        self.release_unlinked(slot);
+        self.remove_name(slot);
         Ok(())
     }
 
@@ -1394,9 +1467,13 @@ impl<
             Err(VfsError::NotFound) => None,
             Err(error) => return Err(error),
         };
+        if target.is_some_and(|target| self.object(target) == self.object(source_slot)) {
+            return Ok(());
+        }
         // Check every new descendant path before changing any namespace entry.
         for entry in &self.overlay {
-            if matches!(entry.state, 1 | 3 | 4) && beneath(entry.path.as_bytes(), source.as_bytes())
+            if matches!(entry.state, 1 | 3 | 4 | 5)
+                && beneath(entry.path.as_bytes(), source.as_bytes())
             {
                 let suffix = entry.path.len - source.len;
                 if destination
@@ -1409,11 +1486,11 @@ impl<
             }
         }
         if let Some(target) = target {
-            self.overlay[target].state = 2;
-            self.release_unlinked(target);
+            self.remove_name(target);
         }
         for entry in &mut self.overlay {
-            if matches!(entry.state, 1 | 3 | 4) && beneath(entry.path.as_bytes(), source.as_bytes())
+            if matches!(entry.state, 1 | 3 | 4 | 5)
+                && beneath(entry.path.as_bytes(), source.as_bytes())
             {
                 let mut path = destination;
                 path.extend(&entry.path.as_bytes()[source.len..])?; // Preflight above guarantees capacity.
@@ -1441,7 +1518,8 @@ impl<
         if mode & !0o777 != 0 {
             return Err(VfsError::PermissionDenied);
         }
-        self.overlay[slot].mode = mode;
+        let object = self.object(slot);
+        self.overlay[object].mode = mode;
         Ok(())
     }
 
@@ -1505,7 +1583,7 @@ impl<
     fn find_overlay(&self, path: &[u8]) -> Option<usize> {
         self.overlay
             .iter()
-            .position(|entry| matches!(entry.state, 1 | 3 | 4) && entry.path.as_bytes() == path)
+            .position(|entry| matches!(entry.state, 1 | 3 | 4 | 5) && entry.path.as_bytes() == path)
             .or_else(|| {
                 self.overlay
                     .iter()
@@ -1521,6 +1599,7 @@ impl<
                 self.overlay.iter().enumerate().position(|(slot, entry)| {
                     entry.state == 2
                         && entry.executions == 0
+                        && self.link_count(slot) == 0
                         && self.index.lookup_exact(entry.path.as_bytes()) == Err(VfsError::NotFound)
                         && !self
                             .descriptors
@@ -1534,10 +1613,13 @@ impl<
     fn create_overlay(&mut self, path: Path, mode: u32) -> Result<usize, VfsError> {
         let index = self.allocate_overlay()?;
         self.storage.clear(index);
-        self.overlay[index].state = 1;
-        self.overlay[index].path = path;
-        self.overlay[index].mode = mode;
-        self.overlay[index].len = 0;
+        self.overlay[index] = OverlayFile {
+            state: 1,
+            path,
+            mode,
+            links: 1,
+            ..OverlayFile::empty()
+        };
         Ok(index)
     }
 
@@ -1966,6 +2048,41 @@ mod tests {
         let mut output = [0; 4];
         assert_eq!(vfs.read(fd, &mut output), Ok(4));
         assert_eq!(&output, b"keep");
+    }
+
+    #[test]
+    fn hardlinks_share_identity_and_preserve_pinned_bytes_at_capacity() {
+        let bytes = index_bytes();
+        let mut fs: VirtualFs<'_, Reader, 2, 32, 3> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        let fd = fs.open(b"/one", O_CREATE | O_READ | O_WRITE).unwrap();
+        fs.write(fd, b"shared").unwrap();
+        fs.hard_link(b"/one", b"/two", false).unwrap();
+        assert_eq!(fs.metadata(b"/one"), fs.metadata(b"/two"));
+        assert_eq!(fs.metadata(b"/one").unwrap().links, 2);
+        assert_eq!(
+            fs.hard_link(b"/two", b"/three", false),
+            Err(VfsError::OverlayLimit)
+        );
+        fs.unlink(b"/one").unwrap();
+        assert_eq!(fs.metadata(b"/two").unwrap().links, 1);
+        assert_eq!(
+            fs.open(b"/one", O_CREATE | O_WRITE),
+            Err(VfsError::OverlayLimit)
+        );
+        fs.rename(b"/two", b"/moved", false).unwrap();
+        let alias = fs.open(b"/moved", O_READ | O_WRITE).unwrap();
+        fs.write(alias, b"S").unwrap();
+        fs.unlink(b"/moved").unwrap();
+        assert_eq!(fs.fstat(fd).unwrap().links, 0);
+        let mut output = [0; 6];
+        fs.seek(fd, 0, 0).unwrap();
+        assert_eq!(fs.read(fd, &mut output), Ok(6));
+        assert_eq!(&output, b"Shared");
+        fs.close(alias).unwrap();
+        fs.close(fd).unwrap();
+        let empty = fs.open(b"/fresh", O_CREATE | O_READ).unwrap();
+        assert_eq!(fs.read(empty, &mut output), Ok(0));
     }
 
     #[test]

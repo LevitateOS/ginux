@@ -119,6 +119,7 @@ pub fn image_link(pid: usize, member: &[u8]) -> Result<Path, i64> {
 /// Linux file type bits are part of mode; identities belong to the domain.
 pub struct Stat {
     pub inode: u64,
+    pub links: u64,
     pub mode: u32,
     pub size: u64,
     pub device_major: u32,
@@ -131,11 +132,11 @@ pub fn write_stat(pid: usize, address: u64, metadata: Stat, statx: bool) -> Resu
     let (ino, mode_at, size_at, blocks_at, length) = if statx {
         bytes[..4].copy_from_slice(&0x7ffu32.to_le_bytes());
         bytes[4..8].copy_from_slice(&4096u32.to_le_bytes());
-        bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&(metadata.links as u32).to_le_bytes());
         bytes[28..30].copy_from_slice(&(mode as u16).to_le_bytes());
         (32, None, 40, 48, 256)
     } else {
-        bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
+        bytes[16..24].copy_from_slice(&metadata.links.to_le_bytes());
         bytes[56..64].copy_from_slice(&4096u64.to_le_bytes());
         (8, Some(24), 48, 64, 144)
     };

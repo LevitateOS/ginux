@@ -443,7 +443,7 @@ impl DescriptorTable {
                     Err(e) => Err(e),
                 }
             }
-            264 | 316 => {
+            264 | 265 | 316 => {
                 call.save(r);
                 self.rename_paths(pid, r, backends)
             }
