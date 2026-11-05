@@ -76,7 +76,7 @@ long script_main(word *stack)
         CHECK(publish("/work/missing","#!/bin/missing\n")==0 && DO(59,"/work/missing",next,next_env)==-2 && intact(),39);
     }
     CHECK(publish("/work/invalid","#! \t\n")==0 && DO(59,"/work/invalid",next,next_env)==-8 && intact(),40);
-    CHECK(publish("/work/owned-interpreter","#!/work/program\n")==0 && DO(59,"/work/owned-interpreter",next,next_env)==-95 && intact(),41);
+    CHECK(publish("/work/owned-interpreter","#!/work/owned-interpreter\n")==0 && DO(59,"/work/owned-interpreter",next,next_env)==-40 && intact(),41);
     fd=DO(2,"/work/program",02000000,0);
     CHECK(fd==6 && call(322,fd,(word)"",(word)next,(word)next_env,0x1000)==-2 && intact(),42);
     CHECK(DO(72,fd,2,0)==0 && DO(8,fd,7,0)==7,43);

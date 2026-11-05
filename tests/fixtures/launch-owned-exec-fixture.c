@@ -25,11 +25,31 @@ static long publish(const char *path, const char *data, word size)
     if (DO(1,fd,data,size)!=(long)size || DO(91,fd,0755,0)!=0 || DO(3,fd,0,0)!=0) return -1;
     return 0;
 }
+static int equal(const char *a, const char *b)
+{
+    for (word i=0;;++i) { if (a[i]!=b[i]) return 0; if (!a[i]) return 1; }
+}
 long owned_exec_main(word *stack)
 {
     word argc=*stack;
     char **argv=(char **)(stack+1), **env=argv+argc+1;
     char mode=argc>1 ? argv[1][0] : 's';
+    if (mode=='b') {
+        CHECK(argc==5 || argc==7 || argc==11,100);
+        int native=equal(argv[argc-1],"native");
+        CHECK(equal(argv[0],native?"/bin/payload":"/work/program") && equal(argv[1],"beta"),101);
+        if (argc==7) CHECK(equal(argv[2],"/work/middle") && equal(argv[3],"alpha option"),102);
+        if (argc==11) CHECK(equal(argv[2],"/work/fourth") && equal(argv[3],"delta") && equal(argv[4],"/work/third") && equal(argv[5],"gamma") && equal(argv[6],"/work/middle") && equal(argv[7],"alpha option"),120);
+        CHECK(equal(argv[argc-3],"/work/script") && equal(argv[argc-2],"spaced argument"),103);
+        CHECK(env[0] && equal(env[0],"OWNED=yes") && !env[1],104);
+        CHECK(DO(2,"/work/program",1,0)==(native?3:-26),105);
+        if (native) CHECK(DO(3,3,0,0)==0,106);
+        CHECK(DO(2,"/work/script",1,0)==3 && DO(3,3,0,0)==0,107);
+        if (argc>=7) CHECK(DO(2,"/work/middle",1,0)==3 && DO(3,3,0,0)==0,108);
+        if (argc==11) CHECK(DO(2,"/work/third",1,0)==3 && DO(3,3,0,0)==0 && DO(2,"/work/fourth",1,0)==3 && DO(3,3,0,0)==0,121);
+        CHECK(DO(1,1,"script-ready\n",13)==13 && DO(0,0,buffer,1)==1,109);
+        DO(1,1,"script-chain: PASS\n",19); return 0;
+    }
     if (mode=='r' && argc>2 && argv[1][1]=='e') {
         CHECK(DO(2,"/work/program",1,0)==-26,10); // Forked child still owns the executable.
         CHECK(DO(1,9,"Z",1)==1 && DO(3,9,0,0)==0,11);
@@ -73,6 +93,33 @@ long owned_exec_main(word *stack)
         CHECK(DO(1,dest,buffer,count)==count,32);
     }
     CHECK(DO(91,dest,0755,0)==0 && DO(3,source,0,0)==0 && DO(3,dest,0,0)==0,33);
+    if (mode=='i' || mode=='j' || mode=='k' || mode=='l') {
+        char *args[]={"ignored argv zero","spaced argument",mode=='k'?"native":"owned",0};
+        char *values[]={"OWNED=yes",0};
+        const char direct[]="#!/work/program beta\n";
+        const char outer[]="#!/work/middle alpha option\n";
+        const char native[]="#!/bin/payload beta\n";
+        const char cycle[]="#!/work/loop\n";
+        CHECK(publish("/work/loop",cycle,sizeof cycle-1)==0,110);
+        CHECK(DO(59,"/work/loop",args,values)==-40,111);
+        CHECK(DO(2,"/work/loop",1,0)==3 && DO(3,3,0,0)==0,112);
+        CHECK(publish("/work/script",direct,sizeof direct-1)==0,113);
+        CHECK(DO(90,"/work/program",0644,0)==0 && DO(59,"/work/script",args,values)==-13,114);
+        CHECK(DO(90,"/work/program",0755,0)==0,115);
+        CHECK(DO(2,"/work/script",1,0)==3 && DO(3,3,0,0)==0,116);
+        if (mode!='i') {
+            CHECK(publish("/work/middle",mode=='k'?native:direct,mode=='k'?sizeof native-1:sizeof direct-1)==0,117);
+            CHECK(publish("/work/script",outer,sizeof outer-1)==0,118);
+        }
+        if (mode=='l') {
+            const char middle[]="#!/work/third gamma\n", third[]="#!/work/fourth delta\n";
+            CHECK(publish("/work/middle",middle,sizeof middle-1)==0 && publish("/work/third",third,sizeof third-1)==0 && publish("/work/fourth",direct,sizeof direct-1)==0,122);
+            const char too_many[]="#!/work/script\n";
+            CHECK(publish("/work/fifth",too_many,sizeof too_many-1)==0 && DO(59,"/work/fifth",args,values)==-40,123);
+            CHECK(DO(2,"/work/fifth",1,0)==3 && DO(3,3,0,0)==0,124);
+        }
+        DO(59,"/work/script",args,values); return 119;
+    }
     CHECK(DO(2,"/work/program",02000000,0)==3,34);
     CHECK(DO(2,"/work/keep",0102,0600)==4 && DO(1,4,"K",1)==1,35);
     CHECK(DO(2,"/work/drop",02000102,0600)==5 && DO(1,5,"C",1)==1,36);

@@ -1050,37 +1050,31 @@ impl Supervisor<'_> {
             };
             (image, r.rsi + path.as_bytes().len() as u64)
         };
-        let script = if let Some(image) = image {
-            let result = self
-                .objects
-                .filesystem
-                .is_script(self.task(index).host, image)
-                .and_then(|script| {
-                    if script {
-                        if r.orig_rax == 322 {
-                            let path = crate::tracee_io::read_path(host, r.rsi)?;
-                            if (path.is_empty()
-                                || (path.as_bytes()[0] != b'/' && r.rdi as i32 != -100))
-                                && self.table(index).exec_cloexec(r.rdi)?
-                            {
-                                return Err(-2);
-                            }
-                        }
-                        crate::exec_script::Script::prepare(host, r).map(Some)
-                    } else {
-                        Ok(None)
+        let mut image = image;
+        let script = if let Some(initial) = image {
+            let check = (|| {
+                if self.objects.filesystem.is_script(initial)? && r.orig_rax == 322 {
+                    let path = crate::tracee_io::read_path(host, r.rsi)?;
+                    if (path.is_empty() || (path.as_bytes()[0] != b'/' && r.rdi as i32 != -100))
+                        && self.table(index).exec_cloexec(r.rdi)?
+                    {
+                        return Err(-2);
                     }
-                });
-            match result {
-                Ok(script) => script,
-                Err(error) => {
-                    self.objects
-                        .filesystem
-                        .release_executable(image)
-                        .expect("script setup executable release");
-                    return Err(error);
                 }
+                Ok(())
+            })();
+            if let Err(error) = check {
+                self.objects
+                    .filesystem
+                    .release_executable(initial)
+                    .expect("script setup release");
+                return Err(error);
             }
+            // Resolution consumes the initial pin on both success and failure.
+            let (resolved, script) =
+                crate::exec_script::Script::resolve(self.objects.filesystem, host, r, initial)?;
+            image = Some(resolved);
+            script
         } else {
             None
         };
@@ -1172,7 +1166,7 @@ impl Supervisor<'_> {
                     // binfmt_script requires its backing to survive the kernel
                     // exec. Retire it before the interpreter's first syscall.
                     r.rsi = if owned.legacy_create { 2 } else { 0x12 }
-                        | u64::from(owned.script.is_none());
+                        | u64::from(!owned.script.is_some_and(|script| script.kernel_script));
                     self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::Create;
                 }
             }
@@ -1201,6 +1195,12 @@ impl Supervisor<'_> {
     ) {
         let exec = self.task_mut(index).exec.take().unwrap();
         if let Some(owned) = exec.owned {
+            if owned
+                .script
+                .is_some_and(|script| script.release_held(self.objects.filesystem).is_err())
+            {
+                self.fail(domain, b"interpreter reference release failed");
+            }
             if self
                 .objects
                 .filesystem
@@ -1253,17 +1253,24 @@ impl Supervisor<'_> {
                 {
                     self.fail(domain, b"new script stack register update failed");
                 }
-                self.task_mut(index).exec.as_mut().unwrap().retire = Some(fd);
                 self.task_mut(index).exec.as_mut().unwrap().owned = None;
-                if self
-                    .objects
-                    .filesystem
-                    .release_executable(owned.image)
-                    .is_err()
-                {
-                    self.fail(domain, b"committed script reference release failed");
+                if script.release_held(self.objects.filesystem).is_err() {
+                    self.fail(domain, b"committed interpreter references release failed");
                 }
-                None
+                if script.kernel_script {
+                    self.task_mut(index).exec.as_mut().unwrap().retire = Some(fd);
+                    if self
+                        .objects
+                        .filesystem
+                        .release_executable(owned.image)
+                        .is_err()
+                    {
+                        self.fail(domain, b"committed script reference release failed");
+                    }
+                    None
+                } else {
+                    Some(owned.image)
+                }
             } else {
                 self.task_mut(index).exec.as_mut().unwrap().owned = None;
                 Some(owned.image)
@@ -1667,6 +1674,12 @@ impl Supervisor<'_> {
         let id = self.task(index).id;
         let group = self.task(index).group;
         if let Some(owned) = self.task_mut(index).exec.take().and_then(|exec| exec.owned) {
+            if owned
+                .script
+                .is_some_and(|script| script.release_held(self.objects.filesystem).is_err())
+            {
+                self.fail(domain, b"interpreter reference release failed");
+            }
             if self
                 .objects
                 .filesystem

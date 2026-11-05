@@ -316,13 +316,29 @@ impl LaunchFs {
         dirfd: u64,
     ) -> Result<Option<Executable>, i64> {
         let path = self.path(pid, address, dirfd)?;
-        if self.owns_path(path.as_bytes()) {
-            let image = self.fs.pin_executable(path.as_bytes()).map_err(errno)?;
+        self.exec_resolved(path.as_bytes())
+    }
+
+    pub fn exec_interpreter(&mut self, pid: usize, name: &[u8]) -> Result<Option<Executable>, i64> {
+        let cwd;
+        let base = if name.first() == Some(&b'/') {
+            b"/".as_slice()
+        } else {
+            cwd = crate::tracee_io::image_cwd(pid)?;
+            cwd.as_bytes()
+        };
+        let path = normalize(base, name)?;
+        self.exec_resolved(path.as_bytes())
+    }
+
+    fn exec_resolved(&mut self, path: &[u8]) -> Result<Option<Executable>, i64> {
+        if self.owns_path(path) {
+            let image = self.fs.pin_executable(path).map_err(errno)?;
             return self.check_exec(image).map(Some);
         }
         if [b"/dev".as_slice(), b"/proc", b"/sys"]
             .iter()
-            .any(|p| within(path.as_bytes(), p))
+            .any(|p| within(path, p))
         {
             return Err(-13);
         }
@@ -394,47 +410,10 @@ impl LaunchFs {
     /// The kernel owns binfmt parsing and optional interpreter arguments. Check
     /// the first interpreter's namespace before handing it the sealed script.
     /// Owned interpreters need a separate owned-executable transaction.
-    pub fn is_script(&self, pid: usize, image: Executable) -> Result<bool, i64> {
-        let mut header = [0u8; 256];
+    pub fn is_script(&self, image: Executable) -> Result<bool, i64> {
+        let mut header = [0u8; 2];
         self.read_executable(image, 0, &mut header)?;
-        if !header.starts_with(b"#!") {
-            return Ok(false);
-        }
-        let line_end = header.iter().position(|b| *b == b'\n').unwrap_or(255);
-        let line = &header[2..line_end];
-        let start = line
-            .iter()
-            .position(|b| !matches!(b, b' ' | b'\t'))
-            .ok_or(-8)?;
-        let end = line[start..]
-            .iter()
-            .position(|b| matches!(b, 0 | b' ' | b'\t'))
-            .map(|n| n + start)
-            .unwrap_or(line.len());
-        if end == start || (end == line.len() && header[line_end] != b'\n') {
-            return Err(-8);
-        }
-        let interpreter = &line[start..end];
-        let cwd;
-        let path = normalize(
-            if interpreter[0] == b'/' {
-                b"/"
-            } else {
-                cwd = crate::tracee_io::image_cwd(pid)?;
-                cwd.as_bytes()
-            },
-            interpreter,
-        )?;
-        if self.owns_path(path.as_bytes()) {
-            return Err(-95);
-        }
-        if [b"/dev".as_slice(), b"/proc", b"/sys"]
-            .iter()
-            .any(|p| within(path.as_bytes(), p))
-        {
-            return Err(-13);
-        }
-        Ok(true)
+        Ok(header == *b"#!")
     }
 
     pub fn mapping_reference(&mut self, handle: u32) -> Result<usize, i64> {

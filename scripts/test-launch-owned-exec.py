@@ -76,6 +76,25 @@ def main():
                         proc.kill()
                         proc.communicate(timeout=5)
             print('PASS owned exec ' + mode, flush=True)
+        for mode in ('interpreter', 'joined-interpreters', 'kernel-interpreter', 'limit-interpreters'):
+            path = work / f'{mode}.toml'
+            path.write_text(config.replace('args = []', 'args = ' + json.dumps([mode])))
+            with (work / f'{mode}.audit').open('wb') as audit:
+                proc = subprocess.Popen([binary, 'launch', str(path), str(root)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=audit)
+                try:
+                    assert select.select([proc.stdout], [], [], 10)[0], mode
+                    assert proc.stdout.readline() == b'script-ready\n', (mode, (work / f'{mode}.audit').read_text())
+                    target, = children(proc.pid)
+                    assert sorted(int(p.name) for p in Path(f'/proc/{target}/fd').iterdir()) == [0, 1, 2]
+                    stdout, _ = proc.communicate(b'G', timeout=10)
+                    assert proc.returncode == 0 and stdout == b'script-chain: PASS\n', (mode, proc.returncode, stdout)
+                    assert b'teardown tasks=0 owned-handles=0' in (work / f'{mode}.audit').read_bytes()
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate(timeout=5)
+            print('PASS script chain ' + mode, flush=True)
         print('test-launch-owned-exec: PASS (ELF, execveat, CLOEXEC, failed exec, private fds, text busy, fork/vfork lifetime)')
 
 

@@ -396,8 +396,11 @@ sealed ELF through execveat. The private fd never enters the public table: the
 kernel closes it on success, and the transaction closes it before returning a
 failed exec. No named host output file is created. Supervisor access to the
 tracee's procfs fd view is required; failure propagates without fallback.
-Named owned shebang scripts use the kernel's image interpreter loader, including
-its single optional argument and recursive image interpreter prefix. The new
+Named owned shebang scripts support up to four consecutive owned interpreters,
+followed by an owned ELF or the kernel's image interpreter loader. Resolution
+pins every owned script until exec commits, enforces executable permissions and
+write exclusion, and rejects cycles/excessive nesting with ELOOP. Each shebang's
+single optional argument and any recursive image interpreter prefix are retained. The new
 exec stack restores the original script pathname in argv and AT_EXECFN before
 user code runs. Arguments and environment survive unchanged; the replaced
 argv[0] follows kernel shebang behavior. The script backing survives kernel
@@ -425,8 +428,9 @@ mapping budget; total process/kernel memory accounting is unfinished.
 Signals interrupting descriptor synchronization or private-fd preparation fail the domain explicitly;
 restart/deferred delivery for that preparation remains incomplete. Path checking
 uses the current lexical view rather than a unified image/overlay resolver.
-Image-file polling, links, guest file mappings, owned interpreters and a full
-image/overlay resolver remain incomplete. This is not compiler support.
+Image-file polling, links, shared writable file mappings and a full
+image/overlay resolver remain incomplete. Compiler compatibility remains bounded
+by these and the configured task, descriptor and storage limits.
 
 When requested, the result file is reserved exclusively before launch, with
 mode 0600 and a maximum path length of 512 bytes. Existing files are never
