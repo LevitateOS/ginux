@@ -924,6 +924,45 @@ impl TcpBackend for LinuxTcpBackend {
         Ok(error)
     }
 
+    fn endpoint(&mut self, handle: Self::Handle, peer: bool) -> Result<TcpEndpoint, NetworkError> {
+        let mut address = [0u8; 28];
+        let mut size = address.len() as u32;
+        Self::result(unsafe {
+            Self::call(
+                if peer { 52 } else { 51 },
+                [
+                    handle.0 as usize,
+                    address.as_mut_ptr() as usize,
+                    &mut size as *mut u32 as usize,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })?;
+        let port = u16::from_be_bytes([address[2], address[3]]);
+        match (u16::from_ne_bytes([address[0], address[1]]), size) {
+            (2, 16) => TcpEndpoint::ipv4([address[4], address[5], address[6], address[7]], port),
+            (10, 28) => {
+                let mut ip = [0; 16];
+                ip.copy_from_slice(&address[8..24]);
+                TcpEndpoint::ipv6(ip, port)
+            }
+            _ => Err(NetworkError::Backend(5)),
+        }
+    }
+
+    fn set_nodelay(&mut self, handle: Self::Handle, enabled: bool) -> Result<(), NetworkError> {
+        let value = i32::from(enabled);
+        Self::result(unsafe {
+            Self::call(
+                54,
+                [handle.0 as usize, 6, 1, &value as *const i32 as usize, 4, 0],
+            )
+        })
+        .map(|_| ())
+    }
+
     fn shutdown(
         &mut self,
         handle: Self::Handle,
