@@ -84,7 +84,7 @@ long owned_exec_main(word *stack)
     }
     CHECK(DO(8,3,0,0)==0 && DO(0,3,buffer,64)==64,44);
     CHECK(publish("/work/bad-elf",buffer,64)==0 && DO(59,"/work/bad-elf",next,next_env)==-8 && intact(),45);
-    CHECK(publish("/work/script","#!/bin/payload\n",15)==0 && DO(59,"/work/script",next,next_env)==-95 && intact(),46);
+    CHECK(publish("/work/script","#!/bin/missing\n",15)==0 && DO(59,"/work/script",next,next_env)==-2 && intact(),46);
     CHECK(DO(1,1,"failed-ready\n",13)==13 && DO(0,0,buffer,1)==1 && buffer[0]=='G',47);
     if (mode=='c' || mode=='v' || mode=='m') {
         long child=mode=='m' ? DO(56,0x4111,0,0) : DO(mode=='v'?58:57,0,0,0);

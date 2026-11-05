@@ -282,6 +282,9 @@ impl DescriptorTable {
     pub fn exec_path_dirfd(&self, pid: usize, fd: u64, address: u64) -> Result<u64, i64> {
         self.path_handle(pid, fd, address)
     }
+    pub fn exec_cloexec(&self, fd: u64) -> Result<bool, i64> {
+        Ok(self.get(fd)?.cloexec)
+    }
 
     /// PTRACE_EVENT_EXEC is the commit point. Failed exec never calls this.
     pub fn exec_completed(&mut self, backends: &mut Backends) -> Result<(), &'static [u8]> {

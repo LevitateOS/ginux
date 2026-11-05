@@ -43,6 +43,8 @@ enum ExecStage {
     Close,
     Kernel,
     Completed,
+    Retire,
+    RetireReenter,
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +54,7 @@ struct Exec {
     next_native: usize,
     stage: ExecStage,
     owned: Option<OwnedExec>,
+    retire: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -61,6 +64,7 @@ struct OwnedExec {
     descriptor: Option<u32>,
     legacy_create: bool,
     failure: Option<i64>,
+    script: Option<crate::exec_script::Script>,
 }
 
 struct Task {
@@ -264,7 +268,12 @@ pub fn supervise(
             if s.task(index).exec.is_some_and(|e| {
                 matches!(
                     e.stage,
-                    ExecStage::Sync | ExecStage::Reenter | ExecStage::Create | ExecStage::Close
+                    ExecStage::Sync
+                        | ExecStage::Reenter
+                        | ExecStage::Create
+                        | ExecStage::Close
+                        | ExecStage::Retire
+                        | ExecStage::RetireReenter
                 )
             }) {
                 s.fail(domain, b"signal interrupted exec descriptor setup");
@@ -425,6 +434,40 @@ impl Supervisor<'_> {
                     return;
                 }
                 ExecStage::Completed => {
+                    if let Some(fd) = exec.retire {
+                        let mut instruction = [0u8; 2];
+                        if r.rip < 2
+                            || copy_memory(
+                                self.task(index).host,
+                                r.rip - 2,
+                                &mut instruction,
+                                false,
+                            ) != Ok(2)
+                            || instruction != [0x0f, 0x05]
+                        {
+                            self.fail(
+                                domain,
+                                b"script descriptor retirement requires a syscall instruction",
+                            );
+                        }
+                        let state = self.task_mut(index).exec.as_mut().unwrap();
+                        state.original = *r;
+                        state.stage = ExecStage::Retire;
+                        r.orig_rax = 3;
+                        r.rax = 3;
+                        r.rdi = fd as u64;
+                        self.run(index, r, domain);
+                        return;
+                    }
+                    self.task_mut(index).exec = None;
+                }
+                ExecStage::RetireReenter => {
+                    if r.orig_rax != exec.original.orig_rax || r.rip != exec.original.rip {
+                        self.fail(
+                            domain,
+                            b"script descriptor retirement replay left its syscall instruction",
+                        );
+                    }
                     self.task_mut(index).exec = None;
                 }
                 _ => self.fail(domain, b"unexpected entry during exec"),
@@ -754,17 +797,48 @@ impl Supervisor<'_> {
             };
             (image, r.rsi + path.as_bytes().len() as u64)
         };
+        let script = if let Some(image) = image {
+            let result = self.objects.filesystem.is_script(image).and_then(|script| {
+                if script {
+                    if r.orig_rax == 322 {
+                        let path = crate::tracee_io::read_path(host, r.rsi)?;
+                        if (path.is_empty() || (path.as_bytes()[0] != b'/' && r.rdi as i32 != -100))
+                            && self.table(index).exec_cloexec(r.rdi)?
+                        {
+                            return Err(-2);
+                        }
+                    }
+                    crate::exec_script::Script::prepare(host, r).map(Some)
+                } else {
+                    Ok(None)
+                }
+            });
+            match result {
+                Ok(script) => script,
+                Err(error) => {
+                    self.objects
+                        .filesystem
+                        .release_executable(image)
+                        .expect("script setup executable release");
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         self.task_mut(index).exec = Some(Exec {
             original: *r,
             native_dirfd,
             next_native: 0,
             stage: ExecStage::Reenter,
+            retire: None,
             owned: image.map(|image| OwnedExec {
                 image,
                 empty_path,
                 descriptor: None,
                 legacy_create: false,
                 failure: None,
+                script,
             }),
         });
         Ok(())
@@ -837,7 +911,10 @@ impl Supervisor<'_> {
                     r.orig_rax = 319;
                     r.rax = 319;
                     r.rdi = owned.empty_path;
-                    r.rsi = if owned.legacy_create { 3 } else { 0x13 };
+                    // binfmt_script requires its backing to survive the kernel
+                    // exec. Retire it before the interpreter's first syscall.
+                    r.rsi = if owned.legacy_create { 2 } else { 0x12 }
+                        | u64::from(owned.script.is_none());
                     self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::Create;
                 }
             }
@@ -899,14 +976,43 @@ impl Supervisor<'_> {
         if self.processes.exec(self.task(index).id).is_err() {
             self.fail(domain, b"virtual exec transition failed");
         }
-        let image = self
-            .task_mut(index)
-            .exec
-            .as_mut()
-            .unwrap()
-            .owned
-            .take()
-            .map(|owned| owned.image);
+        let owned = self.task(index).exec.as_ref().unwrap().owned;
+        let image = if let Some(owned) = owned {
+            if let Some(script) = owned.script {
+                let mut r = self.registers(index, domain);
+                let fd = owned.descriptor.unwrap();
+                if script.restore(self.task(index).host, fd, &mut r).is_err() {
+                    // The kernel has replaced the mm. Returning a fabricated
+                    // exec errno here would resume the wrong address space.
+                    self.fail(domain, b"new script stack restoration failed");
+                }
+                if ptrace(
+                    PTRACE_SETREGS,
+                    self.task(index).host,
+                    0,
+                    &r as *const _ as usize,
+                ) < 0
+                {
+                    self.fail(domain, b"new script stack register update failed");
+                }
+                self.task_mut(index).exec.as_mut().unwrap().retire = Some(fd);
+                self.task_mut(index).exec.as_mut().unwrap().owned = None;
+                if self
+                    .objects
+                    .filesystem
+                    .release_executable(owned.image)
+                    .is_err()
+                {
+                    self.fail(domain, b"committed script reference release failed");
+                }
+                None
+            } else {
+                self.task_mut(index).exec.as_mut().unwrap().owned = None;
+                Some(owned.image)
+            }
+        } else {
+            None
+        };
         let old = core::mem::replace(&mut self.groups[group].as_mut().unwrap().image, image);
         if let Some(old) = old {
             if self.objects.filesystem.release_executable(old).is_err() {
@@ -1075,9 +1181,26 @@ impl Supervisor<'_> {
                     self.finish_exec_failure(index, r, error, domain);
                 }
                 ExecStage::Completed => {
-                    self.task_mut(index).exec = None;
+                    // This can be the kernel's exec syscall exit, before the
+                    // interpreter has entered userspace. Keep retirement state.
+                    if exec.retire.is_none() {
+                        self.task_mut(index).exec = None;
+                    }
                 }
-                ExecStage::Reenter => self.fail(domain, b"unexpected exit during exec replay"),
+                ExecStage::Retire => {
+                    if r.orig_rax != 3 || r.rax != 0 {
+                        self.fail(domain, b"script private descriptor close failed");
+                    }
+                    let mut replay = exec.original;
+                    replay.rip -= 2;
+                    replay.rax = replay.orig_rax;
+                    self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::RetireReenter;
+                    self.run(index, &replay, domain);
+                    return;
+                }
+                ExecStage::Reenter | ExecStage::RetireReenter => {
+                    self.fail(domain, b"unexpected exit during exec replay")
+                }
             }
         }
         let pending = self.task(index).pending;

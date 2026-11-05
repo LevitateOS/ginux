@@ -1,7 +1,8 @@
 //! Populate a freshly injected tracee memfd from pinned VFS bytes. The host
 //! proc path is constructed only from a registered stopped task and its kernel
 //! memfd result, never a guest path or public descriptor. No named output file
-//! is created. The tracee cannot run until this backing is sealed and closed.
+//! is created. The tracee cannot run until this backing is sealed and the host
+//! fd is closed. Script backings retire before the interpreter's first syscall.
 
 use crate::fs_hooks::LaunchFs;
 use crate::supervisor::{syscall1, syscall2, syscall3, syscall4};
@@ -56,7 +57,8 @@ pub fn populate(host: usize, descriptor: u32, fs: &LaunchFs, image: Executable) 
             return Err(mode as i64);
         }
         // Old kernels do not know F_SEAL_EXEC. The write/grow/shrink seals
-        // remain mandatory; the descriptor is private until exec closes it.
+        // remain mandatory; the descriptor stays private until the exec owner
+        // closes it (at commit for ELF, before the first syscall for scripts).
         let mut seals = 0x2f;
         let mut result = unsafe { syscall3(72, fd, 1033, seals) };
         if result == -22 {

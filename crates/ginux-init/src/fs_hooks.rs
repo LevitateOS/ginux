@@ -172,7 +172,7 @@ impl LaunchFs {
         Ok(path)
     }
 
-    /// Assigned paths yield pinned ELF bytes; image paths retain the native
+    /// Assigned paths yield pinned program bytes; image paths retain the native
     /// readonly loader. Neither may fall through into the other's namespace.
     pub fn exec_path(
         &mut self,
@@ -207,7 +207,7 @@ impl LaunchFs {
         let mut header = [0u8; 64];
         let result = self.read_executable(image, 0, &mut header).and_then(|n| {
             if header.starts_with(b"#!") {
-                Err(-95)
+                Ok(image)
             } else if n < 64
                 || &header[..4] != b"\x7fELF"
                 || header[4] != 2
@@ -224,6 +224,50 @@ impl LaunchFs {
                 .expect("invalid executable pin release");
         }
         result
+    }
+
+    /// The kernel owns binfmt parsing and optional interpreter arguments. Check
+    /// the first interpreter's namespace before handing it the sealed script.
+    /// Owned interpreters need a separate owned-executable transaction.
+    pub fn is_script(&self, image: Executable) -> Result<bool, i64> {
+        let mut header = [0u8; 256];
+        self.read_executable(image, 0, &mut header)?;
+        if !header.starts_with(b"#!") {
+            return Ok(false);
+        }
+        let line_end = header.iter().position(|b| *b == b'\n').unwrap_or(255);
+        let line = &header[2..line_end];
+        let start = line
+            .iter()
+            .position(|b| !matches!(b, b' ' | b'\t'))
+            .ok_or(-8)?;
+        let end = line[start..]
+            .iter()
+            .position(|b| matches!(b, 0 | b' ' | b'\t'))
+            .map(|n| n + start)
+            .unwrap_or(line.len());
+        if end == start || (end == line.len() && header[line_end] != b'\n') {
+            return Err(-8);
+        }
+        let interpreter = &line[start..end];
+        let path = normalize(
+            if interpreter[0] == b'/' {
+                b"/"
+            } else {
+                self.cwd.as_bytes()
+            },
+            interpreter,
+        )?;
+        if self.owns_path(path.as_bytes()) {
+            return Err(-95);
+        }
+        if [b"/dev".as_slice(), b"/proc", b"/sys"]
+            .iter()
+            .any(|p| within(path.as_bytes(), p))
+        {
+            return Err(-13);
+        }
+        Ok(true)
     }
 
     pub fn read_executable(

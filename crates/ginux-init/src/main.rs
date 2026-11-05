@@ -13,6 +13,7 @@ mod descriptors;
 mod device_hooks;
 mod dispatch;
 mod exec_image;
+mod exec_script;
 mod fs_hooks;
 mod launch;
 mod launch_tasks;
@@ -89,6 +90,26 @@ unsafe extern "C" fn memcpy(
             core::ptr::read_volatile(source_bytes.add(index)),
         );
         index += 1;
+    }
+    destination
+}
+
+#[no_mangle]
+unsafe extern "C" fn memmove(
+    destination: *mut core::ffi::c_void,
+    source: *const core::ffi::c_void,
+    length: usize,
+) -> *mut core::ffi::c_void {
+    if destination as usize <= source as usize {
+        return memcpy(destination, source, length);
+    }
+    let mut index = length;
+    while index != 0 {
+        index -= 1;
+        core::ptr::write_volatile(
+            destination.cast::<u8>().add(index),
+            core::ptr::read_volatile(source.cast::<u8>().add(index)),
+        );
     }
     destination
 }

@@ -244,3 +244,11 @@ build-launch-owned-exec-fixture:
 
 test-launch-owned-exec:
 	python3 scripts/test-launch-owned-exec.py $(GINUX) .artifacts/launch/launch-owned-exec-fixture
+
+.PHONY: build-launch-script-fixture test-launch-scripts
+build-launch-script-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-script-fixture.c -o .artifacts/launch/launch-script-fixture
+
+test-launch-scripts:
+	python3 scripts/test-launch-scripts.py $(GINUX) .artifacts/launch/launch-script-fixture

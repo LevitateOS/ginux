@@ -384,16 +384,30 @@ sealed ELF through execveat. The private fd never enters the public table: the
 kernel closes it on success, and the transaction closes it before returning a
 failed exec. No named host output file is created. Supervisor access to the
 tracee's procfs fd view is required; failure propagates without fallback.
-Native ELF loading is supported here; guest mmap of owned files remains
-unsupported. Generated scripts still return EOPNOTSUPP. Other invalid formats
-return ENOEXEC. Executable snapshots add kernel-backed memory beyond the VFS
+Named owned shebang scripts use the kernel's image interpreter loader, including
+its single optional argument and recursive image interpreter prefix. The new
+exec stack restores the original script pathname in argv and AT_EXECFN before
+user code runs. Arguments and environment survive unchanged; the replaced
+argv[0] follows kernel shebang behavior. The script backing survives kernel
+exec, then a private close/replay retires it before the interpreter's first
+syscall. It never enters the public descriptor table. Script pins release on
+interpreter commit; ELF pins retain their process lifetime.
+
+Absolute execve/execveat names and cwd-relative execve names are supported.
+Owned interpreters and descriptor-named scripts remain EOPNOTSUPP; a script
+whose required source/relative directory descriptor is CLOEXEC returns ENOENT.
+Script argv/environment arrays are bounded to 4096 entries each. Only the new
+exec address space receives stack writes, including after vfork/CLONE_VM. A
+failure restoring that committed stack stops the domain rather than pretending
+the old program can resume. Other invalid formats return ENOEXEC. Guest mmap of
+owned files remains unsupported. Executable snapshots add memory beyond the VFS
 mapping budget; total process/kernel memory accounting is unfinished.
 
 Signals interrupting descriptor synchronization or private-fd preparation fail the domain explicitly;
 restart/deferred delivery for that preparation remains incomplete. Path checking
 uses the current lexical view rather than a unified image/overlay resolver.
-Readiness beyond bootstrap consoles, compiler-sized writable storage and
-execution of generated files remain incomplete. This is not compiler support.
+Image-file polling, links, guest file mappings, owned interpreters and a full
+image/overlay resolver remain incomplete. This is not compiler support.
 
 When requested, the result file is reserved exclusively before launch, with
 mode 0600 and a maximum path length of 512 bytes. Existing files are never
@@ -435,4 +449,6 @@ make build-launch-directory-fixture
 sudo make test-launch-directories
 make build-launch-owned-exec-fixture
 sudo make test-launch-owned-exec
+make build-launch-script-fixture
+sudo make test-launch-scripts
 ```
