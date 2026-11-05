@@ -14,6 +14,7 @@ mod fs_hooks;
 mod launch;
 mod process_hooks;
 mod supervisor;
+mod teardown;
 
 use crate::dispatch::{
     balanced_surface_name, decide_native, native_arguments_allowed, process_entry, Lane,
@@ -45,6 +46,7 @@ use crate::supervisor::{
     SYS_READ_HOST, SYS_RT_SIGPROCMASK, SYS_SETGID, SYS_SETGROUPS, SYS_SETUID, SYS_SIGNALFD4,
     SYS_WAIT4, VIRTUAL_PID,
 };
+use crate::teardown::TeardownOutcome;
 use ginux_devices::{
     BlockBackend, DeviceError, DeviceKind, DeviceName, DeviceRegistry, DeviceView, IsolatedNetwork,
     Partition, IOCTL_CONSOLE_GET_SIZE,
@@ -518,11 +520,11 @@ fn process_native_main(config_path: *const u8, fixture_path: *const u8) -> ! {
     let config = load_config(config_path);
     let mut domain = Domain::create(config);
     if domain.start().is_err() {
-        process_fail(b"native process domain start failed");
+        startup_fail(&mut domain, b"native process domain start failed");
     }
     let child = unsafe { syscall0(SYS_FORK) };
     if child < 0 {
-        process_fail(b"native process tracee fork failed");
+        startup_fail(&mut domain, b"native process tracee fork failed");
     }
     if child == 0 {
         process_native_tracee(fixture_path);
@@ -553,16 +555,50 @@ fn process_native_tracee(fixture_path: *const u8) -> ! {
 }
 
 fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
+    // L01: arm host cancellation before the first blocking wait. The tracee
+    // was forked by the caller, so its post-execve dispositions stay at
+    // their defaults; only this supervisor observes the flag.
+    if !teardown::arm_cancel_signals() {
+        let _ = ptrace(PTRACE_KILL, root_host_pid, 0, 0);
+        startup_fail(domain, b"cancel signal setup failed");
+    }
     let mut status = 0i32;
-    if wait(root_host_pid, &mut status) < 0 || !stopped(status) {
+    let initial = wait(root_host_pid, &mut status);
+    if teardown::is_cancel_wait(initial) {
+        // Cancelled before the workload stopped for supervision: it never
+        // ran under mediation, so SIGKILL it, reap it, and report. No other
+        // descendant can exist yet.
+        teardown::kill_remaining(&[root_host_pid]);
+        let mut sweep = 0u32;
+        while sweep < 4 {
+            let mut dead = 0i32;
+            if unsafe {
+                syscall4(
+                    SYS_WAIT4,
+                    root_host_pid,
+                    &mut dead as *mut _ as usize,
+                    0,
+                    0,
+                )
+            } <= 0
+            {
+                break;
+            }
+            sweep += 1;
+        }
+        let _ = domain.task_exited(false);
+        line(b"GINUX_NATIVE_PROCESS: outcome=cancelled tasks=0 live-pipes=0");
+        exit_process(teardown::CANCEL_EXIT);
+    }
+    if initial < 0 || !stopped(status) {
         write_all(b"GINUX_NATIVE_PROCESS: initial-status=");
         write_i64(status as i64);
         write_all(b"\n");
-        native_fail(
-            domain,
-            root_host_pid,
-            b"process fixture did not stop after exec",
-        );
+        // The workload never stopped for supervision: either it died
+        // (already reaped by the wait above) or the wait itself failed.
+        // Kill what may remain, then report a startup failure.
+        teardown::kill_remaining(&[root_host_pid]);
+        startup_fail(domain, b"process fixture did not stop after exec");
     }
     let options = PTRACE_O_TRACESYSGOOD
         | PTRACE_O_TRACEFORK
@@ -611,8 +647,6 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         wait_rusage: 0,
         killed_with: 0,
     });
-    let mut root_exited = false;
-    let mut root_failed = false;
     if ptrace(PTRACE_SYSCALL, root_host_pid, 0, 0) < 0 {
         process_native_fail(domain, root_host_pid, b"process initial resume failed");
     }
@@ -629,6 +663,17 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 0,
             )
         };
+        if teardown::is_cancel_wait(waited) {
+            // Host stop request: abandon mediation and tear everything down.
+            teardown_domain(
+                domain,
+                root_host_pid,
+                &mut processes,
+                &mut tasks,
+                &mut pipes,
+                TeardownOutcome::Cancelled,
+            );
+        }
         if waited <= 0 {
             process_native_fail(domain, root_host_pid, b"process wait-any failed");
         }
@@ -640,6 +685,19 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             process_native_fail(domain, root_host_pid, b"unknown host tracee");
         };
         let task = tasks[task_index].unwrap();
+
+        // A host stop request that arrived while a stop was already
+        // dequeued: abandon mediation and tear everything down.
+        if teardown::cancel_requested() {
+            teardown_domain(
+                domain,
+                root_host_pid,
+                &mut processes,
+                &mut tasks,
+                &mut pipes,
+                TeardownOutcome::Cancelled,
+            );
+        }
 
         if !stopped(status) {
             // A zero low byte is a normal exit; anything else is death by
@@ -698,41 +756,30 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 );
             }
             if task.virtual_id == root_virtual {
-                root_exited = true;
-                if exit_status != 0 {
-                    root_failed = true;
-                }
-            }
-            // The main thread may exit while joined-or-detached siblings are
-            // still draining (thread death reports arrive in kernel order, not
-            // creation order), so a zero root exit waits for the remaining
-            // traced tasks instead of failing. A nonzero root exit fails fast.
-            if root_failed {
+                // L01: the root workload is done in every order — clean
+                // exit, nonzero exit, or signal death, ahead of or behind
+                // its descendants. Teardown kills whatever still runs,
+                // reaps every descendant, and reports the root outcome.
+                // (The main thread may exit while joined-or-detached
+                // siblings are still draining: thread death reports arrive
+                // in kernel order, not creation order.)
                 write_all(b"GINUX_NATIVE_PROCESS: root-exit=");
                 write_i64(exit_status as i64);
                 write_all(b" tracing-remaining=");
                 write_u64(tasks.iter().flatten().filter(|entry| entry.tracing).count() as u64);
                 write_all(b"\n");
-                process_native_fail(domain, root_host_pid, b"native process fixture failed");
-            }
-            if root_exited && !tasks.iter().flatten().any(|entry| entry.tracing) {
-                // G05a leak audit: every end died with its task (last close
-                // is the host's), so no pipe object may survive full reap.
-                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: descriptors live-pipes=");
-                write_u64(pipes.active_pipes() as u64);
-                write_all(b"\n");
-                if processes.reap_all() == 0 || processes.active() != 0 {
-                    process_native_fail(domain, root_host_pid, b"native process cleanup failed");
-                }
-                if domain.task_exited(true).is_err() {
-                    process_native_fail(domain, root_host_pid, b"native domain exit failed");
-                }
-                line(b"GINUX_NATIVE_PROCESS: fork=mediated child=ptrace-attached pid-translation=PASS");
-                line(
-                    b"GINUX_NATIVE_PROCESS: wait=translated child-status=real tasks=0 cleanup=PASS",
+                let outcome = match child_status {
+                    ChildStatus::Exited(code) => TeardownOutcome::Exited(code),
+                    ChildStatus::Signaled(signal) => TeardownOutcome::Signaled(signal),
+                };
+                teardown_domain(
+                    domain,
+                    root_host_pid,
+                    &mut processes,
+                    &mut tasks,
+                    &mut pipes,
+                    outcome,
                 );
-                line(b"GATE7_NATIVE_PROCESS: PASS");
-                exit_process(0);
             }
             continue;
         }
@@ -1945,8 +1992,370 @@ fn store_tracee_tid(host_pid: usize, user_tid: usize, tid: u32) -> Result<(), ()
 }
 
 fn process_native_fail(domain: &mut Domain, root_pid: usize, reason: &[u8]) -> ! {
+    // A host stop request racing a supervision failure is still a host
+    // cancellation: report it as one. `EXITKILL` (set on every attached
+    // tracee) guarantees the survivors die with this supervisor.
+    if teardown::cancel_requested() {
+        let _ = ptrace(PTRACE_KILL, root_pid, 0, 0);
+        let _ = domain.task_exited(false);
+        line(b"GINUX_NATIVE_PROCESS: outcome=cancelled tasks=unknown live-pipes=unknown");
+        exit_process(teardown::CANCEL_EXIT);
+    }
     let _ = ptrace(PTRACE_KILL, root_pid, 0, 0);
+    // Reap already-dead descendants so no zombie is stranded. The rest die
+    // with this supervisor through `EXITKILL` and are reaped by init; the
+    // `SIGKILL` effects above persist past this exit either way.
+    let mut sweep = 0u32;
+    while sweep < 16 {
+        let mut status = 0i32;
+        if unsafe {
+            syscall4(
+                SYS_WAIT4,
+                (-1isize) as usize,
+                &mut status as *mut _ as usize,
+                WNOHANG as usize,
+                0,
+            )
+        } <= 0
+        {
+            break;
+        }
+        sweep += 1;
+    }
+    write_all(b"GINUX_NATIVE_PROCESS: outcome=supervisor-error category=supervision reason=");
+    line(reason);
     domain_fail(domain, reason)
+}
+
+/// L01 startup failure: no workload runs under supervision. The caller owns
+/// root cleanup (before the initial stop the root is either already reaped
+/// or already signalled). Reports the §1 `supervisor-error` outcome with
+/// the `startup` category and exits 2 (the G02 startup convention).
+fn startup_fail(domain: &mut Domain, reason: &[u8]) -> ! {
+    // Best-effort reap of a failed start so no zombie is stranded; the only
+    // pid that can exist here is the root, already signalled by the caller.
+    // A sent `SIGKILL` still kills it after this exit even if the reap
+    // misses, with init reaping the zombie.
+    let mut sweep = 0u32;
+    while sweep < 4 {
+        let mut status = 0i32;
+        if unsafe {
+            syscall4(
+                SYS_WAIT4,
+                (-1isize) as usize,
+                &mut status as *mut _ as usize,
+                WNOHANG as usize,
+                0,
+            )
+        } <= 0
+        {
+            break;
+        }
+        sweep += 1;
+    }
+    let _ = domain.task_exited(false);
+    write_all(b"GINUX_NATIVE_PROCESS: outcome=supervisor-error category=startup reason=");
+    line(reason);
+    line(b"GINUX_NATIVE_PROCESS_AUDIT: teardown tasks=0 live-pipes=0");
+    exit_process(teardown::STARTUP_EXIT)
+}
+
+/// L01 full domain teardown. The root workload is dead (or the host asked
+/// the supervisor to stop): SIGKILL every still-traced descendant, reap
+/// each host death, release every descriptor-mirror end, run the
+/// storage/backends seams, prove the live-object audit is zero, then report
+/// and exit. Never returns.
+fn teardown_domain(
+    domain: &mut Domain,
+    root_host_pid: usize,
+    processes: &mut ProcessTable<8>,
+    tasks: &mut [Option<NativeProcessTask>; 8],
+    pipes: &mut PipeSpace<8, 16, 16>,
+    outcome: TeardownOutcome,
+) -> ! {
+    // Signal every still-traced descendant first so the drain below only
+    // observes deaths. Errors are ignored: an already-dead target is
+    // reaped, not signalled.
+    let mut doomed: [usize; 8] = [0; 8];
+    let mut doomed_count = 0usize;
+    for entry in tasks.iter().flatten() {
+        if entry.tracing && doomed_count < doomed.len() {
+            doomed[doomed_count] = entry.host_pid;
+            doomed_count += 1;
+        }
+    }
+    if doomed_count != 0 {
+        write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown survivors-signalled=");
+        write_u64(doomed_count as u64);
+        write_all(b"\n");
+    }
+    teardown::kill_remaining(&doomed[..doomed_count]);
+    let degraded = drain_teardown(domain, root_host_pid, processes, tasks, pipes);
+    // Seams run after the last descendant is reaped, before reporting.
+    teardown::flush_storage_seam();
+    let backends_closed = teardown::close_backends_seam();
+    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: storage-flush=seam-g12a backends-closed=");
+    write_u64(backends_closed as u64);
+    write_all(b"\n");
+    // The virtual table dies wholesale: every recorded death is reaped, and
+    // anything still marked running after the drain is a supervision breach.
+    let reaped = processes.reap_all();
+    let live_tasks = processes.active();
+    let live_pipes = pipes.active_pipes();
+    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown reaped=");
+    write_u64(reaped as u64);
+    write_all(b" tasks=");
+    write_u64(live_tasks as u64);
+    write_all(b" live-pipes=");
+    write_u64(live_pipes as u64);
+    write_all(b"\n");
+    if degraded || live_tasks != 0 || live_pipes != 0 {
+        let _ = domain.task_exited(false);
+        write_all(b"GINUX_NATIVE_PROCESS: outcome=supervisor-error category=supervision reason=");
+        if degraded {
+            line(b"teardown-reap-incomplete");
+        } else {
+            line(b"teardown-live-objects-remain");
+        }
+        exit_process(teardown::SUPERVISOR_EXIT);
+    }
+    match outcome {
+        TeardownOutcome::Exited(0) => {
+            // G05a leak audit: every end died with its task (the host's
+            // close is the last one), so no pipe object may survive.
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: descriptors live-pipes=");
+            write_u64(pipes.active_pipes() as u64);
+            write_all(b"\n");
+            if domain.task_exited(true).is_err() {
+                let _ = domain.task_exited(false);
+                line(b"GINUX_NATIVE_PROCESS: outcome=supervisor-error category=supervision reason=domain-exit-failed");
+                exit_process(teardown::SUPERVISOR_EXIT);
+            }
+            line(b"GINUX_NATIVE_PROCESS: outcome=completed code=0");
+            line(b"GINUX_NATIVE_PROCESS: fork=mediated child=ptrace-attached pid-translation=PASS");
+            line(
+                b"GINUX_NATIVE_PROCESS: wait=translated child-status=real tasks=0 cleanup=PASS",
+            );
+            line(b"GATE7_NATIVE_PROCESS: PASS");
+            exit_process(0)
+        }
+        TeardownOutcome::Exited(code) => {
+            let _ = domain.task_exited(false);
+            write_all(b"GINUX_NATIVE_PROCESS: outcome=workload-failed code=");
+            write_i64(code as i64);
+            write_all(b" tasks=0 live-pipes=0\n");
+            exit_process(code as usize);
+        }
+        TeardownOutcome::Signaled(signal) => {
+            let _ = domain.task_exited(false);
+            write_all(b"GINUX_NATIVE_PROCESS: outcome=workload-failed signal=");
+            write_u64(signal as u64);
+            write_all(b" code=");
+            write_i64(128 + signal as i64);
+            write_all(b" tasks=0 live-pipes=0\n");
+            exit_process(128 + signal as usize);
+        }
+        TeardownOutcome::Cancelled => {
+            let _ = domain.task_exited(false);
+            line(b"GINUX_NATIVE_PROCESS: outcome=cancelled tasks=0 live-pipes=0");
+            exit_process(teardown::CANCEL_EXIT);
+        }
+    }
+}
+
+/// Reap every descendant until no traced task and no teardown-discovered
+/// child remains. Returns true when the drain degraded (a host child
+/// vanished without its death being observed): the caller then fails closed
+/// instead of reporting a clean outcome.
+///
+/// Deaths of known slots record the virtual outcome and release the
+/// descriptor mirror exactly like the main loop. Stops that are not deaths
+/// are resumed toward death: fork events contribute their new child to a
+/// pending-kill list (SIGKILLed at once, reaped silently — the mirror never
+/// observed them, so no virtual bookkeeping is owed), and new-child
+/// `SIGSTOP` attaches get the loop's ptrace options so `EXITKILL` covers
+/// them if the supervisor dies mid-drain.
+fn drain_teardown(
+    domain: &mut Domain,
+    root_host_pid: usize,
+    processes: &mut ProcessTable<8>,
+    tasks: &mut [Option<NativeProcessTask>; 8],
+    pipes: &mut PipeSpace<8, 16, 16>,
+) -> bool {
+    let options = PTRACE_O_TRACESYSGOOD
+        | PTRACE_O_TRACEFORK
+        | PTRACE_O_TRACEVFORK
+        | PTRACE_O_TRACECLONE
+        | PTRACE_O_TRACEEXEC
+        | PTRACE_O_EXITKILL;
+    let mut pending: [usize; 8] = [0; 8];
+    let mut pending_count = 0usize;
+    let mut pending_overflow = false;
+    let mut degraded = false;
+    let mut guard = 0u32;
+    loop {
+        let tracing = tasks.iter().flatten().filter(|entry| entry.tracing).count();
+        if tracing == 0 && pending_count == 0 {
+            // Final sweep: a nonblocking reap must find nothing left.
+            let mut status = 0i32;
+            let swept = unsafe {
+                syscall4(
+                    SYS_WAIT4,
+                    (-1isize) as usize,
+                    &mut status as *mut _ as usize,
+                    WNOHANG as usize,
+                    0,
+                )
+            };
+            if swept > 0 {
+                // A death nobody owned: reap it and degrade rather than
+                // strand a zombie.
+                degraded = true;
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown unowned-reaped host-pid=");
+                write_u64(swept as u64);
+                write_all(b"\n");
+                continue;
+            }
+            return degraded;
+        }
+        guard += 1;
+        if guard > 128 {
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown drain-bound-exceeded tracing=");
+            write_u64(tracing as u64);
+            write_all(b" pending=");
+            write_u64(pending_count as u64);
+            write_all(b"\n");
+            return true;
+        }
+        let mut status = 0i32;
+        let waited = unsafe {
+            syscall4(
+                SYS_WAIT4,
+                (-1isize) as usize,
+                &mut status as *mut _ as usize,
+                0,
+                0,
+            )
+        };
+        if waited <= 0 {
+            if waited == -(ECHILD as isize) {
+                // No host children, yet slots still claim traced tasks: a
+                // host child vanished without its death being observed
+                // (reaped elsewhere). Release its mirror ends, drop the
+                // slots, mark the virtual table for wholesale reap, and
+                // degrade — never strand host-side state.
+                let mut missed = 0u64;
+                for slot in tasks.iter_mut() {
+                    if slot.is_some_and(|entry| entry.tracing) {
+                        pipes.release_task(slot.unwrap().virtual_id.pid);
+                        *slot = None;
+                        missed += 1;
+                    }
+                }
+                processes.shutdown(137);
+                pending_count = 0;
+                degraded = true;
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown reap-missed slots=");
+                write_u64(missed);
+                write_all(b"\n");
+                continue;
+            }
+            process_native_fail(domain, root_host_pid, b"teardown wait failed");
+        }
+        let host_pid = waited as usize;
+        if !stopped(status) {
+            let child_status = if status & 0x7f == 0 {
+                ChildStatus::Exited(status >> 8)
+            } else {
+                ChildStatus::Signaled((status & 0x7f) as u8)
+            };
+            if let Some(task_index) = tasks
+                .iter()
+                .position(|entry| entry.is_some_and(|entry| entry.host_pid == host_pid))
+            {
+                let virtual_id = tasks[task_index].unwrap().virtual_id;
+                let _ = match child_status {
+                    ChildStatus::Exited(code) => processes.exit(virtual_id, code),
+                    ChildStatus::Signaled(signal) => processes.signaled(virtual_id, signal),
+                };
+                pipes.release_task(virtual_id.pid);
+                tasks[task_index] = None;
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown reaped virtual-pid=");
+                write_u64(virtual_id.pid as u64);
+                write_all(b" status=");
+                write_i64(child_status.shell_code() as i64);
+                write_all(b"\n");
+            } else if let Some(index) =
+                pending.iter().position(|pid| *pid == host_pid)
+            {
+                // A fork-event child discovered mid-drain: the host closed
+                // its descriptors with it; the mirror never observed it.
+                pending[index] = pending[pending_count - 1];
+                pending_count -= 1;
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown reaped-pending host-pid=");
+                write_u64(host_pid as u64);
+                write_all(b"\n");
+            } else if pending_overflow {
+                // Forks beyond the pending list were still SIGKILLed at
+                // discovery; reap them silently and degrade.
+                degraded = true;
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown reaped-overflow host-pid=");
+                write_u64(host_pid as u64);
+                write_all(b"\n");
+            } else {
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown unknown-death host-pid=");
+                write_u64(host_pid as u64);
+                write_all(b"\n");
+                process_native_fail(domain, root_host_pid, b"teardown unknown tracee");
+            }
+            continue;
+        }
+        let event = (status as usize) >> 16;
+        if event == PTRACE_EVENT_FORK as usize
+            || event == PTRACE_EVENT_VFORK as usize
+            || event == PTRACE_EVENT_CLONE as usize
+        {
+            let mut child_host_pid = 0usize;
+            if ptrace(
+                PTRACE_GETEVENTMSG,
+                host_pid,
+                0,
+                &mut child_host_pid as *mut _ as usize,
+            ) < 0
+            {
+                process_native_fail(domain, root_host_pid, b"teardown fork event failed");
+            }
+            // Attach EXITKILL coverage at once, then doom it: the mirror
+            // never learns this child, so its death is reaped silently.
+            let _ = ptrace(PTRACE_SETOPTIONS, child_host_pid, 0, options);
+            teardown::kill_remaining(&[child_host_pid]);
+            if pending_count < pending.len() {
+                pending[pending_count] = child_host_pid;
+                pending_count += 1;
+            } else {
+                pending_overflow = true;
+            }
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown fork-doomed host-pid=");
+            write_u64(child_host_pid as u64);
+            write_all(b"\n");
+            if ptrace(PTRACE_CONT, host_pid, 0, 0) < 0 {
+                process_native_fail(domain, root_host_pid, b"teardown fork resume failed");
+            }
+            continue;
+        }
+        if stopped(status) && ((status >> 8) & 0xff) == 19 {
+            // New-child attach stop: same options as the main loop so
+            // EXITKILL covers it, then toward death.
+            let _ = ptrace(PTRACE_SETOPTIONS, host_pid, 0, options);
+        }
+        // Every other stop (syscall traps, stale fork breakpoints,
+        // delivered or queued signals) is resumed toward death: the
+        // SIGKILL queued above still kills the task. Signal 0 resumes
+        // carry no new delivery.
+        if ptrace(PTRACE_CONT, host_pid, 0, 0) < 0 {
+            process_native_fail(domain, root_host_pid, b"teardown resume failed");
+        }
+    }
 }
 
 struct HostBlock {
