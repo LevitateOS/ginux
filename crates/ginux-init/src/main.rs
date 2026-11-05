@@ -23,6 +23,9 @@ use crate::launch::{
     c_string_equals, load_config, parse_argv, print_effective_config, read_file, read_index,
     Command, ELF_BYTES, VFS_INDEX_BYTES,
 };
+use crate::process_hooks::{
+    PTRACE_EVENT_CLONE, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEVFORK,
+};
 use crate::supervisor::{
     exit_process, line, ptrace, read_tracee_word, stopped, syscall0, syscall1, syscall2, syscall3,
     syscall4, syscall5, wait, write_all, write_i64, write_u64, UserRegs, AT_FDCWD, CLOCK_MONOTONIC,
@@ -463,6 +466,7 @@ struct NativeProcessTask {
     fork_result_pending: u32,
     fork_breakpoint_rip: usize,
     fork_breakpoint_word: usize,
+    fork_variant_event: u32,
     tracing: bool,
 }
 
@@ -516,7 +520,11 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             b"process fixture did not stop after exec",
         );
     }
-    let options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | PTRACE_O_EXITKILL;
+    let options = PTRACE_O_TRACESYSGOOD
+        | PTRACE_O_TRACEFORK
+        | PTRACE_O_TRACEVFORK
+        | PTRACE_O_TRACECLONE
+        | PTRACE_O_EXITKILL;
     if ptrace(PTRACE_SETOPTIONS, root_host_pid, 0, options) < 0 {
         native_fail(domain, root_host_pid, b"process ptrace options failed");
     }
@@ -536,6 +544,7 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         fork_result_pending: 0,
         fork_breakpoint_rip: 0,
         fork_breakpoint_word: 0,
+        fork_variant_event: 0,
         tracing: true,
     });
     if ptrace(PTRACE_SYSCALL, root_host_pid, 0, 0) < 0 {
@@ -602,7 +611,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         }
 
         let event = (status as usize) >> 16;
-        if event == PTRACE_EVENT_FORK {
+        if event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE
+        {
             let mut child_host_pid = 0usize;
             if ptrace(
                 PTRACE_GETEVENTMSG,
@@ -630,51 +640,70 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 fork_result_pending: 0,
                 fork_breakpoint_rip: 0,
                 fork_breakpoint_word: 0,
+                fork_variant_event: 0,
                 tracing: true,
             });
-            let mut parent_registers = core::mem::MaybeUninit::<UserRegs>::uninit();
-            if ptrace(
-                PTRACE_GETREGS,
-                host_pid,
-                0,
-                parent_registers.as_mut_ptr() as usize,
-            ) < 0
-            {
-                process_native_fail(domain, root_host_pid, b"fork breakpoint registers failed");
+            if event == PTRACE_EVENT_FORK {
+                // Separate address space (raw fork, or clone without address
+                // sharing, which the lane entry already enforced): the
+                // breakpoint below is invisible to the child, so translate
+                // the parent's observed result when it fires.
+                let mut parent_registers = core::mem::MaybeUninit::<UserRegs>::uninit();
+                if ptrace(
+                    PTRACE_GETREGS,
+                    host_pid,
+                    0,
+                    parent_registers.as_mut_ptr() as usize,
+                ) < 0
+                {
+                    process_native_fail(domain, root_host_pid, b"fork breakpoint registers failed");
+                }
+                let parent_registers = unsafe { parent_registers.assume_init() };
+                let breakpoint_rip = parent_registers.rip as usize;
+                let mut breakpoint_word = 0usize;
+                if ptrace(
+                    PTRACE_PEEKTEXT,
+                    host_pid,
+                    breakpoint_rip,
+                    &mut breakpoint_word as *mut _ as usize,
+                ) < 0
+                {
+                    process_native_fail(domain, root_host_pid, b"fork breakpoint read failed");
+                }
+                if ptrace(
+                    PTRACE_POKETEXT,
+                    host_pid,
+                    breakpoint_rip,
+                    (breakpoint_word & !0xff) | 0xcc,
+                ) < 0
+                {
+                    process_native_fail(domain, root_host_pid, b"fork breakpoint install failed");
+                }
+                let parent = tasks[task_index].as_mut().unwrap();
+                parent.awaiting_exit = false;
+                parent.override_result = false;
+                parent.fork_result_pending = child_virtual.pid;
+                parent.fork_breakpoint_rip = breakpoint_rip;
+                parent.fork_breakpoint_word = breakpoint_word;
+                parent.fork_variant_event = event as u32;
+                if ptrace(PTRACE_CONT, host_pid, 0, 0) < 0 {
+                    process_native_fail(
+                        domain,
+                        root_host_pid,
+                        b"fork parent breakpoint resume failed",
+                    );
+                }
+                continue;
             }
-            let parent_registers = unsafe { parent_registers.assume_init() };
-            let breakpoint_rip = parent_registers.rip as usize;
-            let mut breakpoint_word = 0usize;
-            if ptrace(
-                PTRACE_PEEKTEXT,
-                host_pid,
-                breakpoint_rip,
-                &mut breakpoint_word as *mut _ as usize,
-            ) < 0
-            {
-                process_native_fail(domain, root_host_pid, b"fork breakpoint read failed");
-            }
-            if ptrace(
-                PTRACE_POKETEXT,
-                host_pid,
-                breakpoint_rip,
-                (breakpoint_word & !0xff) | 0xcc,
-            ) < 0
-            {
-                process_native_fail(domain, root_host_pid, b"fork breakpoint install failed");
-            }
+            // vfork/clone children may share the parent's text, where a
+            // breakpoint would also trap the child: resume with SYSCALL and
+            // translate the host child pid at the creation exit stop below.
+            // The entry left `awaiting_exit` set, and `fork_result_pending`
+            // stays clear so the breakpoint branch above is skipped.
             let parent = tasks[task_index].as_mut().unwrap();
-            parent.awaiting_exit = false;
-            parent.override_result = false;
-            parent.fork_result_pending = child_virtual.pid;
-            parent.fork_breakpoint_rip = breakpoint_rip;
-            parent.fork_breakpoint_word = breakpoint_word;
-            if ptrace(PTRACE_CONT, host_pid, 0, 0) < 0 {
-                process_native_fail(
-                    domain,
-                    root_host_pid,
-                    b"fork parent breakpoint resume failed",
-                );
+            parent.fork_variant_event = event as u32;
+            if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
+                process_native_fail(domain, root_host_pid, b"fork parent resume failed");
             }
             continue;
         }
@@ -703,7 +732,15 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             {
                 process_native_fail(domain, root_host_pid, b"fork breakpoint restore failed");
             }
-            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: fork host-result=");
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: fork variant=");
+            if pending.fork_variant_event == PTRACE_EVENT_VFORK as u32 {
+                write_all(b"vfork");
+            } else if pending.fork_variant_event == PTRACE_EVENT_CLONE as u32 {
+                write_all(b"clone");
+            } else {
+                write_all(b"fork");
+            }
+            write_all(b" host-result=");
             write_i64(parent_registers.rax as i64);
             write_all(b" virtual-result=");
             write_u64(virtual_pid as u64);
@@ -723,6 +760,7 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             parent.fork_result_pending = 0;
             parent.fork_breakpoint_rip = 0;
             parent.fork_breakpoint_word = 0;
+            parent.fork_variant_event = 0;
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
                 process_native_fail(domain, root_host_pid, b"fork parent resume failed");
             }
@@ -807,6 +845,36 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 registers.rdi = current.translated_rdi;
                 tasks[waited_index] = None;
                 current.override_result = true;
+            } else if current.syscall >= 56
+                && current.syscall <= 58
+                && registers.rax as i64 > 0
+                && current.fork_variant_event != 0
+            {
+                // Creation exit on the SYSCALL-resumed vfork/clone path (no
+                // breakpoint could be planted in shared text): the kernel
+                // reports the host child pid, which maps to the virtual
+                // child created at the fork-event stop.
+                let host_child = registers.rax as usize;
+                if let Some(child) = tasks
+                    .iter()
+                    .flatten()
+                    .find(|entry| entry.host_pid == host_child)
+                {
+                    let virtual_pid = child.virtual_id.pid;
+                    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: fork variant=");
+                    if current.fork_variant_event == PTRACE_EVENT_VFORK as u32 {
+                        write_all(b"vfork");
+                    } else {
+                        write_all(b"clone");
+                    }
+                    write_all(b" host-result=");
+                    write_i64(registers.rax as i64);
+                    write_all(b" virtual-result=");
+                    write_u64(virtual_pid as u64);
+                    write_all(b"\n");
+                    registers.rax = virtual_pid as u64;
+                    current.override_result = true;
+                }
             } else if current.override_result {
                 registers.rax = current.result as u64;
             }
@@ -821,6 +889,7 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             current.awaiting_exit = false;
             current.override_result = false;
             current.translated_rdi = 0;
+            current.fork_variant_event = 0;
             tasks[task_index] = Some(current);
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
                 process_native_fail(domain, root_host_pid, b"process exit resume failed");
@@ -853,7 +922,7 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     current.override_result = true;
                     registers.orig_rax = u64::MAX;
                 }
-                57 => {}
+                56..=58 => {}
                 61 => {
                     if registers.rdi != u64::MAX {
                         let virtual_pid = registers.rdi as u32;
