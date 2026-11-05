@@ -42,6 +42,28 @@
 //! bytes that never completed a flush) or a torn image fails validation
 //! explicitly and applies nothing.
 //!
+//! # Consistent generations (G12a)
+//!
+//! A durable generation becomes the acknowledged checkpoint only through
+//! [`VirtualFs::checkpoint_generation`], which enforces the ack order the
+//! Recipe coordinator (R07) relies on: bounded
+//! [`VirtualFs::quiesce_retained`] first — every task sharing this storage
+//! parked at a stable point or an explicit [`QuiesceError`] — then the G12
+//! atomic publish. Staged bytes live only in caller memory until the
+//! rename, so interruption at any point leaves either the previous
+//! acknowledged generation or a recoverable newer one at the publish path,
+//! never an acknowledged generation with missing files. A failed quiesce or
+//! flush is a storage failure, never reported durable.
+//!
+//! [`VirtualFs::verify_published`] fully validates one published image
+//! without applying it, and [`VirtualFs::list_recoverable`] reports which
+//! of a caller-supplied candidate set is complete and recoverable (torn
+//! images rejected per candidate). The [`QuiesceGate`] trait is the seam
+//! the process lane implements: it owns task states, the storage lane owns
+//! the overlay bytes, and the supervisor wires them. This is the L01/R06
+//! connection point; the process lane calls quiesce, it does not reimplement
+//! it.
+//!
 //! Image layout (all integers little-endian):
 //!
 //! ```text
@@ -322,6 +344,114 @@ pub struct RecoverSummary {
     pub generation: u32,
 }
 
+/// Process-lane seam for bounded storage quiesce (G12a). The storage lane
+/// owns the overlay bytes; the process lane owns task states. Before a
+/// durable generation is published, the supervisor parks every task sharing
+/// this storage at a stable point (no in-flight mutating syscall) and then
+/// calls [`VirtualFs::quiesce_retained`] with its gate implementation.
+/// This trait is the L01/R06 connection point: implemented on the process
+/// side, consumed on the storage side; neither lane edits the other's
+/// files to use it.
+pub trait QuiesceGate {
+    /// Host failure type. [`VirtualFs::quiesce_retained`] reports a probe
+    /// failure as [`QuiesceError::Gate`]; log the value on the host side
+    /// before returning it.
+    type Error;
+    /// True when every writer sharing this storage is parked at a stable
+    /// point. Called once per poll, at most `max_polls` times per quiesce;
+    /// the core performs no sleeping, so the supervisor paces polls and
+    /// bounds wall time.
+    fn writers_settled(&mut self) -> Result<bool, Self::Error>;
+}
+
+/// Why a bounded quiesce failed. Nothing is staged or published on any
+/// quiesce failure: the previous acknowledged generation is untouched, and
+/// the failure maps to the `storage` failure category, never durable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuiesceError {
+    /// Writers never settled within `max_polls` polls (including
+    /// `max_polls == 0`, which fails closed without polling).
+    Busy,
+    /// The gate probe itself failed.
+    Gate,
+}
+
+impl QuiesceError {
+    /// Stable machine-readable name for logs and error propagation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            QuiesceError::Busy => "quiesce-busy",
+            QuiesceError::Gate => "quiesce-gate",
+        }
+    }
+}
+
+/// Why a consistent-generation checkpoint failed: either the bounded
+/// quiesce or the durable flush. Either way nothing was acknowledged and
+/// nothing new is durable; the previous acknowledged generation stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointError {
+    /// Consistency could not be obtained; the flush never ran.
+    Quiesce(QuiesceError),
+    /// Quiesce succeeded but the publish failed; see [`FlushError`] phases.
+    Flush(FlushError),
+}
+
+impl CheckpointError {
+    /// Stable machine-readable name for logs and error propagation:
+    /// the quiesce failure name, or the failed flush phase.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CheckpointError::Quiesce(error) => error.as_str(),
+            CheckpointError::Flush(error) => error.as_str(),
+        }
+    }
+}
+
+/// What [`VirtualFs::quiesce_retained`](VirtualFs::quiesce_retained)
+/// observed at the stable point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuiesceSummary {
+    /// Gate polls consumed (`1..=max_polls`).
+    pub polls: u32,
+    /// Open writable descriptors at the stable point. Informational: a
+    /// held-open writer is legal; the gate attests it is parked, so the
+    /// staged overlay is still consistent.
+    pub open_writers: usize,
+}
+
+/// What
+/// [`VirtualFs::checkpoint_generation`](VirtualFs::checkpoint_generation)
+/// published: the quiesce observation plus the durable flush record.
+/// `flush.generation` is the acknowledged generation the coordinator (R07)
+/// records against its checkpoint sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenerationSummary {
+    /// Bounded-quiesce observation.
+    pub quiesce: QuiesceSummary,
+    /// Durable publish record.
+    pub flush: FlushSummary,
+}
+
+impl GenerationSummary {
+    /// The acknowledged durable generation.
+    pub const fn generation(self) -> u32 {
+        self.flush.generation
+    }
+}
+
+/// Per-candidate recoverability from
+/// [`VirtualFs::list_recoverable`](VirtualFs::list_recoverable).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenerationReport {
+    /// Index into the caller's candidate path list.
+    pub candidate: usize,
+    /// Recoverable durable generation; zero when unrecoverable.
+    pub generation: u32,
+    /// Why the candidate is unrecoverable; `None` when recoverable.
+    pub error: Option<FlushError>,
+}
+
 /// What [`VirtualFs::checkpoint_retained`] staged. `bytes` is the exact
 /// staged-image length (`out[..bytes]`); a flush publishes exactly those
 /// bytes after stamping the durable generation.
@@ -447,6 +577,70 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         })
     }
 
+    /// Quiesce the shared storage: poll `gate` until the process lane
+    /// attests every writer sharing this storage is parked at a stable
+    /// point, or fail explicitly. At most `max_polls` polls; the core
+    /// performs no sleeping, so the supervisor paces polls and bounds wall
+    /// time. Mutation inside one mediated call already runs to completion,
+    /// so the gate only needs to rule out cross-task in-flight writes.
+    /// Success means the overlay can be staged consistently; it stages and
+    /// publishes nothing by itself. `max_polls == 0` fails closed with
+    /// [`QuiesceError::Busy`].
+    pub fn quiesce_retained<G: QuiesceGate>(
+        &self,
+        gate: &mut G,
+        max_polls: u32,
+    ) -> Result<QuiesceSummary, QuiesceError> {
+        for polls in 1..=max_polls {
+            if gate.writers_settled().map_err(|_| QuiesceError::Gate)? {
+                return Ok(QuiesceSummary {
+                    polls,
+                    open_writers: self.writable_opens(),
+                });
+            }
+        }
+        Err(QuiesceError::Busy)
+    }
+
+    /// Checkpoint a consistent durable generation: bounded quiesce first,
+    /// then the G12 atomic publish. The flush runs only after a successful
+    /// quiesce, so the acknowledged generation always has matching files;
+    /// a quiesce failure reports [`CheckpointError::Quiesce`] with nothing
+    /// published, and a publish failure reports [`CheckpointError::Flush`]
+    /// with the previous generation untouched. Either way the failure is a
+    /// storage error, never a durable claim. Staged bytes live only in
+    /// `scratch` until the rename, so interruption before the coordinator's
+    /// ack leaves the previous acknowledged generation, and interruption
+    /// after the ack leaves a recoverable newer one.
+    pub fn checkpoint_generation<S: DurableStore, G: QuiesceGate>(
+        &self,
+        instance: u64,
+        limits: &RetainedLimits,
+        store: &mut S,
+        gate: &mut G,
+        max_polls: u32,
+        temp_path: &[u8],
+        final_path: &[u8],
+        scratch: &mut [u8],
+    ) -> Result<GenerationSummary, CheckpointError> {
+        let quiesce = self
+            .quiesce_retained(gate, max_polls)
+            .map_err(CheckpointError::Quiesce)?;
+        let flush = self
+            .flush_retained(instance, limits, store, temp_path, final_path, scratch)
+            .map_err(CheckpointError::Flush)?;
+        Ok(GenerationSummary { quiesce, flush })
+    }
+
+    /// Count open writable descriptors. Reported in [`QuiesceSummary`] so
+    /// the supervisor can see held-open writers at the stable point.
+    fn writable_opens(&self) -> usize {
+        self.descriptors
+            .iter()
+            .filter(|descriptor| descriptor.open && descriptor.writable)
+            .count()
+    }
+
     /// Flush the live overlay durably: stage it into `scratch`, stamp the
     /// next durable generation (one past the currently published image, or
     /// [`RETAINED_FIRST_GENERATION`] when nothing was ever published), and
@@ -551,6 +745,78 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             bytes: summary.bytes,
             generation,
         })
+    }
+
+    /// Verify a published image without applying it: read it back through
+    /// `store` into `scratch` and validate it end to end (published
+    /// generation, instance, shape, paths, limits) exactly as
+    /// [`VirtualFs::recover_retained`](VirtualFs::recover_retained) would
+    /// before applying. Returns the recoverable durable generation. A
+    /// missing image reports [`FlushError::Missing`]; torn bytes, a foreign
+    /// instance, or volatile staged bytes report [`FlushError::Invalid`].
+    /// The overlay is never modified, so verification cannot corrupt the
+    /// live view it checks against.
+    pub fn verify_published<S: DurableStore>(
+        &self,
+        instance: u64,
+        limits: &RetainedLimits,
+        store: &mut S,
+        final_path: &[u8],
+        scratch: &mut [u8],
+    ) -> Result<u32, FlushError> {
+        let len = store
+            .read_published(final_path, scratch)
+            .map_err(|_| FlushError::Read)?
+            .ok_or(FlushError::Missing)?;
+        let image = scratch.get(..len).ok_or(FlushError::Read)?;
+        let generation = published_header(image, instance).map_err(FlushError::Invalid)?;
+        if generation == 0 {
+            return Err(FlushError::Invalid(RetainedError::InvalidRecord));
+        }
+        self.validate_retained(instance, limits, image)
+            .map_err(FlushError::Invalid)?;
+        Ok(generation)
+    }
+
+    /// List which of the caller-supplied `candidates` publish paths holds a
+    /// complete recoverable generation. Fills `out` with one
+    /// [`GenerationReport`] per candidate (up to `out.len()`) and returns
+    /// the number of reports written. Each candidate is verified with
+    /// [`VirtualFs::verify_published`](VirtualFs::verify_published):
+    /// complete images report their generation with no error, torn images
+    /// are rejected with their per-candidate failure, and nothing is ever
+    /// applied. The supervisor keeps the newest recoverable generation and
+    /// treats an all-rejected set as a storage failure, never durable.
+    pub fn list_recoverable<S: DurableStore>(
+        &self,
+        instance: u64,
+        limits: &RetainedLimits,
+        store: &mut S,
+        candidates: &[&[u8]],
+        scratch: &mut [u8],
+        out: &mut [GenerationReport],
+    ) -> usize {
+        let mut filled = 0usize;
+        for (candidate, path) in candidates.iter().enumerate() {
+            if filled >= out.len() {
+                break;
+            }
+            let report = match self.verify_published(instance, limits, store, path, scratch) {
+                Ok(generation) => GenerationReport {
+                    candidate,
+                    generation,
+                    error: None,
+                },
+                Err(error) => GenerationReport {
+                    candidate,
+                    generation: 0,
+                    error: Some(error),
+                },
+            };
+            out[filled] = report;
+            filled += 1;
+        }
+        filled
     }
 
     /// Recover a published image: validate it fully, then upsert every

@@ -3,8 +3,9 @@
 mod retained;
 
 pub use retained::{
-    durable_generation, stamp_generation, CheckpointSummary, DurableStore, FlushError,
-    FlushSummary, RecoverSummary, RestoreSummary, RetainedError, RetainedLimits,
+    durable_generation, stamp_generation, CheckpointError, CheckpointSummary, DurableStore,
+    FlushError, FlushSummary, GenerationReport, GenerationSummary, QuiesceError, QuiesceGate,
+    QuiesceSummary, RecoverSummary, RestoreSummary, RetainedError, RetainedLimits,
     RETAINED_FIRST_GENERATION, RETAINED_GENERATION_OFFSET, RETAINED_HEADER_LEN, RETAINED_MAGIC,
 };
 
