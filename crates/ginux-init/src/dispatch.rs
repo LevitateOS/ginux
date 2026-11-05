@@ -2,9 +2,9 @@
 //!
 //! Single owner for entry classification and the contract decision used by
 //! the supervision loops. Lane hooks live in disjoint files
-//! (`process_hooks`, `fs_hooks`, `channel_hooks`) and currently all decline,
-//! so every entry falls through to the existing balanced-contract decision
-//! with byte-identical behavior.
+//! (`process_hooks`, `fs_hooks`, `channel_hooks`). Stateless demonstration hooks
+//! retain their balanced-contract fallback. Configured launch first resolves
+//! its domain-owned filesystem and device objects in `decide_launch`.
 
 use ginux_core::{balanced_arguments_allowed, decide_balanced, BalancedSurface, Decision};
 
@@ -14,6 +14,7 @@ use crate::supervisor::UserRegs;
 pub enum Lane {
     Process,
     Filesystem,
+    Device,
     Channel,
     Contract,
 }
@@ -67,7 +68,36 @@ pub fn decide_native(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> NativeDecisi
             },
             None => NativeDecision::Contract(decide_balanced(syscall)),
         },
-        Lane::Contract => NativeDecision::Contract(decide_balanced(syscall)),
+        Lane::Device | Lane::Contract => NativeDecision::Contract(decide_balanced(syscall)),
+    }
+}
+
+/// Resolve configured domain objects before the immutable native contract.
+/// Device descriptors have a separate reserved range and must resolve before
+/// the filesystem rejects unknown virtual descriptors.
+pub fn decide_launch(
+    pid: usize,
+    registers: &UserRegs,
+    filesystem: &mut crate::fs_hooks::LaunchFs,
+    devices: &mut crate::device_hooks::LaunchDevices,
+) -> NativeDecision {
+    if let Some(result) = devices.claim(pid, registers, filesystem) {
+        NativeDecision::Hooked {
+            lane: Lane::Device,
+            result,
+        }
+    } else if let Some(result) = filesystem.claim(pid, registers) {
+        NativeDecision::Hooked {
+            lane: Lane::Filesystem,
+            result,
+        }
+    } else {
+        decide_native(
+            registers.orig_rax,
+            registers.rdi,
+            registers.rsi,
+            registers.rdx,
+        )
     }
 }
 

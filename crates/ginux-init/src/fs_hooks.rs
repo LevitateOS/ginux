@@ -2,7 +2,8 @@
 //! the supervisor; no writable host descriptor is installed in the workload.
 //! Retained storage, directory descriptors, mappings and exec are not provided.
 
-use crate::supervisor::{syscall4, syscall6, UserRegs};
+use crate::supervisor::{syscall4, UserRegs};
+use crate::tracee_io::{copy_memory, read_path};
 use core::sync::atomic::{AtomicBool, Ordering};
 use ginux_domain::{DomainConfig, Text};
 use ginux_vfs::{
@@ -112,8 +113,8 @@ impl LaunchFs {
     }
 
     /// Native open/dup cannot obtain descriptors in the virtual namespace.
-    pub fn reserve_descriptors(&self) -> bool {
-        if !self.enabled() {
+    pub fn reserve_descriptors(&self, extra_objects: bool) -> bool {
+        if !self.enabled() && !extra_objects {
             return true;
         }
         let mut limits = [0u64; 2];
@@ -131,7 +132,7 @@ impl LaunchFs {
             .any(|p| within(path, p.as_bytes()))
     }
 
-    fn path(&self, pid: usize, address: u64, dirfd: u64) -> Result<Path, i64> {
+    pub(crate) fn path(&self, pid: usize, address: u64, dirfd: u64) -> Result<Path, i64> {
         let text = read_path(pid, address)?;
         if text.is_empty() {
             return Err(-2);
@@ -405,94 +406,29 @@ fn normalize(cwd: &[u8], text: &[u8]) -> Result<Path, i64> {
     Path::from_bytes(&output[..len]).map_err(|_| -36)
 }
 
-#[repr(C)]
-struct IoVec {
-    address: usize,
-    length: usize,
-}
-
-// Parent-only calls honor guest page protections. No PTRACE forced copyout.
-fn copy_memory(pid: usize, address: u64, buffer: &mut [u8], output: bool) -> Result<i64, i64> {
-    if buffer.is_empty() {
-        return Ok(0);
-    }
-    address.checked_add(buffer.len() as u64).ok_or(-14)?;
-    let local = IoVec {
-        address: buffer.as_mut_ptr() as usize,
-        length: buffer.len(),
-    };
-    let remote = IoVec {
-        address: address as usize,
-        length: buffer.len(),
-    };
-    let result = unsafe {
-        syscall6(
-            if output { 311 } else { 310 },
-            pid,
-            &local as *const _ as usize,
-            1,
-            &remote as *const _ as usize,
-            1,
-            0,
-        )
-    };
-    if result <= 0 {
-        Err(-14)
-    } else {
-        Ok(result as i64)
-    }
-}
-
-fn read_path(pid: usize, address: u64) -> Result<Path, i64> {
-    let mut buffer = [0; MAX_PATH];
-    for i in 0..MAX_PATH {
-        copy_memory(
-            pid,
-            address.checked_add(i as u64).ok_or(-14)?,
-            &mut buffer[i..i + 1],
-            false,
-        )?;
-        if buffer[i] == 0 {
-            return Path::from_bytes(&buffer[..i]).map_err(|_| -36);
-        }
-    }
-    Err(-36)
-}
-
 fn copy_metadata(
     pid: usize,
     address: u64,
     metadata: FileMetadata,
     statx: bool,
 ) -> Result<i64, i64> {
-    let mut bytes = [0u8; 256];
-    let mode = metadata.mode
-        | if metadata.kind == NodeKind::Directory {
-            0o40000
-        } else {
-            0o100000
-        };
-    let (ino, mode_at, size_at, blocks_at, length) = if statx {
-        bytes[..4].copy_from_slice(&0x7ffu32.to_le_bytes());
-        bytes[4..8].copy_from_slice(&4096u32.to_le_bytes());
-        bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
-        bytes[28..30].copy_from_slice(&(mode as u16).to_le_bytes());
-        (32, None, 40, 48, 256)
-    } else {
-        bytes[16..24].copy_from_slice(&1u64.to_le_bytes());
-        bytes[56..64].copy_from_slice(&4096u64.to_le_bytes());
-        (8, Some(24), 48, 64, 144)
-    };
-    bytes[ino..ino + 8].copy_from_slice(&metadata.inode.to_le_bytes());
-    if let Some(mode_at) = mode_at {
-        bytes[mode_at..mode_at + 4].copy_from_slice(&mode.to_le_bytes());
-    }
-    bytes[size_at..size_at + 8].copy_from_slice(&metadata.size.to_le_bytes());
-    bytes[blocks_at..blocks_at + 8].copy_from_slice(&metadata.size.div_ceil(512).to_le_bytes());
-    if copy_memory(pid, address, &mut bytes[..length], true)? != length as i64 {
-        return Err(-14);
-    }
-    Ok(0)
+    crate::tracee_io::write_stat(
+        pid,
+        address,
+        crate::tracee_io::Stat {
+            inode: metadata.inode,
+            mode: metadata.mode
+                | if metadata.kind == NodeKind::Directory {
+                    0o40000
+                } else {
+                    0o100000
+                },
+            size: metadata.size,
+            device_major: 0,
+            device_minor: 0,
+        },
+        statx,
+    )
 }
 
 fn errno(error: VfsError) -> i64 {

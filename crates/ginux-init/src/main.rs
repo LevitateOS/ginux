@@ -9,11 +9,13 @@ use ginux_core::{
 };
 
 mod channel_hooks;
+mod device_hooks;
 mod dispatch;
 mod fs_hooks;
 mod launch;
 mod process_hooks;
 mod supervisor;
+mod tracee_io;
 
 use crate::dispatch::{
     balanced_surface_name, decide_native, native_arguments_allowed, process_entry, Lane,
@@ -1517,6 +1519,7 @@ fn supervise_native(pid: usize, domain: &mut Domain) -> ! {
                 let lane_name: &[u8] = match lane {
                     Lane::Process => b"process",
                     Lane::Filesystem => b"filesystem",
+                    Lane::Device => b"device",
                     Lane::Channel => b"channel",
                     Lane::Contract => b"contract",
                 };

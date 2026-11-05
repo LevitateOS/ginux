@@ -200,8 +200,8 @@ executes `[domain].init` with the configured arguments and environment inside
 the supplied host root directory. The bootstrap requires chroot and credential
 change privileges, and a kernel with `close_range` (Linux 5.9 or later).
 It drops to UID/GID 1000 before executing the workload. The configuration must
-select `profile = "balanced"` and `backend = "ptrace-native"`. Device assignments
-and storage backends other than the memory backend below are rejected.
+select `profile = "balanced"` and `backend = "ptrace-native"`. Only the `null`
+device assignment and memory-storage backend described below are supported.
 
 `[domain].workdir` is optional and defaults to `/work`; `/` is also supported.
 The bootstrap creates the working directory if its parent exists, then enters
@@ -257,6 +257,19 @@ Guest-memory copies respect page protections, including partial read copyout.
 No writable host descriptor is exposed. Data disappears at domain teardown;
 there is no retention, export, storage generation or configured storage quota.
 
+The configured `/dev` view is an immutable virtual directory, empty by default;
+image entries beneath it are hidden. `[devices].assignments = ["null"]` exposes
+`/dev/null` through the existing device registry: reads return EOF and writes
+discard up to 4096 bytes per call. Stat/fstat/fstatat/statx report a character
+device with domain-owned identity and major/minor 1:3. Open access modes,
+close-on-exec descriptor flags, seek, close and basic access queries are
+supported; device metadata cannot be changed. There are 64 open-device slots.
+Unknown and duplicate assignments fail before launch. Device descriptors start
+at 1073741824, above the reserved native namespace; device-only configurations
+also clamp native descriptor limits. No host device node or descriptor is used.
+Pipes, descriptor duplication, device polling, and additional device types are
+not implemented by configured launch yet.
+
 When requested, the result file is reserved exclusively before launch, with
 mode 0600 and a maximum path length of 512 bytes. Existing files are never
 overwritten. After completion, it contains one synced JSON object:
@@ -279,4 +292,6 @@ make build-launch-fixture
 sudo make test-launch
 make build-launch-storage-fixture
 sudo make test-launch-storage
+make build-launch-device-fixture
+sudo make test-launch-devices
 ```

@@ -8,7 +8,7 @@ use ginux_core::{balanced_identity_result, balanced_surface, Action, SYS_EXIT, S
 use ginux_domain::{ConfigError, Domain, DomainConfig, ExecutionBackend, ExecutionProfile};
 
 use crate::dispatch::{
-    balanced_surface_name, decide_native, native_arguments_allowed, NativeDecision,
+    balanced_surface_name, decide_launch, native_arguments_allowed, NativeDecision,
 };
 use crate::supervisor::{
     exit_process, line, ptrace, stopped, syscall0, syscall1, syscall2, syscall3, syscall4,
@@ -298,6 +298,8 @@ pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *c
     stage_result_path(result_path);
     let config = launch_load_config(config_path);
     launch_validate(&config);
+    let mut devices = crate::device_hooks::LaunchDevices::prepare(&config)
+        .unwrap_or_else(|reason| launch_startup_fail(reason));
     let mut filesystem = crate::fs_hooks::LaunchFs::prepare(&config)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     print_launch_config(&config);
@@ -311,9 +313,9 @@ pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *c
         launch_domain_fail(&mut domain, b"launch tracee fork failed");
     }
     if child == 0 {
-        launch_tracee(root_path, &filesystem);
+        launch_tracee(root_path, &filesystem, devices.enabled());
     }
-    supervise_launch(child as usize, &mut domain, &mut filesystem)
+    supervise_launch(child as usize, &mut domain, &mut filesystem, &mut devices)
 }
 
 fn launch_validate(config: &DomainConfig) {
@@ -321,9 +323,6 @@ fn launch_validate(config: &DomainConfig) {
         || config.execution_backend != ExecutionBackend::PtraceNative
     {
         launch_startup_fail(b"launch requires profile=balanced backend=ptrace-native");
-    }
-    if !config.devices.as_slice().is_empty() {
-        launch_startup_fail(b"launch does not support device assignments");
     }
     if config.id.as_bytes().is_empty() || config.id.as_bytes().len() > 64 {
         launch_startup_fail(b"domain id length invalid");
@@ -756,12 +755,16 @@ fn finish_signaled(signal: u64) {
     exit_process(128 + signal as usize)
 }
 
-fn launch_tracee(root_path: *const u8, filesystem: &crate::fs_hooks::LaunchFs) -> ! {
+fn launch_tracee(
+    root_path: *const u8,
+    filesystem: &crate::fs_hooks::LaunchFs,
+    devices_enabled: bool,
+) -> ! {
     static ROOT: &[u8] = b"/\0";
     // Host descriptors (including the result file) must not grant the
     // workload authority outside the supplied root. Only stdio is shared.
     const SYS_CLOSE_RANGE: usize = 436;
-    if !filesystem.reserve_descriptors() {
+    if !filesystem.reserve_descriptors(devices_enabled) {
         tracee_setup_fail(
             b"ginux: launch bootstrap failed: descriptor namespace unavailable\n",
             130,
@@ -850,6 +853,7 @@ fn supervise_launch(
     pid: usize,
     domain: &mut Domain,
     filesystem: &mut crate::fs_hooks::LaunchFs,
+    devices: &mut crate::device_hooks::LaunchDevices,
 ) -> ! {
     let mut status = 0i32;
     if wait(pid, &mut status) < 0 {
@@ -954,13 +958,7 @@ fn supervise_launch(
         }
         sequence += 1;
         let syscall = registers.orig_rax;
-        let dispatched = match filesystem.claim(pid, &registers) {
-            Some(result) => NativeDecision::Hooked {
-                lane: crate::dispatch::Lane::Filesystem,
-                result,
-            },
-            None => decide_native(syscall, registers.rdi, registers.rsi, registers.rdx),
-        };
+        let dispatched = decide_launch(pid, &registers, filesystem, devices);
         let decision = match dispatched {
             NativeDecision::Contract(mut decision) => {
                 // Native process ownership is not implemented on this path.
@@ -974,6 +972,7 @@ fn supervise_launch(
                 let lane_name: &[u8] = match lane {
                     crate::dispatch::Lane::Process => b"process",
                     crate::dispatch::Lane::Filesystem => b"filesystem",
+                    crate::dispatch::Lane::Device => b"device",
                     crate::dispatch::Lane::Channel => b"channel",
                     crate::dispatch::Lane::Contract => b"contract",
                 };
