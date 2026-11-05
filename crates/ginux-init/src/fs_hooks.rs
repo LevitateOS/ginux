@@ -1,10 +1,4 @@
-#![allow(dead_code)]
 //! Native filesystem-lane dispatch hooks.
-//!
-//! Note: `dead_code` is allowed module-wide because G06a introduces the
-//! working-directory/resolution surface (`DomainCwd`, `resolve_at`, …) ahead
-//! of its consumer: the supervisor tracee-memory/fd-table wiring owned by a
-//! named follow-up (see G07). Re-enable the lint once that wiring calls it.
 //!
 //! Owner: G-files lane. G06 claims domain directory creation and enumeration
 //! (`mkdir`/`mkdirat`/`getdents64`) so no directory operation reaches the
@@ -14,6 +8,11 @@
 //! adds the domain working-directory state plus the shared relative-path
 //! resolver used by subsequent filesystem operations:
 //!
+//! * Narrow `#[allow(dead_code)]` marks only the surface still waiting for
+//!   supervisor tracee-memory/fd-table wiring (`DomainCwd::chdir`,
+//!   `getcwd_into`, `resolve_at_full`); everything else is called by the
+//!   G07 open path below.
+//!
 //! * [`DomainCwd`] tracks the managed working directory. It starts at the
 //!   configured workdir (default `/work`, see `docs/ginux-recipe-interfaces.md`
 //!   §2–§3) and only moves through [`DomainCwd::chdir`], which resolves the
@@ -21,19 +20,30 @@
 //! * [`resolve_at`] joins `AT_FDCWD`-relative and absolute paths, normalizes
 //!   `.`/`..` with root confinement, and expands symlinks through a
 //!   caller-supplied [`DomainView`] with a bounded follow count. A non-`AT_FDCWD`
-//!   dirfd has no backing table until G07 owns descriptors, so it fails
-//!   closed with [`ResolveError::DirFdUnsupported`] instead of naming a host
-//!   descriptor.
+//!   dirfd has no backing table until supervisor fd-table wiring exists, so
+//!   it fails closed with [`ResolveError::DirFdUnsupported`] instead of
+//!   naming a host descriptor.
+//!
+//! G07 consumes that surface for the descriptor/file-open path: [`open_at`]
+//! resolves an `open`/`openat` request through [`resolve_at`] against the
+//! merged domain view ([`VfsDomainView`], backed by
+//! `ginux-vfs` `classify_merged`), maps native access flags onto the VFS
+//! open flags, and allocates a bounded VFS descriptor. Read-only opens
+//! reference the immutable base image; writable opens copy the file into
+//! the writable overlay first, so a denied write — and even a permitted
+//! one — can never mutate the immutable base. [`close_fd`] releases a
+//! descriptor. Created files take the VFS-default mode; creation-mode/umask
+//! fidelity belongs to G08a with the rest of permission handling.
 //!
 //! Everything here is pure `core` logic over caller buffers: no host calls,
-//! so a denial has zero host effect by construction. The supervision
-//! loop cannot feed tracee path bytes or persist per-task cwd through the
-//! `claim(syscall, rdi, rsi, rdx) -> Option<i64>` channel yet (that needs
-//! tracee-memory read/write plumbing in the supervisor, owned by a later
-//! task), so `claim` keeps returning the explicit `-EPERM` denial for every
-//! claimed entry, including the newly claimed `chdir`/`fchdir`/`getcwd`.
-//! [`ResolveError::errno`] already maps each failure to its faithful errno
-//! for that wiring.
+//! so a denial has zero host effect by construction. The supervision loop
+//! cannot feed tracee path bytes or persist per-task cwd/fd tables through
+//! the `claim(syscall, rdi, rsi, rdx) -> Option<i64>` channel yet (that
+//! needs tracee-memory read/write plumbing in the supervisor, owned by a
+//! later task), so `claim` keeps returning the explicit `-EPERM` denial for
+//! every claimed entry, including the newly claimed
+//! `open`/`openat`/`close`. [`ResolveError::errno`] and [`OpenError::errno`]
+//! already map each failure to its faithful errno for that wiring.
 
 /// `mkdir(2)`: domain directory creation. Claimed for G06.
 pub const SYS_MKDIR: u64 = 83;
@@ -56,10 +66,26 @@ pub const SYS_GETCWD: u64 = 79;
 /// is denied until the supervisor can hand the bytes to [`DomainCwd::chdir`].
 pub const SYS_CHDIR: u64 = 80;
 /// `fchdir(2)`: change to a directory named by a file descriptor. Claimed
-/// for G06a: dirfd values are meaningless without the G07 descriptor table,
-/// so the entry is denied and [`resolve_at`] fails non-`AT_FDCWD` dirfds
-/// closed with [`ResolveError::DirFdUnsupported`].
+/// for G06a: dirfd values stay meaningless because the VFS descriptor table
+/// records no paths and directories cannot be opened into descriptors (see
+/// [`open_at`]), so the entry stays denied and [`resolve_at`] fails
+/// non-`AT_FDCWD` dirfds closed with [`ResolveError::DirFdUnsupported`].
+/// Lifting this needs per-task fd-to-path wiring in the supervisor, owned
+/// by a later task.
 pub const SYS_FCHDIR: u64 = 81;
+/// `open(2)`: domain file open. Claimed for G07: the balanced contract
+/// would mediate it to the host, so claiming closes that host path. The
+/// register channel carries no path bytes, so the entry is denied until
+/// the supervisor can hand the bytes to [`open_at`].
+pub const SYS_OPEN: u64 = 2;
+/// `openat(2)`: domain file open relative to a directory fd. Claimed for
+/// G07 for the same reason; `open` is `openat` with `AT_FDCWD`.
+pub const SYS_OPENAT: u64 = 257;
+/// `close(2)`: release a domain descriptor. Claimed for G07: without the
+/// claim the balanced contract would hand a domain fd number to the host
+/// `close`, closing an unrelated supervisor descriptor. Denied until the
+/// supervisor can route the number to [`close_fd`].
+pub const SYS_CLOSE: u64 = 3;
 
 /// `AT_FDCWD`: a relative path resolves against the domain working
 /// directory. Matches the Linux `AT_FDCWD` value (`-100`).
@@ -75,31 +101,101 @@ pub const MAX_COMPONENTS: usize = 64;
 pub const MAX_FOLLOW: usize = 16;
 
 /// Default domain working directory (`docs/ginux-recipe-interfaces.md` §2:
-/// optional `[domain] workdir`, default `/work`).
+/// optional `[domain] workdir`, default `/work`). Referenced by
+/// [`DomainCwd::new`]; allowed until supervisor launch wiring calls it.
+#[allow(dead_code)]
 pub const DEFAULT_CWD: &[u8] = b"/work";
 
-/// Negative errno constants returned by [`ResolveError::errno`].
+/// Negative errno constants returned by [`ResolveError::errno`] and
+/// [`OpenError::errno`].
+///
+/// Only `EPERM` is referenced by live in-crate code (`claim`); the rest
+/// are consumed through the `errno` mappers, which the supervisor
+/// tracee-memory/fd-table wiring calls once it lands — hence the scoped
+/// allows below, matching the G07 API surface.
 pub const EPERM: i64 = 1;
+#[allow(dead_code)]
 pub const ENOENT: i64 = 2;
+#[allow(dead_code)]
+pub const EIO: i64 = 5;
+#[allow(dead_code)]
 pub const EBADF: i64 = 9;
+#[allow(dead_code)]
+pub const EACCES: i64 = 13;
+#[allow(dead_code)]
+pub const EEXIST: i64 = 17;
+#[allow(dead_code)]
 pub const ENOTDIR: i64 = 20;
+#[allow(dead_code)]
+pub const EISDIR: i64 = 21;
+#[allow(dead_code)]
 pub const EINVAL: i64 = 22;
+#[allow(dead_code)]
+pub const EMFILE: i64 = 24;
+#[allow(dead_code)]
+pub const EFBIG: i64 = 27;
+#[allow(dead_code)]
+pub const ENOSPC: i64 = 28;
+#[allow(dead_code)]
 pub const ERANGE: i64 = 34;
+#[allow(dead_code)]
 pub const ENAMETOOLONG: i64 = 36;
+#[allow(dead_code)]
 pub const ELOOP: i64 = 40;
 
-/// Lane membership by syscall number: directory creation, enumeration, and
-/// working-directory operations.
+/// Native open flag values (Linux x86-64). Only the access mode plus
+/// `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_CLOEXEC` are supported by [`open_at`];
+/// anything else (notably `O_APPEND`, whose end-of-file offset semantics
+/// belong to G07a data I/O) fails with [`OpenError::Invalid`].
+///
+/// Consumed by [`open_at`], which the supervisor wiring calls once it
+/// lands — hence the scoped allows.
+#[allow(dead_code)]
+pub const O_ACCMODE: u32 = 0o3;
+#[allow(dead_code)]
+pub const O_RDONLY: u32 = 0o0;
+#[allow(dead_code)]
+pub const O_WRONLY: u32 = 0o1;
+#[allow(dead_code)]
+pub const O_RDWR: u32 = 0o2;
+#[allow(dead_code)]
+pub const O_CREAT: u32 = 0o100;
+#[allow(dead_code)]
+pub const O_EXCL: u32 = 0o200;
+#[allow(dead_code)]
+pub const O_TRUNC: u32 = 0o1000;
+#[allow(dead_code)]
+pub const O_APPEND: u32 = 0o2000;
+#[allow(dead_code)]
+pub const O_CLOEXEC: u32 = 0o2000000;
+
+/// Lane membership by syscall number: directory creation, enumeration,
+/// working-directory operations, and (G07) descriptor open/close.
 pub fn claims(syscall: u64) -> bool {
     matches!(
         syscall,
-        SYS_MKDIR | SYS_MKDIRAT | SYS_GETDENTS64 | SYS_GETCWD | SYS_CHDIR | SYS_FCHDIR
+        SYS_MKDIR
+            | SYS_MKDIRAT
+            | SYS_GETDENTS64
+            | SYS_GETCWD
+            | SYS_CHDIR
+            | SYS_FCHDIR
+            | SYS_OPEN
+            | SYS_OPENAT
+            | SYS_CLOSE
     )
 }
 
 /// Emulated result when this lane handles the entry. `Some(-EPERM)` denies
 /// the entry explicitly: confinement first — escape is denial, never host
 /// effect. `None` falls through to the shared balanced-contract decision.
+///
+/// G07 keeps every claimed entry denied here, including `open`/`openat`/
+/// `close`: this channel sees only registers, while emulation needs the
+/// tracee path bytes plus per-task cwd/fd-table state (see [`open_at`]).
+/// Claiming still matters — it stops the balanced contract from mediating
+/// these entries to the host — and every other syscall behaves
+/// byte-identically to before.
 pub fn claim(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> Option<i64> {
     let _ = (rdi, rsi, rdx);
     if claims(syscall) {
@@ -116,6 +212,9 @@ pub enum ResolvedKind {
     Directory,
     /// Final component only, and only when the caller passes
     /// `follow_final = false` (e.g. `lstat`-style queries owned by G07b).
+    /// G07 opens always follow the final link, so only [`resolve_at_full`]
+    /// constructs this; it is wired when supervisor memory plumbing lands.
+    #[allow(dead_code)]
     Symlink,
 }
 
@@ -146,7 +245,8 @@ pub enum ResolveError {
 impl ResolveError {
     /// Faithful negative errno for supervisor wiring. Confinement failures
     /// ([`ResolveError::Escape`]) map to `-EPERM`, matching the G06 claim
-    /// denials.
+    /// denials. Allowed until that wiring (via [`OpenError::errno`]) lands.
+    #[allow(dead_code)]
     pub const fn errno(self) -> i64 {
         match self {
             ResolveError::Malformed => -EINVAL,
@@ -165,6 +265,10 @@ impl ResolveError {
 ///
 /// Overlay-aware callers (G07, backed by the VFS merged view) report the
 /// merged answer: live overlay entries win, tombstones read as [`Lookup::Missing`].
+///
+/// Variants are constructed by [`DomainView`] adapters (in-crate:
+/// [`VfsDomainView`]); allowed until supervisor wiring calls them.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Lookup {
     Missing,
@@ -200,6 +304,9 @@ pub struct DomainCwd {
 
 impl DomainCwd {
     /// Working directory from launch configuration: default `/work`.
+    /// Constructed by supervisor launch wiring once per-task cwd
+    /// persistence lands; [`open_at`] only borrows the value.
+    #[allow(dead_code)]
     pub const fn new() -> Self {
         let mut bytes = [0u8; MAX_CWD];
         bytes[0] = b'/';
@@ -212,6 +319,8 @@ impl DomainCwd {
 
     /// Validate a configured absolute workdir shape (lexical only: absolute,
     /// confined, fits). Existence is checked on first use, not here.
+    /// Called by supervisor launch wiring; kept until that lands.
+    #[allow(dead_code)]
     pub fn from_absolute(path: &[u8]) -> Result<Self, ResolveError> {
         if path.is_empty() || path[0] != b'/' || path.contains(&0) {
             return Err(ResolveError::Malformed);
@@ -235,7 +344,9 @@ impl DomainCwd {
     /// current directory per `AT_FDCWD` semantics) through `view` and move
     /// there. The target must be a live directory; anything else — missing,
     /// non-directory, escape, loop — leaves the cwd unchanged and reports
-    /// the denial.
+    /// the denial. Wired to the supervisor `chdir` entry once tracee path
+    /// bytes reach this lane; kept until then.
+    #[allow(dead_code)]
     pub fn chdir<V: DomainView>(&mut self, path: &[u8], view: &mut V) -> Result<(), ResolveError> {
         let mut out = [0u8; MAX_CWD];
         let (len, kind) = resolve_at(self.path(), AT_FDCWD, path, view, &mut out)?;
@@ -251,7 +362,10 @@ impl DomainCwd {
     /// Returns the bytes stored including the NUL, matching the raw
     /// `getcwd(2)` return convention. Fails with [`ResolveError::Malformed`]
     /// for a zero-length buffer and [`ResolveError::BufferTooSmall`]
-    /// (`-ERANGE`) when the path plus NUL does not fit.
+    /// (`-ERANGE`) when the path plus NUL does not fit. Wired to the
+    /// supervisor `getcwd` entry once tracee memory writes land; kept
+    /// until then.
+    #[allow(dead_code)]
     pub fn getcwd_into(&self, buf: &mut [u8]) -> Result<usize, ResolveError> {
         if buf.is_empty() {
             return Err(ResolveError::Malformed);
@@ -296,6 +410,9 @@ pub fn resolve_at<V: DomainView>(
 }
 
 /// [`resolve_at`] with caller-chosen final-symlink behavior.
+/// G07 opens always follow the final link; `lstat`-style queries owned by
+/// G07b will call this. Kept until supervisor wiring lands.
+#[allow(dead_code)]
 pub fn resolve_at_full<V: DomainView>(
     cwd: &[u8],
     dirfd: i64,
@@ -549,4 +666,279 @@ fn append_all(dst: &mut [u8; MAX_CWD], len: usize, src: &[u8]) -> Result<usize, 
     }
     dst[len..end].copy_from_slice(src);
     Ok(end)
+}
+
+// ─── G07: native open and descriptor lifetime ────────────────────────────
+
+use ginux_vfs::{BaseReader, MergedKind, VfsError, VirtualFs};
+
+/// Why an [`open_at`]/[`close_fd`] emulation failed.
+///
+/// Returned to the supervisor wiring once tracee-memory/fd-table plumbing
+/// lands; allowed until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenError {
+    /// Path resolution failed (escape, missing entry, loop, bad dirfd…).
+    Resolve(ResolveError),
+    /// `O_CREAT | O_EXCL` on an entry that already resolves.
+    Exists,
+    /// The resolved target is a directory: the VFS holds no directory
+    /// descriptors, so opens (including `O_CREAT` under a trailing slash)
+    /// fail instead of handing out a directory fd.
+    IsDirectory,
+    /// A VFS-level traversal met a non-directory (the pre-open resolution
+    /// usually reports this first as [`ResolveError::NotDirectory`]).
+    NotDirectory,
+    /// A VFS-level lookup missed (same note as above).
+    NotFound,
+    /// Write access to a base file whose mode denies it, or any other VFS
+    /// permission refusal. The immutable base is never modified.
+    Permission,
+    /// `close` of a number the bounded table has not allocated.
+    BadDescriptor,
+    /// No free slot in the bounded descriptor table.
+    TooManyOpen,
+    /// No free slot for the writable copy in the overlay.
+    NoSpace,
+    /// The writable copy would exceed the overlay file capacity.
+    TooLarge,
+    /// Bad access mode, an unsupported flag (`O_APPEND` and the rest
+    /// outside the [`open_at`] mask), or a malformed create name.
+    Invalid,
+    /// Corrupt image index or a backing-store failure.
+    Io,
+}
+
+impl OpenError {
+    /// Faithful negative errno for supervisor wiring. Permission refusals
+    /// map to `-EACCES`, matching Linux `open(2)` on a mode-denied file;
+    /// confinement escapes keep the lane's `-EPERM` via [`ResolveError`].
+    /// Allowed until that wiring lands.
+    #[allow(dead_code)]
+    pub const fn errno(self) -> i64 {
+        match self {
+            OpenError::Resolve(error) => error.errno(),
+            OpenError::Exists => -EEXIST,
+            OpenError::IsDirectory => -EISDIR,
+            OpenError::NotDirectory => -ENOTDIR,
+            OpenError::NotFound => -ENOENT,
+            OpenError::Permission => -EACCES,
+            OpenError::BadDescriptor => -EBADF,
+            OpenError::TooManyOpen => -EMFILE,
+            OpenError::NoSpace => -ENOSPC,
+            OpenError::TooLarge => -EFBIG,
+            OpenError::Invalid => -EINVAL,
+            OpenError::Io => -EIO,
+        }
+    }
+}
+
+/// [`DomainView`] over the merged domain view: live overlay entries win,
+/// tombstones read as absent. The supervisor builds one per open from its
+/// per-task VFS handle; see [`open_at`]. Allowed until that wiring lands.
+#[allow(dead_code)]
+pub struct VfsDomainView<'v, 'i, R, const FILES: usize, const FILE_SIZE: usize, const FDS: usize> {
+    vfs: &'v mut VirtualFs<'i, R, FILES, FILE_SIZE, FDS>,
+}
+
+impl<'v, 'i, R, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>
+    VfsDomainView<'v, 'i, R, FILES, FILE_SIZE, FDS>
+{
+    /// Borrow the VFS handle for one resolution pass.
+    pub fn new(vfs: &'v mut VirtualFs<'i, R, FILES, FILE_SIZE, FDS>) -> Self {
+        Self { vfs }
+    }
+}
+
+impl<'v, 'i, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize> DomainView
+    for VfsDomainView<'v, 'i, R, FILES, FILE_SIZE, FDS>
+{
+    fn classify(&mut self, path: &[u8], link: &mut [u8; MAX_LINK]) -> Lookup {
+        match self.vfs.classify_merged(path, link) {
+            MergedKind::Missing => Lookup::Missing,
+            MergedKind::File => Lookup::File,
+            MergedKind::Directory => Lookup::Directory,
+            MergedKind::Symlink(len) => Lookup::Symlink(len),
+            MergedKind::TargetTooLong => Lookup::TargetTooLong,
+        }
+    }
+}
+
+/// Emulate `open(path, flags)` / `openat(dirfd, path, flags)` against the
+/// domain: resolve through [`resolve_at`] over the merged view, map native
+/// access flags onto the VFS, and allocate a bounded descriptor.
+///
+/// * Absolute paths ignore `dirfd`; relative paths resolve against `cwd`
+///   when `dirfd == AT_FDCWD` and fail with `-EBADF` otherwise — VFS
+///   descriptors record no paths and directories cannot be opened, so
+///   there is nothing a dirfd could name yet (likewise `fchdir` stays
+///   denied; both need supervisor fd-to-path wiring).
+/// * The final symlink expands (`open`-style); intermediate symlinks
+///   always do.
+/// * `O_CREAT` on a missing final entry resolves the parent and creates in
+///   the overlay with the VFS-default mode; `O_CREAT | O_EXCL` on an
+///   existing entry fails with [`OpenError::Exists`]. A trailing slash on
+///   a missing entry fails with [`OpenError::IsDirectory`].
+/// * Opening a directory fails with [`OpenError::IsDirectory`]: the VFS
+///   holds file descriptors only; directory enumeration stays with G06
+///   until supervised `getdents` emulation lands.
+/// * Read-only opens reference the immutable base image; any writable open
+///   copies the file into the overlay first, so neither denied nor
+///   permitted writes can mutate the base.
+/// * Flags outside the access mode plus
+///   `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_CLOEXEC` fail with
+///   [`OpenError::Invalid`]; `O_TRUNC` without write access is ignored,
+///   matching Linux, and can only ever truncate the overlay copy.
+///
+/// Returns the allocated domain descriptor number (VFS numbering from 3).
+/// Pure `core` logic: the supervisor calls this once tracee path bytes and
+/// per-task `cwd`/VFS handles are plumbed through. Allowed until then.
+#[allow(dead_code)]
+pub fn open_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    path: &[u8],
+    flags: u32,
+) -> Result<i32, OpenError> {
+    if path.is_empty() || path.contains(&0) {
+        return Err(OpenError::Resolve(ResolveError::Malformed));
+    }
+    let accmode = flags & O_ACCMODE;
+    if accmode != O_RDONLY && accmode != O_WRONLY && accmode != O_RDWR {
+        return Err(OpenError::Invalid);
+    }
+    if flags & !(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC) != 0 {
+        return Err(OpenError::Invalid);
+    }
+    let vfs_flags = open_vfs_flags(accmode, flags);
+    let mut canonical = [0u8; MAX_CWD];
+    match resolve_at(
+        cwd.path(),
+        dirfd,
+        path,
+        &mut VfsDomainView::new(vfs),
+        &mut canonical,
+    ) {
+        Ok((len, kind)) => {
+            if kind == ResolvedKind::Directory {
+                return Err(OpenError::IsDirectory);
+            }
+            if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
+                return Err(OpenError::Exists);
+            }
+            vfs.open(&canonical[..len], vfs_flags).map_err(map_vfs_error)
+        }
+        Err(ResolveError::NotFound) if flags & O_CREAT != 0 => {
+            create_at(vfs, cwd, dirfd, path, vfs_flags)
+        }
+        Err(error) => Err(OpenError::Resolve(error)),
+    }
+}
+
+/// Emulate `close(fd)` against the domain: release the descriptor number
+/// previously allocated by [`open_at`]. Unknown numbers — including the
+/// process stdio range below the VFS numbering base — fail with
+/// [`OpenError::BadDescriptor`]. Allowed until supervisor wiring lands.
+#[allow(dead_code)]
+pub fn close_fd<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    fd: i32,
+) -> Result<(), OpenError> {
+    vfs.close(fd).map_err(|error| match error {
+        VfsError::InvalidDescriptor => OpenError::BadDescriptor,
+        _ => OpenError::Io,
+    })
+}
+
+/// `O_CREAT` slow path for [`open_at`]: the full path missed, so resolve
+/// the parent and create the final entry in the overlay via the VFS.
+/// Reached only through [`open_at`]; allowed with it.
+#[allow(dead_code)]
+fn create_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    path: &[u8],
+    vfs_flags: u32,
+) -> Result<i32, OpenError> {
+    // A trailing slash requires a directory; creating there is refused.
+    if path.len() > 1 && path[path.len() - 1] == b'/' {
+        return Err(OpenError::IsDirectory);
+    }
+    let dot: &[u8] = b".";
+    let (parent, name) = match path.iter().rposition(|byte| *byte == b'/') {
+        Some(0) => (&path[..1], &path[1..]),
+        Some(index) => (&path[..index], &path[index + 1..]),
+        None => (dot, path),
+    };
+    if name.is_empty() || name == b"." || name == b".." {
+        return Err(OpenError::Invalid);
+    }
+    let mut parent_out = [0u8; MAX_CWD];
+    let (parent_len, parent_kind) = resolve_at(
+        cwd.path(),
+        dirfd,
+        parent,
+        &mut VfsDomainView::new(vfs),
+        &mut parent_out,
+    )
+    .map_err(OpenError::Resolve)?;
+    if parent_kind != ResolvedKind::Directory {
+        return Err(OpenError::Resolve(ResolveError::NotDirectory));
+    }
+    let mut canonical = [0u8; MAX_CWD];
+    let mut len = append_all(&mut canonical, 0, &parent_out[..parent_len])
+        .map_err(OpenError::Resolve)?;
+    if len > 1 {
+        len = append_all(&mut canonical, len, b"/").map_err(OpenError::Resolve)?;
+    }
+    len = append_all(&mut canonical, len, name).map_err(OpenError::Resolve)?;
+    vfs.open(&canonical[..len], vfs_flags).map_err(map_vfs_error)
+}
+
+/// Map native access/creation flags onto `ginux-vfs` open flags. The caller
+/// ([`open_at`]) already validated the mask; `O_EXCL` needs no VFS bit
+/// because existence is decided during resolution. Allowed with [`open_at`].
+#[allow(dead_code)]
+fn open_vfs_flags(accmode: u32, flags: u32) -> u32 {
+    let mut vfs_flags = 0u32;
+    if accmode != O_WRONLY {
+        vfs_flags |= ginux_vfs::O_READ;
+    }
+    if accmode != O_RDONLY {
+        vfs_flags |= ginux_vfs::O_WRITE;
+    }
+    if flags & O_CREAT != 0 {
+        vfs_flags |= ginux_vfs::O_CREATE;
+    }
+    if flags & O_TRUNC != 0 {
+        vfs_flags |= ginux_vfs::O_TRUNC;
+    }
+    if flags & O_CLOEXEC != 0 {
+        vfs_flags |= ginux_vfs::O_CLOEXEC;
+    }
+    vfs_flags
+}
+
+/// Map a VFS failure onto the faithful [`OpenError`]. `NotFound` and
+/// `NotDirectory` only escape the pre-open [`resolve_at`] pass on bugs,
+/// never on well-formed input. Allowed with [`open_at`].
+#[allow(dead_code)]
+fn map_vfs_error(error: VfsError) -> OpenError {
+    match error {
+        VfsError::NotFound => OpenError::NotFound,
+        VfsError::NotDirectory => OpenError::NotDirectory,
+        VfsError::IsDirectory => OpenError::IsDirectory,
+        VfsError::PermissionDenied => OpenError::Permission,
+        VfsError::InvalidDescriptor => OpenError::BadDescriptor,
+        VfsError::DescriptorLimit => OpenError::TooManyOpen,
+        VfsError::OverlayLimit => OpenError::NoSpace,
+        VfsError::FileTooLarge => OpenError::TooLarge,
+        VfsError::AlreadyExists => OpenError::Exists,
+        VfsError::InvalidPath => OpenError::Invalid,
+        VfsError::SymlinkLoop => OpenError::Resolve(ResolveError::SymlinkLoop),
+        VfsError::InvalidIndex | VfsError::Io => OpenError::Io,
+    }
 }

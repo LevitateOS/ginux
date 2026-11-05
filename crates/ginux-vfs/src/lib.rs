@@ -300,6 +300,21 @@ pub trait BaseReader {
     fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), VfsError>;
 }
 
+/// One absolute path classified in the merged domain view, as reported by
+/// [`VirtualFs::classify_merged`]. Live overlay entries win over the
+/// immutable base; tombstones read as absent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MergedKind {
+    Missing,
+    File,
+    Directory,
+    /// Symlink whose raw target (absolute or relative, uninterpreted) was
+    /// copied into the caller's buffer; the value is the target length.
+    Symlink(usize),
+    /// Symlink target did not fit the caller's buffer.
+    TargetTooLong,
+}
+
 // Overlay slot states: 0 = free, 1 = live file, 2 = tombstone (a removed base
 // entry reads as absent and its slot may be reused), 3 = live directory
 // created by [`VirtualFs::mkdir`]. Directories reuse the file slot; `len` and
@@ -654,6 +669,40 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
     pub fn teardown(&mut self) {
         self.overlay.fill(OverlayFile::empty());
         self.descriptors.fill(Descriptor::empty());
+    }
+
+    /// Classify one absolute path in the merged domain view (overlay wins
+    /// over the base image; tombstones read as absent) without following a
+    /// final symlink, so prefix-walking resolvers can expand links
+    /// themselves. Symlink targets are copied raw into `link`.
+    ///
+    /// Callers pass absolute normalized paths (as built by a canonical
+    /// prefix walk); anything else simply misses. Base symlinks always fit
+    /// the index `MAX_LINK` record, so [`MergedKind::TargetTooLong`] only
+    /// guards callers with a smaller buffer.
+    pub fn classify_merged(&self, path: &[u8], link: &mut [u8; MAX_LINK]) -> MergedKind {
+        if let Some(index) = self.find_overlay(path) {
+            return match self.overlay[index].state {
+                1 => MergedKind::File,
+                3 => MergedKind::Directory,
+                _ => MergedKind::Missing,
+            };
+        }
+        match self.index.lookup_exact(path) {
+            Err(_) => MergedKind::Missing,
+            Ok(entry) => match entry.kind {
+                NodeKind::File => MergedKind::File,
+                NodeKind::Directory => MergedKind::Directory,
+                NodeKind::Symlink => {
+                    if entry.link.len() > link.len() {
+                        MergedKind::TargetTooLong
+                    } else {
+                        link[..entry.link.len()].copy_from_slice(entry.link);
+                        MergedKind::Symlink(entry.link.len())
+                    }
+                }
+            },
+        }
     }
 
     pub fn overlay_files(&self) -> usize {
