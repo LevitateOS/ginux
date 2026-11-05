@@ -35,7 +35,7 @@ use crate::process_hooks::{
     mprotect_shape_error, parse_script_interp, pipe2_flags_valid, reserve_error, round_len,
     thread_supported, ScriptInterp, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, FD_CLOEXEC,
     MAP_ALLOWED_HINTS, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, MAP_SHARED,
-    MMAP_SINGLE_MAX, MMAP_TOTAL_MAX, O_CLOEXEC, PROT_WRITE, PTRACE_EVENT_CLONE,
+    MMAP_SINGLE_MAX, MMAP_TOTAL_MAX, O_CLOEXEC, PROT_EXEC, PROT_WRITE, PTRACE_EVENT_CLONE,
     PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEVFORK, SYS_ARCH_PRCTL, SYS_CLOSE,
     SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_FCNTL, SYS_FUTEX, SYS_GETTID, SYS_GET_ROBUST_LIST,
     SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_RSEQ, SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS,
@@ -1539,12 +1539,13 @@ fn lib_release_group(processes: &ProcessTable<8>, tgid: u32) {
 // host. Other fds (`fstat` below the domain range) keep the previous
 // `-ENOSYS` denial byte-identically.
 //
-// File-backed `mmap` serves the loader's first mapping of each staged
-// library (private, read-only or read+execute, unfixed): the entry stop
-// rewrites the call to an anonymous mapping the host executes, and the
-// exit stop records it in the MemSpace ledger under the M1 caps and
-// fills it with staged bytes at the requested file offset. Shared and
-// writable file-backed shapes stay denied explicitly; an unaligned
+// File-backed `mmap` serves the loader's mappings of each staged
+// library (private, read-only, read+execute, or — since I04-M5 —
+// read+write, unfixed or confined `MAP_FIXED`): the entry stop rewrites
+// the call to an anonymous mapping the host executes, and the exit stop
+// records it in the MemSpace ledger under the M1 caps and fills it
+// with staged bytes at the requested file offset. Shared and
+// writable-executable shapes stay denied explicitly; an unaligned
 // offset fails `-EINVAL`; a fd that is not a live domain fd keeps the
 // pre-M3 `-ENODEV` denial. I04-M4 adds confined `MAP_FIXED` remaps
 // inside live ranges (split, not appended) plus `pread64` on live
@@ -1728,9 +1729,12 @@ fn domain_faccessat_entry(host_pid: usize, dirfd: i64, path_addr: usize, mode: u
 /// the caller rewrites the call to anonymous and stashes the domain fd
 /// plus the file offset. `Err(errno)` denies explicitly: an unknown fd
 /// keeps the pre-M3 `-ENODEV` (the host fd is never consulted); shared,
-/// `MAP_FIXED_NOREPLACE`, and writable shapes fail closed; unknown flags
-/// and unaligned offsets fail like the kernel; the M1 single/total caps
-/// still bind unfixed maps. A `MAP_FIXED` map is allowed only when its
+/// `MAP_FIXED_NOREPLACE`, and writable-executable shapes fail closed;
+/// private writable shapes stay allowed (the host mapping stays
+/// anonymous, so tracee writes never reach staged content or host
+/// files); unknown flags and unaligned offsets fail like the kernel;
+/// the M1 single/total caps still bind unfixed maps. A `MAP_FIXED` map
+/// is allowed only when its
 /// page-rounded span lies wholly inside one live ledger range created
 /// by the earlier whole-file map (same fd with a compatible offset) or
 /// by an anonymous reservation: the exit stop then splits the ledger
@@ -1767,7 +1771,7 @@ fn domain_lib_mmap_allowed(
     if len > MMAP_SINGLE_MAX {
         return Err(ENOMEM);
     }
-    if prot & PROT_WRITE != 0 {
+    if prot & (PROT_WRITE | PROT_EXEC) == (PROT_WRITE | PROT_EXEC) {
         return Err(EACCES);
     }
     if prot & LIB_PROT_READ == 0 {
@@ -1812,6 +1816,30 @@ fn domain_lib_mmap_allowed(
             }
             Ok(())
         }
+    }
+}
+
+/// Whether an `mprotect` may execute on the host: the shape gate
+/// already passed, so this checks confinement. The page-rounded span
+/// must lie wholly inside one live ledger range (an address the loop
+/// mediated: an anonymous reservation or a staged file-backed map);
+/// anything wider or touching non-domain memory (the initial image,
+/// the stack, `brk` growth, unmapped pages) fails `-ENOMEM` like the
+/// kernel, and an unaligned address fails `-EINVAL`. Allowed
+/// transitions (RX→RW for RELRO relocation writes, RW→RO after, RW→RX
+/// rarely) execute on the host and change no accounting.
+fn domain_mprotect_allowed(
+    mem: &MemSpace<8, 256>,
+    tgid: u32,
+    addr: u64,
+    len: u64,
+) -> Result<(), i64> {
+    if addr & 4095 != 0 {
+        return Err(EINVAL);
+    }
+    match mem.find_container(tgid, addr, round_len(len)) {
+        Some(_) => Ok(()),
+        None => Err(ENOMEM),
     }
 }
 
@@ -3607,6 +3635,15 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                                     };
                                     current.file_arg0 = registers.r8;
                                     current.file_arg1 = registers.r9;
+                                    if registers.rdx & PROT_WRITE != 0 {
+                                        write_all(
+                                            b"GINUX_NATIVE_PROCESS_AUDIT: mmap-file-writable len=",
+                                        );
+                                        write_u64(registers.rsi);
+                                        write_all(b" fd=");
+                                        write_u64(registers.r8);
+                                        write_all(b"\n");
+                                    }
                                     registers.r10 |= MAP_ANONYMOUS;
                                     registers.r8 = u64::MAX;
                                 }
@@ -3658,6 +3695,30 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                             registers.orig_rax = u64::MAX;
                             write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mprotect-deny errno=");
                             write_i64(errno);
+                            write_all(b"\n");
+                        } else if let Err(errno) = domain_mprotect_allowed(
+                            &mem,
+                            tgid,
+                            registers.rdi,
+                            registers.rsi,
+                        ) {
+                            // I04-M5: the shape is fine but the span
+                            // widens beyond its ledger region or touches
+                            // non-domain memory: fail closed, never
+                            // execute.
+                            current.result = -errno;
+                            current.override_result = true;
+                            registers.orig_rax = u64::MAX;
+                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mprotect-deny errno=");
+                            write_i64(errno);
+                            write_all(b"\n");
+                        } else {
+                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mprotect addr=");
+                            write_u64(registers.rdi);
+                            write_all(b" len=");
+                            write_u64(registers.rsi);
+                            write_all(b" prot=");
+                            write_u64(registers.rdx);
                             write_all(b"\n");
                         }
                     } else if registers.orig_rax == 11 {
