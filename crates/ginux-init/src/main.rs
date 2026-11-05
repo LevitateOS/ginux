@@ -1819,6 +1819,237 @@ fn domain_lib_mmap_allowed(
     }
 }
 
+/// Whether a confined anonymous `MAP_FIXED` map may execute on the
+/// host: the page-rounded span must lie wholly inside one live ledger
+/// range owned by the same group — an anonymous reservation the tracee
+/// made, or a staged whole-file reservation (the loader's bss zero-fill
+/// tail). The host's fresh anonymous pages are already zero, so the
+/// exit stop only splits the ledger range (bytes move, never added:
+/// the M1 caps stay exact) and stamps the anonymous convention. Every
+/// other fixed shape fails closed with its faithful errno: shared,
+/// `MAP_FIXED_NOREPLACE`, low addresses that would clobber supervisor
+/// memory, and spans outside any live reservation keep M1's `-EPERM`;
+/// unknown flags, zero length, and unaligned addresses fail `-EINVAL`
+/// like the kernel, over-long spans `-ENOMEM`, writable-executable
+/// protections `-EACCES`.
+fn domain_anon_fixed_allowed(
+    mem: &MemSpace<8, 256>,
+    tgid: u32,
+    addr: u64,
+    len: u64,
+    prot: u64,
+    flags: u64,
+) -> Result<(), i64> {
+    if len == 0 {
+        return Err(EINVAL);
+    }
+    if flags & MAP_SHARED != 0 {
+        return Err(EPERM);
+    }
+    if flags & MAP_FIXED_NOREPLACE != 0 {
+        return Err(EPERM);
+    }
+    if flags & !(MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_ALLOWED_HINTS) != 0 {
+        return Err(EINVAL);
+    }
+    if len > MMAP_SINGLE_MAX {
+        return Err(ENOMEM);
+    }
+    if prot & (PROT_WRITE | PROT_EXEC) == (PROT_WRITE | PROT_EXEC) {
+        return Err(EACCES);
+    }
+    if addr & 4095 != 0 {
+        return Err(EINVAL);
+    }
+    let rounded = round_len(len);
+    if addr.checked_add(rounded).is_none() {
+        return Err(EINVAL);
+    }
+    if addr < LIB_MMAP_MIN_ADDR {
+        return Err(EPERM);
+    }
+    match mem.find_container(tgid, addr, rounded) {
+        // Outside any live reservation: M1's `-EPERM`, not the M4
+        // file-fixed `-ENOMEM` — the M1 probe pins EPERM for exactly
+        // this shape (fixed over a dead reservation).
+        None => Err(EPERM),
+        Some(_) => {
+            if mem.region_count(tgid) + 2 > mem.range_capacity() {
+                return Err(ENOMEM);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Host-side `/proc/<pid>/maps` capacity for one exec-image snapshot:
+/// the fresh image (main binary plus ld.so) fits easily; a longer file
+/// parses up to the last complete line.
+const EXEC_MAPS_SIZE: usize = 8192;
+
+/// Scratch for one exec-image snapshot (see `exec_image_snapshot`).
+/// Only the exec-event stop fills it, synchronously, so no domain read
+/// aliases it.
+static mut EXEC_MAPS_BUF: [u8; EXEC_MAPS_SIZE] = [0; EXEC_MAPS_SIZE];
+
+/// One hex digit for the exec-image snapshot parser. `None` ends the
+/// line as malformed; the caller skips it.
+fn exec_maps_hex(byte: u8) -> Option<u64> {
+    if byte >= b'0' && byte <= b'9' {
+        Some((byte - b'0') as u64)
+    } else if byte >= b'a' && byte <= b'f' {
+        Some((byte - b'a' + 10) as u64)
+    } else if byte >= b'A' && byte <= b'F' {
+        Some((byte - b'A' + 10) as u64)
+    } else {
+        None
+    }
+}
+
+/// Parse one `/proc/<pid>/maps` line for the exec-image snapshot and
+/// record it when it is a file-backed image mapping. Returns true when
+/// a range joined the ledger. Only lines with a `/`-led pathname count:
+/// at the exec event the address space holds exactly the fresh image,
+/// so those lines ARE the main binary plus ld.so; anonymous pages and
+/// `[stack]`/`[vdso]`-style specials stay out, keeping later `mprotect`
+/// confinement to the initial exec image.
+fn exec_image_record_line(mem: &mut MemSpace<8, 256>, tgid: u32, line: &[u8]) -> bool {
+    let mut pos = 0usize;
+    let mut start = 0u64;
+    while pos < line.len() && line[pos] != b'-' {
+        let Some(digit) = exec_maps_hex(line[pos]) else {
+            return false;
+        };
+        start = start.saturating_mul(16).saturating_add(digit);
+        pos += 1;
+    }
+    if pos >= line.len() {
+        return false;
+    }
+    pos += 1;
+    let mut end = 0u64;
+    while pos < line.len() && line[pos] != b' ' {
+        let Some(digit) = exec_maps_hex(line[pos]) else {
+            return false;
+        };
+        end = end.saturating_mul(16).saturating_add(digit);
+        pos += 1;
+    }
+    if end <= start {
+        return false;
+    }
+    // Skip the four middle fields (permissions, offset, device, inode).
+    let mut fields = 0;
+    while pos < line.len() && fields < 4 {
+        while pos < line.len() && line[pos] == b' ' {
+            pos += 1;
+        }
+        while pos < line.len() && line[pos] != b' ' {
+            pos += 1;
+        }
+        fields += 1;
+    }
+    while pos < line.len() && line[pos] == b' ' {
+        pos += 1;
+    }
+    if pos >= line.len() || line[pos] != b'/' {
+        return false;
+    }
+    if mem.record_mmap(tgid, start, end - start).is_err() {
+        return false;
+    }
+    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-image addr=");
+    write_u64(start);
+    write_all(b" len=");
+    write_u64(end - start);
+    write_all(b"\n");
+    true
+}
+
+/// Record the fresh exec image's file-backed mappings (the main binary
+/// plus ld.so, already materialized by the host kernel) in the ledger
+/// at exec time, so their later RELRO `mprotect`s and confined fixed
+/// sub-remaps confine rather than deny. Discovery is read-only from
+/// the supervisor's own host-side `/proc` view of the tracee — never
+/// by parsing tracee memory as authority. A lost or truncated read
+/// fails closed (the ledger stays empty and later spans deny as
+/// before); the ranges release with the group on death, so the
+/// teardown zero-audit is unchanged.
+fn exec_image_snapshot(host_pid: usize, mem: &mut MemSpace<8, 256>, tgid: u32) {
+    let mut path = [0u8; 32];
+    path[..6].copy_from_slice(b"/proc/");
+    let mut len = 6usize;
+    let mut pid = host_pid;
+    let mut digits = [0u8; 20];
+    let mut count = 0usize;
+    while pid > 0 && count < digits.len() {
+        digits[count] = b'0' + (pid % 10) as u8;
+        pid /= 10;
+        count += 1;
+    }
+    if count == 0 {
+        return;
+    }
+    while count > 0 && len < path.len() {
+        count -= 1;
+        path[len] = digits[count];
+        len += 1;
+    }
+    if len + 5 > path.len() {
+        return;
+    }
+    // The buffer started zeroed, so the path stays NUL-terminated.
+    path[len..len + 5].copy_from_slice(b"/maps");
+    let fd = unsafe {
+        syscall4(
+            SYS_OPENAT_HOST,
+            AT_FDCWD,
+            path.as_ptr() as usize,
+            O_RDONLY,
+            0,
+        )
+    };
+    if fd < 0 {
+        write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-image-unmapped\n");
+        return;
+    }
+    let buf = unsafe { &mut EXEC_MAPS_BUF[..] };
+    let mut total = 0usize;
+    loop {
+        if total >= buf.len() {
+            break;
+        }
+        let got = unsafe {
+            syscall3(
+                SYS_READ_HOST,
+                fd as usize,
+                buf.as_mut_ptr() as usize + total,
+                buf.len() - total,
+            )
+        };
+        if got <= 0 {
+            break;
+        }
+        total += got as usize;
+    }
+    let _ = unsafe { syscall1(SYS_CLOSE_HOST, fd as usize) };
+    let mut recorded = 0u64;
+    let mut off = 0usize;
+    while off < total {
+        let mut end = off;
+        while end < total && buf[end] != b'\n' {
+            end += 1;
+        }
+        if exec_image_record_line(mem, tgid, &buf[off..end]) {
+            recorded += 1;
+        }
+        off = end + 1;
+    }
+    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-image ranges=");
+    write_u64(recorded);
+    write_all(b"\n");
+}
+
 /// Whether an `mprotect` may execute on the host: the shape gate
 /// already passed, so this checks confinement. The page-rounded span
 /// must lie wholly inside one live ledger range (an address the loop
@@ -2549,6 +2780,12 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             // I04-M1: the new image owns a fresh address space; the old
             // anonymous ledger dies with the replaced image.
             mem.reset(exec_tgid.tgid);
+            // I04-M6: the host kernel already materialized the new
+            // image (main binary plus ld.so); snapshot its file-backed
+            // mappings into the fresh ledger from the supervisor's own
+            // `/proc` view, so later RELRO `mprotect`s and confined
+            // fixed sub-remaps confine rather than deny.
+            exec_image_snapshot(host_pid, &mut mem, exec_tgid.tgid);
             // I04-M2: replacement closes every domain library fd (all
             // are `O_CLOEXEC`-semantic), so no stale overlay fd survives.
             lib_release_group(&processes, exec_tgid.tgid);
@@ -2883,15 +3120,23 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                         // A stashed nonzero `mem_arg1` marks a confined
                         // `MAP_FIXED` remap: split the containing range.
                         // Stale zero means an ordinary (unfixed) mapping.
-                        let fixed = current.file_arg0 != 0 && current.mem_arg1 != 0;
+                        // File-backed remaps also stash their domain fd;
+                        // anonymous remaps stash none, so the split below
+                        // stamps the anonymous convention instead.
+                        let fixed = current.mem_arg1 != 0;
                         let rounded = round_len(current.mem_arg0);
                         let ledger_full = if fixed {
+                            let (fixed_fd, fixed_off) = if current.file_arg0 != 0 {
+                                (current.file_arg0, current.file_arg1)
+                            } else {
+                                (u64::MAX, 0)
+                            };
                             mem.record_fixed(
                                 tgid,
                                 registers.rax,
                                 rounded,
-                                current.file_arg0,
-                                current.file_arg1,
+                                fixed_fd,
+                                fixed_off,
                             )
                         } else if current.file_arg0 != 0 {
                             mem.record_mmap_file(
@@ -2928,6 +3173,16 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                                 registers.rax,
                                 current.mem_arg0,
                             );
+                        } else if fixed {
+                            // I04-M6: a confined anonymous `MAP_FIXED`
+                            // remap (the host's fresh pages are already
+                            // zero): split, not appended, so the caps
+                            // stay exact.
+                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-fixed addr=");
+                            write_u64(registers.rax);
+                            write_all(b" len=");
+                            write_u64(current.mem_arg0);
+                            write_all(b"\n");
                         } else {
                             write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap addr=");
                             write_u64(registers.rax);
@@ -3653,6 +3908,43 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                                     registers.orig_rax = u64::MAX;
                                     write_all(
                                         b"GINUX_NATIVE_PROCESS_AUDIT: mmap-file-deny errno=",
+                                    );
+                                    write_i64(errno);
+                                    write_all(b" len=");
+                                    write_u64(registers.rsi);
+                                    write_all(b"\n");
+                                }
+                            }
+                        } else if registers.r10 & MAP_FIXED != 0
+                            && registers.r10 & MAP_FIXED_NOREPLACE == 0
+                            && registers.r10 & MAP_SHARED == 0
+                        {
+                            // I04-M6: confined anonymous `MAP_FIXED`
+                            // (the loader's bss zero-fill tail, or a
+                            // remap inside the tracee's own anonymous
+                            // reservation) executes on the host with
+                            // the requested address kept; the exit
+                            // stop splits the ledger range. Shared,
+                            // `NOREPLACE`, low, and out-of-reservation
+                            // shapes keep their faithful errnos below.
+                            match domain_anon_fixed_allowed(
+                                &mem,
+                                tgid,
+                                registers.rdi,
+                                registers.rsi,
+                                registers.rdx,
+                                registers.r10,
+                            ) {
+                                Ok(()) => {
+                                    current.mem_arg0 = registers.rsi;
+                                    current.mem_arg1 = registers.rdi;
+                                }
+                                Err(errno) => {
+                                    current.result = -errno;
+                                    current.override_result = true;
+                                    registers.orig_rax = u64::MAX;
+                                    write_all(
+                                        b"GINUX_NATIVE_PROCESS_AUDIT: mmap-deny errno=",
                                     );
                                     write_i64(errno);
                                     write_all(b" len=");

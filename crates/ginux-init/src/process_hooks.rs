@@ -315,7 +315,10 @@ pub fn thread_supported(flags: u64) -> bool {
 ///   `mmap` stays denied until it exists);
 /// - shared: `-EPERM`, no shared mappings in the domain;
 /// - fixed (`MAP_FIXED`, `MAP_FIXED_NOREPLACE`): `-EPERM`, fixed
-///   overwrite could clobber loader and library mappings;
+///   overwrite could clobber loader and library mappings (the
+///   supervision loop honors confined `MAP_FIXED` shapes past this
+///   gate: anonymous remaps inside a live ledger range, and
+///   same-object file-backed remaps);
 /// - unknown flag bits: `-EINVAL`, like the kernel;
 /// - a single request past [`MMAP_SINGLE_MAX`]: `-ENOMEM`;
 /// - writable-executable protections: `-EACCES`, matching the balanced
