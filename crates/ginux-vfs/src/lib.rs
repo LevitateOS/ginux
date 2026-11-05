@@ -3,8 +3,9 @@
 mod retained;
 
 pub use retained::{
-    CheckpointSummary, RestoreSummary, RetainedError, RetainedLimits, RETAINED_HEADER_LEN,
-    RETAINED_MAGIC,
+    durable_generation, stamp_generation, CheckpointSummary, DurableStore, FlushError,
+    FlushSummary, RecoverSummary, RestoreSummary, RetainedError, RetainedLimits,
+    RETAINED_FIRST_GENERATION, RETAINED_GENERATION_OFFSET, RETAINED_HEADER_LEN, RETAINED_MAGIC,
 };
 
 pub const INDEX_MAGIC: &[u8; 8] = b"GINUXVFS";
