@@ -24,9 +24,11 @@ use crate::launch::{
     Command, ELF_BYTES, VFS_INDEX_BYTES,
 };
 use crate::process_hooks::{
-    exec_mediated, thread_supported, PTRACE_EVENT_CLONE, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE,
-    PTRACE_O_TRACEVFORK, SYS_ARCH_PRCTL, SYS_FUTEX, SYS_GETTID, SYS_GET_ROBUST_LIST, SYS_RSEQ,
-    SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS,
+    dup3_flags_valid, exec_mediated, fcntl_supported, pipe2_flags_valid, thread_supported,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, FD_CLOEXEC, O_CLOEXEC, PTRACE_EVENT_CLONE,
+    PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEVFORK, SYS_ARCH_PRCTL, SYS_CLOSE,
+    SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_FCNTL, SYS_FUTEX, SYS_GETTID, SYS_GET_ROBUST_LIST, SYS_PIPE,
+    SYS_PIPE2, SYS_READ, SYS_RSEQ, SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS,
 };
 use crate::supervisor::{
     exit_process, line, ptrace, read_tracee_word, stopped, syscall0, syscall1, syscall2, syscall3,
@@ -35,7 +37,8 @@ use crate::supervisor::{
     PR_SET_NO_NEW_PRIVS, PTRACE_CONT, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_GETEVENTMSG,
     PTRACE_GETREGS, PTRACE_KILL, PTRACE_O_EXITKILL, PTRACE_O_TRACEEXEC, PTRACE_O_TRACEFORK,
     PTRACE_O_TRACESYSGOOD, PTRACE_PEEKTEXT, PTRACE_POKETEXT, PTRACE_SETOPTIONS, PTRACE_SETREGS,
-    PTRACE_SYSCALL, PTRACE_SYSEMU, PTRACE_TRACEME, ECHILD, EINVAL, ESRCH, SIGCHLD, SIGINT, SIGKILL,
+    PTRACE_SYSCALL, PTRACE_SYSEMU, PTRACE_TRACEME, EBADF, ECHILD, EINVAL, ESRCH, SIGCHLD, SIGINT,
+    SIGKILL,
     SIGTERM, SIG_BLOCK, SYS_CHDIR,
     SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC,
     SYS_KILL, SYS_OPENAT_HOST, SYS_PAUSE, SYS_PRCTL, SYS_PREAD64, SYS_PTRACE, SYS_PWRITE64,
@@ -52,7 +55,7 @@ use ginux_kernel_views::{
     ViewError,
 };
 use ginux_process::{
-    ChildStatus, Credentials, EventFd, EventPoll, FutexTable, ProcessError, ProcessTable,
+    ChildStatus, Credentials, EventFd, EventPoll, FutexTable, PipeSpace, ProcessError, ProcessTable,
     SignalAction, SignalDelivery, TaskState, TimerTable, VirtualClock, WaitTarget, EVENT_READ,
     EVENT_WRITE, WAIT_ALLOWED_OPTIONS, WNOHANG,
 };
@@ -498,6 +501,13 @@ struct NativeProcessTask {
     fork_variant_event: u32,
     exec_pending: bool,
     exec_event_seen: bool,
+    /// A mediated descriptor entry stashed for its exit stop: the syscall
+    /// number plus its arguments (pipefd pointer or oldfd, newfd or flags,
+    /// flags). Zero when no descriptor call is in flight.
+    desc_syscall: u64,
+    desc_arg0: u64,
+    desc_arg1: u64,
+    desc_arg2: u64,
     tracing: bool,
     thread_pending: bool,
     clone_ptid: usize,
@@ -564,6 +574,10 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         native_fail(domain, root_host_pid, b"process ptrace options failed");
     }
     let mut processes: ProcessTable<8> = ProcessTable::new();
+    // G05a descriptor mirror: pipe pairs, dups, and close-on-exec ends as
+    // supervisor-owned domain objects, keyed by virtual pid. Every mutation
+    // below follows a host outcome the loop observed.
+    let mut pipes: PipeSpace<8, 16, 16> = PipeSpace::new();
     let root_virtual = processes
         .create_init(Credentials::unprivileged(1000, 1000))
         .unwrap_or_else(|_| process_native_fail(domain, root_host_pid, b"virtual init failed"));
@@ -582,6 +596,10 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         fork_variant_event: 0,
         exec_pending: false,
         exec_event_seen: false,
+        desc_syscall: 0,
+        desc_arg0: 0,
+        desc_arg1: 0,
+        desc_arg2: 0,
         tracing: true,
         thread_pending: false,
         clone_ptid: 0,
@@ -641,6 +659,10 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             if recorded.is_err() {
                 process_native_fail(domain, root_host_pid, b"virtual exit failed");
             }
+            // G05a: the host closed every descriptor with the task. Release
+            // the mirror's ends now, so the pipe objects die their last
+            // close here and no stale write end can hide an EOF elsewhere.
+            pipes.release_task(task.virtual_id.pid);
             // Thread exit with cleanup: a task whose tgid differs from its
             // pid is a thread-group member. Threads are joined over a futex
             // on shared memory, never reaped by `wait4`, so the host slot is
@@ -694,6 +716,11 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 process_native_fail(domain, root_host_pid, b"native process fixture failed");
             }
             if root_exited && !tasks.iter().flatten().any(|entry| entry.tracing) {
+                // G05a leak audit: every end died with its task (last close
+                // is the host's), so no pipe object may survive full reap.
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: descriptors live-pipes=");
+                write_u64(pipes.active_pipes() as u64);
+                write_all(b"\n");
                 if processes.reap_all() == 0 || processes.active() != 0 {
                     process_native_fail(domain, root_host_pid, b"native process cleanup failed");
                 }
@@ -740,6 +767,17 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     process_native_fail(domain, root_host_pid, b"virtual fork failed")
                 })
             };
+            // G05a: the host duplicated the descriptor table with the
+            // address space, so the virtual child inherits the same tracked
+            // ends (pipe references retained). Threads share the host table
+            // while the mirror holds a copy per member; the group-wide exec
+            // scrub below bounds that divergence.
+            if pipes
+                .inherit(child_virtual.pid, task.virtual_id.pid)
+                .is_err()
+            {
+                process_native_fail(domain, root_host_pid, b"descriptor inherit failed");
+            }
             let Some(child_slot) = tasks.iter().position(Option::is_none) else {
                 process_native_fail(domain, root_host_pid, b"host task table full");
             };
@@ -757,6 +795,10 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 fork_variant_event: 0,
                 exec_pending: false,
                 exec_event_seen: false,
+                desc_syscall: 0,
+                desc_arg0: 0,
+                desc_arg1: 0,
+                desc_arg2: 0,
                 tracing: true,
                 thread_pending: false,
                 clone_ptid: 0,
@@ -845,6 +887,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             let epoch = processes.exec(task.virtual_id).unwrap_or_else(|_| {
                 process_native_fail(domain, root_host_pid, b"virtual exec failed")
             });
+            // G05a: the host closed every O_CLOEXEC descriptor during
+            // replacement. Drop the same ends for the whole thread group so
+            // no stale end survives the exec and hides a later EOF.
+            let exec_tgid = processes.view(task.virtual_id).unwrap_or_else(|_| {
+                process_native_fail(domain, root_host_pid, b"exec tgid lookup failed")
+            });
+            let scrubbed =
+                scrub_close_on_exec(&mut pipes, &processes, &tasks, exec_tgid.tgid);
             write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec syscall=");
             write_u64(task.syscall);
             write_all(b" host-pid=");
@@ -853,6 +903,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             write_u64(task.virtual_id.pid as u64);
             write_all(b" epoch=");
             write_u64(epoch as u64);
+            write_all(b" cloexec-dropped=");
+            write_u64(scrubbed as u64);
             write_all(b"\n");
             tasks[task_index].as_mut().unwrap().exec_event_seen = true;
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
@@ -995,7 +1047,168 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             // with its status word already stored.
             let restore_translated_argument =
                 current.syscall == SYS_KILL as u64 && current.translated_rdi != 0;
-            if current.syscall >= 56
+            if current.desc_syscall != 0 && !current.override_result {
+                // G05a descriptor exit: the host executed, so the tracee
+                // keeps the real host result. The mirror follows the
+                // outcome; failures leave it untouched.
+                let desc_result = registers.rax as i64;
+                match current.desc_syscall {
+                    SYS_PIPE | SYS_PIPE2 => {
+                        if desc_result == 0 {
+                            match read_tracee_pipefds(host_pid, current.desc_arg0 as usize) {
+                                Ok((read_fd, write_fd)) => {
+                                    let cloexec = current.desc_syscall == SYS_PIPE2
+                                        && current.desc_arg1 & O_CLOEXEC != 0;
+                                    if pipes
+                                        .create_pipe(
+                                            current.virtual_id.pid,
+                                            read_fd,
+                                            write_fd,
+                                            cloexec,
+                                        )
+                                        .is_err()
+                                    {
+                                        process_native_fail(
+                                            domain,
+                                            root_host_pid,
+                                            b"pipe mirror full",
+                                        );
+                                    }
+                                    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: pipe task=");
+                                    write_u64(current.virtual_id.pid as u64);
+                                    write_all(b" read=");
+                                    write_u64(read_fd as u64);
+                                    write_all(b" write=");
+                                    write_u64(write_fd as u64);
+                                    write_all(b" cloexec=");
+                                    write_u64(if cloexec { 1 } else { 0 });
+                                    write_all(b"\n");
+                                }
+                                Err(()) => {
+                                    process_native_fail(
+                                        domain,
+                                        root_host_pid,
+                                        b"pipe result read failed",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    SYS_DUP => {
+                        if desc_result >= 0 {
+                            if pipes
+                                .duplicate(
+                                    current.virtual_id.pid,
+                                    current.desc_arg0 as u32,
+                                    desc_result as u32,
+                                    false,
+                                )
+                                .is_err()
+                            {
+                                process_native_fail(domain, root_host_pid, b"dup mirror failed");
+                            }
+                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: dup task=");
+                            write_u64(current.virtual_id.pid as u64);
+                            write_all(b" old=");
+                            write_u64(current.desc_arg0);
+                            write_all(b" new=");
+                            write_u64(desc_result as u64);
+                            write_all(b"\n");
+                        }
+                    }
+                    SYS_DUP2 | SYS_DUP3 => {
+                        if desc_result >= 0 {
+                            // `old == new` is a successful no-op: the host
+                            // changed nothing, so the mirror keeps its entry.
+                            if current.desc_arg0 as u32 != desc_result as u32 {
+                                let cloexec = current.desc_syscall == SYS_DUP3
+                                    && current.desc_arg2 & O_CLOEXEC != 0;
+                                if pipes
+                                    .duplicate(
+                                        current.virtual_id.pid,
+                                        current.desc_arg0 as u32,
+                                        desc_result as u32,
+                                        cloexec,
+                                    )
+                                    .is_err()
+                                {
+                                    process_native_fail(
+                                        domain,
+                                        root_host_pid,
+                                        b"dup mirror failed",
+                                    );
+                                }
+                            }
+                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: dup task=");
+                            write_u64(current.virtual_id.pid as u64);
+                            write_all(b" old=");
+                            write_u64(current.desc_arg0);
+                            write_all(b" new=");
+                            write_u64(desc_result as u64);
+                            write_all(b"\n");
+                        }
+                    }
+                    SYS_CLOSE => {
+                        if desc_result == 0
+                            && pipes
+                                .close(current.virtual_id.pid, current.desc_arg0 as u32)
+                                .unwrap_or(false)
+                        {
+                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: close task=");
+                            write_u64(current.virtual_id.pid as u64);
+                            write_all(b" fd=");
+                            write_u64(current.desc_arg0);
+                            write_all(b"\n");
+                        }
+                    }
+                    SYS_FCNTL => {
+                        if desc_result >= 0 {
+                            if current.desc_arg1 == F_DUPFD
+                                || current.desc_arg1 == F_DUPFD_CLOEXEC
+                            {
+                                let cloexec = current.desc_arg1 == F_DUPFD_CLOEXEC;
+                                if pipes
+                                    .duplicate(
+                                        current.virtual_id.pid,
+                                        current.desc_arg0 as u32,
+                                        desc_result as u32,
+                                        cloexec,
+                                    )
+                                    .is_err()
+                                {
+                                    process_native_fail(
+                                        domain,
+                                        root_host_pid,
+                                        b"fcntl mirror failed",
+                                    );
+                                }
+                                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: fcntl-dup task=");
+                                write_u64(current.virtual_id.pid as u64);
+                                write_all(b" old=");
+                                write_u64(current.desc_arg0);
+                                write_all(b" new=");
+                                write_u64(desc_result as u64);
+                                write_all(b"\n");
+                            } else if current.desc_arg1 == F_SETFD {
+                                let _ = pipes.set_cloexec(
+                                    current.virtual_id.pid,
+                                    current.desc_arg0 as u32,
+                                    current.desc_arg2 & FD_CLOEXEC != 0,
+                                );
+                            } else if current.desc_arg1 == F_GETFD {
+                                // Observed only: the host already reported
+                                // the live flag, and the mirror holds no
+                                // copy of its own to update.
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                current.desc_syscall = 0;
+                current.desc_arg0 = 0;
+                current.desc_arg1 = 0;
+                current.desc_arg2 = 0;
+            } else if current.syscall >= 56
                 && current.syscall <= 58
                 && registers.rax as i64 > 0
                 && current.fork_variant_event != 0
@@ -1071,10 +1284,19 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     let epoch = processes.exec(current.virtual_id).unwrap_or_else(|_| {
                         process_native_fail(domain, root_host_pid, b"virtual exec failed")
                     });
+                    // G05a: same close-on-exec scrub as the event path; this
+                    // stop is the only record when the event was missed.
+                    let late_tgid = processes.view(current.virtual_id).unwrap_or_else(|_| {
+                        process_native_fail(domain, root_host_pid, b"exec tgid lookup failed")
+                    });
+                    let late_scrubbed =
+                        scrub_close_on_exec(&mut pipes, &processes, &tasks, late_tgid.tgid);
                     write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-late virtual-pid=");
                     write_u64(current.virtual_id.pid as u64);
                     write_all(b" epoch=");
                     write_u64(epoch as u64);
+                    write_all(b" cloexec-dropped=");
+                    write_u64(late_scrubbed as u64);
                     write_all(b"\n");
                 } else {
                     write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-failed errno=");
@@ -1102,6 +1324,10 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             current.fork_variant_event = 0;
             current.exec_pending = false;
             current.exec_event_seen = false;
+            current.desc_syscall = 0;
+            current.desc_arg0 = 0;
+            current.desc_arg1 = 0;
+            current.desc_arg2 = 0;
             tasks[task_index] = Some(current);
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
                 process_native_fail(domain, root_host_pid, b"process exit resume failed");
@@ -1385,7 +1611,70 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                         }
                     }
                 }
-                1 if matches!(registers.rdi, 1 | 2) && registers.rdx <= 4096 => {}
+                SYS_READ => {
+                    // G05a managed read: pre-supervision stdio and tracked
+                    // pipe ends execute on the host; anything else is not a
+                    // domain object and fails closed.
+                    let tracked = pipes
+                        .lookup(current.virtual_id.pid, registers.rdi as u32)
+                        .is_some();
+                    if !tracked && !matches!(registers.rdi, 0 | 1 | 2) {
+                        current.result = -EBADF;
+                        current.override_result = true;
+                        registers.orig_rax = u64::MAX;
+                    }
+                }
+                1 => {
+                    // G05a managed write: the existing bounded console path
+                    // is unchanged; tracked pipe ends execute regardless of
+                    // length so shell pipelines move arbitrary bytes. Beyond
+                    // that the old denial shape stays (ENOSYS for stdio with
+                    // an overlong write, EBADF past it).
+                    if matches!(registers.rdi, 1 | 2) && registers.rdx <= 4096 {
+                    } else if pipes
+                        .lookup(current.virtual_id.pid, registers.rdi as u32)
+                        .is_some()
+                    {
+                    } else {
+                        current.result = if matches!(registers.rdi, 0 | 1 | 2) {
+                            -ENOSYS
+                        } else {
+                            -EBADF
+                        };
+                        current.override_result = true;
+                        registers.orig_rax = u64::MAX;
+                    }
+                }
+                SYS_PIPE | SYS_DUP | SYS_DUP2 | SYS_CLOSE | SYS_FCNTL | SYS_DUP3 | SYS_PIPE2 => {
+                    // G05a descriptor mediation: flag shapes the mirror
+                    // cannot represent fail here before the host runs.
+                    // Everything else executes on the host and the exit stop
+                    // below mirrors the outcome.
+                    if registers.orig_rax == SYS_PIPE2
+                        && !pipe2_flags_valid(registers.rsi)
+                    {
+                        current.result = -EINVAL;
+                        current.override_result = true;
+                        registers.orig_rax = u64::MAX;
+                    } else if registers.orig_rax == SYS_DUP3
+                        && !dup3_flags_valid(registers.rdx)
+                    {
+                        current.result = -EINVAL;
+                        current.override_result = true;
+                        registers.orig_rax = u64::MAX;
+                    } else if registers.orig_rax == SYS_FCNTL
+                        && !fcntl_supported(registers.rsi)
+                    {
+                        current.result = -ENOSYS;
+                        current.override_result = true;
+                        registers.orig_rax = u64::MAX;
+                    } else {
+                        current.desc_syscall = registers.orig_rax;
+                        current.desc_arg0 = registers.rdi;
+                        current.desc_arg1 = registers.rsi;
+                        current.desc_arg2 = registers.rdx;
+                    }
+                }
                 60 | 231 => {}
                 _ => {
                     current.result = -ENOSYS;
@@ -1524,6 +1813,63 @@ fn wake_waiters_for_child(
         }
         index += 1;
     }
+}
+
+/// Read the two `int` fds the host `pipe`/`pipe2` just stored at the
+/// tracee's `pipefd` pointer, without touching neighboring tracee memory.
+/// Each byte is fetched with its own aligned `PTRACE_PEEKTEXT` read, so an
+/// unaligned two-word array is assembled correctly. Any unreadable word
+/// fails explicitly; the caller treats that as supervision failure, never
+/// as invented descriptors.
+fn read_tracee_pipefds(host_pid: usize, user_pipefd: usize) -> Result<(u32, u32), ()> {
+    let mut bytes = [0u8; 8];
+    let mut index = 0;
+    while index < 8 {
+        let address = user_pipefd.wrapping_add(index);
+        let aligned = address & !0x7;
+        let shift = (address & 0x7) * 8;
+        let mut word = 0usize;
+        if ptrace(
+            PTRACE_PEEKTEXT,
+            host_pid,
+            aligned,
+            &mut word as *mut _ as usize,
+        ) < 0
+        {
+            return Err(());
+        }
+        bytes[index] = ((word >> shift) & 0xff) as u8;
+        index += 1;
+    }
+    Ok((
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+    ))
+}
+
+/// Drop every close-on-exec end held by the tasks of one thread group. The
+/// host kernel closed the same descriptors during executable replacement;
+/// the mirror follows so no stale end survives the exec. Returns the count
+/// dropped for the audit line.
+fn scrub_close_on_exec(
+    pipes: &mut PipeSpace<8, 16, 16>,
+    processes: &ProcessTable<8>,
+    tasks: &[Option<NativeProcessTask>; 8],
+    tgid: u32,
+) -> u32 {
+    let mut dropped = 0;
+    for entry in tasks.iter().flatten() {
+        if !entry.tracing {
+            continue;
+        }
+        let same_group = processes
+            .view(entry.virtual_id)
+            .is_ok_and(|view| view.tgid == tgid);
+        if same_group {
+            dropped += pipes.exec_scrub(entry.virtual_id.pid);
+        }
+    }
+    dropped
 }
 
 /// Store the full Linux wait status word for the reaped virtual child into

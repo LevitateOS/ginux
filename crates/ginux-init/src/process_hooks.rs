@@ -48,6 +48,22 @@
 //! and `kill` (62) forwards the normal termination signals to the
 //! translated host task while signal deaths are recorded as signaled
 //! outcomes with SIGCHLD queued for the parent.
+//!
+//! G05a owns inherited pipes and close-on-exec descriptors, also in the
+//! supervision loop after the wait/kill precedent (no lane-hook claim, so
+//! the other supervision loops keep byte-identical behavior). `pipe` (22)
+//! and `pipe2` (293) execute on the host and the loop mirrors the pair as
+//! supervisor-owned domain objects; `dup` (32), `dup2` (33), `dup3` (292),
+//! and the `fcntl` (72) duplication/flag subset execute the same way with
+//! shared-offset and close-on-exec semantics carried by the host, while
+//! `close` (3) always executes and the mirror drops the entry. Reads and
+//! writes execute only for stdio and tracked ends. Flag shapes the mirror
+//! cannot represent fail here before the host runs: `pipe2` accepts only
+//! `O_CLOEXEC|O_NONBLOCK` (`O_DIRECT` and anything else get `-EINVAL`),
+//! `dup3` accepts only `O_CLOEXEC` (`-EINVAL` otherwise), and only the
+//! `F_DUPFD`/`F_GETFD`/`F_SETFD`/`F_DUPFD_CLOEXEC` `fcntl` commands run
+//! (anything else gets `-ENOSYS`). Fork/clone inheritance and exec scrub
+//! live in the loop next to the fork-event and exec-event paths.
 
 use crate::supervisor::{ENOSYS, SYS_FORK};
 
@@ -92,6 +108,65 @@ pub const CLONE_UNTRACED: u64 = 0x0080_0000;
 /// Low byte of the clone flags: the child exit signal. Threads never carry
 /// one; any nonzero value in a thread shape is denied.
 pub const CLONE_EXIT_SIGNAL_MASK: u64 = 0x0000_00ff;
+
+/// Raw `read` entry: gated in the supervision loop to stdio and tracked
+/// pipe ends; anything else fails closed with `-EBADF`.
+pub const SYS_READ: u64 = 0;
+/// Raw `close` entry: always executes on the host; the loop drops the
+/// mirrored entry when the host reports success.
+pub const SYS_CLOSE: u64 = 3;
+/// Raw `pipe` entry: creates a connected pair, both ends owned by the caller.
+pub const SYS_PIPE: u64 = 22;
+/// Raw `dup` entry: lowest-free alias with `FD_CLOEXEC` cleared.
+pub const SYS_DUP: u64 = 32;
+/// Raw `dup2` entry: alias at an explicit number with `FD_CLOEXEC` cleared.
+pub const SYS_DUP2: u64 = 33;
+/// Raw `fcntl` entry: only the duplication and flag commands below run.
+pub const SYS_FCNTL: u64 = 72;
+/// Raw `dup3` entry: alias at an explicit number with `O_CLOEXEC` choice.
+pub const SYS_DUP3: u64 = 292;
+/// Raw `pipe2` entry: pipe pair with atomic flags.
+pub const SYS_PIPE2: u64 = 293;
+
+/// `O_CLOEXEC` creation flag: the end dies with executable replacement.
+pub const O_CLOEXEC: u64 = 0o2000000;
+/// `O_NONBLOCK` creation flag: the only other flag a pipe pair accepts.
+pub const O_NONBLOCK: u64 = 0o4000;
+/// `O_DIRECT` creation flag: packetized pipe mode the mirror does not
+/// represent; explicitly denied on pipes.
+pub const O_DIRECT: u64 = 0o40000;
+/// The only `pipe2` flags the mirror represents.
+pub const PIPE2_ALLOWED_FLAGS: u64 = O_CLOEXEC | O_NONBLOCK;
+/// `fcntl` duplication/flag commands the mirror represents.
+pub const F_DUPFD: u64 = 0;
+pub const F_GETFD: u64 = 1;
+pub const F_SETFD: u64 = 2;
+pub const F_DUPFD_CLOEXEC: u64 = 1030;
+/// `FD_CLOEXEC` flag bit for `F_GETFD`/`F_SETFD`.
+pub const FD_CLOEXEC: u64 = 1;
+
+/// Whether a `pipe2` flag word names a representable pair: the allowed
+/// subset only. `O_DIRECT` and every other bit fail explicitly with
+/// `-EINVAL` before the host runs.
+pub fn pipe2_flags_valid(flags: u64) -> bool {
+    flags & !PIPE2_ALLOWED_FLAGS == 0 && flags & O_DIRECT == 0
+}
+
+/// Whether a `dup3` flag word names a representable alias: empty or
+/// `O_CLOEXEC` only. Anything else fails explicitly with `-EINVAL`.
+pub fn dup3_flags_valid(flags: u64) -> bool {
+    flags == 0 || flags == O_CLOEXEC
+}
+
+/// Whether an `fcntl` command belongs to the mediated duplication/flag
+/// subset. Anything else (file status flags, locks, leases, signals,
+/// pipe sizing) keeps the existing explicit `-ENOSYS` denial.
+pub fn fcntl_supported(command: u64) -> bool {
+    command == F_DUPFD
+        || command == F_GETFD
+        || command == F_SETFD
+        || command == F_DUPFD_CLOEXEC
+}
 
 /// Raw `arch_prctl` entry: installs or reads the calling thread's TLS base.
 /// Thread-local register state only; mediated for every subcommand.

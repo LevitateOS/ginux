@@ -56,6 +56,7 @@ pub const PTRACE_EVENT_EXEC: usize = 4;
 
 pub const EPERM: i64 = 1;
 pub const ESRCH: i64 = 3;
+pub const EBADF: i64 = 9;
 pub const ECHILD: i64 = 10;
 pub const EINVAL: i64 = 22;
 pub const ENOSYS: i64 = 38;
