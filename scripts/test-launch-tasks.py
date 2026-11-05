@@ -23,10 +23,13 @@ def main():
         shutil.copyfile(fixture, root / 'bin/fixture')
         (root / 'bin/fixture').chmod(0o755)
         (root / 'input').write_bytes(b'abcdef')
+        (root / 'source/sub').mkdir(parents=True)
+        (root / 'source/value').write_bytes(b'parent')
+        (root / 'source/sub/value').write_bytes(b'child')
         config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
         config = config.replace('[devices]\nassignments = []', '[devices]\nassignments = ["null"]')
-        for mode in ('fork', 'vfork', 'clone', 'shared-vfork', 'libc-fork', 'junk-child-tid', 'protected-child-tid', 'handler-return',
+        for mode in ('directory', 'fork', 'vfork', 'clone', 'shared-vfork', 'libc-fork', 'junk-child-tid', 'protected-child-tid', 'handler-return',
                      'inherit', 'kill', 'bound', 'orphan', 'rollback', 'inherit'):
             path, result = work / f'{mode}.toml', work / f'{mode}.json'
             path.write_text(config.replace('args = []', 'args = ' + json.dumps([mode])))

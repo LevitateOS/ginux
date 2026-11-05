@@ -32,7 +32,32 @@ long task_main(word *stack)
     CHECK(call(13,17,(word)action,0,8,0,0)==-95,81);
     action[0]=0; action[1]=2;
     CHECK(call(13,17,(word)action,0,8,0,0)==-95,82);
-    if (mode=='f' || mode=='v' || mode=='c' || mode=='s') {
+    if (mode=='d') {
+        CHECK(DO(80,"/source",0,0)==0,90);
+        long child=DO(57,0,0,0);
+        CHECK(child>=0,91);
+        if (child==0) {
+            CHECK(DO(80,"../work",0,0)==-95,92);
+            CHECK(DO(80,"sub",0,0)==0,93);
+            long fd=DO(2,"value",0,0);
+            CHECK(fd>=3 && DO(0,fd,buffer,1)==1 && buffer[0]=='c',94);
+            CHECK(DO(3,fd,0,0)==0,95);
+            fd=DO(2,"/work/child",0102,0600);
+            CHECK(fd>=3 && DO(1,fd,"x",1)==1,96);
+            DO(60,0,0,0);
+            __builtin_unreachable();
+        }
+        int status=0;
+        CHECK(DO(61,child,&status,0)==child && status==0,97);
+        long fd=DO(2,"value",0,0);
+        CHECK(fd>=3 && DO(0,fd,buffer,1)==1 && buffer[0]=='p',98);
+        CHECK(DO(3,fd,0,0)==0,99);
+        fd=DO(2,"../work/child",0,0);
+        CHECK(fd>=3 && DO(0,fd,buffer,1)==1 && buffer[0]=='x',100);
+        CHECK(DO(3,fd,0,0)==0,101);
+        CHECK(DO(80,"missing",0,0)==-2,102);
+    }
+    else if (mode=='f' || mode=='v' || mode=='c' || mode=='s') {
         long child=(mode=='c' || mode=='s') ? DO(56,mode=='s'?0x4111:17,0,0) : DO(mode=='v'?58:57,0,0,0);
         if (child==0) {
             CHECK(DO(39,0,0,0)==2 && DO(186,0,0,0)==2,12);

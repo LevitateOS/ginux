@@ -33,7 +33,6 @@ pub struct LaunchFs {
     fs: MemoryFs,
     prefixes: [Path; 8],
     count: usize,
-    cwd: Path,
 }
 
 impl LaunchFs {
@@ -108,8 +107,6 @@ impl LaunchFs {
             fs,
             prefixes,
             count,
-            cwd: Path::from_bytes(config.workdir.as_bytes())
-                .map_err(|_| b"storage workdir exceeds bound".as_slice())?,
         })
     }
 
@@ -152,10 +149,12 @@ impl LaunchFs {
             return Err(-2);
         }
         let absolute = text.as_bytes().first() == Some(&b'/');
+        let cwd;
         let base = if absolute {
             b"/".as_slice()
         } else if dirfd as i32 == -100 {
-            self.cwd.as_bytes()
+            cwd = crate::tracee_io::image_cwd(pid)?;
+            cwd.as_bytes()
         } else {
             let fd = (dirfd as u32)
                 .checked_sub(FD_BASE as u32)
@@ -170,6 +169,22 @@ impl LaunchFs {
             return Err(-95);
         }
         Ok(path)
+    }
+
+    /// Directory changes may enter the immutable image. Owned directories
+    /// have no native backing and must not silently enter a hidden image tree.
+    pub fn image_chdir(&self, pid: usize, address: u64) -> Result<(), i64> {
+        let path = self.path(pid, address, (-100i64) as u64)?;
+        if self.owns_path(path.as_bytes()) {
+            return Err(-95);
+        }
+        if [b"/dev".as_slice(), b"/proc", b"/sys"]
+            .iter()
+            .any(|prefix| within(path.as_bytes(), prefix))
+        {
+            return Err(-13);
+        }
+        Ok(())
     }
 
     /// Assigned paths yield pinned program bytes; image paths retain the native
@@ -259,7 +274,7 @@ impl LaunchFs {
     /// The kernel owns binfmt parsing and optional interpreter arguments. Check
     /// the first interpreter's namespace before handing it the sealed script.
     /// Owned interpreters need a separate owned-executable transaction.
-    pub fn is_script(&self, image: Executable) -> Result<bool, i64> {
+    pub fn is_script(&self, pid: usize, image: Executable) -> Result<bool, i64> {
         let mut header = [0u8; 256];
         self.read_executable(image, 0, &mut header)?;
         if !header.starts_with(b"#!") {
@@ -280,11 +295,13 @@ impl LaunchFs {
             return Err(-8);
         }
         let interpreter = &line[start..end];
+        let cwd;
         let path = normalize(
             if interpreter[0] == b'/' {
                 b"/"
             } else {
-                self.cwd.as_bytes()
+                cwd = crate::tracee_io::image_cwd(pid)?;
+                cwd.as_bytes()
             },
             interpreter,
         )?;

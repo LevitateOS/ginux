@@ -500,6 +500,20 @@ impl Supervisor<'_> {
             return;
         }
         match r.orig_rax {
+            80 => {
+                match self
+                    .objects
+                    .filesystem
+                    .image_chdir(self.task(index).host, r.rdi)
+                {
+                    Ok(()) => {
+                        audit_write(b"mediate surface=image-cwd\n");
+                        self.run(index, r, domain);
+                    }
+                    Err(error) => self.emulate(index, r, error, domain),
+                }
+                return;
+            }
             59 | 322 => {
                 let result = self.prepare_exec(index, r);
                 if let Err(errno) = result {
@@ -809,21 +823,26 @@ impl Supervisor<'_> {
             (image, r.rsi + path.as_bytes().len() as u64)
         };
         let script = if let Some(image) = image {
-            let result = self.objects.filesystem.is_script(image).and_then(|script| {
-                if script {
-                    if r.orig_rax == 322 {
-                        let path = crate::tracee_io::read_path(host, r.rsi)?;
-                        if (path.is_empty() || (path.as_bytes()[0] != b'/' && r.rdi as i32 != -100))
-                            && self.table(index).exec_cloexec(r.rdi)?
-                        {
-                            return Err(-2);
+            let result = self
+                .objects
+                .filesystem
+                .is_script(self.task(index).host, image)
+                .and_then(|script| {
+                    if script {
+                        if r.orig_rax == 322 {
+                            let path = crate::tracee_io::read_path(host, r.rsi)?;
+                            if (path.is_empty()
+                                || (path.as_bytes()[0] != b'/' && r.rdi as i32 != -100))
+                                && self.table(index).exec_cloexec(r.rdi)?
+                            {
+                                return Err(-2);
+                            }
                         }
+                        crate::exec_script::Script::prepare(host, r).map(Some)
+                    } else {
+                        Ok(None)
                     }
-                    crate::exec_script::Script::prepare(host, r).map(Some)
-                } else {
-                    Ok(None)
-                }
-            });
+                });
             match result {
                 Ok(script) => script,
                 Err(error) => {

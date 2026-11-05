@@ -58,6 +58,58 @@ pub fn read_path(pid: usize, address: u64) -> Result<Path, i64> {
     Err(-36)
 }
 
+/// Kernel-owned image cwd, expressed relative to the tracee's chroot. Reading
+/// the two proc links does not let a workload select a supervisor host path.
+/// Fork and CLONE_FS sharing retain their native directory semantics.
+pub fn image_cwd(pid: usize) -> Result<Path, i64> {
+    fn link(pid: usize, suffix: &[u8], output: &mut [u8]) -> Result<usize, i64> {
+        let mut name = [0u8; 64];
+        name[..6].copy_from_slice(b"/proc/");
+        let mut digits = [0u8; 20];
+        let mut number = pid;
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (number % 10) as u8;
+            count += 1;
+            number /= 10;
+            if number == 0 {
+                break;
+            }
+        }
+        for n in 0..count {
+            name[6 + n] = digits[count - n - 1];
+        }
+        name[6 + count..6 + count + suffix.len()].copy_from_slice(suffix);
+        let result = unsafe {
+            crate::supervisor::syscall3(
+                89,
+                name.as_ptr() as usize,
+                output.as_mut_ptr() as usize,
+                output.len(),
+            )
+        };
+        if result < 0 {
+            return Err(result as i64);
+        }
+        if result as usize == output.len() {
+            return Err(-36);
+        }
+        Ok(result as usize)
+    }
+    let mut root = [0u8; 4096];
+    let mut cwd = [0u8; 4096];
+    let root_len = link(pid, b"/root", &mut root)?;
+    let cwd_len = link(pid, b"/cwd", &mut cwd)?;
+    let relative = cwd[..cwd_len].strip_prefix(&root[..root_len]).ok_or(-13)?;
+    if relative.is_empty() {
+        return Path::from_bytes(b"/").map_err(|_| -36);
+    }
+    if relative[0] != b'/' || relative.ends_with(b" (deleted)") {
+        return Err(-2);
+    }
+    Path::from_bytes(relative).map_err(|_| -36)
+}
+
 /// Linux file type bits are part of mode; identities belong to the domain.
 pub struct Stat {
     pub inode: u64,
