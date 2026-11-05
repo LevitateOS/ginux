@@ -11,6 +11,8 @@ pub const O_WRITE: u32 = 2;
 pub const O_CREATE: u32 = 4;
 pub const O_TRUNC: u32 = 8;
 pub const O_CLOEXEC: u32 = 16;
+pub const O_APPEND: u32 = 32;
+pub const O_EXCLUSIVE: u32 = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -291,6 +293,14 @@ pub trait BaseReader {
     fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), VfsError>;
 }
 
+/// Metadata from the domain image/overlay, without host inode identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileMetadata {
+    pub kind: NodeKind,
+    pub mode: u32,
+    pub size: u64,
+}
+
 #[derive(Clone, Copy)]
 struct OverlayFile<const FILE_SIZE: usize> {
     state: u8,
@@ -321,6 +331,7 @@ struct Descriptor {
     readable: bool,
     writable: bool,
     close_on_exec: bool,
+    append: bool,
 }
 
 impl Descriptor {
@@ -333,6 +344,7 @@ impl Descriptor {
             readable: false,
             writable: false,
             close_on_exec: false,
+            append: false,
         }
     }
 }
@@ -358,10 +370,26 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
 
     pub fn open(&mut self, path: &[u8], flags: u32) -> Result<i32, VfsError> {
         let path = normalize(path)?;
+        // Exhaustion must not create or truncate a file before failing open.
+        let slot = self
+            .descriptors
+            .iter()
+            .position(|fd| !fd.open)
+            .ok_or(VfsError::DescriptorLimit)?;
         let writable = flags & O_WRITE != 0;
         let readable = flags & O_READ != 0;
         if !writable && !readable {
             return Err(VfsError::PermissionDenied);
+        }
+        if flags & O_TRUNC != 0 && !writable {
+            return Err(VfsError::PermissionDenied);
+        }
+        if flags & (O_CREATE | O_EXCLUSIVE) == (O_CREATE | O_EXCLUSIVE) {
+            match self.metadata(path.as_bytes()) {
+                Ok(_) => return Err(VfsError::AlreadyExists),
+                Err(VfsError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
         }
         let overlay_index = self.find_overlay(path.as_bytes());
         let object: usize;
@@ -374,6 +402,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                 object = self.create_overlay(path, 0o600)?;
                 overlay = true;
             }
+            Some(index) if self.overlay[index].state == 3 => return Err(VfsError::IsDirectory),
             Some(index) => {
                 object = index;
                 overlay = true;
@@ -407,11 +436,6 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         if overlay && flags & O_TRUNC != 0 {
             self.overlay[object].len = 0;
         }
-        let slot = self
-            .descriptors
-            .iter()
-            .position(|descriptor| !descriptor.open)
-            .ok_or(VfsError::DescriptorLimit)?;
         self.descriptors[slot] = Descriptor {
             open: true,
             overlay,
@@ -420,6 +444,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             readable,
             writable,
             close_on_exec: flags & O_CLOEXEC != 0,
+            append: flags & O_APPEND != 0,
         };
         Ok(slot as i32 + 3)
     }
@@ -439,6 +464,9 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                 .saturating_sub(state.offset)
         };
         let length = available.min(output.len());
+        if length == 0 {
+            return Ok(0);
+        }
         if state.overlay {
             output[..length].copy_from_slice(
                 &self.overlay[state.object].data[state.offset..state.offset + length],
@@ -456,9 +484,15 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
 
     pub fn write(&mut self, descriptor: i32, input: &[u8]) -> Result<usize, VfsError> {
         let slot = self.descriptor(descriptor)?;
-        let state = self.descriptors[slot];
+        let mut state = self.descriptors[slot];
         if !state.writable || !state.overlay {
             return Err(VfsError::PermissionDenied);
+        }
+        if input.is_empty() {
+            return Ok(0);
+        }
+        if state.append {
+            state.offset = self.overlay[state.object].len;
         }
         let end = state
             .offset
@@ -466,6 +500,10 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             .ok_or(VfsError::FileTooLarge)?;
         if end > FILE_SIZE {
             return Err(VfsError::FileTooLarge);
+        }
+        if state.offset > self.overlay[state.object].len {
+            let previous = self.overlay[state.object].len;
+            self.overlay[state.object].data[previous..state.offset].fill(0);
         }
         self.overlay[state.object].data[state.offset..end].copy_from_slice(input);
         self.overlay[state.object].len = self.overlay[state.object].len.max(end);
@@ -502,8 +540,14 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
     pub fn unlink(&mut self, path: &[u8]) -> Result<(), VfsError> {
         let path = normalize(path)?;
         if let Some(index) = self.find_overlay(path.as_bytes()) {
+            if self.overlay[index].state == 2 {
+                return Err(VfsError::NotFound);
+            }
+            if self.overlay[index].state == 3 {
+                return Err(VfsError::IsDirectory);
+            }
             self.overlay[index].state = 2;
-            self.overlay[index].len = 0;
+            // Open descriptors still own the removed object's bytes.
             return Ok(());
         }
         let entry = self.index.resolve(path.as_bytes())?;
@@ -525,6 +569,126 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         self.overlay.iter().filter(|entry| entry.state == 1).count()
     }
 
+    pub fn metadata(&self, path: &[u8]) -> Result<FileMetadata, VfsError> {
+        let path = normalize(path)?;
+        if let Some(index) = self.find_overlay(path.as_bytes()) {
+            let file = &self.overlay[index];
+            if file.state == 2 {
+                return Err(VfsError::NotFound);
+            }
+            return Ok(FileMetadata {
+                kind: if file.state == 3 {
+                    NodeKind::Directory
+                } else {
+                    NodeKind::File
+                },
+                mode: file.mode,
+                size: file.len as u64,
+            });
+        }
+        let entry = self.index.resolve(path.as_bytes())?;
+        Ok(FileMetadata {
+            kind: entry.kind,
+            mode: entry.mode,
+            size: entry.size,
+        })
+    }
+
+    pub fn fstat(&self, descriptor: i32) -> Result<FileMetadata, VfsError> {
+        let descriptor = self.descriptors[self.descriptor(descriptor)?];
+        if descriptor.overlay {
+            let file = &self.overlay[descriptor.object];
+            Ok(FileMetadata {
+                kind: NodeKind::File,
+                mode: file.mode,
+                size: file.len as u64,
+            })
+        } else {
+            let entry = self.index.entry(descriptor.object)?;
+            Ok(FileMetadata {
+                kind: entry.kind,
+                mode: entry.mode,
+                size: entry.size,
+            })
+        }
+    }
+
+    pub fn mkdir(&mut self, path: &[u8], mode: u32) -> Result<(), VfsError> {
+        let path = normalize(path)?;
+        match self.metadata(path.as_bytes()) {
+            Ok(_) => return Err(VfsError::AlreadyExists),
+            Err(VfsError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        self.require_parent(path.as_bytes())?;
+        let slot = self.allocate_overlay()?;
+        self.overlay[slot].state = 3;
+        self.overlay[slot].path = path;
+        self.overlay[slot].mode = mode & 0o777;
+        self.overlay[slot].len = 0;
+        Ok(())
+    }
+
+    pub fn chmod(&mut self, path: &[u8], mode: u32) -> Result<(), VfsError> {
+        let path = normalize(path)?;
+        let slot = self
+            .find_overlay(path.as_bytes())
+            .ok_or(VfsError::PermissionDenied)?;
+        if self.overlay[slot].state == 2 {
+            return Err(VfsError::NotFound);
+        }
+        if mode & !0o777 != 0 {
+            return Err(VfsError::PermissionDenied);
+        }
+        self.overlay[slot].mode = mode;
+        Ok(())
+    }
+
+    pub fn fchmod(&mut self, descriptor: i32, mode: u32) -> Result<(), VfsError> {
+        let descriptor = self.descriptors[self.descriptor(descriptor)?];
+        if !descriptor.overlay || mode & !0o777 != 0 {
+            return Err(VfsError::PermissionDenied);
+        }
+        self.overlay[descriptor.object].mode = mode;
+        Ok(())
+    }
+
+    pub fn seek(&mut self, descriptor: i32, offset: i64, whence: u32) -> Result<u64, VfsError> {
+        let slot = self.descriptor(descriptor)?;
+        let base = match whence {
+            0 => 0,
+            1 => self.descriptors[slot].offset as i64,
+            2 => self.fstat(descriptor)?.size as i64,
+            _ => return Err(VfsError::InvalidPath),
+        };
+        let position = base
+            .checked_add(offset)
+            .filter(|value| *value >= 0)
+            .ok_or(VfsError::InvalidPath)?;
+        self.descriptors[slot].offset =
+            usize::try_from(position).map_err(|_| VfsError::FileTooLarge)?;
+        Ok(position as u64)
+    }
+
+    pub fn descriptor_flags(&self, descriptor: i32) -> Result<(u32, bool), VfsError> {
+        let state = self.descriptors[self.descriptor(descriptor)?];
+        let mode = match (state.readable, state.writable) {
+            (true, false) => 0,
+            (false, true) => 1,
+            _ => 2,
+        };
+        Ok((
+            mode | if state.append { 0o2000 } else { 0 },
+            state.close_on_exec,
+        ))
+    }
+
+    pub fn set_close_on_exec(&mut self, descriptor: i32, enabled: bool) -> Result<(), VfsError> {
+        let slot = self.descriptor(descriptor)?;
+        self.descriptors[slot].close_on_exec = enabled;
+        Ok(())
+    }
+
     fn descriptor(&self, descriptor: i32) -> Result<usize, VfsError> {
         let slot = descriptor
             .checked_sub(3)
@@ -538,13 +702,28 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
     fn find_overlay(&self, path: &[u8]) -> Option<usize> {
         self.overlay
             .iter()
-            .position(|entry| entry.state != 0 && entry.path.as_bytes() == path)
+            .position(|entry| matches!(entry.state, 1 | 3) && entry.path.as_bytes() == path)
+            .or_else(|| {
+                self.overlay
+                    .iter()
+                    .position(|entry| entry.state == 2 && entry.path.as_bytes() == path)
+            })
     }
 
     fn allocate_overlay(&self) -> Result<usize, VfsError> {
         self.overlay
             .iter()
             .position(|entry| entry.state == 0)
+            .or_else(|| {
+                self.overlay.iter().enumerate().position(|(slot, entry)| {
+                    entry.state == 2
+                        && self.index.lookup_exact(entry.path.as_bytes()) == Err(VfsError::NotFound)
+                        && !self
+                            .descriptors
+                            .iter()
+                            .any(|fd| fd.open && fd.overlay && fd.object == slot)
+                })
+            })
             .ok_or(VfsError::OverlayLimit)
     }
 
@@ -563,8 +742,13 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             return Err(VfsError::FileTooLarge);
         }
         let index = self.create_overlay(path, entry.mode)?;
-        self.reader
-            .read_at(entry.data_offset, &mut self.overlay[index].data[..size])?;
+        if let Err(error) = self
+            .reader
+            .read_at(entry.data_offset, &mut self.overlay[index].data[..size])
+        {
+            self.overlay[index] = OverlayFile::empty();
+            return Err(error);
+        }
         self.overlay[index].len = size;
         Ok(index)
     }
@@ -594,7 +778,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         } else {
             &path[..split]
         };
-        if self.index.resolve(parent)?.kind != NodeKind::Directory {
+        if self.metadata(parent)?.kind != NodeKind::Directory {
             return Err(VfsError::NotDirectory);
         }
         Ok(())
@@ -805,5 +989,100 @@ mod tests {
         first.teardown();
         assert_eq!(first.overlay_files(), 0);
         assert_eq!(second.overlay_files(), 0);
+    }
+
+    #[test]
+    fn dynamic_directories_metadata_and_sparse_append_io() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 4, 32, 4> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        vfs.mkdir(b"/work", 0o755).unwrap();
+        vfs.mkdir(b"/work/build", 0o700).unwrap();
+        assert_eq!(
+            vfs.metadata(b"/work/build").unwrap().kind,
+            NodeKind::Directory
+        );
+        assert_eq!(vfs.open(b"/work/build", O_READ), Err(VfsError::IsDirectory));
+        let fd = vfs
+            .open(b"/work/build/data", O_READ | O_WRITE | O_CREATE)
+            .unwrap();
+        vfs.seek(fd, 3, 0).unwrap();
+        vfs.write(fd, b"x").unwrap();
+        vfs.fchmod(fd, 0o640).unwrap();
+        assert_eq!(vfs.fstat(fd).unwrap().mode, 0o640);
+        assert_eq!(vfs.fstat(fd).unwrap().size, 4);
+        vfs.seek(fd, 0, 0).unwrap();
+        let mut output = [0xff; 8];
+        assert_eq!(vfs.read(fd, &mut output), Ok(4));
+        assert_eq!(&output[..4], b"\0\0\0x");
+        vfs.seek(fd, 100, 0).unwrap();
+        assert_eq!(vfs.read(fd, &mut output), Ok(0));
+        assert_eq!(vfs.write(fd, b""), Ok(0));
+        assert_eq!(vfs.fstat(fd).unwrap().size, 4);
+        let append = vfs
+            .open(b"/work/build/data", O_WRITE | O_APPEND | O_CLOEXEC)
+            .unwrap();
+        vfs.seek(append, 0, 0).unwrap();
+        vfs.write(append, b"y").unwrap();
+        assert_eq!(vfs.seek(append, 0, 1), Ok(5));
+        assert_eq!(vfs.descriptor_flags(append), Ok((0o2001, true)));
+        assert_eq!(
+            vfs.open(b"/work/build/data", O_READ | O_TRUNC),
+            Err(VfsError::PermissionDenied)
+        );
+        assert_eq!(vfs.fstat(fd).unwrap().size, 5);
+    }
+
+    #[test]
+    fn unlink_recreate_keeps_open_object_and_reclaims_closed_objects() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 2, 8, 4> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        let old = vfs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
+        vfs.write(old, b"old").unwrap();
+        vfs.unlink(b"/new").unwrap();
+        assert_eq!(vfs.unlink(b"/new"), Err(VfsError::NotFound));
+        let new = vfs
+            .open(b"/new", O_READ | O_WRITE | O_CREATE | O_EXCLUSIVE)
+            .unwrap();
+        vfs.write(new, b"new").unwrap();
+        let mut output = [0; 3];
+        vfs.seek(old, 0, 0).unwrap();
+        vfs.read(old, &mut output).unwrap();
+        assert_eq!(&output, b"old");
+        assert_eq!(
+            vfs.open(b"/new", O_WRITE | O_CREATE | O_EXCLUSIVE),
+            Err(VfsError::AlreadyExists)
+        );
+        vfs.close(old).unwrap();
+        vfs.close(new).unwrap();
+        for _ in 0..20 {
+            vfs.unlink(b"/new").unwrap();
+            let fd = vfs.open(b"/new", O_WRITE | O_CREATE).unwrap();
+            vfs.close(fd).unwrap();
+        }
+        assert_eq!(vfs.metadata(b"/new").unwrap().size, 0);
+    }
+
+    #[test]
+    fn descriptor_exhaustion_does_not_create_or_truncate() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 4, 8, 1> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        let fd = vfs.open(b"/new", O_WRITE | O_CREATE).unwrap();
+        vfs.write(fd, b"kept").unwrap();
+        assert_eq!(
+            vfs.open(b"/other", O_WRITE | O_CREATE),
+            Err(VfsError::DescriptorLimit)
+        );
+        assert_eq!(vfs.metadata(b"/other"), Err(VfsError::NotFound));
+        assert_eq!(
+            vfs.open(b"/new", O_WRITE | O_TRUNC),
+            Err(VfsError::DescriptorLimit)
+        );
+        assert_eq!(vfs.fstat(fd).unwrap().size, 4);
+        vfs.close(fd).unwrap();
+        let fd = vfs.open(b"/new", O_WRITE | O_TRUNC).unwrap();
+        assert_eq!(vfs.fstat(fd).unwrap().size, 0);
     }
 }
