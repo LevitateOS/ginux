@@ -87,7 +87,42 @@ def main():
                     if proc.poll() is None:
                         proc.kill()
                         proc.communicate(timeout=5)
-        print('test-launch-checkpoints: PASS (snapshots, isolation, private fds, partial frames, replay, freshness)')
+        def restore(archive, expected='first', failure=False, assignments='memory:/work'):
+            result = work / 'restore-result.json'
+            result.unlink(missing_ok=True)
+            config_path.write_text(config.replace('args = ["checkpoint"]', 'args = ' + json.dumps(['restore', expected])).replace('memory:/work', assignments))
+            proc = subprocess.run([binary, 'launch', str(config_path), str(root), '--result-file', str(result),
+                                   '--restore-file', str(archive)], capture_output=True, timeout=5)
+            assert proc.returncode == (2 if failure else 0), proc.stderr.decode()
+            assert proc.stdout == (b'' if failure else b'restored: PASS\n'), proc.stdout
+            assert json.loads(result.read_text())['outcome'] == ('supervisor-error' if failure else 'exited')
+
+        for sequence, expected in ((1, 'first'), (2, 'second')):
+            archive = work / f'snapshot-None-{sequence}.tar'
+            original = archive.read_bytes()
+            restore(archive, expected)
+            assert archive.read_bytes() == original, 'restore mutated its snapshot'
+        restore(work / 'snapshot-None-1.tar', failure=True, assignments='memory:/out')
+        snapshot = (work / 'snapshot-None-1.tar').read_bytes()
+        for name, data in (('truncated', snapshot[:-512]), ('checksum', b'x' + snapshot[1:])):
+            archive = work / f'{name}.tar'
+            archive.write_bytes(data)
+            restore(archive, failure=True)
+        for kind in ('traversal', 'symlink', 'hardlink', 'duplicate'):
+            archive = work / f'{kind}.tar'
+            with tarfile.open(archive, 'w', format=tarfile.USTAR_FORMAT) as tar:
+                entry = tarfile.TarInfo('work/../../escaped' if kind == 'traversal' else 'work')
+                entry.mode = 0o700
+                entry.type = {'symlink': tarfile.SYMTYPE, 'hardlink': tarfile.LNKTYPE}.get(kind, tarfile.DIRTYPE)
+                entry.linkname = '/outside' if kind in ('symlink', 'hardlink') else ''
+                tar.addfile(entry)
+                if kind == 'duplicate': tar.addfile(entry)
+            restore(archive, failure=True)
+        link = work / 'snapshot-link.tar'
+        link.symlink_to(work / 'snapshot-None-1.tar')
+        restore(link, failure=True)
+        assert not (work / 'escaped').exists()
+        print('test-launch-checkpoints: PASS (capture, restore, long paths, isolation, private fds, malformed inputs)')
 
 
 if __name__ == '__main__':

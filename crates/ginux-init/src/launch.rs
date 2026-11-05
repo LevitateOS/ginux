@@ -34,7 +34,14 @@ pub enum Command {
     Devices(*const u8, *const u8),
     DeviceBench(*const u8, *const u8, *const u8),
     KernelViews(*const u8),
-    Launch(*const u8, *const u8, *const u8, *const u8, Option<usize>),
+    Launch(
+        *const u8,
+        *const u8,
+        *const u8,
+        *const u8,
+        Option<usize>,
+        *const u8,
+    ),
     LaunchUsage,
     Usage,
 }
@@ -107,6 +114,7 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
         let mut result_path: *const u8 = core::ptr::null();
         let mut export_path: *const u8 = core::ptr::null();
         let mut control_fd = None;
+        let mut restore_path: *const u8 = core::ptr::null();
         let mut i = 4;
         while i < argc {
             if i + 1 >= argc {
@@ -121,6 +129,8 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
                 result_path = value;
             } else if c_string_equals(option, b"--export-file") && export_path.is_null() {
                 export_path = value;
+            } else if c_string_equals(option, b"--restore-file") && restore_path.is_null() {
+                restore_path = value;
             } else if c_string_equals(option, b"--control-fd") && control_fd.is_none() {
                 control_fd = parse_control_fd(value);
                 if control_fd.is_none() {
@@ -137,6 +147,7 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
             result_path,
             export_path,
             control_fd,
+            restore_path,
         ))
     } else {
         Some(Command::Usage)
@@ -333,6 +344,7 @@ pub fn launch_main(
     result_path: *const u8,
     export_path: *const u8,
     control_fd: Option<usize>,
+    restore_path: *const u8,
 ) -> ! {
     stage_result_path(result_path);
     crate::storage_export::prepare(export_path)
@@ -344,6 +356,8 @@ pub fn launch_main(
     let mut devices = crate::device_hooks::LaunchDevices::prepare(&config)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     let mut filesystem = crate::fs_hooks::LaunchFs::prepare(&config)
+        .unwrap_or_else(|reason| launch_startup_fail(reason));
+    crate::storage_restore::restore(restore_path, &mut filesystem)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     let mut channels = crate::channel_hooks::LaunchChannels::new();
     let descriptors = crate::descriptors::DescriptorTable::new()
@@ -647,12 +661,12 @@ pub fn usage() -> ! {
     line_stderr(b"ginux: usage: ginux devices <config> <block>");
     line_stderr(b"ginux: usage: ginux device-bench <config> <block> <kind>");
     line_stderr(b"ginux: usage: ginux vfs <config> <rootfs> <index>");
-    line_stderr(b"ginux: usage: ginux launch <config> <root> [--result-file <fresh host path>] [--export-file <fresh tar path>] [--control-fd <inherited socket>]");
+    line_stderr(b"ginux: usage: ginux launch <config> <root> [--result-file <fresh host path>] [--export-file <fresh tar path>] [--control-fd <inherited socket>] [--restore-file <snapshot tar>]");
     exit_process(2)
 }
 
 pub fn launch_usage() -> ! {
-    line_stderr(b"ginux: launch usage: launch <config> <root> [--result-file <fresh host path>] [--export-file <fresh tar path>] [--control-fd <inherited socket>]");
+    line_stderr(b"ginux: launch usage: launch <config> <root> [--result-file <fresh host path>] [--export-file <fresh tar path>] [--control-fd <inherited socket>] [--restore-file <snapshot tar>]");
     exit_process(2)
 }
 

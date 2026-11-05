@@ -18,7 +18,7 @@ use ginux_vfs::{
 pub const FD_BASE: usize = 1 << 20;
 const IO_SIZE: usize = 4096;
 type Path = Text<MAX_PATH>;
-const OBJECTS: usize = 4096;
+pub(crate) const OBJECTS: usize = 4096;
 type MemoryFs = VirtualFs<'static, EmptyReader, OBJECTS, 0, 64, MemoryStorage<OBJECTS>>;
 static mut ROOT_INDEX: [u8; HEADER_SIZE + RECORD_SIZE] = [0; HEADER_SIZE + RECORD_SIZE];
 static ROOT_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -113,6 +113,101 @@ impl LaunchFs {
 
     pub fn enabled(&self) -> bool {
         self.count != 0
+    }
+
+    pub fn restore_entry(
+        &mut self,
+        path: &[u8],
+        directory: bool,
+        mode: u32,
+        length: usize,
+        seen: &mut [bool; OBJECTS],
+        mut read: impl FnMut(&mut [u8]) -> Result<(), &'static [u8]>,
+    ) -> Result<(), &'static [u8]> {
+        let canonical = normalize(b"/", path).map_err(|_| b"invalid restore path".as_slice())?;
+        if canonical.as_bytes() != path
+            || (!self.owns_path(path)
+                && !(directory
+                    && self.prefixes[..self.count]
+                        .iter()
+                        .any(|p| within(p.as_bytes(), path))))
+        {
+            return Err(b"restore path is outside assigned storage");
+        }
+        // Entries may precede their parents in the overlay's slot order.
+        for end in 1..path.len() {
+            if path[end] == b'/' {
+                match self.fs.mkdir(&path[..end], 0o755) {
+                    Ok(()) | Err(VfsError::AlreadyExists) => {}
+                    Err(_) => return Err(b"restore parent creation failed"),
+                }
+            }
+        }
+        if directory {
+            match self.fs.mkdir(path, mode) {
+                Ok(()) | Err(VfsError::AlreadyExists) => {}
+                Err(_) => return Err(b"restore directory creation failed"),
+            }
+            if self
+                .fs
+                .metadata(path)
+                .map_err(|_| b"restore directory lookup failed".as_slice())?
+                .kind
+                != NodeKind::Directory
+            {
+                return Err(b"restore directory collides with file");
+            }
+            self.fs
+                .chmod(path, mode)
+                .map_err(|_| b"restore directory mode failed".as_slice())?;
+        } else {
+            let fd = self
+                .fs
+                .open(path, O_WRITE | O_CREATE | O_EXCLUSIVE)
+                .map_err(|_| b"restore file creation failed".as_slice())?;
+            let result = (|| {
+                self.fs
+                    .truncate(fd, length as u64)
+                    .map_err(|_| b"restore storage bound exceeded".as_slice())?;
+                let mut bytes = [0u8; IO_SIZE];
+                let mut offset = 0;
+                while offset < length {
+                    let count = (length - offset).min(bytes.len());
+                    read(&mut bytes[..count])?;
+                    if self
+                        .fs
+                        .write(fd, &bytes[..count])
+                        .map_err(|_| b"restore file write failed".as_slice())?
+                        != count
+                    {
+                        return Err(b"restore file short write".as_slice());
+                    }
+                    offset += count;
+                }
+                self.fs
+                    .fchmod(fd, mode)
+                    .map_err(|_| b"restore file mode failed".as_slice())
+            })();
+            let closed = self.fs.close(fd);
+            result?;
+            closed.map_err(|_| b"restore file close failed".as_slice())?;
+        }
+        // This launch view has a one-entry immutable root; live owned inode
+        // numbers are stable slot+2 for the duration of startup import.
+        let inode = self
+            .fs
+            .metadata(path)
+            .map_err(|_| b"restore entry lookup failed".as_slice())?
+            .inode;
+        let slot = inode
+            .checked_sub(2)
+            .filter(|slot| *slot < OBJECTS as u64)
+            .ok_or(b"invalid restored inode".as_slice())? as usize;
+        if seen[slot] {
+            return Err(b"duplicate restore entry");
+        }
+        seen[slot] = true;
+        Ok(())
     }
 
     pub fn export(&self) -> Result<(), &'static [u8]> {

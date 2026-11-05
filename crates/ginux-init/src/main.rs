@@ -22,6 +22,7 @@ mod launch_tasks;
 mod process_hooks;
 mod storage_export;
 mod storage_memory;
+mod storage_restore;
 mod supervisor;
 mod tracee_io;
 
@@ -203,9 +204,21 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
             device_bench_main(config_path, block_path, kind)
         }
         Some(Command::KernelViews(config_path)) => kernel_views_main(config_path),
-        Some(Command::Launch(config_path, root_path, result_path, export_path, control_fd)) => {
-            launch_main(config_path, root_path, result_path, export_path, control_fd)
-        }
+        Some(Command::Launch(
+            config_path,
+            root_path,
+            result_path,
+            export_path,
+            control_fd,
+            restore_path,
+        )) => launch_main(
+            config_path,
+            root_path,
+            result_path,
+            export_path,
+            control_fd,
+            restore_path,
+        ),
         Some(Command::LaunchUsage) => launch_usage(),
         Some(Command::Usage) => usage(),
         None => gate1_main(),

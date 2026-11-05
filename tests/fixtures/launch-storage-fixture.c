@@ -20,9 +20,31 @@ long storage_main(word *stack)
 {
     word argc = *stack;
     char **argv = (char **)(stack + 1);
+    if (argc > 2 && argv[1][0] == 'r') {
+        long fd=DO(2,"/work/checkpoint",0,0);
+        CHECK(fd==3,153);
+        word length=argv[2][0]=='f' ? 5 : 6;
+        CHECK(DO(0,fd,output,sizeof output)==(long)length,154);
+        for (word i=0;i<length;++i) CHECK(output[i]==argv[2][i],155);
+        CHECK(DO(5,fd,meta,0)==0 && (*(word *)(meta+24)&0777)==0600,156);
+        CHECK(DO(3,fd,0,0)==0,157);
+        char path[128]="/work/";
+        for (word i=6;i<126;++i) path[i]='a';
+        path[126]=0;
+        CHECK(DO(2,path,0,0)==3 && DO(0,3,output,4)==4 && output[0]=='l' && DO(3,3,0,0)==0,158);
+        CHECK(DO(4,"/work/empty",meta,0)==0 && (*(word *)(meta+24)&0170000)==0040000,159);
+        CHECK(DO(2,"/work/checkpoint",01001,0600)==3 && DO(1,3,"changed",7)==7 && DO(3,3,0,0)==0,160);
+        CHECK(DO(1,1,"restored: PASS\n",15)==15,161);
+        return 0;
+    }
     if (argc > 1 && argv[1][0] == 'c') {
         long fd=DO(2,"/work/checkpoint",0102,0600);
         CHECK(fd==3 && DO(1,fd,"first",5)==5,148);
+        CHECK(DO(83,"/work/empty",0700,0)==0,162);
+        char path[128]="/work/";
+        for (word i=6;i<126;++i) path[i]='a';
+        path[126]=0;
+        CHECK(DO(2,path,0101,0640)==4 && DO(1,4,"long",4)==4 && DO(3,4,0,0)==0,163);
         CHECK(DO(1,1,"checkpoint-ready\n",17)==17 && DO(0,0,output,1)==1,149);
         CHECK(DO(8,fd,0,0)==0 && DO(1,fd,"second",6)==6,150);
         CHECK(DO(1,1,"checkpoint-ready\n",17)==17 && DO(0,0,output,1)==1,151);

@@ -538,4 +538,16 @@ The coordinator owns request deadlines, directory durability, matching runtime
 state, and workload acknowledgement. Snapshot capture serializes with all owned
 filesystem mutations; writable shared mappings/native backing descriptors are
 not exposed. This captures filesystem contents, not process memory or live
-handles. Startup restoration and complete recovery are separate capabilities.
+handles. Complete coordinator state pairing and recovery are separate capabilities.
+
+`--restore-file <snapshot tar>` imports a snapshot into the newly prepared owned
+filesystem before starting the workload. Import is bounded to 4096 live objects
+and 2 GiB of file data, additionally constrained by configured storage capacity.
+It restores regular files, directories and permission bits, and supports the
+long names emitted by Ginux. It rejects links, traversal, duplicate entries,
+invalid metadata/checksums/terminators, truncated archives, and names outside the
+configured storage assignments. The source must be a regular file opened without
+following a symlink; import never changes it. Failure discards the new memory
+view and starts no workload. The coordinator remains responsible for verifying
+the selected snapshot's identity/content and matching runtime state; a supplied
+archive alone is not evidence of a recoverable checkpoint.
