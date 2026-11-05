@@ -37,14 +37,16 @@ def main():
             path.write_text(config)
             command = [binary, 'launch', str(path), str(root), '--result-file', str(result)]
             if park:
-                with (work / f'{counter}.audit').open('w+b') as audit:
+                audit_path = work / f'{counter}.audit'
+                with audit_path.open('wb') as audit:
                     proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=audit)
                     child = None
                     try:
                         deadline = time.monotonic() + 5
                         while time.monotonic() < deadline:
-                            audit.seek(0)
-                            if b'ginux: park surface=lane-channel' in audit.read():
+                            # Read through a separate open file description;
+                            # seeking the inherited stderr would move its writer.
+                            if b'ginux: park surface=lane-channel' in audit_path.read_bytes():
                                 children = Path(f'/proc/{proc.pid}/task/{proc.pid}/children').read_text().split()
                                 assert len(children) == 1, children
                                 child = int(children[0])
