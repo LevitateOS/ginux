@@ -1496,17 +1496,27 @@ impl<const TASKS: usize, const FDS: usize, const PIPES: usize> PipeSpace<TASKS, 
     }
 }
 
-/// One live anonymous mapping: base address plus page-rounded length.
-/// Length is always nonzero; the ledger keeps ranges disjoint.
+/// One live mapping: base address plus page-rounded length. Length is
+/// always nonzero; the ledger keeps ranges disjoint. `file_fd` names the
+/// domain fd the range was filled from (`u64::MAX` for anonymous
+/// reservations); `file_off` is that range's file offset, so a fixed
+/// remap inside it can prove the same object and a compatible offset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemRange {
     pub addr: u64,
     pub len: u64,
+    pub file_fd: u64,
+    pub file_off: u64,
 }
 
 impl MemRange {
     pub const fn empty() -> Self {
-        Self { addr: 0, len: 0 }
+        Self {
+            addr: 0,
+            len: 0,
+            file_fd: u64::MAX,
+            file_off: 0,
+        }
     }
 
     pub const fn end(&self) -> u64 {
@@ -1561,7 +1571,8 @@ impl<const RANGES: usize> MemGroup<RANGES> {
     }
 }
 
-/// Per-thread-group anonymous-mapping ledger for the supervision loop.
+/// Per-thread-group mapping ledger for the supervision loop: anonymous
+/// reservations plus file-backed ranges filled from domain fds.
 /// Keyed by the existing virtual tgid, so no parallel task or memory
 /// owner is introduced: threads share a slot, processes copy on fork,
 /// `exec` resets, and the last member's death releases the slot. Every
@@ -1646,6 +1657,20 @@ impl<const GROUPS: usize, const RANGES: usize> MemSpace<GROUPS, RANGES> {
     /// lane caps. Fails only when the range table is full, which the
     /// entry check makes unreachable; the caller fails closed.
     pub fn record_mmap(&mut self, tgid: u32, addr: u64, len: u64) -> Result<(), ProcessError> {
+        self.record_mmap_file(tgid, addr, len, u64::MAX, 0)
+    }
+
+    /// Record a successful file-backed `mmap`: like [`record_mmap`],
+    /// plus the domain fd and file offset the exit stop filled from, so
+    /// a later fixed remap can prove the same object and offset.
+    pub fn record_mmap_file(
+        &mut self,
+        tgid: u32,
+        addr: u64,
+        len: u64,
+        fd: u64,
+        off: u64,
+    ) -> Result<(), ProcessError> {
         if len == 0 {
             return Ok(());
         }
@@ -1654,9 +1679,125 @@ impl<const GROUPS: usize, const RANGES: usize> MemSpace<GROUPS, RANGES> {
             return Err(ProcessError::TableFull);
         }
         let slot = self.groups[index].regions;
-        self.groups[index].ranges[slot] = MemRange { addr, len };
+        self.groups[index].ranges[slot] = MemRange {
+            addr,
+            len,
+            file_fd: fd,
+            file_off: off,
+        };
         self.groups[index].regions += 1;
         self.groups[index].mmap_bytes = self.groups[index].mmap_bytes.saturating_add(len);
+        Ok(())
+    }
+
+    /// Range-table capacity for one group: the entry stop pre-checks a
+    /// fixed remap against this so the exit stop never overflows it.
+    pub const fn range_capacity(&self) -> usize {
+        RANGES
+    }
+
+    /// The single live range wholly containing `[addr, addr + len)`, if
+    /// any. `None` covers unknown groups, zero lengths, wraparound, and
+    /// ranges outside every live reservation.
+    pub fn find_container(&self, tgid: u32, addr: u64, len: u64) -> Option<MemRange> {
+        if len == 0 {
+            return None;
+        }
+        let end = addr.saturating_add(len);
+        if end <= addr {
+            return None;
+        }
+        let index = self.index(tgid)?;
+        self.groups[index].ranges[..self.groups[index].regions]
+            .iter()
+            .find(|range| range.addr <= addr && end <= range.end())
+            .copied()
+    }
+
+    /// Record a successful `MAP_FIXED` remap confined inside one live
+    /// range: split the container so the ledger stays disjoint, stamp
+    /// the sub-range with its domain fd and file offset, and keep the
+    /// byte total exact (a remap moves bytes, it never adds them).
+    /// Fails when no single live range contains the span or the table
+    /// cannot hold the split; the caller pre-checks both and fails
+    /// closed, so this is unreachable on the mediated path.
+    pub fn record_fixed(
+        &mut self,
+        tgid: u32,
+        addr: u64,
+        len: u64,
+        fd: u64,
+        off: u64,
+    ) -> Result<(), ProcessError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = addr.saturating_add(len);
+        if end <= addr {
+            return Err(ProcessError::InvalidState);
+        }
+        let index = self.index(tgid).ok_or(ProcessError::InvalidState)?;
+        let slot = (0..self.groups[index].regions)
+            .find(|&slot| {
+                let range = self.groups[index].ranges[slot];
+                range.addr <= addr && end <= range.end()
+            })
+            .ok_or(ProcessError::InvalidState)?;
+        let parent = self.groups[index].ranges[slot];
+        if addr == parent.addr && len == parent.len {
+            self.groups[index].ranges[slot].file_fd = fd;
+            self.groups[index].ranges[slot].file_off = off;
+            return Ok(());
+        }
+        if self.groups[index].regions + 2 > RANGES {
+            return Err(ProcessError::TableFull);
+        }
+        let left_len = addr - parent.addr;
+        let right_start = end;
+        let right_len = parent.end() - end;
+        let parent_off_at = |at: u64| parent.file_off.saturating_add(at - parent.addr);
+        if left_len > 0 && right_len > 0 {
+            self.groups[index].ranges[slot].len = left_len;
+            let fresh = self.groups[index].regions;
+            self.groups[index].ranges[fresh] = MemRange {
+                addr,
+                len,
+                file_fd: fd,
+                file_off: off,
+            };
+            self.groups[index].ranges[fresh + 1] = MemRange {
+                addr: right_start,
+                len: right_len,
+                file_fd: parent.file_fd,
+                file_off: parent_off_at(right_start),
+            };
+            self.groups[index].regions += 2;
+        } else if left_len > 0 {
+            self.groups[index].ranges[slot].len = left_len;
+            let fresh = self.groups[index].regions;
+            self.groups[index].ranges[fresh] = MemRange {
+                addr,
+                len,
+                file_fd: fd,
+                file_off: off,
+            };
+            self.groups[index].regions += 1;
+        } else {
+            self.groups[index].ranges[slot] = MemRange {
+                addr,
+                len,
+                file_fd: fd,
+                file_off: off,
+            };
+            let fresh = self.groups[index].regions;
+            self.groups[index].ranges[fresh] = MemRange {
+                addr: right_start,
+                len: right_len,
+                file_fd: parent.file_fd,
+                file_off: parent_off_at(right_start),
+            };
+            self.groups[index].regions += 1;
+        }
         Ok(())
     }
 
@@ -1700,6 +1841,8 @@ impl<const GROUPS: usize, const RANGES: usize> MemSpace<GROUPS, RANGES> {
                     self.groups[index].ranges[fresh] = MemRange {
                         addr: unmap_end,
                         len: right_len,
+                        file_fd: range.file_fd,
+                        file_off: range.file_off.saturating_add(unmap_end - range.addr),
                     };
                     self.groups[index].regions += 1;
                 }

@@ -1183,8 +1183,8 @@ fn materialize_domain_file(
 // `read` on the resulting domain fds; everything else keeps its previous
 // behavior byte-identically (non-library `openat` stays `-ENOSYS`).
 // I04-M3 (below) adds the metadata and file-backed `mmap` shapes over
-// the same view; fixed file-backed mappings stay denied there, which is
-// the intended M3 death point.
+// the same view; I04-M4 extends them with confined fixed remaps and
+// `pread64` on the same fds.
 //
 // Backing content is the SAME loop overlay the G09 stage seam populates
 // from `GINUX_DOMAIN_STAGE` (no third loader): a library open resolves by
@@ -1238,6 +1238,11 @@ const LIB_PROT_READ: u64 = 0x1;
 /// `mmap` `MAP_DENYWRITE` hint the loader sets on every file-backed
 /// mapping (`0x800`): an accepted no-op here, like the M1 benign hints.
 const LIB_MAP_DENYWRITE: u64 = 0x800;
+/// Lowest tracee address a fixed file-backed remap may name: below the
+/// kernel's default `mmap_min_addr` (65536) a fixed map would clobber
+/// the null page and the supervisor-owned low reservation, so it stays
+/// `-EPERM` like the kernel's own low-address refusal.
+const LIB_MMAP_MIN_ADDR: u64 = 65536;
 /// Faithful errnos without a `supervisor.rs` constant.
 const EROFS: i64 = 30;
 const EISDIR: i64 = 21;
@@ -1539,9 +1544,12 @@ fn lib_release_group(processes: &ProcessTable<8>, tgid: u32) {
 // rewrites the call to an anonymous mapping the host executes, and the
 // exit stop records it in the MemSpace ledger under the M1 caps and
 // fills it with staged bytes at the requested file offset. Shared and
-// writable file-backed shapes stay denied explicitly; fixed mappings
-// stay `-EPERM` under the M1 caps; an unaligned offset fails `-EINVAL`;
-// a fd that is not a live domain fd keeps the pre-M3 `-ENODEV` denial.
+// writable file-backed shapes stay denied explicitly; an unaligned
+// offset fails `-EINVAL`; a fd that is not a live domain fd keeps the
+// pre-M3 `-ENODEV` denial. I04-M4 adds confined `MAP_FIXED` remaps
+// inside live ranges (split, not appended) plus `pread64` on live
+// domain fds; unconfined fixed maps stay denied (see
+// `domain_lib_mmap_allowed`).
 
 /// Map a tracee metadata path to its staged domain target: claimed
 /// library shapes resolve by basename (the same object an `openat`
@@ -1720,10 +1728,19 @@ fn domain_faccessat_entry(host_pid: usize, dirfd: i64, path_addr: usize, mode: u
 /// the caller rewrites the call to anonymous and stashes the domain fd
 /// plus the file offset. `Err(errno)` denies explicitly: an unknown fd
 /// keeps the pre-M3 `-ENODEV` (the host fd is never consulted); shared,
-/// fixed, and writable shapes fail closed; unknown flags and unaligned
-/// offsets fail like the kernel; the M1 single/total caps still bind.
+/// `MAP_FIXED_NOREPLACE`, and writable shapes fail closed; unknown flags
+/// and unaligned offsets fail like the kernel; the M1 single/total caps
+/// still bind unfixed maps. A `MAP_FIXED` map is allowed only when its
+/// page-rounded span lies wholly inside one live ledger range created
+/// by the earlier whole-file map (same fd with a compatible offset) or
+/// by an anonymous reservation: the exit stop then splits the ledger
+/// range instead of appending, so teardown still audits zero. Fixed maps
+/// outside any live range fail `-ENOMEM`, low fixed maps that would
+/// clobber supervisor memory fail `-EPERM`, and a remap naming a
+/// different object or offset fails `-EPERM`.
 fn domain_lib_mmap_allowed(
     vpid: u32,
+    addr: u64,
     len: u64,
     prot: u64,
     flags: u64,
@@ -1741,17 +1758,14 @@ fn domain_lib_mmap_allowed(
     if flags & MAP_SHARED != 0 {
         return Err(EPERM);
     }
-    if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
+    if flags & MAP_FIXED_NOREPLACE != 0 {
         return Err(EPERM);
     }
-    if flags & !(MAP_PRIVATE | LIB_MAP_DENYWRITE | MAP_ALLOWED_HINTS) != 0 {
+    if flags & !(MAP_PRIVATE | MAP_FIXED | LIB_MAP_DENYWRITE | MAP_ALLOWED_HINTS) != 0 {
         return Err(EINVAL);
     }
     if len > MMAP_SINGLE_MAX {
         return Err(ENOMEM);
-    }
-    if let Some(errno) = reserve_error(mem.region_count(tgid), mem.mmap_total(tgid), len) {
-        return Err(errno);
     }
     if prot & PROT_WRITE != 0 {
         return Err(EACCES);
@@ -1762,7 +1776,43 @@ fn domain_lib_mmap_allowed(
     if offset & 4095 != 0 {
         return Err(EINVAL);
     }
-    Ok(())
+    if flags & MAP_FIXED == 0 {
+        if let Some(errno) = reserve_error(mem.region_count(tgid), mem.mmap_total(tgid), len) {
+            return Err(errno);
+        }
+        return Ok(());
+    }
+    if addr & 4095 != 0 {
+        return Err(EINVAL);
+    }
+    let rounded = round_len(len);
+    if addr.checked_add(rounded).is_none() {
+        return Err(EINVAL);
+    }
+    if addr < LIB_MMAP_MIN_ADDR {
+        return Err(EPERM);
+    }
+    match mem.find_container(tgid, addr, rounded) {
+        None => Err(ENOMEM),
+        Some(parent) => {
+            if parent.file_fd != u64::MAX {
+                if parent.file_fd != fd {
+                    return Err(EPERM);
+                }
+                if parent
+                    .file_off
+                    .saturating_add(addr - parent.addr)
+                    != offset
+                {
+                    return Err(EPERM);
+                }
+            }
+            if mem.region_count(tgid) + 2 > mem.range_capacity() {
+                return Err(ENOMEM);
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Copy `bytes` into tracee memory at `address`: full aligned words go
@@ -1859,6 +1909,80 @@ fn domain_lib_mmap_fill(host_pid: usize, vpid: u32, fd: u64, offset: u64, addr: 
             write_u64(fd);
             write_all(b"\n");
         }
+    }
+}
+
+/// Emulate `pread64` on a domain library fd: copy overlay bytes at the
+/// requested file offset into tracee memory without moving the
+/// descriptor offset the loader observes (its sequential reads continue
+/// undisturbed). Short at end of file like the entry-stop reads; a
+/// negative offset fails `-EINVAL`. `None` means the fd is not a live
+/// domain fd for this task (the caller keeps `-EBADF`).
+fn domain_lib_pread_entry(
+    host_pid: usize,
+    vpid: u32,
+    fd: u64,
+    buffer: usize,
+    count: usize,
+    offset: i64,
+) -> Option<i64> {
+    let slot = lib_slot_find(vpid, fd)?;
+    if offset < 0 {
+        return Some(-EINVAL);
+    }
+    if count == 0 {
+        return Some(0);
+    }
+    if buffer == 0 {
+        return Some(-EFAULT);
+    }
+    let overlay = unsafe { LIB_OPEN[slot].2 };
+    let outcome = with_exec_vfs(|vfs| {
+        let saved = match lseek_fd(&mut *vfs, overlay, 0, crate::fs_hooks::SEEK_CUR) {
+            Ok(position) => position,
+            Err(_) => return -EIO,
+        };
+        if lseek_fd(&mut *vfs, overlay, offset, crate::fs_hooks::SEEK_SET).is_err() {
+            return -EIO;
+        }
+        let mut total = 0usize;
+        while total < count {
+            let want = (count - total).min(LIB_READ_CHUNK);
+            let chunk = unsafe { &mut STAGE_BUF[..want] };
+            let moved = match read_fd(&mut *vfs, overlay, chunk) {
+                Ok(moved) => moved,
+                Err(error) => {
+                    let errno = match error {
+                        crate::fs_hooks::IoError::BadDescriptor => -EBADF,
+                        _ => -EIO,
+                    };
+                    let _ = lseek_fd(&mut *vfs, overlay, saved as i64, crate::fs_hooks::SEEK_SET);
+                    return if total == 0 { errno } else { total as i64 };
+                }
+            };
+            if moved == 0 {
+                break;
+            }
+            if write_tracee_bytes(host_pid, buffer + total, &chunk[..moved]).is_err() {
+                let _ = lseek_fd(&mut *vfs, overlay, saved as i64, crate::fs_hooks::SEEK_SET);
+                return -EFAULT;
+            }
+            total += moved;
+        }
+        let _ = lseek_fd(&mut *vfs, overlay, saved as i64, crate::fs_hooks::SEEK_SET);
+        total as i64
+    });
+    match outcome {
+        Some(done) if done >= 0 => {
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: lib-pread fd=");
+            write_u64(fd);
+            write_all(b" bytes=");
+            write_u64(done as u64);
+            write_all(b"\n");
+            Some(done)
+        }
+        Some(errno) => Some(errno),
+        None => Some(-EIO),
     }
 }
 
@@ -2728,14 +2852,40 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 let mem_result = registers.rax as i64;
                 if current.syscall == 9 {
                     if mem_result >= 0 {
-                        if mem
-                            .record_mmap(tgid, registers.rax, round_len(current.mem_arg0))
-                            .is_err()
-                        {
+                        // A stashed nonzero `mem_arg1` marks a confined
+                        // `MAP_FIXED` remap: split the containing range.
+                        // Stale zero means an ordinary (unfixed) mapping.
+                        let fixed = current.file_arg0 != 0 && current.mem_arg1 != 0;
+                        let rounded = round_len(current.mem_arg0);
+                        let ledger_full = if fixed {
+                            mem.record_fixed(
+                                tgid,
+                                registers.rax,
+                                rounded,
+                                current.file_arg0,
+                                current.file_arg1,
+                            )
+                        } else if current.file_arg0 != 0 {
+                            mem.record_mmap_file(
+                                tgid,
+                                registers.rax,
+                                rounded,
+                                current.file_arg0,
+                                current.file_arg1,
+                            )
+                        } else {
+                            mem.record_mmap(tgid, registers.rax, rounded)
+                        }
+                        .is_err();
+                        if ledger_full {
                             process_native_fail(domain, root_host_pid, b"memory ledger full");
                         }
                         if current.file_arg0 != 0 {
-                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-file addr=");
+                            if fixed {
+                                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-file-fixed addr=");
+                            } else {
+                                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-file addr=");
+                            }
                             write_u64(registers.rax);
                             write_all(b" len=");
                             write_u64(current.mem_arg0);
@@ -3273,6 +3423,32 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                         }
                     }
                 }
+                17 => {
+                    // I04-M4: `pread64` (17, same number the supervisor
+                    // itself uses for host reads) on a live domain library
+                    // fd serves staged bytes at the requested offset
+                    // without moving the descriptor offset; any other fd
+                    // fails `-EBADF`.
+                    match domain_lib_pread_entry(
+                        host_pid,
+                        current.virtual_id.pid,
+                        registers.rdi,
+                        registers.rsi as usize,
+                        registers.rdx as usize,
+                        registers.r10 as i64,
+                    ) {
+                        Some(result) => {
+                            current.result = result;
+                            current.override_result = true;
+                            registers.orig_rax = u64::MAX;
+                        }
+                        None => {
+                            current.result = -EBADF;
+                            current.override_result = true;
+                            registers.orig_rax = u64::MAX;
+                        }
+                    }
+                }
                 1 => {
                     // G05a managed write: the existing bounded console path
                     // is unchanged; tracked pipe ends execute regardless of
@@ -3405,8 +3581,15 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                             // shape executes as an anonymous mapping the
                             // exit stop fills with staged bytes. Denied
                             // shapes fail here with a faithful errno.
+                            // I04-M4: a confined `MAP_FIXED` remap inside
+                            // a live ledger range executes the same way;
+                            // the requested address rides in `mem_arg1`
+                            // (nonzero exactly for fixed, since low fixed
+                            // addresses stay denied) so the exit stop can
+                            // split the range instead of appending.
                             match domain_lib_mmap_allowed(
                                 current.virtual_id.pid,
+                                registers.rdi,
                                 registers.rsi,
                                 registers.rdx,
                                 registers.r10,
@@ -3417,6 +3600,11 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                             ) {
                                 Ok(()) => {
                                     current.mem_arg0 = registers.rsi;
+                                    current.mem_arg1 = if registers.r10 & MAP_FIXED != 0 {
+                                        registers.rdi
+                                    } else {
+                                        0
+                                    };
                                     current.file_arg0 = registers.r8;
                                     current.file_arg1 = registers.r9;
                                     registers.r10 |= MAP_ANONYMOUS;
