@@ -82,6 +82,7 @@ struct Task {
     exec: Option<Exec>,
     mapping: Option<crate::file_mapping::MappingCall>,
     waiter: Option<usize>,
+    image_chdir: Option<u64>,
 }
 
 struct DescriptorGroup {
@@ -91,6 +92,7 @@ struct DescriptorGroup {
     status: Option<i32>,
     creating: Option<usize>,
     image: Option<Executable>,
+    cwd: Option<i32>,
 }
 
 struct Supervisor<'a> {
@@ -245,6 +247,7 @@ pub fn supervise(
         status: None,
         creating: None,
         image: None,
+        cwd: None,
     });
     s.tasks[0] = Some(Task {
         id,
@@ -260,6 +263,7 @@ pub fn supervise(
         exec: None,
         mapping: None,
         waiter: None,
+        image_chdir: None,
     });
     if ptrace(PTRACE_SETOPTIONS, root, 0, OPTIONS) < 0 {
         s.fail(domain, b"launch ptrace setup failed");
@@ -454,6 +458,11 @@ impl Supervisor<'_> {
                     self.fail(domain, b"process executable release failed");
                 }
             }
+            if let Some(fd) = self.groups[group].as_mut().unwrap().cwd.take() {
+                if self.objects.filesystem.close_cwd(fd).is_err() {
+                    self.fail(domain, b"process cwd release failed");
+                }
+            }
             self.groups[group] = None;
             return Some(result);
         }
@@ -603,6 +612,9 @@ impl Supervisor<'_> {
         let original = *r;
         let id = self.task(index).id;
         let parent_group = self.task(index).group;
+        self.objects
+            .filesystem
+            .select_cwd(self.groups[parent_group].as_ref().unwrap().cwd);
         if self.groups[parent_group]
             .as_ref()
             .unwrap()
@@ -727,17 +739,49 @@ impl Supervisor<'_> {
                     return;
                 }
             }
-            80 => {
-                match self
+            79 => {
+                let result = self
                     .objects
                     .filesystem
-                    .image_chdir(self.task(index).host, r.rdi)
-                {
-                    Ok(()) => {
+                    .getcwd(self.task(index).host, r.rdi, r.rsi)
+                    .unwrap_or_else(|e| e);
+                self.emulate(index, r, result, domain);
+                return;
+            }
+            80 => {
+                match self.objects.filesystem.chdir(self.task(index).host, r.rdi) {
+                    Ok(Some(fd)) => {
+                        self.replace_cwd(index, Some(fd), domain);
+                        self.emulate(index, r, 0, domain);
+                    }
+                    Ok(None) => {
+                        self.task_mut(index).image_chdir = Some(r.rdi);
                         audit_write(b"mediate surface=image-cwd\n");
                         self.run(index, r, domain);
                     }
                     Err(error) => self.emulate(index, r, error, domain),
+                }
+                return;
+            }
+            81 => {
+                match self.table(index).exec_descriptor(r.rdi) {
+                    Ok(ExecDescriptor::Owned(handle)) => {
+                        match self.objects.filesystem.descriptor_cwd(handle) {
+                            Ok(fd) => {
+                                self.replace_cwd(index, Some(fd), domain);
+                                self.emulate(index, r, 0, domain);
+                            }
+                            Err(e) => self.emulate(index, r, e, domain),
+                        }
+                    }
+                    Ok(ExecDescriptor::Native(fd)) => {
+                        // The descriptor owner translates the public number.
+                        self.task_mut(index).image_chdir = Some(r.rdi);
+                        let mut native = *r;
+                        native.rdi = fd as u64;
+                        self.run(index, &native, domain);
+                    }
+                    Err(e) => self.emulate(index, r, e, domain),
                 }
                 return;
             }
@@ -852,6 +896,19 @@ impl Supervisor<'_> {
                     parent_group
                 } else {
                     let group = self.groups.iter().position(|g| g.is_none()).unwrap();
+                    let cwd = match self.groups[parent_group].as_ref().unwrap().cwd {
+                        Some(fd) => match self.objects.filesystem.copy_cwd(fd) {
+                            Ok(fd) => Some(fd),
+                            Err(error) => {
+                                if self.processes.cancel_fork(id, child).is_err() {
+                                    self.fail(domain, b"cwd-limited fork rollback failed");
+                                }
+                                self.emulate(index, r, error, domain);
+                                return;
+                            }
+                        },
+                        None => None,
+                    };
                     let table = match self.groups[parent_group]
                         .as_ref()
                         .unwrap()
@@ -874,6 +931,7 @@ impl Supervisor<'_> {
                         status: None,
                         creating: None,
                         image,
+                        cwd,
                     });
                     self.groups[parent_group].as_mut().unwrap().creating = Some(index);
                     group
@@ -892,6 +950,7 @@ impl Supervisor<'_> {
                     exec: None,
                     mapping: None,
                     waiter: None,
+                    image_chdir: None,
                 });
                 self.task_mut(index).pending = Pending::Fork {
                     child: slot,
@@ -1561,6 +1620,12 @@ impl Supervisor<'_> {
         if let Some(result) = self.task_mut(index).override_result.take() {
             r.rax = result as u64;
         }
+        if let Some(original) = self.task_mut(index).image_chdir.take() {
+            r.rdi = original;
+            if r.rax == 0 {
+                self.replace_cwd(index, None, domain);
+            }
+        }
         let group = self.task(index).group;
         let task = self.tasks[index].as_mut().unwrap();
         match task.call.finish(
@@ -1578,6 +1643,16 @@ impl Supervisor<'_> {
         audit_write(b"\n");
         self.run(index, r, domain);
     }
+    fn replace_cwd(&mut self, index: usize, next: Option<i32>, domain: &mut Domain) {
+        let group = self.task(index).group;
+        let old = core::mem::replace(&mut self.groups[group].as_mut().unwrap().cwd, next);
+        if let Some(fd) = old {
+            if self.objects.filesystem.close_cwd(fd).is_err() {
+                self.fail(domain, b"cwd reference release failed");
+            }
+        }
+    }
+
     fn wait_entry(&mut self, index: usize, r: &mut UserRegs, domain: &mut Domain) {
         let selector = r.rdi as i32;
         if selector != -1 && selector <= 0 || r.rdx & !1 != 0 || r.r10 != 0 {
@@ -1807,6 +1882,11 @@ impl Supervisor<'_> {
             }
         }
         for group in self.groups.iter_mut().flatten() {
+            if let Some(fd) = group.cwd.take() {
+                if self.objects.filesystem.close_cwd(fd).is_err() {
+                    supervision_error(domain, b"teardown cwd release failed");
+                }
+            }
             if let Err(reason) = group.table.release_exited(&mut self.objects) {
                 supervision_error(domain, reason);
             }

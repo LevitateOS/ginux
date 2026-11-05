@@ -30,6 +30,13 @@ static void join(word i)
         if (result!=0 && result!=-11 && result!=-4) { error=90; break; }
     }
 }
+static long change_cwd(void)
+{
+    if (DO(80,"/work/thread-cwd",0,0)!=0) error=92;
+    long fd=DO(2,"relative",0102,0600);
+    if (fd<0 || DO(3,fd,0,0)!=0) error=93;
+    return 0;
+}
 static long basic(void)
 {
     if (DO(39,0,0,0)!=1 || DO(186,0,0,0)!=tid[0] || tid[0]!=2 || DO(110,0,0,0)!=0) { error=11; return 0; }
@@ -112,7 +119,15 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-95 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='x') {
+    if (mode=='c') {
+        CHECK(DO(83,"/work/thread-cwd",0755,0)==0,91);
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],change_cwd)==2,94);
+        join(0);
+        CHECK(!error,error);
+        char cwd[64];
+        CHECK(DO(79,cwd,sizeof cwd,0)==17 && cwd[6]=='t' && cwd[16]==0,95);
+        long fd=DO(2,"relative",0,0); CHECK(fd>=0 && DO(3,fd,0,0)==0,96);
+    } else if (mode=='x') {
         for (word i=0;i<7;++i) CHECK(spawn_thread((word)(stacks[i]+sizeof stacks[i]),&tid[i],busy)>1,87);
         for (word i=0;i<100;++i) DO(39,0,0,0);
         CHECK(DO(1,1,"owned-threads: PASS\n",20)==20,88);

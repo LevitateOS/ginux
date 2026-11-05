@@ -25,8 +25,13 @@ static long create(const char *path, const char *data)
     if (DO(3,fd,0,0)!=0) return -1;
     return 0;
 }
-long directory_main(void)
+long directory_main(word *stack)
 {
+    if (*stack > 1) {
+        CHECK(DO(79,buffer,sizeof buffer,0)==16 && equal(buffer,"/work/cwd-moved"),120);
+        CHECK(create("exec-output","exec")==0,121);
+        return 0;
+    }
     CHECK(DO(83,"/work/dir",0755,0)==0 && DO(83,"/work/dir/sub",0755,0)==0,10);
     CHECK(create("/work/dir/file","file-content")==0 && create("/work/dir/sub/leaf","leaf")==0,11);
     CHECK(DO(2,"/work/dir/file",0200000,0)==-20 && DO(2,"/work/missing",0200000,0)==-2,12);
@@ -107,7 +112,41 @@ long directory_main(void)
     CHECK(DO(91,full,0040750,0)==0 && DO(5,full,meta,0)==0 && (*(unsigned int *)(meta+24)&0777)==0750,74);
     CHECK(DO(91,full,04755,0)==-13,75);
     CHECK(DO(3,full,0,0)==0 && DO(3,alias,0,0)==0 && DO(3,dir,0,0)==0,47);
+    CHECK(DO(83,"/work/cwd",0755,0)==0 && DO(83,"/work/cwd/nested",0755,0)==0,80);
+    CHECK(DO(80,"/work/cwd",0,0)==0,81);
+    CHECK(DO(79,buffer,sizeof buffer,0)==10 && equal(buffer,"/work/cwd"),82);
+    CHECK(DO(79,buffer,9,0)==-34 && DO(79,buffer,0,0)==-22 && DO(79,1,4096,0)==-14,83);
+    CHECK(create("relative","owned")==0 && DO(80,"relative",0,0)==-20,84);
+    long cwd=DO(2,".",0200000,0); CHECK(cwd>=3,85);
+    CHECK(DO(81,12345,0,0)==-9 && DO(80,"missing",0,0)==-2,86);
+    long child2=DO(57,0,0,0); CHECK(child2>=0,87);
+    if (child2==0) {
+        CHECK(DO(80,"nested",0,0)==0 && create("child","child")==0,88);
+        CHECK(DO(79,buffer,sizeof buffer,0)==17 && equal(buffer,"/work/cwd/nested"),89);
+        return 0;
+    }
+    CHECK(DO(61,child2,&status,0)==child2 && status==0,90);
+    CHECK(DO(79,buffer,sizeof buffer,0)==10 && equal(buffer,"/work/cwd"),91);
+    CHECK(DO(82,"/work/cwd","/work/cwd-moved",0)==0,92);
+    CHECK(DO(79,buffer,sizeof buffer,0)==16 && equal(buffer,"/work/cwd-moved"),93);
+    CHECK(DO(80,"/bin",0,0)==0 && DO(79,buffer,sizeof buffer,0)==5 && equal(buffer,"/bin"),94);
+    CHECK(DO(81,cwd,0,0)==0 && DO(3,cwd,0,0)==0,95);
+    long child3=DO(57,0,0,0); CHECK(child3>=0,96);
+    if (child3==0) {
+        char *args[]={"fixture","cwd-child",0}, *env[]={0};
+        DO(59,"/bin/fixture",args,env);
+        return 97;
+    }
+    CHECK(DO(61,child3,&status,0)==child3 && status==0,98);
+    CHECK(DO(4,"exec-output",meta,0)==0 && *(word *)(meta+48)==4,99);
+    CHECK(DO(83,"empty",0755,0)==0 && DO(80,"empty",0,0)==0,100);
+    CHECK(DO(84,"/work/cwd-moved/empty",0,0)==0,101);
+    CHECK(DO(79,buffer,sizeof buffer,0)==-2 && create("hidden","bad")==-2,102);
+    CHECK(DO(80,"/bin",0,0)==0,103);
+    long bin=DO(2,"/bin",0200000,0); CHECK(bin>=3,104);
+    CHECK(DO(80,"/work",0,0)==0 && DO(81,bin,0,0)==0 && DO(3,bin,0,0)==0,105);
+    CHECK(DO(79,buffer,sizeof buffer,0)==5 && equal(buffer,"/bin"),106);
     DO(1,1,"owned-directories: PASS\n",24);
     return 0;
 }
-__asm__(".global _start\n_start:\nandq $-16,%rsp\ncall directory_main\nmov %rax,%rdi\nmov $60,%rax\nsyscall\nud2\n");
+__asm__(".global _start\n_start:\nmov %rsp,%rdi\nandq $-16,%rsp\ncall directory_main\nmov %rax,%rdi\nmov $60,%rax\nsyscall\nud2\n");

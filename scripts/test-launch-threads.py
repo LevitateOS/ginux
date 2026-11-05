@@ -28,7 +28,7 @@ def main():
         config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
         config = config.replace('[devices]\nassignments = []', '[devices]\nassignments = ["null"]')
-        for mode in ('basic', 'mapping', 'pin', 'limit', 'stress', 'fork', 'early', 'rollback', 'basic') + ('x-exit-race',) * 30:
+        for mode in ('basic', 'cwd', 'mapping', 'pin', 'limit', 'stress', 'fork', 'early', 'rollback', 'basic') + ('x-exit-race',) * 30:
             path, result, audit_path = work / f'{mode}.toml', work / f'{mode}.json', work / f'{mode}.audit'
             result.unlink(missing_ok=True)
             path.write_text(config.replace('args = []', 'args = ' + json.dumps([mode])))

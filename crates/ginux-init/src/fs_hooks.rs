@@ -42,6 +42,7 @@ pub struct LaunchFs {
     fs: MemoryFs,
     prefixes: [Path; 8],
     count: usize,
+    cwd: Option<i32>,
 }
 
 impl LaunchFs {
@@ -116,6 +117,7 @@ impl LaunchFs {
             fs,
             prefixes,
             count,
+            cwd: None,
         })
     }
 
@@ -365,7 +367,7 @@ impl LaunchFs {
         let base = if absolute {
             b"/".as_slice()
         } else if dirfd as i32 == -100 {
-            cwd = crate::tracee_io::image_cwd(pid)?;
+            cwd = self.cwd_path(pid)?;
             cwd.as_bytes()
         } else {
             let fd = (dirfd as u32)
@@ -383,20 +385,78 @@ impl LaunchFs {
         Ok(path)
     }
 
-    /// Directory changes may enter the immutable image. Owned directories
-    /// have no native backing and must not silently enter a hidden image tree.
-    pub fn image_chdir(&self, pid: usize, address: u64) -> Result<(), i64> {
+    // Selected by the task owner before each entry. Threads share their
+    // process cwd, while fork owns a separate reference to the same directory.
+    pub fn select_cwd(&mut self, descriptor: Option<i32>) {
+        self.cwd = descriptor;
+    }
+
+    pub fn cwd_path(&self, pid: usize) -> Result<Path, i64> {
+        match self.cwd {
+            Some(fd) => {
+                Path::from_bytes(self.fs.directory_path(fd).map_err(errno)?).map_err(|_| -36)
+            }
+            None => crate::tracee_io::image_cwd(pid),
+        }
+    }
+
+    pub fn copy_cwd(&mut self, fd: i32) -> Result<i32, i64> {
+        self.fs.duplicate(fd, false).map_err(errno)
+    }
+
+    pub fn close_cwd(&mut self, fd: i32) -> Result<(), i64> {
+        self.fs.close(fd).map_err(errno)
+    }
+
+    pub fn descriptor_cwd(&mut self, handle: u32) -> Result<i32, i64> {
+        let fd = handle
+            .checked_sub(FD_BASE as u32)
+            .filter(|n| *n < 64)
+            .ok_or(-20)? as i32
+            + 3;
+        self.fs.directory_path(fd).map_err(errno)?;
+        self.copy_cwd(fd)
+    }
+
+    /// Owned cwd changes never enter the image directory hidden by storage.
+    /// An image change is committed only after its native syscall succeeds.
+    pub fn chdir(&mut self, pid: usize, address: u64) -> Result<Option<i32>, i64> {
         let path = self.path(pid, address, (-100i64) as u64)?;
         if self.owns_path(path.as_bytes()) {
-            return Err(-95);
+            let path = self.owned_path(path.as_bytes(), true, false)?;
+            return self
+                .fs
+                .open_directory(path.as_bytes(), 0)
+                .map(Some)
+                .map_err(errno);
         }
         if [b"/dev".as_slice(), b"/proc", b"/sys"]
             .iter()
-            .any(|prefix| within(path.as_bytes(), prefix))
+            .any(|p| within(path.as_bytes(), p))
         {
             return Err(-13);
         }
-        Ok(())
+        if self.cwd.is_some() && read_path(pid, address)?.as_bytes().first() != Some(&b'/') {
+            return Err(-95);
+        }
+        Ok(None)
+    }
+
+    pub fn getcwd(&self, pid: usize, address: u64, capacity: u64) -> Result<i64, i64> {
+        let path = self.cwd_path(pid)?;
+        let n = path.as_bytes().len();
+        if capacity == 0 {
+            return Err(-22);
+        }
+        if capacity <= n as u64 {
+            return Err(-34);
+        }
+        let mut bytes = [0; MAX_PATH + 1];
+        bytes[..n].copy_from_slice(path.as_bytes());
+        if copy_memory(pid, address, &mut bytes[..n + 1], true)? != (n + 1) as i64 {
+            return Err(-14);
+        }
+        Ok((n + 1) as i64)
     }
 
     /// Assigned paths yield pinned program bytes; image paths retain the native
@@ -416,7 +476,7 @@ impl LaunchFs {
         let base = if name.first() == Some(&b'/') {
             b"/".as_slice()
         } else {
-            cwd = crate::tracee_io::image_cwd(pid)?;
+            cwd = self.cwd_path(pid)?;
             cwd.as_bytes()
         };
         let path = self.routed_path(base, name)?;
@@ -616,6 +676,14 @@ impl LaunchFs {
             Err(error) => return Some(error),
         };
         if !self.owns_path(path.as_bytes()) {
+            // The kernel cwd remains in the immutable image while the task
+            // enters an owned directory. A relative fallback would enter the
+            // hidden image tree; crossing namespaces is resolved explicitly.
+            if self.cwd.is_some()
+                && read_path(pid, address).is_ok_and(|p| p.as_bytes().first() != Some(&b'/'))
+            {
+                return Some(-95);
+            }
             return None;
         }
         let original_path = path;
