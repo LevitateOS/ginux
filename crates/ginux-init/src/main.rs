@@ -9,6 +9,7 @@ use ginux_core::{
 };
 
 mod channel_hooks;
+mod checkpoint_control;
 mod descriptors;
 mod device_hooks;
 mod dispatch;
@@ -202,8 +203,8 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
             device_bench_main(config_path, block_path, kind)
         }
         Some(Command::KernelViews(config_path)) => kernel_views_main(config_path),
-        Some(Command::Launch(config_path, root_path, result_path, export_path)) => {
-            launch_main(config_path, root_path, result_path, export_path)
+        Some(Command::Launch(config_path, root_path, result_path, export_path, control_fd)) => {
+            launch_main(config_path, root_path, result_path, export_path, control_fd)
         }
         Some(Command::LaunchUsage) => launch_usage(),
         Some(Command::Usage) => usage(),

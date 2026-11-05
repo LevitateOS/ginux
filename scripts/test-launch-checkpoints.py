@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Exercise private snapshot control against a real configured workload."""
+import json
+import os
+from pathlib import Path
+import select
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+
+def receive(sock, count):
+    data = bytearray()
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        assert chunk, 'control socket closed before acknowledgement'
+        data.extend(chunk)
+    return bytes(data)
+
+
+def main():
+    if len(sys.argv) != 3 or os.geteuid() != 0:
+        sys.exit('usage (as root): test-launch-checkpoints.py <ginux> <storage-fixture>')
+    binary, fixture = [str(Path(p).resolve()) for p in sys.argv[1:]]
+    template = (Path(__file__).resolve().parent.parent / 'config/domain-gate5.toml').read_text()
+    with tempfile.TemporaryDirectory(prefix='ginux-checkpoints-') as folder:
+        work = Path(folder)
+        root = work / 'root'
+        (root / 'bin').mkdir(parents=True)
+        (root / 'work').mkdir()
+        shutil.copyfile(fixture, root / 'bin/fixture')
+        (root / 'bin/fixture').chmod(0o755)
+        config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
+        config = config.replace('args = []', 'args = ["checkpoint"]')
+        config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
+        config_path = work / 'config.toml'
+        config_path.write_text(config)
+        for failure in (None, 'replay', 'existing'):
+            client, server = socket.socketpair()
+            client.settimeout(5)
+            result = work / f'result-{failure}.json'
+            with (work / f'audit-{failure}').open('wb') as audit:
+                proc = subprocess.Popen([binary, 'launch', str(config_path), str(root),
+                    '--result-file', str(result), '--control-fd', str(server.fileno())],
+                    pass_fds=(server.fileno(),), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=audit)
+                server.close()
+                try:
+                    for sequence, expected in ((1, b'first'), (2, b'second')):
+                        assert select.select([proc.stdout], [], [], 5)[0]
+                        assert proc.stdout.readline() == b'checkpoint-ready\n'
+                        children = Path(f'/proc/{proc.pid}/task/{proc.pid}/children').read_text().split()
+                        assert len(children) == 1
+                        assert sorted(p.name for p in Path(f'/proc/{children[0]}/fd').iterdir()) == ['0', '1', '2']
+                        archive = work / f'snapshot-{failure}-{sequence}.tar'
+                        if sequence == 2 and failure == 'existing':
+                            archive.write_bytes(b'preserve')
+                        request_id = 1 if sequence == 2 and failure == 'replay' else sequence
+                        path = os.fsencode(archive)
+                        frame = b'GXS1' + struct.pack('<QH', request_id, len(path)) + path
+                        client.sendall(frame[:5])
+                        assert not select.select([client], [], [], .02)[0], 'partial request acknowledged'
+                        client.sendall(frame[5:])
+                        if sequence == 2 and failure:
+                            stdout, _ = proc.communicate(timeout=5)
+                            assert proc.returncode == 1 and not stdout
+                            assert json.loads(result.read_text())['outcome'] == 'supervisor-error'
+                            if failure == 'existing': assert archive.read_bytes() == b'preserve'
+                            else: assert not archive.exists()
+                            break
+                        assert receive(client, 20) == b'GXA1' + struct.pack('<QQ', sequence, 0)
+                        with tarfile.open(archive) as tar:
+                            assert tar.extractfile('work/checkpoint').read() == expected
+                        proc.stdin.write(b'G')
+                        proc.stdin.flush()
+                    if failure is None:
+                        stdout, _ = proc.communicate(timeout=5)
+                        assert proc.returncode == 0 and not stdout
+                        with tarfile.open(work / 'snapshot-None-1.tar') as tar:
+                            assert tar.extractfile('work/checkpoint').read() == b'first'
+                        assert json.loads(result.read_text())['code'] == 0
+                finally:
+                    client.close()
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate(timeout=5)
+        print('test-launch-checkpoints: PASS (snapshots, isolation, private fds, partial frames, replay, freshness)')
+
+
+if __name__ == '__main__':
+    main()

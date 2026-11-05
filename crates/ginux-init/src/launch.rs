@@ -34,7 +34,7 @@ pub enum Command {
     Devices(*const u8, *const u8),
     DeviceBench(*const u8, *const u8, *const u8),
     KernelViews(*const u8),
-    Launch(*const u8, *const u8, *const u8, *const u8),
+    Launch(*const u8, *const u8, *const u8, *const u8, Option<usize>),
     LaunchUsage,
     Usage,
 }
@@ -106,6 +106,7 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
         let root_path = unsafe { *argv.add(3) as *const u8 };
         let mut result_path: *const u8 = core::ptr::null();
         let mut export_path: *const u8 = core::ptr::null();
+        let mut control_fd = None;
         let mut i = 4;
         while i < argc {
             if i + 1 >= argc {
@@ -120,6 +121,11 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
                 result_path = value;
             } else if c_string_equals(option, b"--export-file") && export_path.is_null() {
                 export_path = value;
+            } else if c_string_equals(option, b"--control-fd") && control_fd.is_none() {
+                control_fd = parse_control_fd(value);
+                if control_fd.is_none() {
+                    return Some(Command::LaunchUsage);
+                }
             } else {
                 return Some(Command::LaunchUsage);
             }
@@ -130,10 +136,26 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
             root_path,
             result_path,
             export_path,
+            control_fd,
         ))
     } else {
         Some(Command::Usage)
     }
+}
+
+fn parse_control_fd(value: *const u8) -> Option<usize> {
+    let mut fd = 0usize;
+    for i in 0..6 {
+        let byte = unsafe { core::ptr::read_volatile(value.add(i)) };
+        if byte == 0 {
+            return (i != 0 && (3..=65535).contains(&fd)).then_some(fd);
+        }
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        fd = fd * 10 + (byte - b'0') as usize;
+    }
+    None
 }
 
 pub fn load_config(path: *const u8) -> DomainConfig {
@@ -310,9 +332,12 @@ pub fn launch_main(
     root_path: *const u8,
     result_path: *const u8,
     export_path: *const u8,
+    control_fd: Option<usize>,
 ) -> ! {
     stage_result_path(result_path);
     crate::storage_export::prepare(export_path)
+        .unwrap_or_else(|reason| launch_startup_fail(reason));
+    crate::checkpoint_control::prepare(control_fd)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     let config = launch_load_config(config_path);
     launch_validate(&config);
@@ -622,12 +647,12 @@ pub fn usage() -> ! {
     line_stderr(b"ginux: usage: ginux devices <config> <block>");
     line_stderr(b"ginux: usage: ginux device-bench <config> <block> <kind>");
     line_stderr(b"ginux: usage: ginux vfs <config> <rootfs> <index>");
-    line_stderr(b"ginux: usage: ginux launch <config> <root> [--result-file <fresh host path>] [--export-file <fresh tar path>]");
+    line_stderr(b"ginux: usage: ginux launch <config> <root> [--result-file <fresh host path>] [--export-file <fresh tar path>] [--control-fd <inherited socket>]");
     exit_process(2)
 }
 
 pub fn launch_usage() -> ! {
-    line_stderr(b"ginux: launch usage: launch <config> <root> [--result-file <fresh host path>] [--export-file <fresh tar path>]");
+    line_stderr(b"ginux: launch usage: launch <config> <root> [--result-file <fresh host path>] [--export-file <fresh tar path>] [--control-fd <inherited socket>]");
     exit_process(2)
 }
 

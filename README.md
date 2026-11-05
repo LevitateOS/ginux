@@ -525,3 +525,17 @@ not produce a valid successful export. Consumers must require both a successful
 completion result and a validated archive before publishing selected files.
 This is final export only; it does not provide retained storage or checkpoint
 recovery.
+
+A coordinator can additionally pass `--control-fd <inherited Unix stream socket>`
+for mid-run filesystem snapshots. The socket stays private to the supervisor.
+A bounded request is `GXS1`, a little-endian u64 sequence (strictly increasing),
+a little-endian u16 pathname length (1–512), and the non-NUL pathname bytes.
+The destination must be fresh. After writing, syncing and closing its archive,
+the supervisor replies `GXA1`, the matching little-endian u64 sequence, and a
+little-endian u64 zero status. Malformed requests, peer loss, and capture failure
+stop the domain. Partial requests are buffered within the fixed frame bound.
+The coordinator owns request deadlines, directory durability, matching runtime
+state, and workload acknowledgement. Snapshot capture serializes with all owned
+filesystem mutations; writable shared mappings/native backing descriptors are
+not exposed. This captures filesystem contents, not process memory or live
+handles. Startup restoration and complete recovery are separate capabilities.

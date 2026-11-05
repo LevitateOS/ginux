@@ -116,18 +116,27 @@ impl LaunchFs {
     }
 
     pub fn export(&self) -> Result<(), &'static [u8]> {
-        crate::storage_export::finish(|archive| {
-            for slot in 0..OBJECTS {
-                if let Some((path, metadata)) = self.fs.overlay_entry(slot) {
-                    archive.entry(path, metadata, |offset, buffer| {
-                        self.fs
-                            .read_overlay(slot, offset, buffer)
-                            .map_err(|_| b"export read failed".as_slice())
-                    })?;
-                }
+        crate::storage_export::finish(|archive| self.write_archive(archive))
+    }
+
+    pub fn snapshot(&self, path: *const u8) -> Result<(), &'static [u8]> {
+        crate::storage_export::capture(path, |archive| self.write_archive(archive))
+    }
+
+    fn write_archive(
+        &self,
+        archive: &mut crate::storage_export::Archive,
+    ) -> Result<(), &'static [u8]> {
+        for slot in 0..OBJECTS {
+            if let Some((path, metadata)) = self.fs.overlay_entry(slot) {
+                archive.entry(path, metadata, |offset, buffer| {
+                    self.fs
+                        .read_overlay(slot, offset, buffer)
+                        .map_err(|_| b"export read failed".as_slice())
+                })?;
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     pub fn teardown(&mut self) {

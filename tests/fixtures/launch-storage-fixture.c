@@ -20,6 +20,15 @@ long storage_main(word *stack)
 {
     word argc = *stack;
     char **argv = (char **)(stack + 1);
+    if (argc > 1 && argv[1][0] == 'c') {
+        long fd=DO(2,"/work/checkpoint",0102,0600);
+        CHECK(fd==3 && DO(1,fd,"first",5)==5,148);
+        CHECK(DO(1,1,"checkpoint-ready\n",17)==17 && DO(0,0,output,1)==1,149);
+        CHECK(DO(8,fd,0,0)==0 && DO(1,fd,"second",6)==6,150);
+        CHECK(DO(1,1,"checkpoint-ready\n",17)==17 && DO(0,0,output,1)==1,151);
+        CHECK(DO(3,fd,0,0)==0,152);
+        return 0;
+    }
     if (argc > 1 && (argv[1][0] == 'e' || argv[1][0] == 'f')) {
         CHECK(DO(83,"/out/empty",0755,0)==0,143);
         long fd=DO(2,"/out/product",0101,0700);

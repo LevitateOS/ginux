@@ -262,3 +262,7 @@ build-launch-script-fixture:
 
 test-launch-scripts:
 	python3 scripts/test-launch-scripts.py $(GINUX) .artifacts/launch/launch-script-fixture
+
+.PHONY: test-launch-checkpoints
+test-launch-checkpoints:
+	python3 scripts/test-launch-checkpoints.py $(GINUX) .artifacts/launch/launch-storage-fixture

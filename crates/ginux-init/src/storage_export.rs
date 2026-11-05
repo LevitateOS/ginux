@@ -11,6 +11,13 @@ pub fn prepare(path: *const u8) -> Result<(), Error> {
     if path.is_null() {
         return Ok(());
     }
+    unsafe {
+        EXPORT_FD = create(path)?;
+    }
+    Ok(())
+}
+
+fn create(path: *const u8) -> Result<isize, Error> {
     let mut length = 0;
     while length <= crate::launch::MAX_RESULT_PATH_LEN {
         if unsafe { core::ptr::read_volatile(path.add(length)) } == 0 {
@@ -44,10 +51,14 @@ pub fn prepare(path: *const u8) -> Result<(), Error> {
         }
         fd = duplicate;
     }
-    unsafe {
-        EXPORT_FD = fd;
-    }
-    Ok(())
+    Ok(fd)
+}
+
+pub fn capture(
+    path: *const u8,
+    write: impl FnOnce(&mut Archive) -> Result<(), Error>,
+) -> Result<(), Error> {
+    complete(create(path)?, write)
 }
 
 pub fn finish(write: impl FnOnce(&mut Archive) -> Result<(), Error>) -> Result<(), Error> {
@@ -58,6 +69,10 @@ pub fn finish(write: impl FnOnce(&mut Archive) -> Result<(), Error>) -> Result<(
     unsafe {
         EXPORT_FD = -1;
     }
+    complete(fd, write)
+}
+
+fn complete(fd: isize, write: impl FnOnce(&mut Archive) -> Result<(), Error>) -> Result<(), Error> {
     let mut archive = Archive(fd as usize);
     let result = write(&mut archive)
         .and_then(|_| archive.bytes(&[0; 1024]))

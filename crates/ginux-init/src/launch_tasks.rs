@@ -181,11 +181,16 @@ pub fn supervise(
     s.resume(0, 0, domain);
     let mut poll_tick = 0;
     loop {
-        let polling = s
-            .tasks
-            .iter()
-            .flatten()
-            .any(|t| t.blocked.is_some() && t.call.needs_poll_tick());
+        // No owned mutation can interleave with snapshot serialization here.
+        // Native mappings only hold readonly backing references.
+        if let Err(reason) = crate::checkpoint_control::poll(s.objects.filesystem) {
+            s.fail(domain, reason);
+        }
+        let polling = crate::checkpoint_control::enabled()
+            || s.tasks
+                .iter()
+                .flatten()
+                .any(|t| t.blocked.is_some() && t.call.needs_poll_tick());
         if polling {
             let now = crate::descriptors::monotonic_nanoseconds()
                 .unwrap_or_else(|_| s.fail(domain, b"readiness clock failed"))
