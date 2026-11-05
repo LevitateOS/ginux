@@ -396,8 +396,8 @@ impl LaunchFs {
             }
         }
         let (address, dirfd) = match r.orig_rax {
-            2 | 4 | 6 | 83 | 84 | 87 | 90 => (r.rdi, (-100i64) as u64),
-            257 | 258 | 262 | 263 | 268 | 332 => (r.rsi, r.rdi),
+            2 | 4 | 6 | 83 | 84 | 87 | 89 | 90 => (r.rdi, (-100i64) as u64),
+            257 | 258 | 262 | 263 | 267 | 268 | 332 => (r.rsi, r.rdi),
             _ => return None,
         };
         let path = match self.path(pid, address, dirfd) {
@@ -411,15 +411,22 @@ impl LaunchFs {
             2 => self.open(path.as_bytes(), r.rsi, r.rdx),
             257 => self.open(path.as_bytes(), r.rdx, r.r10),
             4 | 6 => self.stat(pid, path.as_bytes(), r.rsi, false),
+            // The owned namespace has no symlinks. Existing non-links must
+            // report EINVAL, not leak through to an absent native image path.
+            89 | 267 => self
+                .fs
+                .metadata(path.as_bytes())
+                .map_err(errno)
+                .and_then(|_| Err(-22)),
             262 => {
-                if r.r10 & !0x100 != 0 {
+                if r.r10 & !0x900 != 0 {
                     Err(-22)
                 } else {
                     self.stat(pid, path.as_bytes(), r.rdx, false)
                 }
             }
             332 => {
-                if r.rdx & !0x9100 != 0 {
+                if r.rdx & !0x7900 != 0 || r.rdx & 0x6000 == 0x6000 {
                     Err(-22)
                 } else {
                     self.stat(pid, path.as_bytes(), r.r8, true)

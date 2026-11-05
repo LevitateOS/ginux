@@ -429,7 +429,7 @@ impl DescriptorTable {
                 call.save(r);
                 self.rename_paths(pid, r, backends)
             }
-            258 | 262 | 263 | 268 | 269 | 332 | 439 => {
+            258 | 262 | 263 | 267 | 268 | 269 | 332 | 439 => {
                 call.save(r);
                 self.path_descriptor(pid, r, backends)
             }

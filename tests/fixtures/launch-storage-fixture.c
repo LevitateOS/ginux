@@ -73,6 +73,12 @@ long storage_main(word *stack)
     long fd = call(257, -100, (word)"build/nested/file", 0102|0400|02000000, 0644, 0, 0);
     CHECK(fd == 3, 18);
     CHECK(DO(1, fd, "hello", 5) == 5, 19);
+    CHECK(DO(89,"/work/build/nested/file",output,16)==-22,103);
+    CHECK(call(267,-100,(word)"/work/build/nested/file",(word)output,16,0,0)==-22,104);
+    CHECK(DO(89,"/work/build/nested/missing",output,16)==-2,105);
+    CHECK(call(262,-100,(word)"/work/build/nested/file",(word)meta,0x900,0,0)==0,106);
+    CHECK(call(332,-100,(word)"/work/build/nested/file",0x900,0x7ff,(word)meta,0)==0,107);
+    CHECK(call(332,-100,(word)"/work/build/nested/file",0x6000,0x7ff,(word)meta,0)==-22,108);
     // O_NOCTTY must not reject regular files, including descriptor reopening.
     long reader = DO(2, "/work/build/nested/file", 0400, 0);
     CHECK(reader >= 3 && DO(0, reader, output, 5) == 5, 99);
