@@ -21,6 +21,36 @@ long pipe_main(word *stack)
     word argc = *stack;
     char **argv = (char **)(stack + 1);
     int pair[2];
+    if (argc > 1 && argv[1][0] == 'p') {
+        CHECK(call(53,2,5,0,(word)pair,0,0)==-95,100);
+        CHECK(call(53,1,1,0,(word)pair,0,0)==-95,101);
+        CHECK(call(53,1,5,0,1,0,0)==-14,102);
+        CHECK(call(53,1,5|02004000,0,(word)pair,0,0)==0,103);
+        CHECK(pair[0]==3 && pair[1]==4,104);
+        CHECK(DO(72,pair[0],1,0)==1 && DO(72,pair[0],3,0)==04002,105);
+        CHECK(call(45,pair[0],(word)buffer,8,0,0,0)==-11,106);
+        CHECK(DO(1,pair[0],"abcdef",6)==6 && DO(1,pair[0],"xy",2)==2,107);
+        CHECK(call(45,pair[1],(word)buffer,2,0,0,0)==2 && buffer[0]=='a' && buffer[1]=='b',108);
+        CHECK(DO(0,pair[1],buffer,8)==2 && buffer[0]=='x' && buffer[1]=='y',109);
+        CHECK(call(44,pair[1],(word)"reply",5,0,0,0)==5,110);
+        CHECK(DO(0,pair[0],buffer,8)==5 && buffer[0]=='r',111);
+        CHECK(DO(1,pair[0],data,4097)==-90,112);
+        CHECK(DO(1,pair[0],1,8)==-14 && DO(0,pair[1],buffer,8)==-11,113);
+        CHECK(DO(5,pair[0],meta,0)==0 && (*(unsigned int *)(meta+24)&0170000)==0140000,114);
+        long alias=DO(32,pair[1],0,0);
+        CHECK(alias>=3 && DO(3,pair[1],0,0)==0,115);
+        CHECK(DO(1,pair[0],"last",4)==4 && DO(3,pair[0],0,0)==0,116);
+        CHECK(DO(0,alias,buffer,8)==4 && buffer[0]=='l' && DO(0,alias,buffer,8)==0,117);
+        CHECK(call(44,alias,(word)"x",1,0x4000,0,0)==-32,118);
+        CHECK(DO(3,alias,0,0)==0,119);
+        // Closed pairs release both directions and their capacity.
+        for (int i=0;i<20;i++) {
+            CHECK(call(53,1,5,0,(word)pair,0,0)==0,120);
+            CHECK(DO(3,pair[0],0,0)==0 && DO(3,pair[1],0,0)==0,121);
+        }
+        DO(1,1,"owned-pipes: PASS\n",18);
+        return 0;
+    }
     if (argc > 1 && argv[1][0] == 'b') {
         CHECK(DO(293,pair,0,0) == 0, 10);
         return DO(0,pair[0],buffer,1) == -11 ? 11 : 12;

@@ -64,6 +64,7 @@ const APPEND: u32 = 0o2000;
 #[derive(Clone, Copy)]
 struct Pipe {
     live: bool,
+    packet: bool,
     data: [u8; CAPACITY],
     head: usize,
     len: usize,
@@ -77,6 +78,7 @@ impl Pipe {
     const fn empty() -> Self {
         Self {
             live: false,
+            packet: false,
             data: [0; CAPACITY],
             head: 0,
             len: 0,
@@ -92,6 +94,7 @@ impl Pipe {
 struct PipeFd {
     pipe: usize,
     write: bool,
+    peer: Option<usize>,
 }
 
 pub enum ChannelResult {
@@ -130,7 +133,25 @@ impl LaunchChannels {
             }
         } else if !matches!(
             r.orig_rax,
-            0 | 1 | 3 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 32 | 33 | 72 | 74 | 75 | 77 | 91 | 292
+            0 | 1
+                | 3
+                | 5
+                | 8
+                | 16
+                | 17
+                | 18
+                | 19
+                | 20
+                | 32
+                | 33
+                | 44
+                | 45
+                | 72
+                | 74
+                | 75
+                | 77
+                | 91
+                | 292
         ) {
             return None;
         }
@@ -138,7 +159,12 @@ impl LaunchChannels {
             Ok(entry) => entry,
             Err(error) => return Some(ChannelResult::Ready(error)),
         };
-        if matches!(r.orig_rax, 0 | 1) {
+        if matches!(r.orig_rax, 0 | 1 | 44 | 45) {
+            if matches!(r.orig_rax, 44 | 45)
+                && (entry.peer.is_none() || r.r10 & !(0x40 | 0x4000) != 0 || r.r8 != 0 || r.r9 != 0)
+            {
+                return Some(ChannelResult::Ready(-95));
+            }
             return Some(match self.io(pid, slot, entry, r) {
                 Ok(result) => result,
                 Err(error) => ChannelResult::Ready(error),
@@ -149,7 +175,7 @@ impl LaunchChannels {
                 self.close(slot);
                 Ok(0)
             }
-            5 => Self::stat(pid, r.rsi, false, entry.pipe),
+            5 => Self::stat(pid, r.rsi, false, entry.pipe, entry.peer.is_some()),
             8 | 17 | 18 => Err(-29),
             16 if r.rsi == 0x5421 => {
                 // FIONBIO changes the shared open-file status, not this
@@ -176,7 +202,12 @@ impl LaunchChannels {
             72 => match r.rsi {
                 3 => Ok(self.flags(entry) as i64),
                 4 if r.rdx & !((NONBLOCK | APPEND | 3) as u64) == 0 => {
-                    let flags = (r.rdx as u32 & (NONBLOCK | APPEND)) | u32::from(entry.write);
+                    let flags = (r.rdx as u32 & (NONBLOCK | APPEND))
+                        | if entry.peer.is_some() {
+                            2
+                        } else {
+                            u32::from(entry.write)
+                        };
                     self.set_flags(entry, flags);
                     Ok(0)
                 }
@@ -193,6 +224,7 @@ impl LaunchChannels {
                         if r.orig_rax == 262 { r.rdx } else { r.r8 },
                         r.orig_rax == 332,
                         entry.pipe,
+                        entry.peer.is_some(),
                     )
                 }
             }
@@ -219,15 +251,52 @@ impl LaunchChannels {
             .ok_or(-24)?;
         let p = &mut self.pipes[pipe];
         p.live = true;
+        p.packet = false;
         p.head = 0;
         p.len = 0;
         p.readers = 1;
         p.writers = 1;
         p.read_flags = flags as u32 & NONBLOCK;
         p.write_flags = 1 | p.read_flags;
-        self.descriptors[first] = Some(PipeFd { pipe, write: false });
-        self.descriptors[second] = Some(PipeFd { pipe, write: true });
+        self.descriptors[first] = Some(PipeFd {
+            pipe,
+            write: false,
+            peer: None,
+        });
+        self.descriptors[second] = Some(PipeFd {
+            pipe,
+            write: true,
+            peer: None,
+        });
         Ok([PIPE_FD_BASE + first as u32, PIPE_FD_BASE + second as u32])
+    }
+
+    /// Connected local sequenced-packet endpoints: no names, networking,
+    /// descriptor transfer, or native workload sockets are involved.
+    pub fn allocate_packet_pair(&mut self, flags: u64) -> Result<[u32; 2], i64> {
+        let first = self.allocate(flags)?;
+        let second = match self.allocate(flags) {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.release(first[0]);
+                self.release(first[1]);
+                return Err(error);
+            }
+        };
+        let a = (first[0] - PIPE_FD_BASE) as usize;
+        let b = (second[0] - PIPE_FD_BASE) as usize;
+        let pa = self.descriptors[a].unwrap().pipe;
+        let pb = self.descriptors[b].unwrap().pipe;
+        self.descriptors[a].as_mut().unwrap().peer = Some(pb);
+        self.descriptors[b].as_mut().unwrap().peer = Some(pa);
+        // Transfer writer ownership into the opposite duplex endpoint.
+        self.descriptors[(first[1] - PIPE_FD_BASE) as usize] = None;
+        self.descriptors[(second[1] - PIPE_FD_BASE) as usize] = None;
+        for index in [pa, pb] {
+            self.pipes[index].packet = true;
+            self.pipes[index].read_flags |= 2;
+        }
+        Ok([first[0], second[0]])
     }
 
     pub fn release(&mut self, handle: u32) {
@@ -240,6 +309,15 @@ impl LaunchChannels {
         let slot = handle.checked_sub(PIPE_FD_BASE)? as usize;
         let entry = self.entry(slot).ok()?;
         let pipe = &self.pipes[entry.pipe];
+        if let Some(peer) = entry.peer {
+            let output = &self.pipes[peer];
+            return Some(
+                (if pipe.len != 0 { 0x41 } else { 0 })
+                    | (if CAPACITY - output.len >= 2 { 0x104 } else { 0 })
+                    | (if pipe.writers == 0 { 16 } else { 0 })
+                    | (if output.readers == 0 { 8 } else { 0 }),
+            );
+        }
         Some(if entry.write {
             (if pipe.len < CAPACITY { 0x104 } else { 0 }) | (if pipe.readers == 0 { 8 } else { 0 })
         } else {
@@ -269,17 +347,24 @@ impl LaunchChannels {
 
     fn close(&mut self, slot: usize) {
         if let Some(entry) = self.descriptors[slot].take() {
-            let p = &mut self.pipes[entry.pipe];
-            if entry.write {
-                p.writers -= 1;
-            } else {
-                p.readers -= 1;
+            self.close_direction(entry.pipe, entry.write);
+            if let Some(peer) = entry.peer {
+                self.close_direction(peer, true);
             }
-            if p.readers == 0 && p.writers == 0 {
-                p.live = false;
-                p.len = 0;
-                p.head = 0;
-            }
+        }
+    }
+
+    fn close_direction(&mut self, index: usize, write: bool) {
+        let pipe = &mut self.pipes[index];
+        if write {
+            pipe.writers -= 1;
+        } else {
+            pipe.readers -= 1;
+        }
+        if pipe.readers == 0 && pipe.writers == 0 {
+            pipe.live = false;
+            pipe.len = 0;
+            pipe.head = 0;
         }
     }
 
@@ -290,27 +375,42 @@ impl LaunchChannels {
         entry: PipeFd,
         r: &UserRegs,
     ) -> Result<ChannelResult, i64> {
-        let writing = r.orig_rax == 1;
-        if writing != entry.write {
+        let writing = matches!(r.orig_rax, 1 | 44);
+        if entry.peer.is_none() && writing != entry.write {
             return Err(-9);
         }
-        if r.rdx == 0 {
+        if r.rdx == 0 && entry.peer.is_none() {
             return Ok(ChannelResult::Ready(0));
         }
-        let nonblock = self.flags(entry) & NONBLOCK != 0;
+        let nonblock =
+            self.flags(entry) & NONBLOCK != 0 || matches!(r.orig_rax, 44 | 45) && r.r10 & 0x40 != 0;
         let fd = PIPE_FD_BASE + slot as u32;
         let mut buffer = [0u8; IO_SIZE];
-        let p = &mut self.pipes[entry.pipe];
+        let pipe = if writing {
+            entry.peer.unwrap_or(entry.pipe)
+        } else {
+            entry.pipe
+        };
+        let p = &mut self.pipes[pipe];
         if writing {
             if p.readers == 0 {
                 // Deliver the ordinary SIGPIPE to this supervised caller, not
                 // to the supervisor. Its disposition determines the outcome.
-                let _ = unsafe { syscall2(SYS_KILL, pid, 13) };
+                if r.orig_rax != 44 || r.r10 & 0x4000 == 0 {
+                    let _ = unsafe { syscall2(SYS_KILL, pid, 13) };
+                }
                 return Err(-32);
             }
-            let available = CAPACITY - p.len;
+            if p.packet && r.rdx > IO_SIZE as u64 {
+                return Err(-90);
+            }
+            let overhead = if p.packet { 2 } else { 0 };
+            let available = (CAPACITY - p.len).saturating_sub(overhead);
             let atomic = r.rdx <= IO_SIZE as u64;
-            if available == 0 || (atomic && available < r.rdx as usize) {
+            if CAPACITY - p.len < overhead
+                || (available == 0 && r.rdx != 0)
+                || (atomic && available < r.rdx as usize)
+            {
                 return Ok(if nonblock {
                     ChannelResult::Ready(-11)
                 } else {
@@ -321,6 +421,12 @@ impl LaunchChannels {
             let copied = copy_memory(pid, r.rsi, &mut buffer[..count], false)? as usize;
             if atomic && copied != count {
                 return Err(-14);
+            }
+            if p.packet {
+                for byte in (copied as u16).to_le_bytes() {
+                    p.data[(p.head + p.len) % CAPACITY] = byte;
+                    p.len += 1;
+                }
             }
             for byte in &buffer[..copied] {
                 p.data[(p.head + p.len) % CAPACITY] = *byte;
@@ -337,24 +443,34 @@ impl LaunchChannels {
                     ChannelResult::Blocked { fd }
                 });
             }
-            let count = r.rdx.min(IO_SIZE as u64).min(p.len as u64) as usize;
+            let overhead = if p.packet { 2 } else { 0 };
+            let length = if p.packet {
+                u16::from_le_bytes([p.data[p.head], p.data[(p.head + 1) % CAPACITY]]) as usize
+            } else {
+                p.len
+            };
+            let count = r.rdx.min(IO_SIZE as u64).min(length as u64) as usize;
             for (i, byte) in buffer[..count].iter_mut().enumerate() {
-                *byte = p.data[(p.head + i) % CAPACITY];
+                *byte = p.data[(p.head + overhead + i) % CAPACITY];
             }
             let copied = copy_memory(pid, r.rsi, &mut buffer[..count], true)? as usize;
-            p.head = (p.head + copied) % CAPACITY;
-            p.len -= copied;
+            if p.packet && copied != count {
+                return Err(-14);
+            }
+            let consumed = if p.packet { length + overhead } else { copied };
+            p.head = (p.head + consumed) % CAPACITY;
+            p.len -= consumed;
             Ok(ChannelResult::Ready(copied as i64))
         }
     }
 
-    fn stat(pid: usize, address: u64, statx: bool, pipe: usize) -> Result<i64, i64> {
+    fn stat(pid: usize, address: u64, statx: bool, pipe: usize, socket: bool) -> Result<i64, i64> {
         write_stat(
             pid,
             address,
             Stat {
                 inode: 0x2_0000_0000 + pipe as u64,
-                mode: 0o10600,
+                mode: if socket { 0o140600 } else { 0o10600 },
                 size: 0,
                 device_major: 0,
                 device_minor: 0,

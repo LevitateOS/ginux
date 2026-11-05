@@ -370,7 +370,7 @@ impl DescriptorTable {
                 call.save(r);
                 self.open(pid, r, backends, call)
             }
-            22 | 293 => {
+            22 | 53 | 293 => {
                 call.save(r);
                 self.pipe(pid, r, backends)
             }
@@ -402,7 +402,7 @@ impl DescriptorTable {
                     },
                 }
             }
-            0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 74 | 75 | 77 | 78 | 91 | 217 => {
+            0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 44 | 45 | 74 | 75 | 77 | 78 | 91 | 217 => {
                 call.save(r);
                 call.pinned
                     .map(Ok)
@@ -575,7 +575,17 @@ impl DescriptorTable {
         r: &UserRegs,
         backends: &mut Backends,
     ) -> Result<NativeDecision, i64> {
-        let flags = if r.orig_rax == 293 { r.rsi } else { 0 };
+        let packet = r.orig_rax == 53;
+        if packet && (r.rdi != 1 || r.rsi & !(CLOEXEC | 0o4000) != 5 || r.rdx != 0) {
+            return Err(-95);
+        }
+        let flags = if packet {
+            r.rsi & !5
+        } else if r.orig_rax == 293 {
+            r.rsi
+        } else {
+            0
+        };
         if flags & !(CLOEXEC | 0o4000) != 0 {
             return Err(-22);
         }
@@ -587,7 +597,12 @@ impl DescriptorTable {
                 return Err(e);
             }
         };
-        let handles = match backends.channels.allocate(flags & !CLOEXEC) {
+        let allocated = if packet {
+            backends.channels.allocate_packet_pair(flags & !CLOEXEC)
+        } else {
+            backends.channels.allocate(flags & !CLOEXEC)
+        };
+        let handles = match allocated {
             Ok(handles) => handles,
             Err(e) => {
                 self.entries[first] = None;
@@ -598,7 +613,7 @@ impl DescriptorTable {
         let mut bytes = [0u8; 8];
         bytes[..4].copy_from_slice(&(first as u32).to_le_bytes());
         bytes[4..].copy_from_slice(&(second as u32).to_le_bytes());
-        let copied = copy_memory(pid, r.rdi, &mut bytes, true);
+        let copied = copy_memory(pid, if packet { r.r10 } else { r.rdi }, &mut bytes, true);
         if copied != Ok(8) {
             backends.channels.release(handles[0]);
             backends.channels.release(handles[1]);

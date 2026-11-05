@@ -76,6 +76,7 @@ def main():
 
         invoke()
         invoke(assigned=True)
+        invoke(["packet"], assigned=True)
         invoke(['sigpipe'], sig=signal.SIGPIPE)
         invoke(['blocked-read'], sig=signal.SIGKILL, park=True)
         invoke(['write-full'], sig=signal.SIGKILL, park=True)
