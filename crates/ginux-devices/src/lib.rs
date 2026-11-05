@@ -575,6 +575,8 @@ pub trait TcpBackend {
     fn write(&mut self, handle: Self::Handle, input: &[u8]) -> Result<usize, NetworkError>;
     fn readiness(&mut self, handle: Self::Handle) -> Result<TcpReadiness, NetworkError>;
     fn socket_error(&mut self, handle: Self::Handle) -> Result<i32, NetworkError>;
+    fn endpoint(&mut self, handle: Self::Handle, peer: bool) -> Result<TcpEndpoint, NetworkError>;
+    fn set_nodelay(&mut self, handle: Self::Handle, enabled: bool) -> Result<(), NetworkError>;
     fn shutdown(
         &mut self,
         handle: Self::Handle,
@@ -705,6 +707,16 @@ impl<B: TcpBackend, const ENDPOINTS: usize, const SOCKETS: usize>
     pub fn socket_error(&mut self, socket: u32) -> Result<i32, NetworkError> {
         let handle = self.handle(socket)?;
         self.backend.socket_error(handle)
+    }
+
+    pub fn endpoint(&mut self, socket: u32, peer: bool) -> Result<TcpEndpoint, NetworkError> {
+        let handle = self.handle(socket)?;
+        self.backend.endpoint(handle, peer)
+    }
+
+    pub fn set_nodelay(&mut self, socket: u32, enabled: bool) -> Result<(), NetworkError> {
+        let handle = self.handle(socket)?;
+        self.backend.set_nodelay(handle, enabled)
     }
 
     pub fn shutdown(&mut self, socket: u32, read: bool, write: bool) -> Result<(), NetworkError> {
@@ -1185,6 +1197,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(network.socket_error(socket), Ok(0));
+        assert_eq!(network.endpoint(socket, true), Ok(endpoint));
+        let local = network.endpoint(socket, false).unwrap();
+        assert_eq!(local.family, TcpFamily::Ipv4);
+        assert_eq!(&local.address[..4], &[127, 0, 0, 1]);
+        assert_ne!(local.port, 0);
+        network.set_nodelay(socket, true).unwrap();
         assert_eq!(network.write(socket, b"ping"), Ok(4));
         let mut response = [0; 16];
         let count = loop {
