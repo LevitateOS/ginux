@@ -32,7 +32,9 @@ def main():
         (root / 'input').write_bytes(b'Q')
         config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"\nworkdir = "/"')
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
-        for mode in ('plain', 'optional', 'nested', 'relative', 'at', 'fork', 'vfork', 'clone', 'many'):
+        fork_modes = ('fork', 'vfork', 'clone', 'fd-fork', 'fd-vfork')
+        for mode in ('plain', 'optional', 'nested', 'relative', 'at', 'fork', 'vfork', 'clone', 'many',
+                     'descriptor', 'unlinked', 'dir-relative', 'dir-renamed', 'fd-fork', 'fd-vfork'):
             path, result, audit_path = [work / (mode + suffix) for suffix in ('.toml', '.json', '.audit')]
             path.write_text(config.replace('args = []', 'args = ' + json.dumps([mode])))
             with audit_path.open('wb') as audit:
@@ -49,14 +51,14 @@ def main():
                     assert select.select([proc.stdout], [], [], 10)[0], (mode, 'script exec stalled', audit_path.read_text())
                     assert proc.stdout.readline() == b'script-ready\n', (mode, audit_path.read_text())
                     target = initial
-                    if mode in ('fork', 'vfork', 'clone'):
+                    if mode in fork_modes:
                         descendants = children(initial)
                         assert len(descendants) == 1, descendants
                         target = descendants[0]
                     assert sorted(int(p.name) for p in Path(f'/proc/{target}/fd').iterdir()) == [0, 1, 2], ('private fd leaked', mode)
                     assert Path(f'/proc/{target}/exe').read_bytes() == Path(fixture).read_bytes()
                     stdout, _ = proc.communicate(b'G', timeout=10)
-                    expected = b'script: PASS\n' + (b'parent: PASS\n' if mode in ('fork', 'vfork', 'clone') else b'')
+                    expected = b'script: PASS\n' + (b'parent: PASS\n' if mode in fork_modes else b'')
                     assert proc.returncode == 0 and stdout == expected, (mode, proc.returncode, stdout, audit_path.read_text())
                     record = json.loads(result.read_text())
                     assert record == dict(version=1, outcome='exited', code=0, signal=None, generation=None), record

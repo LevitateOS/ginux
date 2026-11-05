@@ -492,7 +492,9 @@ impl DescriptorTable {
         } else {
             r.rdx &= !CLOEXEC;
         }
-        let decision = if r.orig_rax == 257 {
+        let decision = if let Some(decision) = self.open_descriptor_path(pid, r, backends) {
+            decision
+        } else if r.orig_rax == 257 {
             self.path_descriptor(pid, r, backends)
         } else {
             Ok(backends.claim(pid, r))
@@ -519,6 +521,52 @@ impl DescriptorTable {
                 other
             }
         }
+    }
+
+    fn open_descriptor_path(
+        &self,
+        pid: usize,
+        r: &UserRegs,
+        backends: &mut Backends,
+    ) -> Option<Result<NativeDecision, i64>> {
+        let address = if r.orig_rax == 2 { r.rdi } else { r.rsi };
+        let path = match read_path(pid, address) {
+            Ok(path) => path,
+            Err(error) => return Some(Err(error)),
+        };
+        let suffix = path.as_bytes().strip_prefix(b"/dev/fd/")?;
+        Some((|| {
+            let end = suffix
+                .iter()
+                .position(|b| *b == b'/')
+                .unwrap_or(suffix.len());
+            if end == 0 {
+                return Err(-2);
+            }
+            let mut fd = 0u64;
+            for digit in &suffix[..end] {
+                if !digit.is_ascii_digit() {
+                    return Err(-2);
+                }
+                fd = fd
+                    .checked_mul(10)
+                    .and_then(|n| n.checked_add((digit - b'0') as u64))
+                    .ok_or(-2)?;
+            }
+            // Path digits are names, not an i32 syscall argument. Never let a
+            // larger number wrap onto a different public descriptor.
+            if fd >= LIMIT as u64 {
+                return Err(-2);
+            }
+            let handle = match self.get(fd).map_err(|_| -2)?.handle {
+                Handle::Owned(handle) if (1048576..1048640).contains(&handle) => handle,
+                _ => return Err(-95),
+            };
+            let flags = if r.orig_rax == 2 { r.rsi } else { r.rdx };
+            let tail = &suffix[end..];
+            let handle = backends.filesystem.open_descriptor(handle, tail, flags)?;
+            Ok(ready(handle))
+        })())
     }
 
     fn pipe(

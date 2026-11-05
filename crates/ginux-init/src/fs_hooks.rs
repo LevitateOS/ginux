@@ -203,6 +203,36 @@ impl LaunchFs {
         self.check_exec(image)
     }
 
+    /// Readonly reopening through a public descriptor resolved by its owner.
+    /// It cannot import a native fd or grant host filesystem write authority.
+    pub fn open_descriptor(&mut self, handle: u32, suffix: &[u8], flags: u64) -> Result<i64, i64> {
+        let fd = handle
+            .checked_sub(FD_BASE as u32)
+            .filter(|n| *n < 64)
+            .ok_or(-95)? as i32
+            + 3;
+        const ALLOWED: u64 = 0o4000 | 0o100000 | 0o200000 | 0o400000 | 0o2000000;
+        if flags & !ALLOWED != 0 {
+            return Err(-13);
+        }
+        if !suffix.is_empty() {
+            let directory = self.fs.directory_path(fd).map_err(errno)?;
+            let path = normalize(directory, suffix)?;
+            if !self.owns_path(path.as_bytes()) {
+                return Err(-95);
+            }
+            return self.open(path.as_bytes(), flags, 0);
+        }
+        let metadata = self.fs.fstat(fd).map_err(errno)?;
+        if flags & 0o200000 != 0 && metadata.kind != NodeKind::Directory {
+            return Err(-20);
+        }
+        let status = if flags & 0o2000000 != 0 { O_CLOEXEC } else { 0 }
+            | if flags & 0o4000 != 0 { O_NONBLOCK } else { 0 };
+        let reopened = self.fs.reopen_readonly(fd, status).map_err(errno)?;
+        Ok(FD_BASE as i64 + reopened as i64 - 3)
+    }
+
     fn check_exec(&mut self, image: Executable) -> Result<Executable, i64> {
         let mut header = [0u8; 64];
         let result = self.read_executable(image, 0, &mut header).and_then(|n| {

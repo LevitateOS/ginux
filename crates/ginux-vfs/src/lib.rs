@@ -576,6 +576,34 @@ impl<
         Ok(slot as i32 + 3)
     }
 
+    /// Reopen the same object with a fresh read offset, including an unlinked
+    /// file. This is not dup: status flags and offsets belong to the new open
+    /// description. The caller supplies authority through an existing handle.
+    pub fn reopen_readonly(&mut self, descriptor: i32, flags: u32) -> Result<i32, VfsError> {
+        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+            return Err(VfsError::InvalidPath);
+        }
+        let source = self.descriptors[self.descriptor(descriptor)?];
+        let slot = self
+            .descriptors
+            .iter()
+            .position(|fd| !fd.open)
+            .ok_or(VfsError::DescriptorLimit)?;
+        self.descriptors[slot] = Descriptor {
+            open: true,
+            overlay: source.overlay,
+            object: source.object,
+            offset: 0,
+            readable: true,
+            writable: false,
+            close_on_exec: flags & O_CLOEXEC != 0,
+            append: false,
+            directory: source.directory,
+            nonblocking: flags & O_NONBLOCK != 0,
+        };
+        Ok(slot as i32 + 3)
+    }
+
     /// Open a directory description. Enumeration cookies share this object
     /// through the launcher's aliases, just like ordinary file offsets.
     pub fn open_directory(&mut self, path: &[u8], flags: u32) -> Result<i32, VfsError> {
@@ -1775,6 +1803,47 @@ mod tests {
             Err(VfsError::PermissionDenied)
         );
         vfs.close(root).unwrap();
+    }
+
+    #[test]
+    fn readonly_reopen_retains_deleted_objects_with_independent_offsets() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 4, 32, 4> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        let original = vfs.open(b"/program", O_CREATE | O_READ | O_WRITE).unwrap();
+        vfs.write(original, b"old bytes").unwrap();
+        let reopened = vfs
+            .reopen_readonly(original, O_CLOEXEC | O_NONBLOCK)
+            .unwrap();
+        let inode = vfs.fstat(reopened).unwrap().inode;
+        assert_eq!(vfs.seek(original, 0, 1), Ok(9));
+        let mut output = [0u8; 9];
+        assert_eq!(vfs.read(reopened, &mut output[..3]), Ok(3));
+        assert_eq!(&output[..3], b"old");
+        assert_eq!(vfs.seek(original, 0, 1), Ok(9));
+        assert_eq!(vfs.write(reopened, b"no"), Err(VfsError::PermissionDenied));
+        assert_eq!(vfs.truncate(reopened, 0), Err(VfsError::PermissionDenied));
+        vfs.unlink(b"/program").unwrap();
+        vfs.close(original).unwrap();
+        let replacement = vfs.open(b"/program", O_CREATE | O_WRITE).unwrap();
+        vfs.write(replacement, b"new").unwrap();
+        assert_ne!(vfs.fstat(replacement).unwrap().inode, inode);
+        vfs.close(replacement).unwrap();
+        let again = vfs.reopen_readonly(reopened, 0).unwrap();
+        vfs.close(reopened).unwrap();
+        assert_eq!(vfs.read(again, &mut output), Ok(9));
+        assert_eq!(&output, b"old bytes");
+        vfs.close(again).unwrap();
+        assert_eq!(
+            vfs.reopen_readonly(again, 0),
+            Err(VfsError::InvalidDescriptor)
+        );
+        let directory = vfs.open_directory(b"/", 0).unwrap();
+        let other = vfs.reopen_readonly(directory, 0).unwrap();
+        vfs.seek(directory, 1, 0).unwrap();
+        assert_eq!(vfs.seek(other, 0, 1), Ok(0));
+        vfs.close(directory).unwrap();
+        vfs.close(other).unwrap();
     }
 
     #[test]

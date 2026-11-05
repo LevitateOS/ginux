@@ -42,13 +42,41 @@ impl Script {
         } else {
             (r.rsi, r.rdx, r.r10)
         };
-        let path = read_path(host, path)?;
-        // Descriptor-based names need a virtual /dev/fd resolver. Fail before
-        // changing the image until that resolver belongs to the descriptor owner.
-        if path.is_empty()
-            || (r.orig_rax == 322 && path.as_bytes()[0] != b'/' && r.rdi as i32 != -100)
+        let mut path = read_path(host, path)?;
+        if r.orig_rax == 322
+            && (path.is_empty() || (path.as_bytes()[0] != b'/' && r.rdi as i32 != -100))
         {
-            return Err(-95);
+            // The interpreter reopens a public descriptor name, never the
+            // private memfd or the filesystem backend's integer handle.
+            let mut bytes = [0u8; MAX_PATH];
+            bytes[..8].copy_from_slice(b"/dev/fd/");
+            let mut digits = [0u8; 10];
+            let mut n = r.rdi as u32;
+            let mut length = 0;
+            loop {
+                digits[length] = b'0' + (n % 10) as u8;
+                length += 1;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            let mut end = 8;
+            for digit in digits[..length].iter().rev() {
+                bytes[end] = *digit;
+                end += 1;
+            }
+            if !path.is_empty() {
+                bytes[end] = b'/';
+                end += 1;
+                let next = end
+                    .checked_add(path.as_bytes().len())
+                    .filter(|end| *end < MAX_PATH)
+                    .ok_or(-36)?;
+                bytes[end..next].copy_from_slice(path.as_bytes());
+                end = next;
+            }
+            path = Text::from_bytes(&bytes[..end]).map_err(|_| -36)?;
         }
         let original_argc = count(host, argv)?.max(1);
         count(host, env)?;

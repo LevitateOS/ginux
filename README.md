@@ -394,8 +394,15 @@ syscall. It never enters the public descriptor table. Script pins release on
 interpreter commit; ELF pins retain their process lifetime.
 
 Absolute execve/execveat names and cwd-relative execve names are supported.
-Owned interpreters and descriptor-named scripts remain EOPNOTSUPP; a script
-whose required source/relative directory descriptor is CLOEXEC returns ENOENT.
+Owned scripts also support execveat on an open/unlinked file and relative to an
+owned directory descriptor, including a renamed directory. The interpreter sees
+the public /dev/fd/N[/path] name. Readonly open/openat resolves that name through
+the public table and creates a fresh owned description with offset zero; it can
+retain an unlinked object independently of its source description. It rejects
+writes, native/device/pipe descriptors and directory escapes rather than passing
+an integer to the native kernel. General /dev/fd metadata and procfs semantics
+are not provided. Owned interpreters remain EOPNOTSUPP; a script whose required
+source/relative directory descriptor is CLOEXEC returns ENOENT.
 Script argv/environment arrays are bounded to 4096 entries each. Only the new
 exec address space receives stack writes, including after vfork/CLONE_VM. A
 failure restoring that committed stack stops the domain rather than pretending

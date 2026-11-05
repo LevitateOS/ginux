@@ -9,7 +9,7 @@ static long call(long n, word a, word b, word c, word d, word e)
     return result;
 }
 #define DO(n,a,b,c) call(n,(word)(a),(word)(b),(word)(c),0,0)
-#define CHECK(expr,code) if (!(expr)) return code
+#define CHECK(expr,code) do { if (!(expr)) return code; } while (0)
 static char buffer[4096];
 static char *many[4098];
 static word length(const char *s) { word n=0; while(s[n]) ++n; return n; }
@@ -33,11 +33,13 @@ long script_main(word *stack)
         const char *name=argv[large?2:argc-2];
         int plain=equal(mode,"plain");
         int nested=equal(mode,"nested");
+        int descriptor=equal(mode,"descriptor") || equal(mode,"unlinked") || equal(mode,"fd-fork") || equal(mode,"fd-vfork");
+        int directory=equal(mode,"dir-relative") || equal(mode,"dir-renamed");
         CHECK(argc==(word)(large?4098:(plain?3:(nested?6:4))),11);
         if(large) for(word n=3;n<argc-1;++n) CHECK(equal(argv[n],"padding"),23);
         if (!plain) CHECK(equal(argv[nested?3:1],"option with spaces"),12);
         if (nested) CHECK(equal(argv[1],"nested option") && equal(argv[2],"/bin/wrapper"),13);
-        CHECK(equal(name,equal(mode,"relative")?"work/program":"/work/program"),14);
+        CHECK(equal(name,descriptor?"/dev/fd/6":(directory?"/dev/fd/6/program":(equal(mode,"relative")?"work/program":"/work/program"))),14);
         word *aux=(word *)(env+3); int found=0;
         while(aux[0]) { if(aux[0]==31) { CHECK(equal((char *)aux[1],name),15); found=1; } aux+=2; }
         CHECK(found,16);
@@ -46,7 +48,10 @@ long script_main(word *stack)
         long fd=DO(2,name,0,0); CHECK(fd>=3,19);
         CHECK(DO(0,fd,buffer,sizeof buffer)>2 && buffer[0]=='#' && buffer[1]=='!' && DO(3,fd,0,0)==0,20);
         // A script is readable data once its interpreter starts, not a running ELF pin.
-        fd=DO(2,name,1,0); CHECK(fd>=3 && DO(3,fd,0,0)==0,21);
+        fd=DO(2,name,1,0);
+        if(descriptor || directory) CHECK(fd==-13,21);
+        else CHECK(fd>=3 && DO(3,fd,0,0)==0,21);
+        if(descriptor) CHECK(DO(8,6,0,1)==7,24);
         CHECK(DO(1,1,"script-ready\n",13)==13 && DO(0,0,buffer,1)==1 && buffer[0]=='G',22);
         DO(1,1,"script: PASS\n",13); return 0;
     }
@@ -74,19 +79,40 @@ long script_main(word *stack)
     CHECK(publish("/work/owned-interpreter","#!/work/program\n")==0 && DO(59,"/work/owned-interpreter",next,next_env)==-95 && intact(),41);
     fd=DO(2,"/work/program",02000000,0);
     CHECK(fd==6 && call(322,fd,(word)"",(word)next,(word)next_env,0x1000)==-2 && intact(),42);
-    CHECK(DO(72,fd,2,0)==0 && call(322,fd,(word)"",(word)next,(word)next_env,0x1000)==-95 && DO(3,fd,0,0)==0,43);
+    CHECK(DO(72,fd,2,0)==0 && DO(8,fd,7,0)==7,43);
+    long reopened=DO(257,-999,"/dev/fd/6",02000000);
+    CHECK(reopened==7 && DO(72,reopened,1,0)==1 && DO(0,reopened,buffer,2)==2 && buffer[0]=='#' && buffer[1]=='!',52);
+    CHECK(DO(2,"/dev/fd/4294967302",0,0)==-2,61);
+    CHECK(DO(8,fd,0,1)==7 && DO(2,"/dev/fd/6",1,0)==-13 && DO(3,reopened,0,0)==0 && DO(3,fd,0,0)==0,53);
+    CHECK(DO(2,"/dev/fd/6",0,0)==-2 && DO(2,"/dev/fd/5",0,0)==-95 && DO(2,"/dev/fd/nope",0,0)==-2,54);
     fd=DO(2,"/work",02200000,0);
     CHECK(fd==6 && call(322,fd,(word)"program",(word)next,(word)next_env,0)==-2 && DO(3,fd,0,0)==0,51);
     CHECK(DO(1,1,"failed-ready\n",13)==13 && DO(0,0,buffer,1)==1 && buffer[0]=='G',44);
-    if(equal(mode,"fork") || equal(mode,"vfork") || equal(mode,"clone")) {
-        long child=equal(mode,"clone")?DO(56,0x4111,0,0):DO(equal(mode,"vfork")?58:57,0,0,0);
+    int descriptor=equal(mode,"descriptor") || equal(mode,"unlinked") || equal(mode,"fd-fork") || equal(mode,"fd-vfork");
+    int directory=equal(mode,"dir-relative") || equal(mode,"dir-renamed");
+    if(descriptor) {
+        CHECK(DO(2,"/work/program",0,0)==6 && DO(8,6,7,0)==7,55);
+        if(equal(mode,"unlinked")) CHECK(DO(87,"/work/program",0,0)==0,56);
+    }
+    if(directory) {
+        CHECK(DO(2,"/work",0200000,0)==6,57);
+        CHECK(DO(2,"/dev/fd/6/../../input",0,0)==-95,58);
+        if(equal(mode,"dir-renamed")) {
+            CHECK(DO(83,"/work/sub",0755,0)==0 && DO(82,"/work/program","/work/sub/program",0)==0,59);
+            CHECK(DO(3,6,0,0)==0 && DO(2,"/work/sub",0200000,0)==6 && DO(82,"/work/sub","/work/moved",0)==0,60);
+        }
+    }
+    if(equal(mode,"fork") || equal(mode,"vfork") || equal(mode,"clone") || equal(mode,"fd-fork") || equal(mode,"fd-vfork")) {
+        long child=equal(mode,"clone")?DO(56,0x4111,0,0):DO((equal(mode,"vfork") || equal(mode,"fd-vfork"))?58:57,0,0,0);
         CHECK(child>=0,45);
         if(child) {
             int status=-1; CHECK(DO(61,child,&status,0)==child && status==0 && intact(),46);
             DO(1,1,"parent: PASS\n",13); return 0;
         }
     }
-    if(equal(mode,"many")) { many[4095]=(char *)mode; many[4096]=0; DO(59,"/work/program",many,next_env); }
+    if(descriptor) call(322,6,(word)"",(word)next,(word)next_env,0x1000);
+    else if(directory) call(322,6,(word)"program",(word)next,(word)next_env,0);
+    else if(equal(mode,"many")) { many[4095]=(char *)mode; many[4096]=0; DO(59,"/work/program",many,next_env); }
     else if(equal(mode,"at")) call(322,-999,(word)"/work/program",(word)next,(word)next_env,0);
     else DO(59,equal(mode,"relative")?"work/program":"/work/program",next,next_env);
     return 47;
