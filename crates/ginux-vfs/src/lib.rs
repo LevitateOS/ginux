@@ -1091,6 +1091,13 @@ impl<
         self.descriptors.fill(Descriptor::empty());
     }
 
+    /// Exact live namespace identity for archive duplicate detection. This
+    /// never follows a symlink or resolves an alternate name for the caller.
+    pub fn named_overlay_slot(&self, path: &[u8]) -> Option<usize> {
+        self.find_overlay(path)
+            .filter(|slot| self.overlay[*slot].state != 2)
+    }
+
     /// Enumerate live writable entries while the caller has quiesced mutation.
     /// Slots are opaque and stable only until the next filesystem mutation.
     pub fn overlay_entry(&self, slot: usize) -> Option<(&[u8], FileMetadata)> {

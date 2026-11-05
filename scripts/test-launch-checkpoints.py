@@ -76,6 +76,11 @@ def main():
                         assert receive(client, 20) == b'GXA1' + struct.pack('<QQ', sequence, 0)
                         with tarfile.open(archive) as tar:
                             assert tar.extractfile('work/checkpoint').read() == expected
+                            assert tar.getmember('work/check-hardlink').islnk()
+                            assert tar.getmember('work/check-hardlink').linkname == 'work/checkpoint'
+                            assert tar.extractfile('work/check-hardlink').read() == expected
+                            assert tar.getmember('work/long-hardlink').islnk()
+                            assert tar.getmember('work/long-hardlink').linkname == 'work/' + 'a'*120
                             assert tar.getmember('work/check-link').linkname == 'checkpoint'
                             assert tar.getmember('work/long-link').linkname == '/work/' + 'a'*120
                             assert tar.getmember('work/absolute').linkname == '/usr/bin/x'
@@ -144,6 +149,39 @@ def main():
                 tar.addfile(entry)
                 if kind == 'duplicate': tar.addfile(entry)
             restore(archive, failure=True)
+        for name, target, target_type, extra in (
+                ('forward-hardlink', 'work/future', None, None),
+                ('absolute-hardlink', '/work/checkpoint', None, None),
+                ('traversing-hardlink', 'work/../checkpoint', None, None),
+                ('directory-hardlink', 'work/dir', tarfile.DIRTYPE, None),
+                ('symlink-hardlink', 'work/sym', tarfile.SYMTYPE, None),
+                ('hardlink-mode', 'work/source', tarfile.REGTYPE, 0o700)):
+            archive = work/(name+'.tar')
+            with tarfile.open(archive, 'w', format=tarfile.USTAR_FORMAT) as tar:
+                if target_type is not None:
+                    entry=tarfile.TarInfo(target)
+                    entry.type=target_type
+                    entry.mode=0o600
+                    if target_type==tarfile.SYMTYPE:
+                        entry.linkname='/work/source'
+                    tar.addfile(entry)
+                entry=tarfile.TarInfo('work/bad-alias')
+                entry.type=tarfile.LNKTYPE
+                entry.linkname=target
+                entry.mode=extra or 0o600
+                tar.addfile(entry)
+            restore(archive, failure=True)
+        # A size above the former 2 GiB ceiling is checked against the actual
+        # configured budget. It must reach payload validation, not that old cap.
+        archive = work/'large-header.tar'
+        entry = tarfile.TarInfo('work/large')
+        entry.mode=0o600
+        entry.size=2*1024*1024*1024+1
+        archive.write_bytes(entry.tobuf(format=tarfile.USTAR_FORMAT))
+        saved_config = config
+        config = config.replace('memory_mib = 256', 'memory_mib = 4096')
+        restore(archive, failure=True, error=b'truncated restore archive')
+        config = saved_config
         # A syntactically valid link must never redirect later restore entries.
         archive = work / 'link-parent.tar'
         with tarfile.open(archive, 'w', format=tarfile.USTAR_FORMAT) as tar:

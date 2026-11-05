@@ -5,7 +5,6 @@ use crate::storage_memory::MappedArray;
 use crate::supervisor::{syscall1, syscall2, syscall3, syscall4};
 use ginux_vfs::NodeKind;
 type Error = &'static [u8];
-const LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 struct Input(usize);
 impl Drop for Input {
     fn drop(&mut self) {
@@ -75,9 +74,18 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
     }
     let mut input = Input(fd as usize);
     let mut stat = [0u64; 18];
+    let archive_bound = files
+        .byte_limit()
+        .checked_add(
+            (files.capacity() as u64)
+                .checked_mul(3072)
+                .ok_or(b"restore archive bound overflow".as_slice())?,
+        )
+        .and_then(|n| n.checked_add(1024))
+        .ok_or(b"restore archive bound overflow".as_slice())?;
     if unsafe { syscall2(5, input.0, stat.as_mut_ptr() as usize) } < 0
         || stat[3] & 0o170000 != 0o100000
-        || stat[6] > LIMIT + 8 * 1024 * 1024
+        || stat[6] > archive_bound
     {
         return Err(b"restore archive is not a bounded regular file");
     }
@@ -136,12 +144,13 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
         }
         let kind = match header[156] {
             b'5' => NodeKind::Directory,
-            b'0' | 0 => NodeKind::File,
+            b'0' | 0 | b'1' => NodeKind::File,
             b'2' => NodeKind::Symlink,
             _ => return Err(b"unsupported restore entry kind"),
         };
         let directory = kind == NodeKind::Directory;
-        if link_len != 0 && kind != NodeKind::Symlink {
+        let hardlink = header[156] == b'1';
+        if link_len != 0 && kind != NodeKind::Symlink && !hardlink {
             return Err(b"restore link target on non-link");
         }
         let target = if link_len != 0 {
@@ -150,12 +159,18 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
             field(&header[157..257])
         };
         let mode = octal(&header[100..108])?;
-        if mode & !0o777 != 0 || (kind != NodeKind::File && size != 0) {
+        if mode & !0o777 != 0 || ((kind != NodeKind::File || hardlink) && size != 0) {
             return Err(b"invalid restore metadata");
         }
         total = total
-            .checked_add(size)
-            .filter(|n| *n <= LIMIT)
+            .checked_add(
+                size + if kind == NodeKind::Symlink {
+                    target.len() as u64
+                } else {
+                    0
+                },
+            )
+            .filter(|n| *n <= files.byte_limit())
             .ok_or(b"restore archive byte bound exceeded".as_slice())?;
         let mut path = [0u8; 256];
         path[0] = b'/';
@@ -188,6 +203,7 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
                 link: target,
                 mode: mode as u32,
                 length: size as usize,
+                hardlink,
             },
             &mut seen,
             |bytes| input.exact(bytes),

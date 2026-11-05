@@ -69,7 +69,11 @@ long storage_main(word *stack)
         path[126]=0;
         CHECK(DO(2,path,0,0)==3 && DO(0,3,output,4)==4 && output[0]=='l' && DO(3,3,0,0)==0,158);
         CHECK(DO(4,"/work/empty",meta,0)==0 && (*(word *)(meta+24)&0170000)==0040000,159);
+        CHECK(DO(4,"/work/checkpoint",meta,0)==0 && *(word *)(meta+16)==2,210);
+        word inode=*(word *)(meta+8);
+        CHECK(DO(4,"/work/check-hardlink",meta,0)==0 && *(word *)(meta+8)==inode && *(word *)(meta+16)==2,211);
         CHECK(DO(2,"/work/checkpoint",01001,0600)==3 && DO(1,3,"changed",7)==7 && DO(3,3,0,0)==0,160);
+        CHECK(DO(2,"/work/check-hardlink",0,0)==3 && DO(0,3,output,7)==7 && output[0]=='c' && DO(3,3,0,0)==0,212);
         CHECK(DO(89,"/work/check-link",output,sizeof output)==10 && output[0]=='c',189);
         CHECK(DO(2,"/work/check-link",0,0)==3 && DO(0,3,output,7)==7 && output[0]=='c' && DO(3,3,0,0)==0,190);
         CHECK(DO(89,"/work/long-link",output,sizeof output)==126 && output[0]=='/',191);
@@ -86,6 +90,8 @@ long storage_main(word *stack)
         for (word i=6;i<126;++i) path[i]='a';
         path[126]=0;
         CHECK(DO(2,path,0101,0640)==4 && DO(1,4,"long",4)==4 && DO(3,4,0,0)==0,163);
+        CHECK(DO(86,"/work/checkpoint","/work/check-hardlink",0)==0,213);
+        CHECK(DO(86,path,"/work/long-hardlink",0)==0,214);
         CHECK(DO(88,"checkpoint","/work/check-link",0)==0,194);
         CHECK(DO(88,path,"/work/long-link",0)==0,195);
         CHECK(DO(88,"/usr/bin/x","/work/absolute",0)==0,196);

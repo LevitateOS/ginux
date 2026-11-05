@@ -36,6 +36,7 @@ pub struct RestoreEntry<'a> {
     pub link: &'a [u8],
     pub mode: u32,
     pub length: usize,
+    pub hardlink: bool,
 }
 
 pub struct LaunchFs {
@@ -43,6 +44,7 @@ pub struct LaunchFs {
     prefixes: [Path; 8],
     count: usize,
     cwd: Option<i32>,
+    byte_limit: usize,
 }
 
 impl LaunchFs {
@@ -141,7 +143,12 @@ impl LaunchFs {
             prefixes,
             count,
             cwd: None,
+            byte_limit: limit,
         })
+    }
+
+    pub fn byte_limit(&self) -> u64 {
+        self.byte_limit as u64
     }
 
     pub fn capacity(&self) -> usize {
@@ -164,6 +171,7 @@ impl LaunchFs {
             link,
             mode,
             length,
+            hardlink,
         } = entry;
         let directory = kind == NodeKind::Directory;
         let canonical = normalize(b"/", path).map_err(|_| b"invalid restore path".as_slice())?;
@@ -211,6 +219,41 @@ impl LaunchFs {
             self.fs
                 .chmod(path, mode)
                 .map_err(|_| b"restore directory mode failed".as_slice())?;
+        } else if hardlink {
+            if link.is_empty()
+                || link[0] == b'/'
+                || link.contains(&0)
+                || link
+                    .split(|b| *b == b'/')
+                    .any(|p| p.is_empty() || p == b"." || p == b"..")
+            {
+                return Err(b"invalid restore hardlink target");
+            }
+            let mut target = [0u8; MAX_PATH];
+            if link.len() + 1 >= MAX_PATH {
+                return Err(b"restore hardlink target exceeds path bound");
+            }
+            target[0] = b'/';
+            target[1..1 + link.len()].copy_from_slice(link);
+            let target = &target[..link.len() + 1];
+            let slot = self
+                .fs
+                .named_overlay_slot(target)
+                .ok_or(b"restore hardlink target is not a prior entry".as_slice())?;
+            let (_, metadata) = self
+                .fs
+                .overlay_entry(slot)
+                .ok_or(b"restore hardlink target missing".as_slice())?;
+            if !seen[slot]
+                || metadata.kind != NodeKind::File
+                || metadata.mode != mode
+                || !self.owns_path(target)
+            {
+                return Err(b"restore hardlink target or mode is invalid");
+            }
+            self.fs
+                .hard_link(target, path, false)
+                .map_err(|_| b"restore hardlink creation failed".as_slice())?;
         } else if kind == NodeKind::Symlink {
             self.fs
                 .symlink(link, path)
@@ -249,15 +292,10 @@ impl LaunchFs {
         }
         // This launch view has a one-entry immutable root; live owned inode
         // numbers are stable slot+2 for the duration of startup import.
-        let inode = self
+        let slot = self
             .fs
-            .metadata_no_follow(path)
-            .map_err(|_| b"restore entry lookup failed".as_slice())?
-            .inode;
-        let slot = inode
-            .checked_sub(2)
-            .filter(|slot| *slot < self.fs.namespace_capacity() as u64)
-            .ok_or(b"invalid restored inode".as_slice())? as usize;
+            .named_overlay_slot(path)
+            .ok_or(b"restore entry lookup failed".as_slice())?;
         if seen[slot] {
             return Err(b"duplicate restore entry");
         }
@@ -279,8 +317,19 @@ impl LaunchFs {
     ) -> Result<(), &'static [u8]> {
         for slot in 0..self.fs.namespace_capacity() {
             if let Some((path, metadata)) = self.fs.overlay_entry(slot) {
-                if metadata.links > 1 {
-                    return Err(b"hardlink archive identity is not implemented");
+                let prior = if metadata.kind == NodeKind::File && metadata.links > 1 {
+                    (0..slot)
+                        .filter_map(|slot| self.fs.overlay_entry(slot))
+                        .find(|(_, prior)| {
+                            prior.kind == NodeKind::File && prior.inode == metadata.inode
+                        })
+                        .map(|(path, _)| path)
+                } else {
+                    None
+                };
+                if let Some(target) = prior {
+                    archive.hardlink(path, metadata, target)?;
+                    continue;
                 }
                 archive.entry(path, metadata, |offset, buffer| {
                     self.fs

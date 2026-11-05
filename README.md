@@ -582,19 +582,24 @@ little-endian u64 zero status. Malformed requests, peer loss, and capture failur
 stop the domain. Partial requests are buffered within the fixed frame bound.
 The coordinator owns request deadlines, directory durability, matching runtime
 state, and workload acknowledgement. Snapshot capture serializes with all owned
-filesystem mutations. Archives currently fail explicitly when live hardlinks
-would lose identity; hardlink archive records are not implemented.
-Writable shared mappings/native backing descriptors are
+filesystem mutations. Regular hardlinks are encoded once as payload and then
+as zero-size tar hardlink entries referring to an earlier name; inode identity
+survives restore. Writable shared mappings/native backing descriptors are
 not exposed. This captures filesystem contents, not process memory or live
 handles. Complete coordinator state pairing and recovery are separate capabilities.
 
 `--restore-file <snapshot tar>` imports a snapshot into the newly prepared owned
 filesystem before starting the workload. Import is bounded by the configured namespace capacity
-and 2 GiB of file data, additionally constrained by configured storage capacity.
+and the configured file-data budget. Archive bytes are bounded by that budget
+plus 3072 bytes per namespace slot and a 1024-byte terminator; at most three
+headers per slot cover GNU long names and link targets. There is no fixed 2 GiB
+ceiling. File payloads use ustar octal size fields (below 8 GiB per file).
 It restores regular files, directories, symlinks and permission bits, including
 long names and link targets emitted by Ginux. Absolute link targets are retained
-as data, never followed during import. It rejects hardlinks, symlink parents,
-traversal, duplicate entries,
+as data, never followed during import. Hardlinks require a previously imported
+regular-file name with matching mode; aliases share its storage. Import rejects
+forward, absolute or traversing hardlink targets, directory/symlink hardlink
+targets, symlink parents, traversal, duplicate entries,
 invalid metadata/checksums/terminators, truncated archives, and names outside the
 configured storage assignments. The source must be a regular file opened without
 following a symlink; import never changes it. Failure discards the new memory

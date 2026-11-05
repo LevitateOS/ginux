@@ -111,6 +111,25 @@ impl Archive {
         &mut self,
         path: &[u8],
         metadata: FileMetadata,
+        read: impl FnMut(usize, &mut [u8]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.entry_data(path, metadata, None, read)
+    }
+    pub fn hardlink(
+        &mut self,
+        path: &[u8],
+        metadata: FileMetadata,
+        target: &[u8],
+    ) -> Result<(), Error> {
+        self.entry_data(path, metadata, Some(target), |_, _| {
+            Err(b"hardlink has no payload")
+        })
+    }
+    fn entry_data(
+        &mut self,
+        path: &[u8],
+        metadata: FileMetadata,
+        hardlink: Option<&[u8]>,
         mut read: impl FnMut(usize, &mut [u8]) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let name = path
@@ -123,10 +142,14 @@ impl Archive {
         {
             return Err(b"invalid export path");
         }
-        let (kind, length) = match metadata.kind {
-            NodeKind::File => (b'0', metadata.size),
-            NodeKind::Directory => (b'5', 0),
-            NodeKind::Symlink => (b'2', 0),
+        let (kind, length) = if hardlink.is_some() {
+            (b'1', 0)
+        } else {
+            match metadata.kind {
+                NodeKind::File => (b'0', metadata.size),
+                NodeKind::Directory => (b'5', 0),
+                NodeKind::Symlink => (b'2', 0),
+            }
         };
         if name.len() > 100 {
             // GNU long names preserve any normalized VFS path, including a
@@ -136,7 +159,19 @@ impl Archive {
             self.bytes(&[0; 512][..512 - name.len()])?;
         }
         let mut target = [0; ginux_vfs::MAX_PATH];
-        let target = if metadata.kind == NodeKind::Symlink {
+        let target = if let Some(target) = hardlink {
+            let target = target
+                .strip_prefix(b"/")
+                .ok_or(b"invalid hardlink export target".as_slice())?;
+            if target.is_empty()
+                || target
+                    .split(|b| *b == b'/')
+                    .any(|p| p.is_empty() || p == b"." || p == b"..")
+            {
+                return Err(b"invalid hardlink export target");
+            }
+            target
+        } else if metadata.kind == NodeKind::Symlink {
             let length =
                 usize::try_from(metadata.size).map_err(|_| b"invalid export link".as_slice())?;
             if length == 0 || length > target.len() {
