@@ -24,12 +24,17 @@ use crate::launch::{
     c_string_equals, load_config, parse_argv, print_effective_config, read_file, read_index,
     Command, ELF_BYTES, VFS_INDEX_BYTES,
 };
+use crate::fs_hooks::{
+    chmod_at, resolve_at, DomainCwd, ResolveError, ResolvedKind, VfsDomainView,
+    MAX_CWD as DOMAIN_PATH_MAX, AT_FDCWD as DOMAIN_AT_FDCWD,
+};
 use crate::process_hooks::{
-    dup3_flags_valid, exec_mediated, fcntl_supported, pipe2_flags_valid, thread_supported,
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, FD_CLOEXEC, O_CLOEXEC, PTRACE_EVENT_CLONE,
-    PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEVFORK, SYS_ARCH_PRCTL, SYS_CLOSE,
-    SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_FCNTL, SYS_FUTEX, SYS_GETTID, SYS_GET_ROBUST_LIST, SYS_PIPE,
-    SYS_PIPE2, SYS_READ, SYS_RSEQ, SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS,
+    dup3_flags_valid, exec_bit_set, exec_mediated, fcntl_supported, parse_script_interp,
+    pipe2_flags_valid, thread_supported, ScriptInterp, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD,
+    FD_CLOEXEC, O_CLOEXEC, PTRACE_EVENT_CLONE, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE,
+    PTRACE_O_TRACEVFORK, SYS_ARCH_PRCTL, SYS_CLOSE, SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_FCNTL,
+    SYS_FUTEX, SYS_GETTID, SYS_GET_ROBUST_LIST, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_RSEQ,
+    SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS, SCRIPT_INTERP_MAX,
 };
 use crate::supervisor::{
     exit_process, line, ptrace, read_tracee_word, stopped, syscall0, syscall1, syscall2, syscall3,
@@ -62,7 +67,10 @@ use ginux_process::{
     EVENT_WRITE, WAIT_ALLOWED_OPTIONS, WNOHANG,
 };
 use ginux_runtime::{execute, AddressSpace, AuditAction, LoadError};
-use ginux_vfs::{BaseReader, Index, VfsError, VirtualFs, O_CREATE, O_READ, O_WRITE};
+use ginux_vfs::{
+    encode_header, encode_record, BaseReader, Entry, Index, NodeKind, VfsError, VirtualFs,
+    HEADER_SIZE, RECORD_SIZE, O_CREATE, O_READ, O_TRUNC, O_WRITE,
+};
 
 global_asm!(
     ".global _start",
@@ -155,6 +163,7 @@ unsafe extern "C" fn memcmp(
 
 #[no_mangle]
 extern "C" fn rust_main(initial_stack: *const usize) -> ! {
+    scan_stage_env(initial_stack);
     let argc = unsafe { *initial_stack };
     let argv = unsafe { initial_stack.add(1) };
     match parse_argv(argc, argv) {
@@ -474,6 +483,682 @@ fn process_fail(reason: &[u8]) -> ! {
     exit_process(1)
 }
 
+// G09 domain-executable loading for the process-native supervision loop.
+//
+// The loop below has no filesystem virtualization yet (all file syscalls
+// stay `-ENOSYS`), but a mediated `execve`/`execveat` that names a
+// domain-produced file must still load under supervision. This section
+// keeps one loop-global domain view for that path only:
+//
+// * The view is a `VirtualFs` over a seeded structural base (`/`, `/tmp`,
+//   `/tmp/g09` as directories) plus a writable overlay. It is populated
+//   once at startup from the host directory named
+//   by `GINUX_DOMAIN_STAGE` (a supervisor-side test seam, never visible to
+//   the workload): every regular file `<stage>/<name>` becomes the domain
+//   object `/tmp/g09/<name>` with mode `0o600` (no execute bit, so the
+//   tracee must `chmod` it through the domain first — the G08a path).
+//   Without the variable the view stays empty and every exec falls through
+//   to the host byte-identically.
+// * At a mediated exec entry the loop resolves the tracee path in this
+//   view. A missing path falls through to the host (existing host binaries
+//   and faithful host `ENOENT`); a directory or a file with no execute bit
+//   fails `-EACCES` without executing; a file with an execute bit is
+//   materialized back at its domain path — mode `0o700`, supervisor-owned
+//   bytes — and the host call then loads those exact bytes with the tracee
+//   still attached (same pid, exec-epoch bump, never detached). Scripts
+//   stage their domain interpreter first (bounded recursion); a malformed
+//   `#!` line fails `-ENOEXEC`; an interpreter the domain does not know is
+//   left for the host (for example `/bin/sh`).
+// * `chmod(2)` and plain `fchmodat(2)` are emulated against the same view
+//   through the G08a `chmod_at` path and never touch the host: a missing
+//   domain path reports `-ENOENT`.
+//
+// This is controlled native loading, not export-and-execute on the host:
+// the supervisor never runs the bytes itself, it only places the domain's
+// own bytes where the domain path names them so the supervised tracee's
+// `execve` succeeds. Host writes are confined to `/tmp/g09/` and only for
+// paths that resolved to loop-overlay objects; every other path behaves
+// exactly as before. The view shares one working directory (`/work`,
+// matching `DomainCwd::new`) across tasks because `chdir` stays
+// unmediated; per-task directories arrive with the G07 merge.
+
+/// `GINUX_DOMAIN_STAGE` value capacity: a host directory path.
+const STAGE_DIR_MAX: usize = 256;
+/// Domain prefix every staged object lives under, and the only prefix the
+/// loop ever materializes to on the host.
+const STAGE_PREFIX: &[u8] = b"/tmp/g09/";
+/// Overlay file capacity: at most this many staged executables.
+const EXEC_OVERLAY_FILES: usize = 8;
+/// Overlay object capacity: staged binaries and scripts fit here.
+const EXEC_FILE_SIZE: usize = 65536;
+/// Overlay descriptor capacity: staging reads hold one at a time.
+const EXEC_FDS: usize = 4;
+/// Host directory entries scanned per `getdents64` call while staging.
+const STAGE_READDIR_BYTES: usize = 2048;
+/// Host file bytes moved per read/write call while staging.
+const STAGE_IO_BYTES: usize = 4096;
+/// Deepest interpreter chain staged for one exec (script -> interp -> ...).
+const EXEC_INTERP_DEPTH: usize = 3;
+
+/// Raw host syscalls the no_std supervisor needs beyond `supervisor.rs`.
+const SYS_GETDENTS64_HOST: usize = 217;
+const SYS_MKDIR_HOST: usize = 83;
+const SYS_FCHMOD_HOST: usize = 91;
+/// Host `openat` flags for staging.
+const HOST_O_RDONLY: usize = 0;
+const HOST_O_WRONLY: usize = 1;
+const HOST_O_CREAT: usize = 64;
+const HOST_O_TRUNC: usize = 512;
+/// `linux_dirent64.d_type` for a regular file.
+const HOST_DIRENT_REGULAR: u8 = 8;
+/// Negative errnos without a `supervisor.rs` constant.
+const EACCES: i64 = 13;
+const ENOENT: i64 = 2;
+const EIO: i64 = 5;
+const EFAULT: i64 = 14;
+const ENOEXEC: i64 = 8;
+const ELOOP: i64 = 40;
+
+/// Staged-file mode after `chmod`: owner read/write/execute.
+const STAGED_MODE: usize = 0o700;
+
+type ExecVfs<'a> = VirtualFs<'a, EmptyBase, EXEC_OVERLAY_FILES, EXEC_FILE_SIZE, EXEC_FDS>;
+
+/// Empty backing image: the domain-executable view starts with no base
+/// entries, so every resolved file is a loop-overlay (domain-produced)
+/// object. The reader never runs; it only satisfies the `VirtualFs` bound.
+struct EmptyBase;
+
+impl BaseReader for EmptyBase {
+    fn read_at(&mut self, _offset: u64, _output: &mut [u8]) -> Result<(), VfsError> {
+        Err(VfsError::Io)
+    }
+}
+
+static mut STAGE_DIR: [u8; STAGE_DIR_MAX] = [0; STAGE_DIR_MAX];
+static mut STAGE_LEN: usize = 0;
+/// Seeded base image: a header plus directory records for `/`, `/tmp`,
+/// and `/tmp/g09`, so staged files have resolvable parents in the merged
+/// view. The base is structural only; every staged file is an overlay
+/// (domain-produced) object.
+static mut EXEC_BASE_BYTES: [u8; HEADER_SIZE + 3 * RECORD_SIZE] = [0; HEADER_SIZE + 3 * RECORD_SIZE];
+static mut EXEC_VFS: Option<ExecVfs<'static>> = None;
+static mut EXEC_READY: bool = false;
+static mut EXEC_CWD: DomainCwd = DomainCwd::new();
+static mut STAGE_BUF: [u8; EXEC_FILE_SIZE] = [0; EXEC_FILE_SIZE];
+
+/// Borrow the loop's domain view. `None` before `exec_domain_init` runs.
+fn with_exec_vfs<R>(op: impl FnOnce(&mut ExecVfs<'_>) -> R) -> Option<R> {
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(EXEC_VFS);
+        slot.as_mut().map(op)
+    }
+}
+
+/// Snapshot the loop's shared working directory for one resolution.
+fn exec_cwd_snapshot() -> DomainCwd {
+    unsafe { *core::ptr::addr_of!(EXEC_CWD) }
+}
+
+/// Remember the `GINUX_DOMAIN_STAGE` host directory from the supervisor's
+/// own environment. Runs in `rust_main` before dispatch: the value is a
+/// supervisor input like the config path (never workload-visible), so an
+/// absent, empty, or overlong variable simply leaves staging off.
+fn scan_stage_env(initial_stack: *const usize) {
+    const PREFIX: &[u8] = b"GINUX_DOMAIN_STAGE=";
+    let argc = unsafe { *initial_stack };
+    if argc > 512 {
+        return;
+    }
+    let mut cursor = unsafe { initial_stack.add(1 + argc + 1) };
+    let mut entries = 0;
+    while entries < 256 {
+        let entry = unsafe { *cursor };
+        if entry == 0 {
+            break;
+        }
+        let bytes = entry as *const u8;
+        let mut index = 0;
+        while index < PREFIX.len() + STAGE_DIR_MAX {
+            let byte = unsafe { *bytes.add(index) };
+            if index < PREFIX.len() {
+                if byte != PREFIX[index] {
+                    break;
+                }
+            } else if byte == 0 {
+                let len = index - PREFIX.len();
+                if len > 0 && len < STAGE_DIR_MAX {
+                    unsafe {
+                        let mut staged = 0;
+                        while staged < len {
+                            STAGE_DIR[staged] = *bytes.add(PREFIX.len() + staged);
+                            staged += 1;
+                        }
+                        STAGE_DIR[len] = 0;
+                        STAGE_LEN = len;
+                    }
+                }
+                return;
+            }
+            index += 1;
+        }
+        cursor = unsafe { cursor.add(1) };
+        entries += 1;
+    }
+}
+
+/// Build the loop's domain view over the seeded structural base. Runs once
+/// at supervision start; without it every domain lookup reports "no view"
+/// and exec falls through to the host.
+fn exec_domain_init() {
+    unsafe {
+        if EXEC_READY {
+            return;
+        }
+        let mut header = [0u8; HEADER_SIZE];
+        encode_header(3, &mut header);
+        let mut records = [[0u8; RECORD_SIZE]; 3];
+        let dirs: [&[u8]; 3] = [b"/", b"/tmp", b"/tmp/g09"];
+        let mut index = 0;
+        let mut valid = true;
+        while index < 3 {
+            if encode_record(
+                Entry {
+                    path: dirs[index],
+                    kind: NodeKind::Directory,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    size: 0,
+                    data_offset: 0,
+                    link: b"",
+                },
+                &mut records[index],
+            )
+            .is_err()
+            {
+                valid = false;
+            }
+            index += 1;
+        }
+        if !valid {
+            return;
+        }
+        let base = &mut *core::ptr::addr_of_mut!(EXEC_BASE_BYTES);
+        base[..HEADER_SIZE].copy_from_slice(&header);
+        let mut record = 0;
+        while record < 3 {
+            let start = HEADER_SIZE + record * RECORD_SIZE;
+            base[start..start + RECORD_SIZE].copy_from_slice(&records[record]);
+            record += 1;
+        }
+        let bytes: &'static [u8] = &*core::ptr::addr_of!(EXEC_BASE_BYTES);
+        if let Ok(index) = Index::new(bytes) {
+            EXEC_VFS = Some(VirtualFs::new(index, EmptyBase));
+            EXEC_READY = true;
+        }
+    }
+}
+
+/// Copy the staged host directory into a local buffer for one host call.
+fn stage_dir_snapshot(out: &mut [u8; STAGE_DIR_MAX]) -> usize {
+    unsafe {
+        let len = STAGE_LEN;
+        if len == 0 || len >= STAGE_DIR_MAX {
+            return 0;
+        }
+        out[..len].copy_from_slice(&STAGE_DIR[..len]);
+        out[len] = 0;
+        len
+    }
+}
+
+/// Load every regular file in the stage directory into the domain overlay
+/// as `/tmp/g09/<name>` with mode `0o600`. Bounds: at most
+/// `EXEC_OVERLAY_FILES` files, names that fit the domain path, contents
+/// that fit one overlay object; anything else is skipped with an audit
+/// line and never half-planted (short writes roll back via `unlink`).
+fn preload_domain_stage() {
+    let mut dir = [0u8; STAGE_DIR_MAX];
+    if stage_dir_snapshot(&mut dir) == 0 {
+        return;
+    }
+    let fd = unsafe {
+        syscall3(
+            SYS_OPENAT_HOST,
+            AT_FDCWD,
+            dir.as_ptr() as usize,
+            HOST_O_RDONLY,
+        )
+    };
+    if fd < 0 {
+        return;
+    }
+    // The materialization target exists before any exec can need it.
+    let _ = unsafe {
+        syscall2(
+            SYS_MKDIR_HOST,
+            b"/tmp\0".as_ptr() as usize,
+            0o755,
+        )
+    };
+    let _ = unsafe { syscall2(SYS_MKDIR_HOST, b"/tmp/g09\0".as_ptr() as usize, 0o755) };
+    let mut names = [0u8; STAGE_READDIR_BYTES];
+    let mut staged = 0u32;
+    loop {
+        let count = unsafe {
+            syscall3(
+                SYS_GETDENTS64_HOST,
+                fd as usize,
+                names.as_mut_ptr() as usize,
+                names.len(),
+            )
+        };
+        if count <= 0 || staged >= EXEC_OVERLAY_FILES as u32 {
+            break;
+        }
+        let mut offset = 0;
+        while offset < count as usize {
+            let reclen = u16::from_le_bytes([names[offset + 16], names[offset + 17]]) as usize;
+            if reclen < 19 || offset + reclen > count as usize {
+                break;
+            }
+            let dtype = names[offset + 18];
+            if dtype == HOST_DIRENT_REGULAR && staged < EXEC_OVERLAY_FILES as u32 {
+                let mut end = offset + 19;
+                while end < offset + reclen && names[end] != 0 {
+                    end += 1;
+                }
+                if end > offset + 19 && end < offset + reclen {
+                    stage_domain_file(&dir, &names[offset + 19..end], &mut staged);
+                }
+            }
+            if reclen == 0 {
+                break;
+            }
+            offset += reclen;
+        }
+    }
+    let _ = unsafe { syscall1(SYS_CLOSE_HOST, fd as usize) };
+    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-stage files=");
+    write_u64(staged as u64);
+    write_all(b"\n");
+}
+
+/// Plant one stage-directory file into the domain overlay, then drop every
+/// partial write on any bound or I/O failure.
+fn stage_domain_file(dir: &[u8; STAGE_DIR_MAX], name: &[u8], staged: &mut u32) {
+    if name.is_empty() || name.len() + STAGE_PREFIX.len() > DOMAIN_PATH_MAX {
+        return;
+    }
+    if name.contains(&b'/') {
+        return;
+    }
+    let mut domain = [0u8; DOMAIN_PATH_MAX];
+    domain[..STAGE_PREFIX.len()].copy_from_slice(STAGE_PREFIX);
+    domain[STAGE_PREFIX.len()..STAGE_PREFIX.len() + name.len()].copy_from_slice(name);
+    let domain_len = STAGE_PREFIX.len() + name.len();
+    // Host source path: `<stage>/<name>`.
+    let mut host = [0u8; STAGE_DIR_MAX + 258];
+    let mut host_len = 0;
+    while dir[host_len] != 0 && host_len < STAGE_DIR_MAX {
+        host[host_len] = dir[host_len];
+        host_len += 1;
+    }
+    if host_len == 0 || host_len + 1 + name.len() + 1 > host.len() {
+        return;
+    }
+    host[host_len] = b'/';
+    host_len += 1;
+    host[host_len..host_len + name.len()].copy_from_slice(name);
+    host_len += name.len();
+    host[host_len] = 0;
+    let source = unsafe {
+        syscall4(
+            SYS_OPENAT_HOST,
+            AT_FDCWD,
+            host.as_ptr() as usize,
+            HOST_O_RDONLY,
+            0,
+        )
+    };
+    if source < 0 {
+        return;
+    }
+    let planted = with_exec_vfs(|vfs| {
+        let descriptor = match vfs.open(
+            &domain[..domain_len],
+            O_CREATE | O_WRITE | O_TRUNC,
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(_) => return false,
+        };
+        let mut done = true;
+        loop {
+            let chunk = unsafe {
+                syscall3(
+                    SYS_READ_HOST,
+                    source as usize,
+                    core::ptr::addr_of_mut!(STAGE_BUF) as usize,
+                    STAGE_IO_BYTES.min(EXEC_FILE_SIZE),
+                )
+            };
+            if chunk < 0 {
+                done = false;
+                break;
+            }
+            if chunk == 0 {
+                break;
+            }
+            let bytes = unsafe { &STAGE_BUF[..chunk as usize] };
+            let mut written = 0;
+            while written < bytes.len() {
+                match vfs.write(descriptor, &bytes[written..]) {
+                    Ok(0) => break,
+                    Ok(count) => written += count,
+                    Err(_) => {
+                        done = false;
+                        break;
+                    }
+                }
+            }
+            if !done || written < bytes.len() {
+                done = false;
+                break;
+            }
+        }
+        let _ = vfs.close(descriptor);
+        if !done {
+            let _ = vfs.unlink(&domain[..domain_len]);
+        }
+        done
+    })
+    .unwrap_or(false);
+    let _ = unsafe { syscall1(SYS_CLOSE_HOST, source as usize) };
+    if planted {
+        *staged += 1;
+        write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-stage file=");
+        write_all(&domain[..domain_len]);
+        write_all(b"\n");
+    }
+}
+
+/// Create every missing parent directory of a canonical domain path on the
+/// host (`/tmp` and `/tmp/g09` for staged objects). Existing components
+/// report an error that the caller ignores; the later open fails honestly
+/// if a component is still missing.
+fn mkdir_domain_parents(canonical: &[u8]) {
+    let mut index = 1;
+    while index < canonical.len() {
+        if canonical[index] == b'/' {
+            let mut prefix = [0u8; DOMAIN_PATH_MAX + 1];
+            prefix[..index].copy_from_slice(&canonical[..index]);
+            prefix[index] = 0;
+            let _ = unsafe {
+                syscall2(SYS_MKDIR_HOST, prefix.as_ptr() as usize, 0o755)
+            };
+        }
+        index += 1;
+    }
+}
+
+/// Write `content` to the host file at its domain path with mode `0o700`.
+/// Only call with paths that resolved to loop-overlay objects under
+/// `STAGE_PREFIX`; the prefix check here is the last gate before any host
+/// write, so a non-staged path can never reach the host through this call.
+fn write_staged_host(canonical: &[u8], content: &[u8]) -> Result<(), i64> {
+    if canonical.len() < STAGE_PREFIX.len() || &canonical[..STAGE_PREFIX.len()] != STAGE_PREFIX {
+        return Err(-EIO);
+    }
+    if canonical.contains(&0) {
+        return Err(-EIO);
+    }
+    let mut path = [0u8; DOMAIN_PATH_MAX + 1];
+    path[..canonical.len()].copy_from_slice(canonical);
+    path[canonical.len()] = 0;
+    mkdir_domain_parents(canonical);
+    let fd = unsafe {
+        syscall4(
+            SYS_OPENAT_HOST,
+            AT_FDCWD,
+            path.as_ptr() as usize,
+            HOST_O_WRONLY | HOST_O_CREAT | HOST_O_TRUNC,
+            STAGED_MODE,
+        )
+    };
+    if fd < 0 {
+        return Err(-EIO);
+    }
+    let mut offset = 0;
+    while offset < content.len() {
+        let moved = unsafe {
+            syscall4(
+                SYS_PWRITE64,
+                fd as usize,
+                content.as_ptr().add(offset) as usize,
+                content.len() - offset,
+                offset,
+            )
+        };
+        if moved <= 0 {
+            let _ = unsafe { syscall1(SYS_CLOSE_HOST, fd as usize) };
+            return Err(-EIO);
+        }
+        offset += moved as usize;
+    }
+    // `openat` applied the mode through the caller's umask; pin it exactly.
+    if unsafe { syscall3(SYS_FCHMOD_HOST, fd as usize, STAGED_MODE, 0) } < 0 {
+        let _ = unsafe { syscall1(SYS_CLOSE_HOST, fd as usize) };
+        return Err(-EIO);
+    }
+    let _ = unsafe { syscall1(SYS_CLOSE_HOST, fd as usize) };
+    Ok(())
+}
+
+/// Read a NUL-terminated tracee string into `out`, returning its length
+/// without the NUL. Fails when no NUL appears within `DOMAIN_PATH_MAX`
+/// bytes or any word is unreadable; the caller then falls back to the
+/// host (exec) or reports `-EFAULT` (chmod), never inventing a path.
+fn read_tracee_cstr(host_pid: usize, addr: usize, out: &mut [u8; DOMAIN_PATH_MAX]) -> Result<usize, ()> {
+    let mut len = 0;
+    while len < DOMAIN_PATH_MAX {
+        let address = addr.wrapping_add(len);
+        let aligned = address & !0x7;
+        let shift = (address & 0x7) * 8;
+        let mut word = 0usize;
+        if ptrace(
+            PTRACE_PEEKTEXT,
+            host_pid,
+            aligned,
+            &mut word as *mut _ as usize,
+        ) < 0
+        {
+            return Err(());
+        }
+        let byte = ((word >> shift) & 0xff) as u8;
+        out[len] = byte;
+        if byte == 0 {
+            return Ok(len);
+        }
+        len += 1;
+    }
+    Err(())
+}
+
+/// Emulate `chmod`/`fchmodat` against the loop's domain view through the
+/// G08a path. The host is never touched: a resolved object gets its plain
+/// permission bits (including the execute bit a later `execve` needs), a
+/// path the domain does not know reports `-ENOENT`, and an unreadable
+/// tracee pointer reports `-EFAULT`.
+fn domain_chmod_entry(host_pid: usize, path_addr: usize, mode: u32) -> i64 {
+    let mut raw = [0u8; DOMAIN_PATH_MAX];
+    let len = match read_tracee_cstr(host_pid, path_addr, &mut raw) {
+        Ok(len) => len,
+        Err(()) => return -EFAULT,
+    };
+    let outcome = with_exec_vfs(|vfs| {
+        let cwd = exec_cwd_snapshot();
+        chmod_at(vfs, &cwd, DOMAIN_AT_FDCWD, &raw[..len], mode)
+    });
+    match outcome {
+        None => -EIO,
+        Some(Ok(())) => 0,
+        Some(Err(error)) => error.errno(),
+    }
+}
+
+/// What a mediated exec entry does with its tracee path: run the host call
+/// (unknown to the domain, or staged and ready) or deny without executing.
+enum DomainExec {
+    Host,
+    Deny(i64),
+}
+
+/// Decide a mediated `execve`/`execveat` against the loop's domain view.
+/// Missing domain paths fall through to the host so existing host binaries
+/// keep working and the host reports its own faithful `ENOENT`; an empty
+/// path is `-ENOENT` without executing; escapes and loops fail with the
+/// resolution errno; directories and files with no execute bit fail
+/// `-EACCES`; files with an execute bit are materialized (script
+/// interpreters first) and then run by the host call under supervision.
+fn domain_exec_entry(host_pid: usize, path_addr: usize) -> DomainExec {
+    let mut raw = [0u8; DOMAIN_PATH_MAX];
+    let len = match read_tracee_cstr(host_pid, path_addr, &mut raw) {
+        Ok(len) => len,
+        Err(()) => return DomainExec::Host,
+    };
+    if len == 0 {
+        return DomainExec::Deny(-ENOENT);
+    }
+    let view = with_exec_vfs(|vfs| {
+        let cwd = exec_cwd_snapshot();
+        let mut canonical = [0u8; DOMAIN_PATH_MAX];
+        let resolved = resolve_at(
+            cwd.path(),
+            DOMAIN_AT_FDCWD,
+            &raw[..len],
+            &mut VfsDomainView::new(&mut *vfs),
+            &mut canonical,
+        );
+        match resolved {
+            Err(ResolveError::NotFound) => None,
+            Err(error) => Some(Err(error.errno())),
+            Ok((_, ResolvedKind::Directory)) => Some(Err(-EACCES)),
+            Ok((length, ResolvedKind::File)) => {
+                Some(materialize_domain_file(vfs, &canonical[..length], 0))
+            }
+            // `resolve_at` follows the final link, so this arm is
+            // unreachable; treat it like a miss rather than staging.
+            Ok((_, ResolvedKind::Symlink)) => None,
+        }
+    });
+    match view {
+        // No domain view, or a path the domain does not know: the host
+        // call runs exactly as before this task.
+        None => DomainExec::Host,
+        Some(None) => DomainExec::Host,
+        Some(Some(Ok(()))) => {
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-domain-staged path=");
+            write_all(&raw[..len]);
+            write_all(b"\n");
+            DomainExec::Host
+        }
+        Some(Some(Err(errno))) => {
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-domain-denied errno=");
+            write_i64(-errno);
+            write_all(b" path=");
+            write_all(&raw[..len]);
+            write_all(b"\n");
+            DomainExec::Deny(errno)
+        }
+    }
+}
+
+/// Stage one resolved domain file for supervised loading: check the stored
+/// mode, stage a domain-resident script interpreter first (bounded depth,
+/// `-ELOOP` past it), write the exact domain bytes at the domain path, and
+/// report readiness. `canonical` must already resolve to a live file; the
+/// `STAGE_PREFIX` gate inside `write_staged_host` still refuses anything
+/// else. Directory kinds and files with no execute bit fail `-EACCES`.
+fn materialize_domain_file(
+    vfs: &mut ExecVfs<'_>,
+    canonical: &[u8],
+    depth: usize,
+) -> Result<(), i64> {
+    if depth > EXEC_INTERP_DEPTH {
+        return Err(-ELOOP);
+    }
+    let meta = vfs.metadata_merged(canonical).map_err(|_| -EIO)?;
+    if meta.kind != NodeKind::File {
+        return Err(-EACCES);
+    }
+    if !exec_bit_set(meta.mode) {
+        return Err(-EACCES);
+    }
+    let descriptor = vfs.open(canonical, O_READ).map_err(|_| -EIO)?;
+    let mut total = 0usize;
+    loop {
+        let rest = unsafe { &mut STAGE_BUF[total..] };
+        match vfs.read(descriptor, rest) {
+            Ok(0) => break,
+            Ok(count) => total += count,
+            Err(_) => {
+                let _ = vfs.close(descriptor);
+                return Err(-EIO);
+            }
+        }
+    }
+    let _ = vfs.close(descriptor);
+    // A script stages its interpreter before itself so the kernel finds it
+    // at the domain path when it parses the `#!` line. Interpreters the
+    // domain does not know stay for the host (`/bin/sh` keeps working);
+    // malformed lines fail `-ENOEXEC` like the kernel would.
+    let mut interp = [0u8; SCRIPT_INTERP_MAX];
+    match parse_script_interp(unsafe { &STAGE_BUF[..total] }, &mut interp) {
+        ScriptInterp::NotScript => {}
+        ScriptInterp::Bad => return Err(-ENOEXEC),
+        ScriptInterp::Interp(length) => {
+            let cwd = exec_cwd_snapshot();
+            let mut resolved = [0u8; DOMAIN_PATH_MAX];
+            let outcome = resolve_at(
+                cwd.path(),
+                DOMAIN_AT_FDCWD,
+                &interp[..length],
+                &mut VfsDomainView::new(&mut *vfs),
+                &mut resolved,
+            );
+            match outcome {
+                Err(ResolveError::NotFound) => {}
+                Err(error) => return Err(error.errno()),
+                Ok((_, ResolvedKind::Directory)) => return Err(-EACCES),
+                Ok((resolved_len, ResolvedKind::File)) => {
+                    materialize_domain_file(vfs, &resolved[..resolved_len], depth + 1)?;
+                }
+                Ok((_, ResolvedKind::Symlink)) => return Err(-EIO),
+            }
+        }
+    }
+    // Re-read after interpreter staging: recursion reuses `STAGE_BUF`.
+    let staged: &[u8] = unsafe {
+        let descriptor = vfs.open(canonical, O_READ).map_err(|_| -EIO)?;
+        let mut total = 0usize;
+        loop {
+            let rest = &mut STAGE_BUF[total..];
+            match vfs.read(descriptor, rest) {
+                Ok(0) => break,
+                Ok(count) => total += count,
+                Err(_) => {
+                    let _ = vfs.close(descriptor);
+                    return Err(-EIO);
+                }
+            }
+        }
+        let _ = vfs.close(descriptor);
+        &STAGE_BUF[..total]
+    };
+    write_staged_host(canonical, staged)
+}
+
 #[derive(Clone, Copy)]
 struct NativeProcessTask {
     host_pid: usize,
@@ -555,6 +1240,11 @@ fn process_native_tracee(fixture_path: *const u8) -> ! {
 }
 
 fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
+    // G09: the loop's domain-executable view lives for the whole run and
+    // costs nothing when `GINUX_DOMAIN_STAGE` is absent (empty view, every
+    // exec falls through byte-identically).
+    exec_domain_init();
+    preload_domain_stage();
     // L01: arm host cancellation before the first blocking wait. The tracee
     // was forked by the caller, so its post-execve dispositions stay at
     // their defaults; only this supervisor observes the flag.
@@ -1449,8 +2139,53 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     // event records the virtual transition. Shapes needing
                     // descriptor-table plumbing never execute and fail here.
                     if exec_mediated(registers.orig_rax, registers.rdi, registers.r8) {
-                        current.exec_pending = true;
-                        current.exec_event_seen = false;
+                        // G09: a domain file stages its bytes at the domain
+                        // path first (or denies with a faithful errno); the
+                        // host call below then loads them under supervision.
+                        // `execve` takes the path in `rdi`, `execveat` in
+                        // `rsi`.
+                        let path_addr = if registers.orig_rax == 59 {
+                            registers.rdi
+                        } else {
+                            registers.rsi
+                        };
+                        match domain_exec_entry(host_pid, path_addr as usize) {
+                            DomainExec::Host => {
+                                current.exec_pending = true;
+                                current.exec_event_seen = false;
+                            }
+                            DomainExec::Deny(errno) => {
+                                current.result = errno;
+                                current.override_result = true;
+                                registers.orig_rax = u64::MAX;
+                            }
+                        }
+                    } else {
+                        current.result = -ENOSYS;
+                        current.override_result = true;
+                        registers.orig_rax = u64::MAX;
+                    }
+                }
+                90 | 268 => {
+                    // G09: `chmod` (90) and plain `fchmodat` (268) run
+                    // against the loop's domain view through the G08a path
+                    // and never touch the host. `fchmodat` shapes needing
+                    // descriptor-table plumbing (non-CWD dirfd, nonzero
+                    // flags) stay `-ENOSYS` like the exec gate above.
+                    let plain = registers.orig_rax == 90
+                        || (registers.rdi == AT_FDCWD as u64 && registers.r10 == 0);
+                    if plain {
+                        // `chmod` takes (path, mode); `fchmodat` takes
+                        // (dirfd, path, mode, flags).
+                        let (path_addr, mode) = if registers.orig_rax == 90 {
+                            (registers.rdi, registers.rsi)
+                        } else {
+                            (registers.rsi, registers.rdx)
+                        };
+                        current.result =
+                            domain_chmod_entry(host_pid, path_addr as usize, mode as u32);
+                        current.override_result = true;
+                        registers.orig_rax = u64::MAX;
                     } else {
                         current.result = -ENOSYS;
                         current.override_result = true;

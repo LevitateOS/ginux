@@ -64,6 +64,20 @@
 //! `F_DUPFD`/`F_GETFD`/`F_SETFD`/`F_DUPFD_CLOEXEC` `fcntl` commands run
 //! (anything else gets `-ENOSYS`). Fork/clone inheritance and exec scrub
 //! live in the loop next to the fork-event and exec-event paths.
+//!
+//! G09 connects domain-produced executables to the same supervised exec
+//! mediation. The supervision loop (in `main.rs`, the only other file this
+//! lane edits this round) resolves a mediated `execve`/`execveat` path in
+//! the loop's domain view: a file with any execute bit set is materialized
+//! at its domain path so the host kernel loads those exact bytes with the
+//! tracee still attached (same pid, exec-epoch bump, never detached); a
+//! directory or a file with no execute bit fails with `-EACCES` and never
+//! executes; a path the domain does not know falls through to the host so
+//! existing host binaries keep working byte-identically; a script whose
+//! interpreter resolves in the domain is staged the same way, while a
+//! malformed script line fails with `-ENOEXEC`. This file owns only the
+//! register-free policy predicates ([`exec_bit_set`], [`parse_script_interp`]);
+//! the tracee-memory and VFS orchestration lives in the loop.
 
 use crate::supervisor::{ENOSYS, SYS_FORK};
 
@@ -271,6 +285,11 @@ pub fn claim(syscall: u64, rdi: u64, _rsi: u64, _rdx: u64) -> Option<i64> {
 /// still attached. Any other `execveat` shape (non-CWD dirfd, or nonzero
 /// flags such as `AT_EMPTY_PATH`) needs descriptor-table plumbing from
 /// G05a/G07 and is denied so it never executes on the host.
+///
+/// G09 keeps this gate unchanged and adds a domain step after it in the
+/// supervision loop: a mediated path that resolves to a domain file is
+/// staged (see [`exec_bit_set`]) before the host call runs, so staging
+/// never widens the shapes that execute.
 pub fn exec_mediated(syscall: u64, dirfd: u64, flags: u64) -> bool {
     if syscall == SYS_EXECVE {
         return true;
@@ -279,4 +298,64 @@ pub fn exec_mediated(syscall: u64, dirfd: u64, flags: u64) -> bool {
         return dirfd == AT_FDCWD && flags == 0;
     }
     false
+}
+
+/// Permission bits that make a domain file executable: any of owner, group,
+/// or other execute, matching the kernel's check shape for a domain without
+/// user/group distinction. The loop denies a domain
+/// file with none of these set (`-EACCES`) before the host runs.
+pub const EXEC_MODE_BITS: u32 = 0o111;
+
+/// Whether a domain file's stored mode carries any execute bit.
+pub fn exec_bit_set(mode: u32) -> bool {
+    mode & EXEC_MODE_BITS != 0
+}
+
+/// Capacity of the script-interpreter path buffer: one domain path.
+pub const SCRIPT_INTERP_MAX: usize = 256;
+
+/// What a staged file's first bytes say about script execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScriptInterp {
+    /// Not a script (fewer than two bytes or no `#!` prefix): the kernel
+    /// loads the bytes as an executable image.
+    NotScript,
+    /// A script whose interpreter path fills `out[..len]`.
+    Interp(usize),
+    /// A `#!` line with no interpreter (empty or overlong): the kernel
+    /// would report `ENOEXEC`, so the loop denies without executing.
+    Bad,
+}
+
+/// Parse the interpreter out of script bytes: `#!`, optional blanks, then
+/// the interpreter up to the first blank or newline, mirroring the kernel's
+/// `binfmt_script` split (one interpreter word; the loop leaves any
+/// trailing argument to the kernel). The caller stages the `out[..len]`
+/// path when it resolves in the domain and lets the host resolve the rest
+/// (for example `/bin/sh`), exactly like the staged script itself.
+pub fn parse_script_interp(content: &[u8], out: &mut [u8; SCRIPT_INTERP_MAX]) -> ScriptInterp {
+    if content.len() < 2 || content[0] != b'#' || content[1] != b'!' {
+        return ScriptInterp::NotScript;
+    }
+    let mut index = 2;
+    while index < content.len() && (content[index] == b' ' || content[index] == b'\t') {
+        index += 1;
+    }
+    let start = index;
+    while index < content.len()
+        && content[index] != b' '
+        && content[index] != b'\t'
+        && content[index] != b'\n'
+    {
+        index += 1;
+    }
+    if index == start {
+        return ScriptInterp::Bad;
+    }
+    let len = index - start;
+    if len > SCRIPT_INTERP_MAX {
+        return ScriptInterp::Bad;
+    }
+    out[..len].copy_from_slice(&content[start..index]);
+    ScriptInterp::Interp(len)
 }
