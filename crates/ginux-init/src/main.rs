@@ -542,7 +542,6 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         process_native_fail(domain, root_host_pid, b"process initial resume failed");
     }
     line(b"GINUX_NATIVE_PROCESS: virtual-init=1 host-pid=unexposed ptrace=attached");
-    let mut native_child_exits = 0usize;
 
     loop {
         status = 0;
@@ -579,14 +578,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             if let Some(entry) = tasks[task_index].as_mut() {
                 entry.tracing = false;
             }
-            if task.virtual_id != root_virtual && exit_status == 23 {
-                native_child_exits += 1;
-            }
             if task.virtual_id == root_virtual {
-                if exit_status != 0
-                    || native_child_exits != 32
-                    || tasks.iter().flatten().any(|entry| entry.tracing)
-                {
+                if exit_status != 0 || tasks.iter().flatten().any(|entry| entry.tracing) {
                     write_all(b"GINUX_NATIVE_PROCESS: root-exit=");
                     write_i64(exit_status as i64);
                     write_all(b" tracing-remaining=");
@@ -600,8 +593,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 if domain.task_exited(true).is_err() {
                     process_native_fail(domain, root_host_pid, b"native domain exit failed");
                 }
-                line(b"GINUX_NATIVE_PROCESS: fork=mediated iterations=32 concurrent-children=2 child=ptrace-attached pid-translation=PASS");
-                line(b"GINUX_NATIVE_PROCESS: wait=translated child-exits=32 exit-status=23 tasks=0 cleanup=PASS");
+                line(b"GINUX_NATIVE_PROCESS: fork=mediated child=ptrace-attached pid-translation=PASS");
+                line(b"GINUX_NATIVE_PROCESS: wait=translated child-status=real tasks=0 cleanup=PASS");
                 line(b"GATE7_NATIVE_PROCESS: PASS");
                 exit_process(0);
             }
@@ -796,11 +789,19 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 write_all(b" virtual-result=");
                 write_u64(waited_virtual.pid as u64);
                 write_all(b"\n");
-                if processes
+                let completed = processes
                     .wait(current.virtual_id, Some(waited_virtual.pid))
-                    .is_err()
+                    .unwrap_or_else(|_| {
+                        process_native_fail(domain, root_host_pid, b"virtual wait failed")
+                    });
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: wait child-status=");
+                write_i64(completed.status as i64);
+                write_all(b"\n");
+                if registers.rsi != 0
+                    && store_tracee_status(host_pid, registers.rsi as usize, completed.status)
+                        .is_err()
                 {
-                    process_native_fail(domain, root_host_pid, b"virtual wait failed");
+                    process_native_fail(domain, root_host_pid, b"wait status store failed");
                 }
                 registers.rax = waited_virtual.pid as u64;
                 registers.rdi = current.translated_rdi;
@@ -888,6 +889,35 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             process_native_fail(domain, root_host_pid, b"process syscall dispatch failed");
         }
     }
+}
+
+/// Encode the virtual child's real status into the Linux wait status word
+/// the parent's `wait4` reported through, without touching neighboring tracee
+/// memory. The kernel already wrote the host child's status there at the
+/// syscall exit stop; ordinary parent/child ownership requires the parent to
+/// observe the virtual child's status instead. Signal-vs-exit distinction
+/// stays with G05; here the parent observes the real numeric status the same
+/// way a shell reports it.
+fn store_tracee_status(host_pid: usize, user_status: usize, child_status: i32) -> Result<(), ()> {
+    let encoded = (child_status as u32 & 0xff) << 8;
+    let aligned = user_status & !0x7;
+    let shift = (user_status & 0x7) * 8;
+    let mut word = 0usize;
+    if ptrace(
+        PTRACE_PEEKTEXT,
+        host_pid,
+        aligned,
+        &mut word as *mut _ as usize,
+    ) < 0
+    {
+        return Err(());
+    }
+    let mask = 0xffff_ffffusize << shift;
+    let merged = (word & !mask) | ((encoded as usize) << shift);
+    if ptrace(PTRACE_POKETEXT, host_pid, aligned, merged) < 0 {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn process_native_fail(domain: &mut Domain, root_pid: usize, reason: &[u8]) -> ! {
