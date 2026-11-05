@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import select
 import subprocess
 import sys
 import tempfile
@@ -34,8 +35,26 @@ def main():
             path.write_text(config)
             result = work / 'result.json'
             result.unlink(missing_ok=True)
-            proc = subprocess.run([binary, 'launch', str(path), str(root), '--result-file', str(result)],
-                                  capture_output=True, timeout=20)
+            command = [binary, 'launch', str(path), str(root), '--result-file', str(result)]
+            if args == ['mapping']:
+                with (work / 'mapping.audit').open('wb') as audit:
+                    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=audit)
+                    try:
+                        assert select.select([proc.stdout], [], [], 10)[0], 'mapping workload did not become ready'
+                        assert proc.stdout.readline() == b'mapping-ready\n'
+                        children = Path(f'/proc/{proc.pid}/task/{proc.pid}/children').read_text().split()
+                        assert len(children) == 1, children
+                        native = sorted(p.name for p in Path(f'/proc/{children[0]}/fd').iterdir())
+                        assert native == ['0', '1', '2'], ('mapping leaked native fds', native)
+                        stdout, _ = proc.communicate(b'G', timeout=10)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.communicate(timeout=5)
+                proc.stdout = stdout
+                proc.stderr = (work / 'mapping.audit').read_bytes()
+            else:
+                proc = subprocess.run(command, capture_output=True, timeout=20)
             record = json.loads(result.read_text())
             if proc.returncode != expected:
                 sys.exit(f'launch failed: {proc.returncode}\n{proc.stderr.decode()}\n{record}')
@@ -52,6 +71,7 @@ def main():
             invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], [])
         invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['quota'])
         invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['bounds'], memory=16)
+        invoke(['memory:/work', 'memory:/out'], ['mapping'])
         invoke([], ['no-storage'])
         for assignment in ['disk0', 'memory:/', 'memory:/proc', 'memory:/sys/x', 'memory:/dev',
                            'memory:/bin', 'memory:/work/../out', 'memory:/work/', 'memory:work']:

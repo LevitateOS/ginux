@@ -272,6 +272,24 @@ impl DescriptorTable {
         None
     }
 
+    pub fn native_descriptor_set(&self) -> [bool; LIMIT] {
+        let mut used = [false; LIMIT];
+        for descriptor in self.entries.iter().flatten() {
+            if let Handle::Native { fd, .. } = descriptor.handle {
+                used[fd as usize] = true;
+            }
+        }
+        used
+    }
+
+    pub fn mapping_file(&self, fd: u64) -> Result<Option<u32>, i64> {
+        match self.get(fd)?.handle {
+            Handle::Native { .. } => Ok(None),
+            Handle::Owned(handle) if (1048576..1048640).contains(&handle) => Ok(Some(handle)),
+            _ => Err(-95),
+        }
+    }
+
     pub fn exec_descriptor(&self, fd: u64) -> Result<ExecDescriptor, i64> {
         match self.get(fd)?.handle {
             Handle::Native { fd, console: false } => Ok(ExecDescriptor::Native(fd)),

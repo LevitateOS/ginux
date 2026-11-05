@@ -1,7 +1,8 @@
 //! Configured-launch ephemeral memory storage. Bytes and descriptors belong to
 //! the supervisor; no writable host descriptor is installed in the workload.
 //! Directory descriptions and executable references share the VFS owner.
-//! Retained storage and guest file mappings are not provided.
+//! Retained storage is not provided. File mappings use the supervised backing
+//! transfer in file_mapping; writable shared mappings remain unsupported.
 
 use crate::storage_memory::MemoryStorage;
 use crate::supervisor::UserRegs;
@@ -315,6 +316,16 @@ impl LaunchFs {
             return Err(-13);
         }
         Ok(true)
+    }
+
+    pub fn mapping_reference(&mut self, handle: u32) -> Result<usize, i64> {
+        let slot = handle
+            .checked_sub(FD_BASE as u32)
+            .filter(|n| *n < 64)
+            .ok_or(-9)?;
+        let (storage, object) = self.fs.readable_storage(slot as i32 + 3).map_err(errno)?;
+        let fd = storage.backing(object).map_err(errno)?;
+        crate::file_mapping::readonly_reference(fd)
     }
 
     pub fn executable_name(&self, image: Executable) -> Result<Path, i64> {

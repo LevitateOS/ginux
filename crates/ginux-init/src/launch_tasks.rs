@@ -80,6 +80,7 @@ struct Task {
     blocked: Option<UserRegs>,
     sequence: u64,
     exec: Option<Exec>,
+    mapping: Option<crate::file_mapping::MappingCall>,
     waiter: Option<usize>,
 }
 
@@ -103,6 +104,7 @@ struct Supervisor<'a> {
     sequence: u64,
     wake_needed: bool,
     root_status: Option<i32>,
+    tearing_down: bool,
 }
 
 pub fn supervise(
@@ -146,6 +148,7 @@ pub fn supervise(
         sequence: 0,
         wake_needed: false,
         root_status: None,
+        tearing_down: false,
     };
     s.groups[0] = Some(DescriptorGroup {
         table: descriptors,
@@ -167,6 +170,7 @@ pub fn supervise(
         blocked: None,
         sequence: 0,
         exec: None,
+        mapping: None,
         waiter: None,
     });
     if ptrace(PTRACE_SETOPTIONS, root, 0, OPTIONS) < 0 {
@@ -268,17 +272,19 @@ pub fn supervise(
         }
         let signal = ((status >> 8) & 255) as usize;
         if signal != 133 {
-            if s.task(index).exec.is_some_and(|e| {
-                matches!(
-                    e.stage,
-                    ExecStage::Sync
-                        | ExecStage::Reenter
-                        | ExecStage::Create
-                        | ExecStage::Close
-                        | ExecStage::Retire
-                        | ExecStage::RetireReenter
-                )
-            }) {
+            if s.task(index).mapping.is_some()
+                || s.task(index).exec.is_some_and(|e| {
+                    matches!(
+                        e.stage,
+                        ExecStage::Sync
+                            | ExecStage::Reenter
+                            | ExecStage::Create
+                            | ExecStage::Close
+                            | ExecStage::Retire
+                            | ExecStage::RetireReenter
+                    )
+                })
+            {
                 s.fail(domain, b"signal interrupted exec descriptor setup");
             }
             let mut info = [0u64; 16];
@@ -427,6 +433,13 @@ impl Supervisor<'_> {
         self.run(index, r, domain);
     }
     fn entry(&mut self, index: usize, r: &mut UserRegs, domain: &mut Domain) {
+        if let Some(mapping) = &self.task(index).mapping {
+            match mapping.entry(r) {
+                Ok(next) => self.run(index, &next, domain),
+                Err(reason) => self.fail(domain, reason),
+            }
+            return;
+        }
         if let Some(exec) = self.task(index).exec {
             match exec.stage {
                 ExecStage::Reenter => {
@@ -498,6 +511,79 @@ impl Supervisor<'_> {
             self.task_mut(index).blocked = Some(original);
             audit_write(b"park surface=descriptor-snapshot\n");
             return;
+        }
+        if r.orig_rax == 9 && r.r10 & 0x20 == 0 {
+            match self.table(index).mapping_file(r.r8) {
+                Ok(Some(handle)) => {
+                    if r.r10 & 3 == 0 || r.r10 & 3 != 2 && r.rdx & 2 != 0 {
+                        self.emulate(index, r, -95, domain);
+                        return;
+                    }
+                    if r.rsi == 0 || r.r9 & 4095 != 0 {
+                        self.emulate(index, r, -22, domain);
+                        return;
+                    }
+                    if self
+                        .tasks
+                        .iter()
+                        .flatten()
+                        .any(|task| task.group == parent_group && task.call.native_mutation())
+                    {
+                        self.task_mut(index).blocked = Some(original);
+                        audit_write(b"park surface=mapping-descriptors\n");
+                        return;
+                    }
+                    // Cleanup replays the syscall and restores private stack
+                    // scratch. A fixed map must not replace either region.
+                    if r.r10 & 0x10 != 0 {
+                        let end = r
+                            .rsi
+                            .checked_add(4095)
+                            .map(|n| n & !4095)
+                            .and_then(|n| r.rdi.checked_add(n));
+                        let Some(end) = end else {
+                            self.emulate(index, r, -22, domain);
+                            return;
+                        };
+                        if r.rdi < r.rsp.saturating_sub(256) && end > r.rsp.saturating_sub(512)
+                            || r.rdi < r.rip && end > r.rip.saturating_sub(2)
+                        {
+                            self.emulate(index, r, -95, domain);
+                            return;
+                        }
+                    }
+                    let backing = match self.objects.filesystem.mapping_reference(handle) {
+                        Ok(fd) => fd,
+                        Err(error) => {
+                            self.emulate(index, r, error, domain);
+                            return;
+                        }
+                    };
+                    self.groups[parent_group].as_mut().unwrap().creating = Some(index);
+                    let mapping = match crate::file_mapping::MappingCall::new(
+                        self.task(index).host,
+                        original,
+                        backing,
+                        self.table(index).native_descriptor_set(),
+                    ) {
+                        Ok(mapping) => mapping,
+                        Err(reason) => self.fail(domain, reason),
+                    };
+                    let next = match mapping.entry(r) {
+                        Ok(next) => next,
+                        Err(reason) => self.fail(domain, reason),
+                    };
+                    self.task_mut(index).mapping = Some(mapping);
+                    audit_write(b"mediate surface=owned-file-mapping\n");
+                    self.run(index, &next, domain);
+                    return;
+                }
+                Err(error) => {
+                    self.emulate(index, r, error, domain);
+                    return;
+                }
+                Ok(None) => {}
+            }
         }
         match r.orig_rax {
             89 | 267 => {
@@ -702,6 +788,7 @@ impl Supervisor<'_> {
                     blocked: None,
                     sequence: 0,
                     exec: None,
+                    mapping: None,
                     waiter: None,
                 });
                 self.task_mut(index).pending = Pending::Fork {
@@ -1164,6 +1251,22 @@ impl Supervisor<'_> {
         self.resume(parent, 0, domain);
     }
     fn syscall_exit(&mut self, index: usize, r: &mut UserRegs, domain: &mut Domain) {
+        if let Some(mut mapping) = self.task_mut(index).mapping.take() {
+            match mapping.exit(self.task(index).host, r) {
+                Ok(crate::file_mapping::Progress::Run(next)) => {
+                    self.task_mut(index).mapping = Some(mapping);
+                    self.run(index, &next, domain);
+                }
+                Ok(crate::file_mapping::Progress::Done(next)) => {
+                    let group = self.task(index).group;
+                    self.groups[group].as_mut().unwrap().creating = None;
+                    self.wake_needed = true;
+                    self.run(index, &next, domain);
+                }
+                Err(reason) => self.fail(domain, reason),
+            }
+            return;
+        }
         if let Some(exec) = self.task(index).exec {
             match exec.stage {
                 ExecStage::Sync => {
@@ -1498,8 +1601,12 @@ impl Supervisor<'_> {
             }
         }
         self.task_mut(index).alive = false;
+        let mapping_aborted = self.task_mut(index).mapping.take().is_some();
         self.task_mut(index).wait_status = Some(status);
         self.task_mut(index).blocked = None;
+        if mapping_aborted && !self.tearing_down {
+            self.fail(domain, b"task died during private mapping transaction");
+        }
         if let Err(reason) = self.tasks[index]
             .as_mut()
             .unwrap()
@@ -1536,6 +1643,7 @@ impl Supervisor<'_> {
         }
     }
     fn teardown(&mut self, domain: &mut Domain) {
+        self.tearing_down = true;
         for t in self
             .tasks
             .iter()

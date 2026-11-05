@@ -20,6 +20,52 @@ long storage_main(word *stack)
 {
     word argc = *stack;
     char **argv = (char **)(stack + 1);
+    if (argc > 1 && argv[1][0] == 'm') {
+        long fd=DO(2,"/work/mapped",0102,0600);
+        CHECK(fd==3 && DO(77,fd,8192,0)==0,110);
+        CHECK(DO(1,fd,"old",3)==3 && DO(8,fd,4096,0)==4096 && DO(1,fd,"second",6)==6,111);
+        CHECK(call(9,0,8192,3,1,fd,0)==-95,112);
+        long shared=call(9,0,4096,1,1,fd,0);
+        CHECK(shared>0 && *(volatile char *)shared=='o',132);
+        CHECK(DO(10,shared,4096,3)==-13 && DO(11,shared,4096,0)==0,133);
+        CHECK(call(9,0,8192,3,2,fd,1)==-22,113);
+        word stack_pointer; __asm__ volatile("mov %%rsp,%0":"=r"(stack_pointer));
+        CHECK(call(9,(stack_pointer-16384)&~4095UL,32768,3,0x12,fd,0)==-95,134);
+        long mapped=call(9,0,8192,3,2,fd,0);
+        CHECK(mapped>0,114);
+        volatile char *bytes=(volatile char *)mapped;
+        CHECK(bytes[0]=='o' && bytes[4096]=='s' && bytes[8191]==0,115);
+        CHECK(DO(8,fd,0,1)==4102,116);
+        CHECK(DO(8,fd,0,0)==0 && DO(1,fd,"new",3)==3 && bytes[0]=='n',117);
+        bytes[0]='C';
+        CHECK(DO(8,fd,0,0)==0 && DO(0,fd,output,3)==3 && output[0]=='n',118);
+        long child=DO(57,0,0,0);
+        CHECK(child>=0,119);
+        if (!child) {
+            CHECK(DO(8,fd,4096,0)==4096 && DO(1,fd,"fresh",5)==5,120);
+            DO(60,0,0,0); __builtin_unreachable();
+        }
+        int status;
+        CHECK(DO(61,child,&status,0)==child && status==0 && bytes[4096]=='f',121);
+        child=DO(57,0,0,0);
+        CHECK(child>=0,122);
+        if (!child) {
+            CHECK(DO(77,fd,0,0)==0,123);
+            volatile char fault=bytes[4096]; (void)fault;
+            DO(60,99,0,0); __builtin_unreachable();
+        }
+        CHECK(DO(61,child,&status,0)==child && (status&127)==7,124);
+        CHECK(DO(77,fd,8192,0)==0 && bytes[4096]==0,125);
+        CHECK(DO(11,mapped,8192,0)==0,126);
+        CHECK(DO(8,fd,0,0)==0 && DO(1,fd,"kept",4)==4,127);
+        mapped=call(9,0,4096,1,2,fd,0); CHECK(mapped>0,128);
+        CHECK(DO(87,"/work/mapped",0,0)==0 && DO(3,fd,0,0)==0,129);
+        fd=DO(2,"/work/mapped",0102,0600);
+        CHECK(fd==3 && DO(1,fd,"other",5)==5 && *(volatile char *)mapped=='k',130);
+        CHECK(DO(11,mapped,4096,0)==0 && DO(3,fd,0,0)==0,131);
+        CHECK(DO(1,1,"mapping-ready\n",14)==14 && DO(0,0,output,1)==1 && output[0]=='G',135);
+        return 0;
+    }
     if (argc > 1 && argv[1][0] == 'n') {
         CHECK(DO(2, "/work/new", 0101, 0644) < 0, 10);
         return 0;

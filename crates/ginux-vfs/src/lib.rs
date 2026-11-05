@@ -485,6 +485,15 @@ impl<
         }
     }
 
+    /// Readable regular-file backing for an adapter-owned mapping reference.
+    pub fn readable_storage(&mut self, descriptor: i32) -> Result<(&mut S, usize), VfsError> {
+        let fd = self.descriptors[self.descriptor(descriptor)?];
+        if !fd.overlay || fd.directory || !fd.readable {
+            return Err(VfsError::PermissionDenied);
+        }
+        Ok((&mut self.storage, fd.object))
+    }
+
     pub fn storage(&self) -> &S {
         &self.storage
     }

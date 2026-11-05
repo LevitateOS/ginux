@@ -502,3 +502,14 @@ checks for syscall ABI dispatch, clone restrictions, descriptor inheritance,
 thread reuse, successful and failed worker exec, signals, wait-status writes,
 nonblocking waits, and vfork. The existing native fork fixture also runs. These
 checks do not claim complete libc, job-control, or systemd compatibility.
+
+Configured owned files support private mappings and read-only shared mappings.
+Mediated writes and truncation affect the same anonymous backing; private writes
+remain copy-on-write, and unlinking preserves existing mappings. Writable shared
+mappings and shared protection upgrades are rejected. Mapping uses a temporary
+readonly descriptor transfer through a private local socket, requiring host
+`pidfd_open`/`pidfd_getfd` support and ptrace access. Temporary descriptors and
+scratch bytes are retired before the workload resumes. Fixed mappings cannot
+replace the transaction's syscall instruction or scratch stack region. Failure
+or a signal during descriptor transfer stops the domain instead of resuming a
+partially transformed syscall. This adds no retained-storage guarantee.
