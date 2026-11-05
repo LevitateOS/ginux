@@ -58,9 +58,8 @@ pub const fn balanced_surface(syscall: u64) -> BalancedSurface {
             BalancedSurface::ImageRead
         }
         9 | 10 | 11 | 12 | 28 => BalancedSurface::Memory,
-        13 | 14 | 15 | SYS_FORK | SYS_WAIT4 | 99 | 158 | 202 | 218 | 273 | 302 | 334 => {
-            BalancedSurface::Task
-        }
+        13 | 14 | 15 | 35 | SYS_FORK | SYS_WAIT4 | 99 | 158 | 202 | 218 | 228 | 229 | 230 | 273
+        | 302 | 334 => BalancedSurface::Task,
         1 | SYS_POLL | 20 => BalancedSurface::Console,
         318 => BalancedSurface::Random,
         SYS_GETPID | SYS_GETUID | SYS_GETGID | SYS_GETEUID | SYS_GETEGID | SYS_GETPPID
@@ -119,6 +118,12 @@ pub const fn balanced_arguments_allowed(syscall: u64, arg0: u64, arg1: u64, arg2
         9 | 10 => arg2 & (PROT_WRITE | PROT_EXEC) != (PROT_WRITE | PROT_EXEC),
         17 => arg2 <= 1024 * 1024,
         257 => arg2 & (O_ACCMODE | MUTATING_OPEN_FLAGS) == 0,
+        // Only global read-only clocks. Dynamic fd clocks and host process/
+        // thread CPU clock encodings must never cross the virtual PID/FD ABI.
+        228 | 229 => matches!(arg0, 0 | 1),
+        // Relative or absolute sleeps use the same clocks; the kernel checks
+        // timespec addresses/ranges and signals interrupt the actual tracee.
+        230 => matches!(arg0, 0 | 1) && arg1 <= 1,
         302 => arg0 == 0 && arg1 <= 15,
         318 => arg2 <= 256,
         SYS_WAIT4 => arg0 == u64::MAX || arg0 > 0,

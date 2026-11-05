@@ -32,7 +32,25 @@ long task_main(word *stack)
     CHECK(call(13,17,(word)action,0,8,0,0)==-95,81);
     action[0]=0; action[1]=2;
     CHECK(call(13,17,(word)action,0,8,0,0)==-95,82);
-    if (mode=='d') {
+    if (mode=='z') {
+        long before[2], after[2], delay[2]={0,20000000}, resolution[2];
+        CHECK(DO(228,0,before,0)==0 && before[0]>0,103);
+        CHECK(DO(229,1,resolution,0)==0 && (resolution[0] || resolution[1]),104);
+        CHECK(DO(228,1,before,0)==0,105);
+        CHECK(call(230,1,0,(word)delay,0,0,0)==0,106);
+        CHECK(DO(228,1,after,0)==0,107);
+        CHECK((after[0]-before[0])*1000000000+after[1]-before[1]>=20000000,108);
+        CHECK(call(230,0,0,(word)delay,0,0,0)==0,109);
+        CHECK(call(230,1,1,(word)before,0,0,0)==0,110); // Past absolute deadline.
+        CHECK(DO(35,delay,0,0)==0,111);
+        CHECK(DO(228,-5,after,0)<0 && DO(228,2,after,0)<0,112);
+        CHECK(DO(229,-5,after,0)<0 && call(230,-5,0,(word)delay,0,0,0)<0,113);
+        CHECK(call(230,1,2,(word)delay,0,0,0)<0,114);
+        CHECK(DO(228,1,1,0)==-14,115);
+        delay[1]=1000000000;
+        CHECK(DO(35,delay,0,0)==-22 && call(230,1,0,(word)delay,0,0,0)==-22,116);
+    }
+    else if (mode=='d') {
         CHECK(DO(80,"/source",0,0)==0,90);
         long child=DO(57,0,0,0);
         CHECK(child>=0,91);
