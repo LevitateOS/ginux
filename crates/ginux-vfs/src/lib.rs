@@ -303,22 +303,20 @@ pub struct FileMetadata {
 }
 
 #[derive(Clone, Copy)]
-struct OverlayFile<const FILE_SIZE: usize> {
+struct OverlayFile {
     state: u8,
     path: Path,
     mode: u32,
     len: usize,
-    data: [u8; FILE_SIZE],
 }
 
-impl<const FILE_SIZE: usize> OverlayFile<FILE_SIZE> {
+impl OverlayFile {
     const fn empty() -> Self {
         Self {
             state: 0,
             path: Path::new(),
             mode: 0,
             len: 0,
-            data: [0; FILE_SIZE],
         }
     }
 }
@@ -350,10 +348,73 @@ impl Descriptor {
     }
 }
 
-pub struct VirtualFs<'a, R, const FILES: usize, const FILE_SIZE: usize, const FDS: usize> {
+/// Overlay bytes are separate from names, metadata and open descriptions.
+/// Operations must validate allocation/ranges before publishing bytes. A failed
+/// resize preserves the previous readable contents; clear is idempotent.
+/// Slots are owned by VirtualFs and are always below its FILES bound.
+pub trait OverlayStorage {
+    fn resize(&mut self, slot: usize, old_len: usize, new_len: usize) -> Result<(), VfsError>;
+    fn read(&self, slot: usize, offset: usize, output: &mut [u8]) -> Result<(), VfsError>;
+    fn write(&mut self, slot: usize, offset: usize, input: &[u8]) -> Result<(), VfsError>;
+    fn clear(&mut self, slot: usize);
+}
+
+/// Allocation-free backing retained for small/freestanding VFS users.
+pub struct InlineStorage<const FILES: usize, const FILE_SIZE: usize> {
+    data: [[u8; FILE_SIZE]; FILES],
+}
+impl<const FILES: usize, const FILE_SIZE: usize> Default for InlineStorage<FILES, FILE_SIZE> {
+    fn default() -> Self {
+        Self {
+            data: [[0; FILE_SIZE]; FILES],
+        }
+    }
+}
+impl<const FILES: usize, const FILE_SIZE: usize> OverlayStorage
+    for InlineStorage<FILES, FILE_SIZE>
+{
+    fn resize(&mut self, slot: usize, old_len: usize, new_len: usize) -> Result<(), VfsError> {
+        if new_len > FILE_SIZE {
+            return Err(VfsError::FileTooLarge);
+        }
+        if new_len > old_len {
+            self.data[slot][old_len..new_len].fill(0);
+        }
+        Ok(())
+    }
+    fn read(&self, slot: usize, offset: usize, output: &mut [u8]) -> Result<(), VfsError> {
+        let end = offset
+            .checked_add(output.len())
+            .ok_or(VfsError::FileTooLarge)?;
+        output.copy_from_slice(self.data[slot].get(offset..end).ok_or(VfsError::Io)?);
+        Ok(())
+    }
+    fn write(&mut self, slot: usize, offset: usize, input: &[u8]) -> Result<(), VfsError> {
+        let end = offset
+            .checked_add(input.len())
+            .ok_or(VfsError::FileTooLarge)?;
+        self.data[slot]
+            .get_mut(offset..end)
+            .ok_or(VfsError::Io)?
+            .copy_from_slice(input);
+        Ok(())
+    }
+    fn clear(&mut self, _: usize) { /* Future growth explicitly zeroes exposed bytes. */
+    }
+}
+
+pub struct VirtualFs<
+    'a,
+    R,
+    const FILES: usize,
+    const FILE_SIZE: usize,
+    const FDS: usize,
+    S = InlineStorage<FILES, FILE_SIZE>,
+> {
     index: Index<'a>,
     reader: R,
-    overlay: [OverlayFile<FILE_SIZE>; FILES],
+    overlay: [OverlayFile; FILES],
+    storage: S,
     descriptors: [Descriptor; FDS],
 }
 
@@ -361,12 +422,31 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
     VirtualFs<'a, R, FILES, FILE_SIZE, FDS>
 {
     pub fn new(index: Index<'a>, reader: R) -> Self {
+        Self::with_storage(index, reader, InlineStorage::default())
+    }
+}
+
+impl<
+        'a,
+        R: BaseReader,
+        const FILES: usize,
+        const FILE_SIZE: usize,
+        const FDS: usize,
+        S: OverlayStorage,
+    > VirtualFs<'a, R, FILES, FILE_SIZE, FDS, S>
+{
+    pub fn with_storage(index: Index<'a>, reader: R, storage: S) -> Self {
         Self {
             index,
             reader,
+            storage,
             overlay: [OverlayFile::empty(); FILES],
             descriptors: [Descriptor::empty(); FDS],
         }
+    }
+
+    pub fn storage(&self) -> &S {
+        &self.storage
     }
 
     pub fn open(&mut self, path: &[u8], flags: u32) -> Result<i32, VfsError> {
@@ -435,6 +515,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             },
         }
         if overlay && flags & O_TRUNC != 0 {
+            self.storage.resize(object, self.overlay[object].len, 0)?;
             self.overlay[object].len = 0;
         }
         self.descriptors[slot] = Descriptor {
@@ -469,9 +550,8 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             return Ok(0);
         }
         if state.overlay {
-            output[..length].copy_from_slice(
-                &self.overlay[state.object].data[state.offset..state.offset + length],
-            );
+            self.storage
+                .read(state.object, state.offset, &mut output[..length])?;
         } else {
             let entry = self.index.entry(state.object)?;
             self.reader.read_at(
@@ -499,15 +579,11 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             .offset
             .checked_add(input.len())
             .ok_or(VfsError::FileTooLarge)?;
-        if end > FILE_SIZE {
-            return Err(VfsError::FileTooLarge);
-        }
-        if state.offset > self.overlay[state.object].len {
-            let previous = self.overlay[state.object].len;
-            self.overlay[state.object].data[previous..state.offset].fill(0);
-        }
-        self.overlay[state.object].data[state.offset..end].copy_from_slice(input);
-        self.overlay[state.object].len = self.overlay[state.object].len.max(end);
+        let previous = self.overlay[state.object].len;
+        self.storage
+            .resize(state.object, previous, previous.max(end))?;
+        self.storage.write(state.object, state.offset, input)?;
+        self.overlay[state.object].len = previous.max(end);
         self.descriptors[slot].offset = end;
         Ok(input.len())
     }
@@ -526,16 +602,43 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
 
     pub fn close(&mut self, descriptor: i32) -> Result<(), VfsError> {
         let slot = self.descriptor(descriptor)?;
+        let state = self.descriptors[slot];
         self.descriptors[slot] = Descriptor::empty();
+        if state.overlay {
+            self.release_unlinked(state.object);
+        }
         Ok(())
     }
 
     pub fn close_on_exec(&mut self) {
-        for descriptor in &mut self.descriptors {
-            if descriptor.open && descriptor.close_on_exec {
-                *descriptor = Descriptor::empty();
+        for slot in 0..FDS {
+            if self.descriptors[slot].open && self.descriptors[slot].close_on_exec {
+                let _ = self.close(slot as i32 + 3);
             }
         }
+    }
+
+    fn release_unlinked(&mut self, object: usize) {
+        if self.overlay[object].state == 2
+            && !self
+                .descriptors
+                .iter()
+                .any(|fd| fd.open && fd.overlay && fd.object == object)
+        {
+            self.storage.clear(object);
+        }
+    }
+
+    pub fn truncate(&mut self, descriptor: i32, length: u64) -> Result<(), VfsError> {
+        let state = self.descriptors[self.descriptor(descriptor)?];
+        if !state.overlay || !state.writable {
+            return Err(VfsError::PermissionDenied);
+        }
+        let length = usize::try_from(length).map_err(|_| VfsError::FileTooLarge)?;
+        self.storage
+            .resize(state.object, self.overlay[state.object].len, length)?;
+        self.overlay[state.object].len = length;
+        Ok(())
     }
 
     pub fn unlink(&mut self, path: &[u8]) -> Result<(), VfsError> {
@@ -548,6 +651,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                 return Err(VfsError::IsDirectory);
             }
             self.overlay[index].state = 2;
+            self.release_unlinked(index);
             // Open descriptors still own the removed object's bytes.
             return Ok(());
         }
@@ -562,6 +666,9 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
     }
 
     pub fn teardown(&mut self) {
+        for slot in 0..FILES {
+            self.storage.clear(slot);
+        }
         self.overlay.fill(OverlayFile::empty());
         self.descriptors.fill(Descriptor::empty());
     }
@@ -630,6 +737,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         }
         self.require_parent(path.as_bytes())?;
         let slot = self.allocate_overlay()?;
+        self.storage.clear(slot);
         self.overlay[slot].state = 3;
         self.overlay[slot].path = path;
         self.overlay[slot].mode = mode & 0o777;
@@ -737,6 +845,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
 
     fn create_overlay(&mut self, path: Path, mode: u32) -> Result<usize, VfsError> {
         let index = self.allocate_overlay()?;
+        self.storage.clear(index);
         self.overlay[index].state = 1;
         self.overlay[index].path = path;
         self.overlay[index].mode = mode;
@@ -746,14 +855,22 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
 
     fn copy_to_overlay(&mut self, path: Path, entry: Entry<'_>) -> Result<usize, VfsError> {
         let size = usize::try_from(entry.size).map_err(|_| VfsError::FileTooLarge)?;
-        if size > FILE_SIZE {
-            return Err(VfsError::FileTooLarge);
-        }
         let index = self.create_overlay(path, entry.mode)?;
-        if let Err(error) = self
-            .reader
-            .read_at(entry.data_offset, &mut self.overlay[index].data[..size])
-        {
+        let copied = (|| {
+            self.storage.resize(index, 0, size)?;
+            let mut buffer = [0u8; 4096];
+            let mut offset = 0;
+            while offset < size {
+                let count = buffer.len().min(size - offset);
+                self.reader
+                    .read_at(entry.data_offset + offset as u64, &mut buffer[..count])?;
+                self.storage.write(index, offset, &buffer[..count])?;
+                offset += count;
+            }
+            Ok::<(), VfsError>(())
+        })();
+        if let Err(error) = copied {
+            self.storage.clear(index);
             self.overlay[index] = OverlayFile::empty();
             return Err(error);
         }
@@ -1092,5 +1209,43 @@ mod tests {
         vfs.close(fd).unwrap();
         let fd = vfs.open(b"/new", O_WRITE | O_TRUNC).unwrap();
         assert_eq!(vfs.fstat(fd).unwrap().size, 0);
+    }
+
+    #[test]
+    fn backing_capacity_and_truncate_preserve_contents_and_open_offset() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 4, 8, 4, InlineStorage<4, 8192>> =
+            VirtualFs::with_storage(
+                Index::new(&bytes).unwrap(),
+                Reader(*b"BASETOOL"),
+                InlineStorage::default(),
+            );
+        let fd = vfs.open(b"/large", O_READ | O_WRITE | O_CREATE).unwrap();
+        let payload = [b'x'; 5000];
+        assert_eq!(vfs.write(fd, &payload), Ok(5000));
+        assert_eq!(vfs.truncate(fd, 9000), Err(VfsError::FileTooLarge));
+        assert_eq!(vfs.fstat(fd).unwrap().size, 5000);
+        assert_eq!(vfs.seek(fd, 0, 1), Ok(5000));
+        vfs.seek(fd, 0, 0).unwrap();
+        let mut output = [0; 5000];
+        assert_eq!(vfs.read(fd, &mut output), Ok(5000));
+        assert_eq!(output, payload);
+        vfs.truncate(fd, 3).unwrap();
+        assert_eq!(vfs.seek(fd, 0, 1), Ok(5000));
+        vfs.truncate(fd, 8192).unwrap();
+        assert_eq!(vfs.seek(fd, 0, 1), Ok(5000));
+        vfs.seek(fd, 0, 0).unwrap();
+        output.fill(0xff);
+        assert_eq!(vfs.read(fd, &mut output), Ok(5000));
+        assert_eq!(&output[..3], b"xxx");
+        assert!(output[3..].iter().all(|byte| *byte == 0));
+        let readonly = vfs.open(b"/large", O_READ).unwrap();
+        assert_eq!(vfs.truncate(readonly, 0), Err(VfsError::PermissionDenied));
+        assert_eq!(vfs.fstat(fd).unwrap().size, 8192);
+        vfs.close(readonly).unwrap();
+        let truncating = vfs.open(b"/large", O_WRITE | O_TRUNC).unwrap();
+        assert_eq!(vfs.fstat(fd).unwrap().size, 0);
+        assert_eq!(vfs.seek(fd, 0, 1), Ok(5000));
+        vfs.close(truncating).unwrap();
     }
 }

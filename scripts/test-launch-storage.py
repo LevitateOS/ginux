@@ -24,9 +24,10 @@ def main():
         shutil.copyfile(fixture, root / 'bin/fixture')
         (root / 'bin/fixture').chmod(0o755)
 
-        def invoke(assignments, args, expected=0):
+        def invoke(assignments, args, expected=0, memory=256):
             config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
             config = config.replace('args = []', 'args = ' + json.dumps(args))
+            config = config.replace('memory_mib = 256', 'memory_mib = ' + str(memory))
             config = config.replace('assignments = []', 'assignments = ' + json.dumps(assignments), 1)
             config = config.replace('id = "gate5-demo"', 'id = "storage-fixture"\nworkdir = "/work"')
             path = work / 'launch.toml'
@@ -50,6 +51,7 @@ def main():
         for _ in range(2):
             invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], [])
         invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['quota'])
+        invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['bounds'], memory=16)
         invoke([], ['no-storage'])
         for assignment in ['disk0', 'memory:/', 'memory:/proc', 'memory:/sys/x', 'memory:/dev',
                            'memory:/bin', 'memory:/work/../out', 'memory:/work/', 'memory:work']:

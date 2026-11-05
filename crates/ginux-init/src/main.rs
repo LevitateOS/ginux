@@ -16,6 +16,7 @@ mod fs_hooks;
 mod launch;
 mod launch_tasks;
 mod process_hooks;
+mod storage_memory;
 mod supervisor;
 mod tracee_io;
 

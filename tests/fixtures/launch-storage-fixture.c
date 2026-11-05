@@ -25,16 +25,38 @@ long storage_main(word *stack)
         return 0;
     }
     if (argc > 1 && argv[1][0] == 'q') {
-        char path[] = "/out/file-00";
-        for (word i = 0; i < 99; ++i) {
-            path[10] = '0' + i / 10;
-            path[11] = '0' + i % 10;
+        char path[] = "/out/file-0000";
+        for (word i = 0; i < 9999; ++i) {
+            path[10] = '0' + i / 1000;
+            path[11] = '0' + i / 100 % 10;
+            path[12] = '0' + i / 10 % 10;
+            path[13] = '0' + i % 10;
             long fd = DO(2, path, 0101, 0644);
-            if (fd == -28) return i > 0 && i < 32 ? 0 : 61;
+            if (fd == -28) return i == 4093 ? 0 : 61;
             CHECK(fd >= 3 && fd < 256, 62);
             CHECK(DO(3, fd, 0, 0) == 0, 63);
         }
         return 64;
+    }
+    if (argc > 1 && argv[1][0] == 'b') {
+        const word mib=1024*1024;
+        long a=DO(2,"/out/a",0102,0600), b=DO(2,"/out/b",0102,0600), c=DO(2,"/out/c",0102,0600);
+        CHECK(a>=3 && b>=3 && c>=3,75);
+        CHECK(DO(77,a,12*mib,0)==0 && DO(77,b,8*mib,0)==-28,76);
+        CHECK(DO(5,b,meta,0)==0 && *(word *)(meta+48)==0,77);
+        CHECK(DO(77,a,4*mib,0)==0 && DO(77,b,8*mib,0)==0,78);
+        CHECK(DO(77,c,5*mib,0)==-28,79);
+        CHECK(DO(3,a,0,0)==0 && DO(87,"/out/a",0,0)==0 && DO(77,c,5*mib,0)==0,80);
+        CHECK(DO(87,"/out/b",0,0)==0 && DO(77,c,9*mib,0)==-28,81);
+        CHECK(DO(3,b,0,0)==0 && DO(77,c,9*mib,0)==0,82);
+        long alias=DO(32,c,0,0), d=DO(2,"/out/d",0102,0600);
+        CHECK(alias>=3 && d>=3 && DO(87,"/out/c",0,0)==0,83);
+        CHECK(DO(77,d,16*mib,0)==-28 && DO(3,c,0,0)==0 && DO(77,d,16*mib,0)==-28,84);
+        CHECK(DO(3,alias,0,0)==0 && DO(77,d,16*mib,0)==0,85);
+        CHECK(DO(8,d,16*mib-1,0)==16*mib-1 && DO(0,d,output,1)==1 && output[0]==0,86);
+        CHECK(DO(1,d,"!",1)==-28 && DO(5,d,meta,0)==0 && *(word *)(meta+48)==16*mib,87);
+        CHECK(DO(77,d,-1,0)==-22 && DO(5,d,meta,0)==0 && *(word *)(meta+48)==16*mib,88);
+        return 0; // Teardown must release a still-linked full-quota mapping.
     }
     word limits[2];
     CHECK(call(302,0,7,0,(word)limits,0,0) == 0, 65);
@@ -100,10 +122,21 @@ long storage_main(word *stack)
     CHECK(fd >= 3 && fd < 256, 50);
     for (word i = 0; i < sizeof data; ++i) data[i] = i % 251;
     for (word i = 0; i < sizeof data; i += 4096) CHECK(DO(1, fd, data+i, 4096) == 4096, 51);
-    CHECK(DO(1, fd, "x", 1) == -27, 52);
+    CHECK(DO(1, fd, "x", 1) == 1, 52);
     CHECK(DO(8, fd, 0, 0) == 0, 53);
     for (word i = 0; i < sizeof output; i += 4096) CHECK(DO(0, fd, output+i, 4096) == 4096, 54);
     for (word i = 0; i < sizeof output; ++i) CHECK(output[i] == data[i], 55);
+    CHECK(DO(0,fd,output,1)==1 && output[0]=='x',89);
+    // Sparse growth and truncate/regrow must never reveal stale bytes.
+    CHECK(DO(8,fd,2*1024*1024,0)==2*1024*1024 && DO(1,fd,"Q",1)==1,90);
+    CHECK(DO(8,fd,2*1024*1024-1,0)==2*1024*1024-1,91);
+    CHECK(DO(0,fd,output,2)==2 && output[0]==0 && output[1]=='Q',92);
+    CHECK(DO(77,fd,3,0)==0 && DO(77,fd,8192,0)==0 && DO(8,fd,0,0)==0,93);
+    CHECK(DO(0,fd,output,4096)==4096,94);
+    CHECK(output[0]==data[0] && output[1]==data[1] && output[2]==data[2],95);
+    for (word i=3;i<4096;++i) CHECK(output[i]==0,96);
+    CHECK(DO(0,fd,output,4096)==4096,97);
+    for (word i=0;i<4096;++i) CHECK(output[i]==0,98);
     CHECK(DO(91, fd, 0755, 0) == 0, 56);
     CHECK(DO(5, fd, meta, 0) == 0 && (*(unsigned int *)(meta+24) & 0777) == 0755, 57);
     CHECK(DO(3, fd, 0, 0) == 0, 58);

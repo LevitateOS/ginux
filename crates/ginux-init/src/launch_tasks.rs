@@ -1156,6 +1156,7 @@ impl Supervisor<'_> {
         if self.objects.refs.active() != 0 || self.processes.active() != 0 {
             supervision_error(domain, b"domain teardown retained owned state")
         }
+        self.objects.filesystem.teardown();
         line_stderr(b"ginux: teardown tasks=0 owned-handles=0");
     }
     fn fail(&mut self, domain: &mut Domain, reason: &[u8]) -> ! {

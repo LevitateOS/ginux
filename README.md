@@ -216,7 +216,8 @@ the workload exit code, or `128 + signal` for signal termination. Startup
 failure returns 2; supervision or result-writing failure returns 1. Non-x86-64
 syscall ABIs and job-control
 group stops fail explicitly. Audit output is capped at 64 KiB plus a truncation
-notice. This path does not implement resource quotas from the domain metadata.
+notice. Process resource quotas remain unfinished; anonymous writable backing
+has the allocation bound described below.
 
 Configured `poll` resolves at most 16 public descriptors through their owning
 table. Pipes, assigned memory files/directories, null, and console aliases may
@@ -249,14 +250,23 @@ storage. Paths must be canonical, unique, and cannot cover init, `/`, `/proc`,
 Without assignments, native image access remains read-only.
 
 This backend supports regular-file open/create/exclusive-create/truncate/append,
-read/write/pread, seek, close, basic descriptor flags, mkdir, file unlink, chmod,
+read/write/pread, ftruncate, seek, close, basic descriptor flags, mkdir, file unlink, chmod,
 and stat/fstat/fstatat/statx metadata. Relative paths use the configured workdir;
 directory descriptors, directory enumeration/removal, symlinks, hardlinks,
 rename, file mappings and execution of generated files
 are unsupported. Path normalization is lexical; this is not a complete unified
-image/overlay filesystem. IO is bounded to 4096 bytes per call. Capacity is
-32 objects (including seeded directories), 65536 bytes per file and 64
-independently opened file handles. Aliases use the common descriptor table. Exhaustion returns `ENOSPC`, `EFBIG`, or `EMFILE` as appropriate.
+image/overlay filesystem. IO is bounded to 4096 bytes per call. Metadata supports
+4096 objects (including seeded directories) and 64 independently opened file
+handles. File bytes grow on demand in anonymous supervisor mappings rather than
+fixed per-file arrays. Their total mapped capacity, including page rounding and
+growth reserve, cannot exceed `[resources].memory_mib`; files share that bound
+instead of a 64 KiB per-file ceiling. This accounts for overlay backing, not
+total supervisor/tracee RAM. Allocation exhaustion returns `ENOSPC` without
+changing the file's length, bytes or open offset. Shrinking/truncating returns
+unused mapped pages; regrowth and sparse gaps read as zero. Unlinked bytes remain
+until the last open reference closes, and teardown releases all mappings.
+Aliases use the common descriptor table. Metadata and handle exhaustion return
+`ENOSPC` and `EMFILE` respectively.
 
 Configured launch gives each process a table of up to 256 public descriptors for bootstrap
 stdio, immutable-image files, writable files, devices and pipes. Allocation uses

@@ -3,6 +3,7 @@
 //! Retained storage, directory descriptors, mappings and generated-file exec
 //! are not provided.
 
+use crate::storage_memory::MemoryStorage;
 use crate::supervisor::UserRegs;
 use crate::tracee_io::{copy_memory, read_path};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +16,8 @@ use ginux_vfs::{
 pub const FD_BASE: usize = 1 << 20;
 const IO_SIZE: usize = 4096;
 type Path = Text<MAX_PATH>;
-type MemoryFs = VirtualFs<'static, EmptyReader, 32, 65536, 64>;
+const OBJECTS: usize = 4096;
+type MemoryFs = VirtualFs<'static, EmptyReader, OBJECTS, 0, 64, MemoryStorage<OBJECTS>>;
 static mut ROOT_INDEX: [u8; HEADER_SIZE + RECORD_SIZE] = [0; HEADER_SIZE + RECORD_SIZE];
 static ROOT_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -85,9 +87,10 @@ impl LaunchFs {
             record.try_into().unwrap(),
         )
         .map_err(|_| b"invalid storage root index".as_slice())?;
-        let mut fs = MemoryFs::new(
+        let mut fs = MemoryFs::with_storage(
             Index::new(index_bytes).map_err(|_| b"invalid storage root index".as_slice())?,
             EmptyReader,
+            MemoryStorage::new((config.memory_mib as usize) * 1024 * 1024),
         );
         for prefix in &prefixes[..count] {
             let path = prefix.as_bytes();
@@ -111,6 +114,15 @@ impl LaunchFs {
 
     pub fn enabled(&self) -> bool {
         self.count != 0
+    }
+
+    pub fn teardown(&mut self) {
+        self.fs.teardown();
+        assert_eq!(
+            self.fs.storage().allocated_bytes(),
+            0,
+            "overlay teardown retained bytes"
+        );
     }
 
     pub fn readiness(&self, handle: u32) -> Option<u16> {
@@ -307,6 +319,8 @@ impl LaunchFs {
                 .map(|n| n as i64)
                 .map_err(errno),
             91 => self.fs.fchmod(fd, r.rsi as u32).map(|_| 0).map_err(errno),
+            77 if r.rsi as i64 >= 0 => self.fs.truncate(fd, r.rsi).map(|_| 0).map_err(errno),
+            77 => Err(-22),
             72 => self
                 .fs
                 .descriptor_flags(fd)
