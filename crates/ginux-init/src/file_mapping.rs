@@ -226,7 +226,13 @@ struct Message {
 }
 
 fn send_backing(host: usize, socket: u32, backing: usize) -> Result<(), ()> {
-    let pidfd = unsafe { syscall2(434, host, 0) };
+    // The stopped caller may be a nonleader thread, including after its leader
+    // exited. Address that task's live fd table rather than the process leader.
+    let mut pidfd = unsafe { syscall2(434, host, 0x80) }; // PIDFD_THREAD
+    if pidfd == -22 {
+        // Older kernels can still support mappings by process leaders.
+        pidfd = unsafe { syscall2(434, host, 0) };
+    }
     if pidfd < 0 {
         return Err(());
     }

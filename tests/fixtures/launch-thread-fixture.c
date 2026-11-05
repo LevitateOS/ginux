@@ -74,10 +74,25 @@ static long native_work(void)
     }
     return 0;
 }
+static long mapped(void)
+{
+    if (DO(1,3,"thread-map",10)!=10) { error=81; return 0; }
+    long address=call(9,0,4096,3,2,3,0);
+    if (address<0) { error=82; return 0; }
+    char *bytes=(char *)address;
+    if (bytes[0]!='t' || bytes[9]!='p') error=83;
+    bytes[0]='X';
+    char first=0;
+    if (call(17,3,(word)&first,1,0,0,0)!=1 || first!='t') error=84;
+    if (DO(11,address,4096,0)!=0) error=85;
+    return 0;
+}
 static long after_leader(void)
 {
     char input;
     if (DO(0,0,&input,1)!=1 || input!='G') return 41;
+    mapped();
+    if (error) return error;
     char *args[]={"fixture","basic",0}, *env[]={0};
     if (DO(59,"/bin/fixture",args,env)!=-95) return 42;
     if (DO(39,0,0,0)!=1) return 43;
@@ -92,7 +107,11 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-95 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='h') {
+    if (mode=='m') {
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],mapped)==2,86);
+        join(0);
+        CHECK(!error,error);
+    } else if (mode=='h') {
         CHECK(DO(22,pair,0,0)==0 && pair[0]==5,49);
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],pinned)==2,50);
         CHECK(DO(1,1,"hold-ready\n",11)==11,51);
