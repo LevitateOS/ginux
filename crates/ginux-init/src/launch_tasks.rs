@@ -1,7 +1,7 @@
 //! Task ownership for configured native launch. A newborn never runs before
 //! its process identity and descriptor snapshot are installed.
 
-use crate::descriptors::{Backends, DescriptorTable};
+use crate::descriptors::{Backends, DescriptorCall, DescriptorTable};
 use crate::dispatch::{
     balanced_surface_name, decide_launch, native_arguments_allowed, NativeDecision,
 };
@@ -48,6 +48,7 @@ struct Task {
     host: usize,
     alive: bool,
     descriptors: DescriptorTable,
+    call: DescriptorCall,
     pending: Pending,
     override_result: Option<i64>,
     blocked: Option<UserRegs>,
@@ -111,6 +112,7 @@ pub fn supervise(
         host: root,
         alive: true,
         descriptors,
+        call: DescriptorCall::new(),
         pending: Pending::None,
         override_result: None,
         blocked: None,
@@ -376,6 +378,9 @@ impl Supervisor<'_> {
                     self.emulate(index, r, -38, domain);
                     return;
                 }
+                if self.task(index).call.native_mutation() {
+                    self.fail(domain, b"fork overlapped descriptor mutation");
+                }
                 let Some(slot) = self.tasks.iter().position(|t| t.is_none()) else {
                     self.emulate(index, r, -11, domain);
                     return;
@@ -401,6 +406,7 @@ impl Supervisor<'_> {
                     host: 0,
                     alive: true,
                     descriptors: table,
+                    call: DescriptorCall::new(),
                     pending: Pending::None,
                     override_result: None,
                     blocked: None,
@@ -442,7 +448,13 @@ impl Supervisor<'_> {
         }
         let decision = {
             let task = self.tasks[index].as_mut().unwrap();
-            decide_launch(task.host, r, &mut task.descriptors, &mut self.objects)
+            decide_launch(
+                task.host,
+                r,
+                &mut task.descriptors,
+                &mut self.objects,
+                &mut task.call,
+            )
         };
         match decision {
             NativeDecision::Park { fd } => {
@@ -714,7 +726,8 @@ impl Supervisor<'_> {
         if let Some(result) = self.task_mut(index).override_result.take() {
             r.rax = result as u64;
         }
-        let result = self.tasks[index].as_mut().unwrap().descriptors.finish(r);
+        let task = self.tasks[index].as_mut().unwrap();
+        let result = task.call.finish(&mut task.descriptors, r);
         if let Err(reason) = result {
             self.fail(domain, reason)
         }
@@ -792,6 +805,7 @@ impl Supervisor<'_> {
             self.fail(domain, b"duplicate task death")
         }
         self.task_mut(index).alive = false;
+        self.task_mut(index).call.reset();
         self.task_mut(index).blocked = None;
         if self.processes.exit(self.task(index).id, status).is_err() {
             self.fail(domain, b"virtual task exit failed")
