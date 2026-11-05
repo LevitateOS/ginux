@@ -113,6 +113,15 @@ impl LaunchFs {
         self.count != 0
     }
 
+    pub fn readiness(&self, handle: u32) -> Option<u16> {
+        let slot = handle.checked_sub(FD_BASE as u32)?;
+        if slot >= 64 {
+            return None;
+        }
+        // This owner contains only regular memory files and directories.
+        self.fs.fstat(slot as i32 + 3).ok().map(|_| 0x145)
+    }
+
     fn owns_path(&self, path: &[u8]) -> bool {
         self.prefixes[..self.count]
             .iter()

@@ -220,3 +220,11 @@ build-launch-thread-fixture:
 
 test-launch-threads:
 	python3 scripts/test-launch-threads.py $(GINUX) .artifacts/launch/launch-thread-fixture
+
+.PHONY: build-launch-poll-fixture test-launch-poll
+build-launch-poll-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-poll-fixture.c -o .artifacts/launch/launch-poll-fixture
+
+test-launch-poll:
+	python3 scripts/test-launch-poll.py $(GINUX) .artifacts/launch/launch-poll-fixture

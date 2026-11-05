@@ -20,6 +20,13 @@ pub struct LaunchDevices {
 }
 
 impl LaunchDevices {
+    pub fn readiness(&self, handle: u32) -> Option<u16> {
+        let slot = handle.checked_sub(FD_BASE)? as usize;
+        // Configured launch currently assigns only null, whose reads/writes
+        // never wait. Future device kinds must supply their own readiness.
+        self.flags.get(slot).copied().flatten().map(|_| 0x145)
+    }
+
     pub fn prepare(config: &DomainConfig) -> Result<Self, &'static [u8]> {
         let mut registry = DeviceRegistry::new();
         for device in config.devices.as_slice() {

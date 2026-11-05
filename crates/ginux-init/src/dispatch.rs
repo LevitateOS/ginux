@@ -37,6 +37,8 @@ pub fn classify(syscall: u64) -> Lane {
 pub enum NativeDecision {
     /// An owned channel cannot progress yet. Keep this task at entry.
     Park { fd: u32 },
+    /// A public-descriptor readiness query awaits an object or timer change.
+    ParkPoll,
     /// A lane hook claimed the entry; emulate it with this result.
     Hooked { lane: Lane, result: i64 },
     /// No hook claimed the entry; apply the shared contract decision.

@@ -218,12 +218,20 @@ syscall ABIs and job-control
 group stops fail explicitly. Audit output is capped at 64 KiB plus a truncation
 notice. This path does not implement resource quotas from the domain metadata.
 
-Bootstrap-console readiness supports `poll` queries with at most 16
-slots containing descriptors 0, 1, 2 or ignored negative descriptors. The native
-supervisor validates the descriptor array before continuation. Timeouts from
-0 through 300000 ms are supported; infinite or larger waits, other descriptors,
-unreadable arrays, and oversized queries are denied. Closed
-descriptors retain the kernel's `POLLNVAL` result.
+Configured `poll` resolves at most 16 public descriptors through their owning
+table. Pipes, assigned memory files/directories, null, and console aliases may
+share a query; negative descriptors are ignored and closed/unknown descriptors
+report `POLLNVAL`. Pipe readiness includes buffered input, available output
+space, peer-close `POLLHUP` and missing-reader `POLLERR`. Error/hangup events are
+reported even with an empty requested mask. Timeouts from 0 through 300000 ms
+and negative (infinite) waits are supported; unreadable or unwritable arrays
+return `EFAULT`. Parked queries retry on object changes; finite and console
+waits also use a 1 ms supervisor tick, keeping deadlines while other tasks run.
+Infinite owned-object waits need no periodic retry. Console queries use only
+the supervisor's explicitly shared stdio OFDs; image-file polling returns
+`EOPNOTSUPP`, never a query on a coincidentally numbered host descriptor.
+General nonfatal signal interruption/restart of parked queries remains
+unfinished; SIGKILL death is consumed and reaped through the task owner.
 
 Optional `[storage].assignments` entries of the form `"memory:/absolute/path"`
 declare empty, ephemeral writable namespaces. For example:
@@ -263,8 +271,7 @@ Bootstrap constrains the real descriptor soft/hard limits to 256 while keeping
 lower operator limits. Allocation respects that lower soft limit; runtime
 NOFILE-limit changes are currently denied. Reported limits are not inflated to
 accommodate backend handle ranges. Libc spawn preflight now accepts the public
-numbers. Relative directory-fd access, poll on remapped stdio or non-bootstrap
-descriptors remain unfinished.
+numbers. Relative directory-fd access remains unfinished.
 Guest-memory copies respect page protections, including partial read copyout.
 No writable host descriptor is exposed. Data disappears at domain teardown;
 there is no retention, export, storage generation or configured storage quota.
@@ -278,8 +285,8 @@ close-on-exec descriptor flags, seek, close and basic access queries are
 supported; device metadata cannot be changed. There are 64 open-device slots.
 Unknown and duplicate assignments fail before launch. Device aliases share the
 common descriptor table and handle lifetime. No host device node or descriptor
-is used. Device polling and additional device types are not implemented by
-configured launch yet.
+is used. Null is immediately readable/writable for polling. Additional device
+types are not implemented by configured launch yet.
 
 Anonymous `pipe`/`pipe2` are emulated with supervisor-owned memory and virtual
 handles. Up to eight pipes hold 65536 bytes each; aliases use the common table.
@@ -287,7 +294,7 @@ handles. Up to eight pipes hold 65536 bytes each; aliases use the common table.
 writes of up to 4096 bytes are atomic. Reads consume only bytes successfully
 copied out, so invalid/partially inaccessible destinations do not lose data.
 Read/write direction, EOF, SIGPIPE, metadata, seek rejection, descriptor/status
-flags, pipe-size queries and aliases across owners are supported.
+flags, `FIONBIO`, pipe-size queries and aliases across owners are supported.
 Alias status flags and endpoint lifetimes are shared; close-on-exec flags are
 per descriptor. No native pipe or host descriptor is given to the workload.
 
@@ -378,4 +385,6 @@ make build-launch-exec-fixture
 sudo make test-launch-exec
 make build-launch-thread-fixture
 sudo make test-launch-threads
+make build-launch-poll-fixture
+sudo make test-launch-poll
 ```

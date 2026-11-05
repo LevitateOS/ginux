@@ -5,7 +5,7 @@ use crate::channel_hooks::LaunchChannels;
 use crate::device_hooks::LaunchDevices;
 use crate::dispatch::{decide_objects, Lane, NativeDecision};
 use crate::fs_hooks::LaunchFs;
-use crate::supervisor::{syscall3, syscall4, UserRegs};
+use crate::supervisor::{syscall2, syscall3, syscall4, UserRegs};
 use crate::tracee_io::{copy_memory, read_path};
 use ginux_core::decide_balanced;
 
@@ -105,6 +105,9 @@ pub struct DescriptorCall {
     pending: Option<Pending>,
     saved_args: Option<[u64; 7]>,
     pinned: Option<Descriptor>,
+    poll_wait: bool,
+    poll_tick: bool,
+    poll_deadline: Option<u64>,
 }
 impl DescriptorCall {
     pub const fn new() -> Self {
@@ -112,10 +115,16 @@ impl DescriptorCall {
             pending: None,
             saved_args: None,
             pinned: None,
+            poll_wait: false,
+            poll_tick: false,
+            poll_deadline: None,
         }
     }
     pub fn native_mutation(&self) -> bool {
         self.pending.is_some()
+    }
+    pub fn needs_poll_tick(&self) -> bool {
+        self.poll_tick
     }
     pub fn reset(&mut self, backends: &mut Backends) -> Result<(), &'static [u8]> {
         if let Some(Descriptor {
@@ -143,6 +152,9 @@ impl DescriptorCall {
         backends: &mut Backends,
     ) -> Result<bool, &'static [u8]> {
         let mut changed = false;
+        self.poll_wait = false;
+        self.poll_tick = false;
+        self.poll_deadline = None;
         if let Some(pending) = self.pending.take() {
             match pending {
                 Pending::Open { slot } => {
@@ -402,7 +414,7 @@ impl DescriptorTable {
                 call.save(r);
                 self.path_descriptor(pid, r, backends)
             }
-            7 => self.console_poll(pid, r),
+            7 => self.poll(pid, r, backends, call),
             _ => Ok(backends.claim(pid, r)),
         };
         result.unwrap_or_else(ready)
@@ -661,42 +673,120 @@ impl DescriptorTable {
         Ok(decision)
     }
 
-    fn console_poll(&self, pid: usize, r: &UserRegs) -> Result<NativeDecision, i64> {
-        // Preserve the existing bounded bootstrap poll surface. Moved stdio or
-        // other owned objects need the pending common readiness adapter.
-        if r.rsi > 16 || r.rdx > 300000 {
+    fn poll(
+        &self,
+        pid: usize,
+        r: &UserRegs,
+        backends: &Backends,
+        call: &mut DescriptorCall,
+    ) -> Result<NativeDecision, i64> {
+        let timeout = r.rdx as i32;
+        if r.rsi > 16 || timeout > 300000 {
             return Err(-1);
         }
-        for i in 0..r.rsi {
-            let address = r.rdi.checked_add(i * 8).ok_or(-1)?;
-            let mut bytes = [0; 8];
-            copy_memory(pid, address, &mut bytes, false).map_err(|_| -1)?;
-            let fd = i32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let count = r.rsi as usize;
+        let mut bytes = [0u8; 128];
+        let length = count * 8;
+        if copy_memory(pid, r.rdi, &mut bytes[..length], false)? != length as i64 {
+            return Err(-14);
+        }
+        // Console OFDs are inherited unchanged from this supervisor. Only
+        // explicitly tracked console handles can query those host descriptors.
+        // Image descriptors are not supervisor handles and remain unsupported.
+        let mut consoles = [PollFd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        }; 16];
+        let mut ready_count = 0;
+        for i in 0..count {
+            let entry = &mut bytes[i * 8..i * 8 + 8];
+            let fd = i32::from_ne_bytes(entry[..4].try_into().unwrap());
+            let events = u16::from_ne_bytes(entry[4..6].try_into().unwrap());
+            entry[6..8].fill(0);
             if fd < 0 {
                 continue;
             }
-            if fd > 2 {
-                return Err(-1);
-            }
-            match self.entries[fd as usize] {
-                Some(Descriptor {
-                    handle:
-                        Handle::Native {
-                            fd: raw,
-                            console: true,
-                        },
+            let revents = match self.get(fd as u64) {
+                Ok(Descriptor {
+                    handle: Handle::Native { fd, console: true },
                     ..
-                }) if raw == fd as u32 => {}
-                None if !self
-                    .entries
-                    .iter()
-                    .flatten()
-                    .any(|d| matches!(d.handle,Handle::Native {fd:raw,..} if raw==fd as u32)) => {}
-                _ => return Err(-1),
-            }
+                }) => {
+                    assert!(fd < 3);
+                    consoles[i] = PollFd {
+                        fd: fd as i32,
+                        events,
+                        revents: 0,
+                    };
+                    0
+                }
+                Ok(Descriptor {
+                    handle: Handle::Native { .. },
+                    ..
+                }) => return Err(-95),
+                Ok(Descriptor {
+                    handle: Handle::Owned(handle),
+                    ..
+                }) => {
+                    // Assigned regular memory files/directories and null are
+                    // immediately ready. Pipes supply their own live state.
+                    let available = backends
+                        .channels
+                        .readiness(handle)
+                        .or_else(|| backends.filesystem.readiness(handle))
+                        .or_else(|| backends.devices.readiness(handle))
+                        .ok_or(-95)?;
+                    available & (events | 8 | 16)
+                }
+                _ => 32, // POLLNVAL, even when events is zero.
+            };
+            entry[6..8].copy_from_slice(&revents.to_ne_bytes());
         }
-        Ok(NativeDecision::Contract(decide_balanced(7)))
+        let result = unsafe { syscall3(7, consoles.as_mut_ptr() as usize, count, 0) };
+        if result < 0 {
+            return Err(result as i64);
+        }
+        for i in 0..count {
+            let output = &mut bytes[i * 8 + 6..i * 8 + 8];
+            let revents = u16::from_ne_bytes(output.try_into().unwrap()) | consoles[i].revents;
+            output.copy_from_slice(&revents.to_ne_bytes());
+            ready_count += i64::from(revents != 0);
+        }
+        let now = monotonic_nanoseconds()?;
+        if !call.poll_wait && timeout > 0 {
+            call.poll_deadline = Some(now + timeout as u64 * 1_000_000);
+        }
+        if ready_count != 0 || timeout == 0 || call.poll_deadline.is_some_and(|end| now >= end) {
+            for i in 0..count {
+                let address = r.rdi.checked_add((i * 8 + 6) as u64).ok_or(-14)?;
+                if copy_memory(pid, address, &mut bytes[i * 8 + 6..i * 8 + 8], true)? != 2 {
+                    return Err(-14);
+                }
+            }
+            return Ok(ready(ready_count));
+        }
+        call.poll_wait = true;
+        // Infinite owned-object waits need no timer: object progress/death
+        // already wakes them. External console IO needs periodic observation.
+        call.poll_tick = timeout > 0 || consoles[..count].iter().any(|fd| fd.fd >= 0);
+        Ok(NativeDecision::ParkPoll)
     }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: u16,
+    revents: u16,
+}
+
+pub fn monotonic_nanoseconds() -> Result<u64, i64> {
+    let mut time = [0u64; 2];
+    if unsafe { syscall2(228, 1, time.as_mut_ptr() as usize) } < 0 {
+        return Err(-5);
+    }
+    Ok(time[0] * 1_000_000_000 + time[1])
 }
 
 fn ready(result: i64) -> NativeDecision {

@@ -234,6 +234,19 @@ impl LaunchChannels {
         self.close((handle - PIPE_FD_BASE) as usize);
     }
 
+    /// Current readiness of a live owned endpoint. ERR/HUP do not depend on
+    /// the requested event mask; buffered bytes and HUP may coexist.
+    pub fn readiness(&self, handle: u32) -> Option<u16> {
+        let slot = handle.checked_sub(PIPE_FD_BASE)? as usize;
+        let entry = self.entry(slot).ok()?;
+        let pipe = &self.pipes[entry.pipe];
+        Some(if entry.write {
+            (if pipe.len < CAPACITY { 0x104 } else { 0 }) | (if pipe.readers == 0 { 8 } else { 0 })
+        } else {
+            (if pipe.len != 0 { 0x41 } else { 0 }) | (if pipe.writers == 0 { 16 } else { 0 })
+        })
+    }
+
     fn entry(&self, slot: usize) -> Result<PipeFd, i64> {
         self.descriptors.get(slot).copied().flatten().ok_or(-9)
     }

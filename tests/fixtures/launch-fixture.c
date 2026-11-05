@@ -77,12 +77,12 @@ long launch_fixture_main(word *stack)
         if (call3(7, (word)&fds[1], 1, 300000) != 1) return 103;
         if (call3(7, (word)fds, 3, 300001) != -1) return 111;
         if (call3(7, 0, 0, 1) != 0) return 112;
-        if (call3(7, (word)fds, 3, (word)-1) != -1) return 104;
+        if (call3(7, (word)fds, 3, (word)-1) != 1 || fds[1].revents != 4) return 104;
         if (call3(7, (word)fds, 17, 0) != -1) return 105;
-        if (call3(7, 1, 1, 0) != -1) return 106;
-        if (call3(7, (word)-4, 2, 0) != -1) return 107;
+        if (call3(7, 1, 1, 0) != -14) return 106;
+        if (call3(7, (word)-4, 2, 0) != -14) return 107;
         fds[0].fd = 3;
-        if (call3(7, (word)fds, 1, 0) != -1) return 108;
+        if (call3(7, (word)fds, 1, 0) != 1 || fds[0].revents != 32) return 108;
         if (call3(3, 0, 0, 0) != 0) return 109;
         fds[0].fd = 0;
         fds[0].events = 0;

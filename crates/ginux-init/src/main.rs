@@ -1516,7 +1516,7 @@ fn supervise_native(pid: usize, domain: &mut Domain) -> ! {
         sequence += 1;
         let syscall = registers.orig_rax;
         let decision = match decide_native(syscall, registers.rdi, registers.rsi, registers.rdx) {
-            NativeDecision::Park { .. } => {
+            NativeDecision::Park { .. } | NativeDecision::ParkPoll => {
                 native_fail(domain, pid, b"unexpected configured channel wait")
             }
             NativeDecision::Contract(decision) => decision,

@@ -153,7 +153,22 @@ pub fn supervise(
     line_stderr(b"ginux: launch backend=ptrace-native profile=balanced elf-loader=host");
     line_stderr(b"ginux: launch tracee-uid=1000 tracee-gid=1000 root=host-path-read-only");
     s.resume(0, 0, domain);
+    let mut poll_tick = 0;
     loop {
+        let polling = s
+            .tasks
+            .iter()
+            .flatten()
+            .any(|t| t.blocked.is_some() && t.call.needs_poll_tick());
+        if polling {
+            let now = crate::descriptors::monotonic_nanoseconds()
+                .unwrap_or_else(|_| s.fail(domain, b"readiness clock failed"))
+                / 1_000_000;
+            if now != poll_tick {
+                poll_tick = now;
+                s.wake_needed = true;
+            }
+        }
         s.wake(domain);
         status = 0;
         let host = unsafe {
@@ -161,11 +176,21 @@ pub fn supervise(
                 SYS_WAIT4,
                 usize::MAX,
                 &mut status as *mut _ as usize,
-                WALL,
+                WALL | usize::from(polling), // WNOHANG while readiness/timers await progress.
                 0,
             )
         };
         if host == -4 {
+            continue;
+        }
+        if host == 0 {
+            // No trace stop is pending. Sleep for one readiness tick instead
+            // of spinning or blocking wait4 beyond a finite poll deadline.
+            let delay = [0u64, 1_000_000];
+            let result = unsafe { syscall2(35, delay.as_ptr() as usize, 0) };
+            if result < 0 && result != -4 {
+                s.fail(domain, b"readiness sleep failed");
+            }
             continue;
         }
         if host < 0 {
@@ -332,18 +357,29 @@ impl Supervisor<'_> {
         unsafe { r.assume_init() }
     }
     fn resume(&mut self, index: usize, signal: usize, domain: &mut Domain) {
-        if ptrace(PTRACE_SYSCALL, self.task(index).host, 0, signal) < 0 {
+        let result = ptrace(PTRACE_SYSCALL, self.task(index).host, 0, signal);
+        if result == -3 {
+            // SIGKILL can end a ptrace stop between an object retry and
+            // resume. Keep ownership until wait4 supplies the actual death.
+            self.task_mut(index).blocked = None;
+        } else if result < 0 {
             self.fail(domain, b"launch task resume failed")
         }
     }
     fn run(&mut self, index: usize, r: &UserRegs, domain: &mut Domain) {
-        if ptrace(
+        let result = ptrace(
             PTRACE_SETREGS,
             self.task(index).host,
             0,
             r as *const _ as usize,
-        ) < 0
-        {
+        );
+        if result == -3 {
+            // A parked task may die while copyin/readiness is being retried.
+            // Do not invent an IO result or a supervisor failure for its exit.
+            self.task_mut(index).blocked = None;
+            return;
+        }
+        if result < 0 {
             self.fail(domain, b"launch register update failed")
         }
         self.resume(index, 0, domain);
@@ -596,6 +632,10 @@ impl Supervisor<'_> {
             )
         };
         match decision {
+            NativeDecision::ParkPoll => {
+                self.task_mut(index).blocked = Some(original);
+                audit_write(b"park surface=owned-poll\n");
+            }
             NativeDecision::Park { fd } => {
                 self.task_mut(index).blocked = Some(original);
                 audit_write(b"park\nginux: park surface=lane-channel fd=");
@@ -974,8 +1014,8 @@ impl Supervisor<'_> {
         }
     }
     fn wake(&mut self, domain: &mut Domain) {
-        // Only object operations and observed deaths can satisfy these waits.
-        // Other tasks' register/signal/fork stops do not change readiness.
+        // Object operations, observed deaths and readiness ticks retry parked
+        // calls. Unrelated register/signal stops do not request a retry.
         if !core::mem::replace(&mut self.wake_needed, false) {
             return;
         }
