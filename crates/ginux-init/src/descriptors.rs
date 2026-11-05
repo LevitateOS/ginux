@@ -10,6 +10,10 @@ use crate::tracee_io::{copy_memory, read_path};
 use ginux_core::decide_balanced;
 
 pub const LIMIT: usize = 256;
+pub enum ExecDescriptor {
+    Native(u32),
+    Owned(u32),
+}
 const CLOEXEC: u64 = 0o2000000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -266,11 +270,17 @@ impl DescriptorTable {
         None
     }
 
-    pub fn exec_native_descriptor(&self, fd: u64) -> Result<u32, i64> {
+    pub fn exec_descriptor(&self, fd: u64) -> Result<ExecDescriptor, i64> {
         match self.get(fd)?.handle {
-            Handle::Native { fd, console: false } => Ok(fd),
+            Handle::Native { fd, console: false } => Ok(ExecDescriptor::Native(fd)),
+            Handle::Owned(handle) if (1048576..1048640).contains(&handle) => {
+                Ok(ExecDescriptor::Owned(handle))
+            }
             _ => Err(-95),
         }
+    }
+    pub fn exec_path_dirfd(&self, pid: usize, fd: u64, address: u64) -> Result<u64, i64> {
+        self.path_handle(pid, fd, address)
     }
 
     /// PTRACE_EVENT_EXEC is the commit point. Failed exec never calls this.

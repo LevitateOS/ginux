@@ -67,10 +67,10 @@ long exec_main(word *stack)
         CHECK(DO(59,"/malformed",next,next_env)==-8 && intact(),42);
         CHECK(DO(59,"/bin/second",1,next_env)==-14 && intact(),43);
         CHECK(DO(59,1,next,next_env)==-14 && intact(),44);
-        CHECK(DO(59,"/work/closed",next,next_env)==-95 && intact(),45);
-        CHECK(DO(59,"/work/hidden",next,next_env)==-95 && intact(),46);
+        CHECK(DO(59,"/work/closed",next,next_env)==-13 && intact(),45);
+        CHECK(DO(59,"/work/hidden",next,next_env)==-2 && intact(),46);
         CHECK(DO(59,"/dev/null",next,next_env)==-13 && intact(),47);
-        CHECK(call(322,4,(word)"",(word)next,(word)next_env,0x1000,0)==-95 && intact(),48);
+        CHECK(call(322,4,(word)"",(word)next,(word)next_env,0x1000,0)==-13 && intact(),48);
     }
     if (mode=='c') {
         long child=DO(57,0,0,0);

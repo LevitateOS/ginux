@@ -1,7 +1,7 @@
 //! Task ownership for configured native launch. A newborn never runs before
 //! its process identity and descriptor snapshot are installed.
 
-use crate::descriptors::{Backends, DescriptorCall, DescriptorTable};
+use crate::descriptors::{Backends, DescriptorCall, DescriptorTable, ExecDescriptor};
 use crate::dispatch::{
     balanced_surface_name, decide_launch, native_arguments_allowed, NativeDecision,
 };
@@ -14,6 +14,7 @@ use crate::tracee_io::copy_memory;
 use ginux_core::{balanced_identity_result, balanced_surface, Action};
 use ginux_domain::Domain;
 use ginux_process::{Credentials, ProcessError, ProcessTable, TaskId};
+use ginux_vfs::Executable;
 
 const TASKS: usize = 16;
 const WALL: usize = 0x4000_0000;
@@ -38,6 +39,8 @@ enum Pending {
 enum ExecStage {
     Sync,
     Reenter,
+    Create,
+    Close,
     Kernel,
     Completed,
 }
@@ -48,6 +51,16 @@ struct Exec {
     native_dirfd: u64,
     next_native: usize,
     stage: ExecStage,
+    owned: Option<OwnedExec>,
+}
+
+#[derive(Clone, Copy)]
+struct OwnedExec {
+    image: Executable,
+    empty_path: u64,
+    descriptor: Option<u32>,
+    legacy_create: bool,
+    failure: Option<i64>,
 }
 
 struct Task {
@@ -70,6 +83,7 @@ struct DescriptorGroup {
     leader: TaskId,
     status: Option<i32>,
     creating: Option<usize>,
+    image: Option<Executable>,
 }
 
 struct Supervisor<'a> {
@@ -133,6 +147,7 @@ pub fn supervise(
         leader: id,
         status: None,
         creating: None,
+        image: None,
     });
     s.tasks[0] = Some(Task {
         id,
@@ -246,10 +261,12 @@ pub fn supervise(
         }
         let signal = ((status >> 8) & 255) as usize;
         if signal != 133 {
-            if s.task(index)
-                .exec
-                .is_some_and(|e| matches!(e.stage, ExecStage::Sync | ExecStage::Reenter))
-            {
+            if s.task(index).exec.is_some_and(|e| {
+                matches!(
+                    e.stage,
+                    ExecStage::Sync | ExecStage::Reenter | ExecStage::Create | ExecStage::Close
+                )
+            }) {
                 s.fail(domain, b"signal interrupted exec descriptor setup");
             }
             let mut info = [0u64; 16];
@@ -315,6 +332,11 @@ impl Supervisor<'_> {
                 .release_exited(&mut self.objects)
             {
                 self.fail(domain, reason);
+            }
+            if let Some(image) = self.groups[group].as_mut().unwrap().image.take() {
+                if self.objects.filesystem.release_executable(image).is_err() {
+                    self.fail(domain, b"process executable release failed");
+                }
             }
             self.groups[group] = None;
             return Some(result);
@@ -551,12 +573,19 @@ impl Supervisor<'_> {
                         Ok(table) => table,
                         Err(reason) => self.fail(domain, reason),
                     };
+                    let image = self.groups[parent_group].as_ref().unwrap().image;
+                    if let Some(image) = image {
+                        if self.objects.filesystem.retain_executable(image).is_err() {
+                            self.fail(domain, b"fork executable retain failed");
+                        }
+                    }
                     self.groups[group] = Some(DescriptorGroup {
                         table,
                         owners: 1,
                         leader: child,
                         status: None,
                         creating: None,
+                        image,
                     });
                     self.groups[parent_group].as_mut().unwrap().creating = Some(index);
                     group
@@ -685,27 +714,6 @@ impl Supervisor<'_> {
             return Err(-95);
         }
         let host = self.task(index).host;
-        let mut native_dirfd = r.rdi;
-        if r.orig_rax == 59 {
-            self.objects.filesystem.native_exec_path(host, r.rdi)?;
-        } else {
-            if r.r8 & !0x1100 != 0 {
-                return Err(-22);
-            }
-            let path = crate::tracee_io::read_path(host, r.rsi)?;
-            if path.is_empty() {
-                if r.r8 & 0x1000 == 0 {
-                    return Err(-2);
-                }
-                native_dirfd = self.table(index).exec_native_descriptor(r.rdi)? as u64;
-            } else {
-                if path.as_bytes()[0] != b'/' && r.rdi as i32 != -100 {
-                    return Err(-95);
-                }
-                self.objects.filesystem.native_exec_path(host, r.rsi)?;
-                native_dirfd = (-100i64) as u64;
-            }
-        }
         let mut instruction = [0u8; 2];
         let address = r.rip.checked_sub(2).ok_or(-95)?;
         if copy_memory(host, address, &mut instruction, false) != Ok(2)
@@ -713,11 +721,51 @@ impl Supervisor<'_> {
         {
             return Err(-95);
         }
+        let mut native_dirfd = r.rdi;
+        let (image, empty_path) = if r.orig_rax == 59 {
+            let path = crate::tracee_io::read_path(host, r.rdi)?;
+            let image = self
+                .objects
+                .filesystem
+                .exec_path(host, r.rdi, (-100i64) as u64)?;
+            (image, r.rdi + path.as_bytes().len() as u64)
+        } else {
+            if r.r8 & !0x1100 != 0 {
+                return Err(-22);
+            }
+            let path = crate::tracee_io::read_path(host, r.rsi)?;
+            let image = if path.is_empty() {
+                if r.r8 & 0x1000 == 0 {
+                    return Err(-2);
+                }
+                match self.table(index).exec_descriptor(r.rdi)? {
+                    ExecDescriptor::Native(fd) => {
+                        native_dirfd = fd as u64;
+                        None
+                    }
+                    ExecDescriptor::Owned(handle) => {
+                        Some(self.objects.filesystem.exec_descriptor(handle)?)
+                    }
+                }
+            } else {
+                let dirfd = self.table(index).exec_path_dirfd(host, r.rdi, r.rsi)?;
+                native_dirfd = (-100i64) as u64;
+                self.objects.filesystem.exec_path(host, r.rsi, dirfd)?
+            };
+            (image, r.rsi + path.as_bytes().len() as u64)
+        };
         self.task_mut(index).exec = Some(Exec {
             original: *r,
             native_dirfd,
             next_native: 0,
             stage: ExecStage::Reenter,
+            owned: image.map(|image| OwnedExec {
+                image,
+                empty_path,
+                descriptor: None,
+                legacy_create: false,
+                failure: None,
+            }),
         });
         Ok(())
     }
@@ -740,12 +788,95 @@ impl Supervisor<'_> {
             audit_write(b" close-on-exec=");
             audit_u64(cloexec as u64);
             audit_write(b"\n");
+        } else if let Some(owned) = exec.owned {
+            *r = exec.original;
+            if owned.failure.is_some() {
+                r.orig_rax = 3;
+                r.rax = 3;
+                r.rdi = owned.descriptor.unwrap() as u64;
+                self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::Close;
+            } else {
+                let mut empty = [1u8];
+                if copy_memory(self.task(index).host, owned.empty_path, &mut empty, false) != Ok(1)
+                    || empty[0] != 0
+                {
+                    self.task_mut(index)
+                        .exec
+                        .as_mut()
+                        .unwrap()
+                        .owned
+                        .as_mut()
+                        .unwrap()
+                        .failure = Some(-14);
+                    if owned.descriptor.is_some() {
+                        self.exec_step(index, r, domain);
+                        return;
+                    }
+                    self.finish_exec_failure(index, r, -14, domain);
+                    self.emulate(index, r, -14, domain);
+                    return;
+                }
+                if let Some(fd) = owned.descriptor {
+                    r.orig_rax = 322;
+                    r.rax = 322;
+                    r.rdi = fd as u64;
+                    r.rsi = owned.empty_path;
+                    r.rdx = if exec.original.orig_rax == 59 {
+                        exec.original.rsi
+                    } else {
+                        exec.original.rdx
+                    };
+                    r.r10 = if exec.original.orig_rax == 59 {
+                        exec.original.rdx
+                    } else {
+                        exec.original.r10
+                    };
+                    r.r8 = 0x1000;
+                    self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::Kernel;
+                } else {
+                    r.orig_rax = 319;
+                    r.rax = 319;
+                    r.rdi = owned.empty_path;
+                    r.rsi = if owned.legacy_create { 3 } else { 0x13 };
+                    self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::Create;
+                }
+            }
         } else {
             *r = exec.original;
             r.rdi = exec.native_dirfd;
             self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::Kernel;
         }
         self.run(index, r, domain);
+    }
+
+    fn replay_exec(&mut self, index: usize, domain: &mut Domain) {
+        let mut replay = self.task(index).exec.unwrap().original;
+        replay.rip -= 2;
+        replay.rax = replay.orig_rax;
+        self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::Reenter;
+        self.run(index, &replay, domain);
+    }
+
+    fn finish_exec_failure(
+        &mut self,
+        index: usize,
+        r: &mut UserRegs,
+        error: i64,
+        domain: &mut Domain,
+    ) {
+        let exec = self.task_mut(index).exec.take().unwrap();
+        if let Some(owned) = exec.owned {
+            if self
+                .objects
+                .filesystem
+                .release_executable(owned.image)
+                .is_err()
+            {
+                self.fail(domain, b"failed exec reference release failed");
+            }
+        }
+        *r = exec.original;
+        r.rax = error as u64;
     }
 
     fn exec_completed(&mut self, index: usize, domain: &mut Domain) {
@@ -767,6 +898,20 @@ impl Supervisor<'_> {
         }
         if self.processes.exec(self.task(index).id).is_err() {
             self.fail(domain, b"virtual exec transition failed");
+        }
+        let image = self
+            .task_mut(index)
+            .exec
+            .as_mut()
+            .unwrap()
+            .owned
+            .take()
+            .map(|owned| owned.image);
+        let old = core::mem::replace(&mut self.groups[group].as_mut().unwrap().image, image);
+        if let Some(old) = old {
+            if self.objects.filesystem.release_executable(old).is_err() {
+                self.fail(domain, b"replaced executable release failed");
+            }
         }
         self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::Completed;
         self.wake_needed = true;
@@ -848,20 +993,86 @@ impl Supervisor<'_> {
                     self.run(index, &replay, domain);
                     return;
                 }
+                ExecStage::Create => {
+                    if r.orig_rax != 319 {
+                        self.fail(domain, b"exec private descriptor creation lost its syscall");
+                    }
+                    let owned = exec.owned.unwrap();
+                    if r.rax as i64 == -22 && !owned.legacy_create {
+                        self.task_mut(index)
+                            .exec
+                            .as_mut()
+                            .unwrap()
+                            .owned
+                            .as_mut()
+                            .unwrap()
+                            .legacy_create = true;
+                        self.replay_exec(index, domain);
+                        return;
+                    }
+                    if (r.rax as i64) < 0 {
+                        self.finish_exec_failure(index, r, r.rax as i64, domain);
+                    } else {
+                        if r.rax >= crate::descriptors::LIMIT as u64 {
+                            self.fail(domain, b"exec private descriptor outside table bound");
+                        }
+                        let fd = r.rax as u32;
+                        self.task_mut(index)
+                            .exec
+                            .as_mut()
+                            .unwrap()
+                            .owned
+                            .as_mut()
+                            .unwrap()
+                            .descriptor = Some(fd);
+                        if let Err(error) = crate::exec_image::populate(
+                            self.task(index).host,
+                            fd,
+                            self.objects.filesystem,
+                            owned.image,
+                        ) {
+                            self.task_mut(index)
+                                .exec
+                                .as_mut()
+                                .unwrap()
+                                .owned
+                                .as_mut()
+                                .unwrap()
+                                .failure = Some(error);
+                        }
+                        self.replay_exec(index, domain);
+                        return;
+                    }
+                }
+                ExecStage::Close => {
+                    if r.orig_rax != 3 || r.rax != 0 {
+                        self.fail(domain, b"exec private descriptor close failed");
+                    }
+                    self.finish_exec_failure(
+                        index,
+                        r,
+                        exec.owned.unwrap().failure.unwrap(),
+                        domain,
+                    );
+                }
                 ExecStage::Kernel => {
                     if r.rax as i64 >= 0 {
                         self.fail(domain, b"exec success missing its ownership event");
                     }
-                    let old = exec.original;
-                    r.rdi = old.rdi;
-                    r.rsi = old.rsi;
-                    r.rdx = old.rdx;
-                    r.r10 = old.r10;
-                    r.r8 = old.r8;
-                    r.r9 = old.r9;
-                    r.orig_rax = old.orig_rax;
-                    // Public descriptors, aliases and owned refs are unchanged.
-                    self.task_mut(index).exec = None;
+                    if exec.owned.is_some() {
+                        self.task_mut(index)
+                            .exec
+                            .as_mut()
+                            .unwrap()
+                            .owned
+                            .as_mut()
+                            .unwrap()
+                            .failure = Some(r.rax as i64);
+                        self.replay_exec(index, domain);
+                        return;
+                    }
+                    let error = r.rax as i64;
+                    self.finish_exec_failure(index, r, error, domain);
                 }
                 ExecStage::Completed => {
                     self.task_mut(index).exec = None;
@@ -1033,6 +1244,16 @@ impl Supervisor<'_> {
         }
         let id = self.task(index).id;
         let group = self.task(index).group;
+        if let Some(owned) = self.task_mut(index).exec.take().and_then(|exec| exec.owned) {
+            if self
+                .objects
+                .filesystem
+                .release_executable(owned.image)
+                .is_err()
+            {
+                self.fail(domain, b"terminated exec reference release failed");
+            }
+        }
         if let Pending::Fork {
             child, parent_tid, ..
         } = self.task(index).pending
@@ -1149,6 +1370,11 @@ impl Supervisor<'_> {
         for group in self.groups.iter_mut().flatten() {
             if let Err(reason) = group.table.release_exited(&mut self.objects) {
                 supervision_error(domain, reason);
+            }
+            if let Some(image) = group.image.take() {
+                if self.objects.filesystem.release_executable(image).is_err() {
+                    supervision_error(domain, b"teardown executable release failed");
+                }
             }
         }
         self.processes.shutdown(137);

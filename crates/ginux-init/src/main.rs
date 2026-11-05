@@ -12,6 +12,7 @@ mod channel_hooks;
 mod descriptors;
 mod device_hooks;
 mod dispatch;
+mod exec_image;
 mod fs_hooks;
 mod launch;
 mod launch_tasks;

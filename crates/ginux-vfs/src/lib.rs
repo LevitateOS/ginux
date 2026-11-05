@@ -31,6 +31,7 @@ pub enum VfsError {
     NotDirectory,
     IsDirectory,
     DirectoryNotEmpty,
+    TextBusy,
     SymlinkLoop,
     PermissionDenied,
     InvalidDescriptor,
@@ -304,6 +305,14 @@ pub struct FileMetadata {
     pub size: u64,
 }
 
+/// A VFS-owned executable reference. Retain/release explicitly when process
+/// ownership changes; an unlinked executable cannot be recycled while pinned.
+#[derive(Clone, Copy)]
+pub struct Executable {
+    object: usize,
+    pub size: usize,
+}
+
 pub struct DirectoryEntry<'a> {
     pub name: &'a [u8],
     pub inode: u64,
@@ -333,6 +342,7 @@ struct OverlayFile {
     path: Path,
     mode: u32,
     len: usize,
+    executions: usize,
 }
 
 impl OverlayFile {
@@ -342,6 +352,7 @@ impl OverlayFile {
             path: Path::new(),
             mode: 0,
             len: 0,
+            executions: 0,
         }
     }
 }
@@ -514,6 +525,9 @@ impl<
             }
             Some(index) if self.overlay[index].state == 3 => return Err(VfsError::IsDirectory),
             Some(index) => {
+                if writable && self.overlay[index].executions != 0 {
+                    return Err(VfsError::TextBusy);
+                }
                 object = index;
                 overlay = true;
             }
@@ -725,6 +739,9 @@ impl<
         if !state.writable || !state.overlay {
             return Err(VfsError::PermissionDenied);
         }
+        if self.overlay[state.object].executions != 0 {
+            return Err(VfsError::TextBusy);
+        }
         if input.is_empty() {
             return Ok(0);
         }
@@ -776,6 +793,7 @@ impl<
 
     fn release_unlinked(&mut self, object: usize) {
         if self.overlay[object].state == 2
+            && self.overlay[object].executions == 0
             && !self
                 .descriptors
                 .iter()
@@ -789,6 +807,9 @@ impl<
         let state = self.descriptors[self.descriptor(descriptor)?];
         if !state.overlay || !state.writable {
             return Err(VfsError::PermissionDenied);
+        }
+        if self.overlay[state.object].executions != 0 {
+            return Err(VfsError::TextBusy);
         }
         let length = usize::try_from(length).map_err(|_| VfsError::FileTooLarge)?;
         self.storage
@@ -819,6 +840,101 @@ impl<
         self.overlay[index].state = 2;
         self.overlay[index].path = path;
         Ok(())
+    }
+
+    pub fn pin_executable(&mut self, path: &[u8]) -> Result<Executable, VfsError> {
+        let path = normalize(path)?;
+        let metadata = self.metadata(path.as_bytes())?;
+        if metadata.kind != NodeKind::File {
+            return Err(VfsError::PermissionDenied);
+        }
+        let object = self
+            .find_overlay(path.as_bytes())
+            .ok_or(VfsError::PermissionDenied)?;
+        self.pin_object(object)
+    }
+
+    pub fn pin_executable_fd(&mut self, descriptor: i32) -> Result<Executable, VfsError> {
+        let state = self.descriptors[self.descriptor(descriptor)?];
+        if !state.overlay || state.directory {
+            return Err(VfsError::PermissionDenied);
+        }
+        self.pin_object(state.object)
+    }
+
+    fn pin_object(&mut self, object: usize) -> Result<Executable, VfsError> {
+        if self.overlay[object].mode & 0o111 == 0 {
+            return Err(VfsError::PermissionDenied);
+        }
+        if self
+            .descriptors
+            .iter()
+            .any(|fd| fd.open && fd.overlay && fd.object == object && fd.writable)
+        {
+            return Err(VfsError::TextBusy);
+        }
+        let image = Executable {
+            object,
+            size: self.overlay[object].len,
+        };
+        self.overlay[object].executions = self.overlay[object]
+            .executions
+            .checked_add(1)
+            .ok_or(VfsError::OverlayLimit)?;
+        Ok(image)
+    }
+
+    pub fn retain_executable(&mut self, image: Executable) -> Result<(), VfsError> {
+        let object = self
+            .overlay
+            .get_mut(image.object)
+            .ok_or(VfsError::InvalidDescriptor)?;
+        if object.executions == 0 || object.len != image.size {
+            return Err(VfsError::InvalidDescriptor);
+        }
+        object.executions = object
+            .executions
+            .checked_add(1)
+            .ok_or(VfsError::OverlayLimit)?;
+        Ok(())
+    }
+
+    pub fn release_executable(&mut self, image: Executable) -> Result<(), VfsError> {
+        let object = self
+            .overlay
+            .get_mut(image.object)
+            .ok_or(VfsError::InvalidDescriptor)?;
+        object.executions = object
+            .executions
+            .checked_sub(1)
+            .ok_or(VfsError::InvalidDescriptor)?;
+        self.release_unlinked(image.object);
+        Ok(())
+    }
+
+    pub fn read_executable(
+        &self,
+        image: Executable,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<usize, VfsError> {
+        let object = self
+            .overlay
+            .get(image.object)
+            .ok_or(VfsError::InvalidDescriptor)?;
+        if object.executions == 0 || object.len != image.size {
+            return Err(VfsError::InvalidDescriptor);
+        }
+        let count = output.len().min(image.size.saturating_sub(offset));
+        if count != 0 {
+            self.storage
+                .read(image.object, offset, &mut output[..count])?;
+        }
+        Ok(count)
+    }
+
+    pub fn executable_pins(&self) -> usize {
+        self.overlay.iter().map(|object| object.executions).sum()
     }
 
     pub fn teardown(&mut self) {
@@ -1124,6 +1240,7 @@ impl<
             .or_else(|| {
                 self.overlay.iter().enumerate().position(|(slot, entry)| {
                     entry.state == 2
+                        && entry.executions == 0
                         && self.index.lookup_exact(entry.path.as_bytes()) == Err(VfsError::NotFound)
                         && !self
                             .descriptors
@@ -1658,5 +1775,59 @@ mod tests {
             Err(VfsError::PermissionDenied)
         );
         vfs.close(root).unwrap();
+    }
+
+    #[test]
+    fn executable_pins_exclude_writers_and_retain_unlinked_bytes() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 2, 32, 4> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        let writer = vfs.open(b"/program", O_CREATE | O_READ | O_WRITE).unwrap();
+        vfs.write(writer, b"executable-bytes").unwrap();
+        assert!(matches!(
+            vfs.pin_executable(b"/program"),
+            Err(VfsError::PermissionDenied)
+        ));
+        vfs.fchmod(writer, 0o755).unwrap();
+        assert!(matches!(
+            vfs.pin_executable(b"/program"),
+            Err(VfsError::TextBusy)
+        ));
+        vfs.close(writer).unwrap();
+        let reader = vfs.open(b"/program", O_READ).unwrap();
+        vfs.seek(reader, 4, 0).unwrap();
+        let image = vfs.pin_executable_fd(reader).unwrap();
+        assert_eq!(vfs.executable_pins(), 1);
+        assert_eq!(
+            vfs.open(b"/program", O_WRITE | O_TRUNC),
+            Err(VfsError::TextBusy)
+        );
+        let mut output = [0u8; 32];
+        assert_eq!(vfs.read_executable(image, 0, &mut output), Ok(16));
+        assert_eq!(&output[..16], b"executable-bytes");
+        assert_eq!(vfs.seek(reader, 0, 1), Ok(4));
+        vfs.retain_executable(image).unwrap(); // A forked process owns another reference.
+        vfs.rename(b"/program", b"/moved", false).unwrap();
+        vfs.unlink(b"/moved").unwrap();
+        vfs.close(reader).unwrap();
+        let replacement = vfs.open(b"/moved", O_CREATE | O_WRITE).unwrap();
+        vfs.write(replacement, b"new").unwrap();
+        vfs.close(replacement).unwrap();
+        assert_eq!(
+            vfs.open(b"/other", O_CREATE | O_WRITE),
+            Err(VfsError::OverlayLimit)
+        );
+        vfs.release_executable(image).unwrap();
+        assert_eq!(vfs.executable_pins(), 1);
+        assert_eq!(
+            vfs.open(b"/other", O_CREATE | O_WRITE),
+            Err(VfsError::OverlayLimit)
+        );
+        assert_eq!(vfs.read_executable(image, 0, &mut output), Ok(16));
+        assert_eq!(&output[..16], b"executable-bytes");
+        vfs.release_executable(image).unwrap();
+        assert_eq!(vfs.executable_pins(), 0);
+        let reused = vfs.open(b"/other", O_CREATE | O_READ | O_WRITE).unwrap();
+        assert_eq!(vfs.read(reused, &mut output), Ok(0));
     }
 }

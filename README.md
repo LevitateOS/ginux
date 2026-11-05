@@ -264,7 +264,8 @@ ordinary nested directories. Normal fchmod/chmod accept full st_mode values
 while special permission bits remain unsupported.
 Relative paths without a directory fd use the configured workdir. Native-image
 relative directory-fd access and image subtree mutation remain unsupported, as
-do symlinks, hardlinks, file mappings and execution of generated files.
+do symlinks, hardlinks, guest file mappings and generated shebang scripts.
+Owned ELF execution is described below.
 Path normalization is lexical; this is not a complete unified
 image/overlay filesystem. IO is bounded to 4096 bytes per call. Metadata supports
 4096 objects (including seeded directories) and 64 independently opened file
@@ -357,8 +358,9 @@ exit or supervision failure kills and reaps all remaining
 descendants and releases owned descriptors before reporting completion.
 Image execve and execveat are supervised, including relative paths from the
 configured workdir, absolute execveat paths, and AT_EMPTY_PATH on image
-file descriptors. Relative directory-fd execution remains unsupported. Generated
-files and virtual devices cannot execute through the native image path.
+file descriptors. Relative native-image directory-fd execution remains
+unsupported. Virtual devices cannot execute; assigned file paths use the owned
+loader described below.
 Before exec, controlled fcntl syscalls synchronize each native handle's CLOEXEC
 bit: any surviving public alias keeps its native handle. The supervisor replays
 the original verified x86-64 syscall instruction; no executable bytes change.
@@ -367,7 +369,27 @@ Failed exec preserves every public descriptor and its flags. Successful exec
 keeps task identity and advances the existing process owner's exec state. Exec
 currently requires the sole remaining task to be its process leader; other
 threaded exec transitions return EOPNOTSUPP.
-Signals interrupting descriptor synchronization fail the domain explicitly;
+Owned ELF64 x86-64 files support execve and execveat, including owned directory
+descriptors and AT_EMPTY_PATH on an open, possibly unlinked file. VFS checks
+executable permissions and rejects writable open descriptions with ETXTBSY.
+Executable references survive fork and keep unlinked objects alive; replacing
+the last executing process releases write exclusion without changing file
+offsets or names.
+
+The exec transaction creates a private CLOEXEC memfd in the stopped tracee.
+The supervisor opens only that registered task's fresh kernel fd through procfs,
+copies pinned VFS bytes into it, applies mandatory write/grow/shrink/seal locks,
+sets mode 0500 and closes its own descriptor. The tracee then executes that
+sealed ELF through execveat. The private fd never enters the public table: the
+kernel closes it on success, and the transaction closes it before returning a
+failed exec. No named host output file is created. Supervisor access to the
+tracee's procfs fd view is required; failure propagates without fallback.
+Native ELF loading is supported here; guest mmap of owned files remains
+unsupported. Generated scripts still return EOPNOTSUPP. Other invalid formats
+return ENOEXEC. Executable snapshots add kernel-backed memory beyond the VFS
+mapping budget; total process/kernel memory accounting is unfinished.
+
+Signals interrupting descriptor synchronization or private-fd preparation fail the domain explicitly;
 restart/deferred delivery for that preparation remains incomplete. Path checking
 uses the current lexical view rather than a unified image/overlay resolver.
 Readiness beyond bootstrap consoles, compiler-sized writable storage and
@@ -411,4 +433,6 @@ make build-launch-poll-fixture
 sudo make test-launch-poll
 make build-launch-directory-fixture
 sudo make test-launch-directories
+make build-launch-owned-exec-fixture
+sudo make test-launch-owned-exec
 ```

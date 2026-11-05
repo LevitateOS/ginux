@@ -236,3 +236,11 @@ build-launch-directory-fixture:
 
 test-launch-directories:
 	python3 scripts/test-launch-directories.py $(GINUX) .artifacts/launch/launch-directory-fixture
+
+.PHONY: build-launch-owned-exec-fixture test-launch-owned-exec
+build-launch-owned-exec-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-owned-exec-fixture.c -o .artifacts/launch/launch-owned-exec-fixture
+
+test-launch-owned-exec:
+	python3 scripts/test-launch-owned-exec.py $(GINUX) .artifacts/launch/launch-owned-exec-fixture

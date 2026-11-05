@@ -1,7 +1,7 @@
 //! Configured-launch ephemeral memory storage. Bytes and descriptors belong to
 //! the supervisor; no writable host descriptor is installed in the workload.
-//! Retained storage, directory descriptors, mappings and generated-file exec
-//! are not provided.
+//! Directory descriptions and executable references share the VFS owner.
+//! Retained storage and guest file mappings are not provided.
 
 use crate::storage_memory::MemoryStorage;
 use crate::supervisor::UserRegs;
@@ -9,8 +9,9 @@ use crate::tracee_io::{copy_memory, read_path};
 use core::sync::atomic::{AtomicBool, Ordering};
 use ginux_domain::{DomainConfig, Text};
 use ginux_vfs::{
-    BaseReader, Entry, FileMetadata, Index, NodeKind, VfsError, VirtualFs, HEADER_SIZE, MAX_PATH,
-    O_APPEND, O_CLOEXEC, O_CREATE, O_EXCLUSIVE, O_NONBLOCK, O_READ, O_TRUNC, O_WRITE, RECORD_SIZE,
+    BaseReader, Entry, Executable, FileMetadata, Index, NodeKind, VfsError, VirtualFs, HEADER_SIZE,
+    MAX_PATH, O_APPEND, O_CLOEXEC, O_CREATE, O_EXCLUSIVE, O_NONBLOCK, O_READ, O_TRUNC, O_WRITE,
+    RECORD_SIZE,
 };
 
 pub const FD_BASE: usize = 1 << 20;
@@ -117,6 +118,11 @@ impl LaunchFs {
     }
 
     pub fn teardown(&mut self) {
+        assert_eq!(
+            self.fs.executable_pins(),
+            0,
+            "overlay teardown retained executable references"
+        );
         self.fs.teardown();
         assert_eq!(
             self.fs.storage().allocated_bytes(),
@@ -166,13 +172,18 @@ impl LaunchFs {
         Ok(path)
     }
 
-    /// Image execution must not fall through an assigned writable namespace.
-    /// This shares the current lexical path view; generated-file exec awaits
-    /// a storage backend capable of providing executable mappings.
-    pub fn native_exec_path(&self, pid: usize, address: u64) -> Result<(), i64> {
-        let path = self.path(pid, address, (-100i64) as u64)?;
+    /// Assigned paths yield pinned ELF bytes; image paths retain the native
+    /// readonly loader. Neither may fall through into the other's namespace.
+    pub fn exec_path(
+        &mut self,
+        pid: usize,
+        address: u64,
+        dirfd: u64,
+    ) -> Result<Option<Executable>, i64> {
+        let path = self.path(pid, address, dirfd)?;
         if self.owns_path(path.as_bytes()) {
-            return Err(-95);
+            let image = self.fs.pin_executable(path.as_bytes()).map_err(errno)?;
+            return self.check_exec(image).map(Some);
         }
         if [b"/dev".as_slice(), b"/proc", b"/sys"]
             .iter()
@@ -180,7 +191,56 @@ impl LaunchFs {
         {
             return Err(-13);
         }
-        Ok(())
+        Ok(None)
+    }
+
+    pub fn exec_descriptor(&mut self, handle: u32) -> Result<Executable, i64> {
+        let fd = handle
+            .checked_sub(FD_BASE as u32)
+            .filter(|n| *n < 64)
+            .ok_or(-95)?;
+        let image = self.fs.pin_executable_fd(fd as i32 + 3).map_err(errno)?;
+        self.check_exec(image)
+    }
+
+    fn check_exec(&mut self, image: Executable) -> Result<Executable, i64> {
+        let mut header = [0u8; 64];
+        let result = self.read_executable(image, 0, &mut header).and_then(|n| {
+            if header.starts_with(b"#!") {
+                Err(-95)
+            } else if n < 64
+                || &header[..4] != b"\x7fELF"
+                || header[4] != 2
+                || header[5] != 1
+                || header[18..20] != [62, 0]
+            {
+                Err(-8)
+            } else {
+                Ok(image)
+            }
+        });
+        if result.is_err() {
+            self.release_executable(image)
+                .expect("invalid executable pin release");
+        }
+        result
+    }
+
+    pub fn read_executable(
+        &self,
+        image: Executable,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<usize, i64> {
+        self.fs
+            .read_executable(image, offset, output)
+            .map_err(errno)
+    }
+    pub fn retain_executable(&mut self, image: Executable) -> Result<(), i64> {
+        self.fs.retain_executable(image).map_err(errno)
+    }
+    pub fn release_executable(&mut self, image: Executable) -> Result<(), i64> {
+        self.fs.release_executable(image).map_err(errno)
     }
 
     /// Configured-launch dispatch only; demo paths keep their existing contract.
@@ -294,7 +354,7 @@ impl LaunchFs {
 
     fn open(&mut self, path: &[u8], flags: u64, mode: u64) -> Result<i64, i64> {
         // NOFOLLOW is valid because this backend has no symlinks. Unsupported
-        // directory/path-only behavior never falls through to native storage.
+        // path-only behavior never falls through to native storage.
         const ALLOWED: u64 = 3
             | 0o100
             | 0o200
@@ -606,6 +666,7 @@ fn errno(error: VfsError) -> i64 {
         VfsError::NotDirectory => -20,
         VfsError::IsDirectory => -21,
         VfsError::DirectoryNotEmpty => -39,
+        VfsError::TextBusy => -26,
         VfsError::AlreadyExists => -17,
         VfsError::PermissionDenied => -13,
         VfsError::InvalidDescriptor => -9,
