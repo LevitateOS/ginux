@@ -262,12 +262,15 @@ while open; their handles retain metadata but cannot create new children.
 Minimal assignment roots remain busy; overlapping assignments merely seed
 ordinary nested directories. Normal fchmod/chmod accept full st_mode values
 while special permission bits remain unsupported.
-Relative paths without a directory fd use the configured workdir. Native-image
-relative directory-fd access and image subtree mutation remain unsupported, as
-do symlinks, hardlinks, guest file mappings and generated shebang scripts.
-Owned ELF execution is described below.
-Path normalization is lexical; this is not a complete unified
-image/overlay filesystem. IO is bounded to 4096 bytes per call. Metadata supports
+Relative paths without a directory fd use the calling process's image cwd.
+Owned symlink/symlinkat, readlink/readlinkat and nofollow metadata are supported.
+Resolution expands links before processing parent components, bounds link chains,
+and rechecks storage assignment boundaries. Unlink and rename act on the final
+link itself; exclusive create and O_NOFOLLOW retain their distinct semantics.
+Cross-image/owned traversal, native-image relative directory-fd access, image
+subtree mutation, hardlinks and owned-directory chdir remain unsupported.
+Owned execution and private file mappings are described below.
+This is not a complete unified image/overlay filesystem. IO is bounded to 4096 bytes per call. Metadata supports
 4096 objects (including seeded directories) and 64 independently opened file
 handles. File bytes grow on demand in anonymous supervisor mappings rather than
 fixed per-file arrays. Their total mapped capacity, including page rounding and
@@ -416,18 +419,21 @@ the public table and creates a fresh owned description with offset zero; it can
 retain an unlinked object independently of its source description. It rejects
 writes, native/device/pipe descriptors and directory escapes rather than passing
 an integer to the native kernel. General /dev/fd metadata and procfs semantics
-are not provided. Owned interpreters remain EOPNOTSUPP; a script whose required
-source/relative directory descriptor is CLOEXEC returns ENOENT.
+are not provided. Up to four consecutive owned shebang scripts may lead to an
+owned ELF or native image interpreter chain. Every owned script stays pinned
+until exec commits or fails; cycles and excessive depth return ELOOP. A script
+whose required source/relative directory descriptor is CLOEXEC returns ENOENT.
 Script argv/environment arrays are bounded to 4096 entries each. Only the new
 exec address space receives stack writes, including after vfork/CLONE_VM. A
 failure restoring that committed stack stops the domain rather than pretending
-the old program can resume. Other invalid formats return ENOEXEC. Guest mmap of
-owned files remains unsupported. Executable snapshots add memory beyond the VFS
+the old program can resume. Other invalid formats return ENOEXEC. Executable
+snapshots add memory beyond the VFS
 mapping budget; total process/kernel memory accounting is unfinished.
 
 Signals interrupting descriptor synchronization or private-fd preparation fail the domain explicitly;
 restart/deferred delivery for that preparation remains incomplete. Path checking
-uses the current lexical view rather than a unified image/overlay resolver.
+resolves owned links within assigned storage; traversal across the separate
+image and owned namespaces remains unsupported.
 Image-file polling, links, shared writable file mappings and a full
 image/overlay resolver remain incomplete. Compiler compatibility remains bounded
 by these and the configured task, descriptor and storage limits.
@@ -520,15 +526,15 @@ partially transformed syscall. This adds no retained-storage guarantee.
 
 Configured launch accepts `--export-file <fresh tar path>` to retrieve its owned
 writable files after a successful workload exit. The supervisor first terminates
-and reaps remaining tasks, then writes regular files and directories to the
-caller-selected archive, preserving file modes and long paths. Deleted names and
+and reaps remaining tasks, then writes regular files, directories and symlinks to
+the caller-selected archive, preserving file modes, long paths and link targets. Deleted names and
 immutable image contents are excluded. Guest paths are archive data and never
 select host destinations. The output path is reserved exclusively before launch;
 write, sync or close failures fail the launch. Failed or interrupted workloads do
 not produce a valid successful export. Consumers must require both a successful
 completion result and a validated archive before publishing selected files.
-This is final export only; it does not provide retained storage or checkpoint
-recovery.
+Final export does not capture live process state; coordinated filesystem snapshots
+and startup restore are described below.
 
 A coordinator can additionally pass `--control-fd <inherited Unix stream socket>`
 for mid-run filesystem snapshots. The socket stays private to the supervisor.
@@ -547,8 +553,10 @@ handles. Complete coordinator state pairing and recovery are separate capabiliti
 `--restore-file <snapshot tar>` imports a snapshot into the newly prepared owned
 filesystem before starting the workload. Import is bounded to 4096 live objects
 and 2 GiB of file data, additionally constrained by configured storage capacity.
-It restores regular files, directories and permission bits, and supports the
-long names emitted by Ginux. It rejects links, traversal, duplicate entries,
+It restores regular files, directories, symlinks and permission bits, including
+long names and link targets emitted by Ginux. Absolute link targets are retained
+as data, never followed during import. It rejects hardlinks, symlink parents,
+traversal, duplicate entries,
 invalid metadata/checksums/terminators, truncated archives, and names outside the
 configured storage assignments. The source must be a regular file opened without
 following a symlink; import never changes it. Failure discards the new memory
