@@ -327,7 +327,12 @@ passed through. Byte-flow checks alone do not prove ordinary child commands work
 
 Configured launch supervises up to 16 native tasks through the existing process
 owner. Fork and vfork are supported, as are clone flags `SIGCHLD`,
-`CLONE_VM | CLONE_VFORK | SIGCHLD`, and the x86-64 pthread shape `0x3d0f00`.
+`CLONE_VM | CLONE_VFORK | SIGCHLD`, libc fork's
+`CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD` (`0x1200011`), and the
+x86-64 pthread shape `0x3d0f00`. Libc fork suppresses native child-TID copyout
+and publishes virtual identity into the child's private address space before it
+runs. Invalid/readonly child-TID addresses do not force writes or fail the fork;
+kernel clear-TID registration remains intact.
 Pthread tasks share their process's descriptor table, retain independent syscall
 transactions, and use distinct virtual TIDs with a common virtual process ID.
 Kernel parent-TID copyout is suppressed; the supervisor publishes the virtual TID
@@ -349,8 +354,11 @@ no rusage buffer. An invalid status pointer does not consume the child. Orphans
 are adopted by the virtual init, while the supervisor acts as the native
 subreaper. Kill supports positive domain IDs with signals 0 or SIGKILL; other
 signal forms are rejected. SIGCHLD auto-reap dispositions are rejected; bootstrap
-resets an inherited ignored SIGCHLD to its default disposition. Job control,
-interruption/restart of parked calls and SIGCHLD notification for adopted
+resets an inherited ignored SIGCHLD to its default disposition.
+Native rt_sigreturn restores the kernel signal frame, allowing handlers to
+return to the interrupted program. A real SIGCHLD handler case checks virtual
+sender identity, a handler syscall, and continued execution after return.
+Job control, interruption/restart of parked calls and SIGCHLD notification for adopted
 children and robust-futex owner-death behavior remain incomplete. Supported
 futex operations are wait/wake/requeue and their ordinary variants; PI futexes
 are denied before the kernel can publish native owner TIDs. Final root-process

@@ -14,6 +14,13 @@ static long call(long n, word a, word b, word c, word d, word e, word f)
 #define CHECK(expr,code) if (!(expr)) return code
 static void pause_forever(void) { for (;;) __asm__ volatile("pause"); }
 static char buffer[8];
+static volatile int fork_tid=0x1357;
+static volatile int child_signal;
+extern void signal_return(void);
+static void child_handler(int signal, const int *info, void *context) {
+    (void)context;
+    child_signal=(signal==17 && info[4]==2 && info[5]==0 && info[6]==37 && DO(39,0,0,0)==1)?1:-1;
+}
 long task_main(word *stack)
 {
     word argc=*stack;
@@ -38,10 +45,35 @@ long task_main(word *stack)
         CHECK(DO(61,child,&status,0)==child && status==(37<<8),15);
         CHECK(DO(61,child,&status,0)==-10,16);
         CHECK(DO(61,-1,&status,0)==-10,17);
+    } else if (mode=='l' || mode=='j' || mode=='p' || mode=='h') {
+        if(mode=='h') {
+            word handler[4]={(word)child_handler,0x4000004,(word)signal_return,0};
+            CHECK(call(13,17,(word)handler,0,8,0,0)==0,92);
+        }
+        long protected=call(9,0,4096,1,0x22,(word)-1,0);
+        CHECK(protected>0,90);
+        word address=mode=='j'?1:(mode=='p'?(word)protected:(word)&fork_tid);
+        long child=call(56,0x1200011,0,0,address,0,0);
+        if (!child) {
+            CHECK(DO(39,0,0,0)==2 && DO(186,0,0,0)==2,83);
+            if(mode=='l' || mode=='h') { CHECK(fork_tid==2,84); }
+            else { CHECK(fork_tid==0x1357 && *(volatile int *)protected==0,85); }
+            return 37;
+        }
+        CHECK(child==2 && fork_tid==0x1357 && *(volatile int *)protected==0,86);
+        int status=0;
+        CHECK(DO(61,child,&status,0)==child && status==(37<<8),87);
+        CHECK(DO(61,child,&status,0)==-10,88);
+        if(mode=='h') {
+            for(word n=0;n<1000 && !child_signal;++n) DO(39,0,0,0);
+            CHECK(child_signal==1,93);
+        }
+        CHECK(DO(11,protected,4096,0)==0,91);
     } else if (mode=='r') {
         int pipe[2]; CHECK(DO(22,pipe,0,0)==0,76);
         word limit[2]={1,1}; CHECK(DO(302,0,6,limit)==0,80);
         CHECK(DO(57,0,0,0)==-11 && DO(57,0,0,0)==-11,77);
+        CHECK(call(56,0x1200011,0,0,(word)&fork_tid,0,0)==-11 && fork_tid==0x1357,89);
         CHECK(DO(1,pipe[1],"K",1)==1 && DO(0,pipe[0],buffer,1)==1 && buffer[0]=='K',78);
         CHECK(DO(3,pipe[0],0,0)==0 && DO(3,pipe[1],0,0)==0,79);
     } else if (mode=='i') {
@@ -128,3 +160,4 @@ long task_main(word *stack)
     return 0;
 }
 __asm__(".global _start\n_start:\nmov %rsp,%rdi\nandq $-16,%rsp\ncall task_main\nmov %rax,%rdi\nmov $60,%rax\nsyscall\nud2\n");
+__asm__(".global signal_return\nsignal_return:\nmov $15,%rax\nsyscall\nud2\n");

@@ -28,6 +28,7 @@ enum Pending {
         child: usize,
         flags: u64,
         parent_tid: Option<u64>,
+        child_tid: Option<u64>,
     },
     Wait {
         child: usize,
@@ -560,7 +561,8 @@ impl Supervisor<'_> {
             56..=58 => {
                 let flags = r.rdi;
                 let thread = r.orig_rax == 56 && flags == 0x3d0f00;
-                if r.orig_rax == 56 && !thread && !matches!(flags, 17 | 0x4111) {
+                let libc_fork = r.orig_rax == 56 && flags == 0x1200011;
+                if r.orig_rax == 56 && !thread && !matches!(flags, 17 | 0x4111 | 0x1200011) {
                     self.emulate(index, r, -38, domain);
                     return;
                 }
@@ -650,9 +652,15 @@ impl Supervisor<'_> {
                     child: slot,
                     flags,
                     parent_tid: thread.then_some(r.rdx),
+                    child_tid: libc_fork.then_some(r.r10),
                 };
                 if thread {
                     r.rdi &= !0x100000;
+                }
+                if libc_fork {
+                    // Keep CHILD_CLEARTID, but suppress the native child TID
+                    // copyout. Publish virtual identity at the birth barrier.
+                    r.rdi &= !0x1000000;
                 }
                 audit_write(b"mediate surface=owned-process-create\n");
                 self.run(index, r, domain);
@@ -1032,6 +1040,7 @@ impl Supervisor<'_> {
             child: slot,
             flags,
             parent_tid,
+            child_tid,
         } = self.task(parent).pending
         else {
             self.fail(domain, b"unreserved child event")
@@ -1068,6 +1077,14 @@ impl Supervisor<'_> {
             if copy_memory(self.task(parent).host, address, &mut virtual_tid, true) != Ok(4) {
                 self.fail(domain, b"thread identity copyout failed");
             }
+        }
+        if let Some(address) = child_tid {
+            let mut virtual_tid = self.task(slot).id.pid.to_ne_bytes();
+            // Linux ignores a failed CHILD_SETTID put_user, unlike the parent
+            // copyout. Never force a write through readonly guest memory.
+            let _ = copy_memory(host, address, &mut virtual_tid, true);
+        }
+        if parent_tid.is_some() || child_tid.is_some() {
             let mut child_regs = self.registers(slot, domain);
             child_regs.rdi = flags;
             if ptrace(PTRACE_SETREGS, host, 0, &child_regs as *const _ as usize) < 0 {
@@ -1209,6 +1226,7 @@ impl Supervisor<'_> {
                 child,
                 flags,
                 parent_tid,
+                ..
             } => {
                 r.rdi = flags;
                 if (r.rax as i64) < 0 {
