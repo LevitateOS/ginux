@@ -68,17 +68,25 @@ def main():
             invoke(["exit", str(code)], code, "exited")
         invoke(["args", "one two", ""], 0, "exited", env=["GREETING=hello world", "EMPTY="],
                stdout=b"one two\n\nGREETING=hello world\nEMPTY=\n")
+        # Largest documented argv/environment, mostly quotes and backslashes,
+        # so the normalized configuration exceeds 4 KiB.
+        big_args = [("q\"b\\" * 32)[:128] for _ in range(6)]
+        big_env = [f"BIG{i}=" + ("\"\\" * 128)[:251] for i in range(8)]
+        invoke(["args", *big_args], 0, "exited", env=big_env,
+               stdout="".join(f"{line}\n" for line in big_args + big_env).encode())
         invoke(["cwd"], 0, "exited", stdout=b"configured working directory\n")
         invoke(["cwd"], 0, "exited", stdout=b"root working directory\n",
                changes={"args = [": 'workdir = "/"\nargs = ['})
         invoke(["exit"], 0, "exited", changes={"args = [": 'workdir = "/work/a..b"\nargs = ['})
         invoke(["trap"], 133, "signaled")
+        invoke(["handler"], 0, "exited", stdout=b"handled\n")
         invoke(["segv"], 139, "signaled")
         invoke(["fork"], 0, "exited")
         invoke(["poll"], 0, "exited")
         invoke(["int80"], 1, "supervisor-error")
         invoke(["descriptor"], 0, "exited")
         invoke(["descriptor", "0"], 0, "exited", cloexec_stdin=True)
+        invoke(["list"], 0, "exited", stdout=b"input\n")
         with (work / "secret").open("w+b") as secret:
             secret.write(b"host-only data")
             secret.flush()
@@ -177,11 +185,17 @@ def main():
                      ["device-bench", "config", "block"]):
             proc = subprocess.run([binary, *args], capture_output=True, timeout=10)
             if (proc.returncode != 2 or proc.stdout
-                    or b"unknown or incomplete command" not in proc.stderr):
+                    or b"ginux: usage:" not in proc.stderr):
                 raise RuntimeError(f"invalid command {args!r} ran a workload: {proc!r}")
             if unused_result.exists():
                 raise RuntimeError("invalid command created a result file")
         print("PASS unknown and incomplete commands fail without demo output or result files")
+        for args in (["config"], ["native", "config"], ["devices", "config"], ["confg", "x.toml"],
+                     ["--help"], ["help"]):
+            proc = subprocess.run([binary, *args], capture_output=True, timeout=10)
+            if proc.returncode != 2 or proc.stdout or b"ginux: usage:" not in proc.stderr:
+                raise RuntimeError(f"unknown or incomplete argv ran the demonstration: {proc!r}")
+        print("PASS unknown and incomplete commands report usage without running a demo")
         # Exercise the bootstrap failure in a real unprivileged process.
         work.chmod(0o755)
         config_path = work / "unprivileged.toml"

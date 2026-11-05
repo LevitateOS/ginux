@@ -13,7 +13,7 @@ use crate::supervisor::*;
 use crate::tracee_io::copy_memory;
 use ginux_core::{balanced_identity_result, balanced_surface, Action};
 use ginux_domain::Domain;
-use ginux_process::{Credentials, ProcessError, ProcessTable, TaskId};
+use ginux_process::{Credentials, ProcessError, ProcessTable, TaskId, WaitTarget};
 use ginux_vfs::Executable;
 
 const TASKS: usize = 16;
@@ -72,6 +72,7 @@ struct Task {
     id: TaskId,
     host: usize,
     alive: bool,
+    wait_status: Option<i32>,
     group: usize,
     call: DescriptorCall,
     pending: Pending,
@@ -158,6 +159,7 @@ pub fn supervise(
         id,
         host: root,
         alive: true,
+        wait_status: None,
         group: 0,
         call: DescriptorCall::new(),
         pending: Pending::None,
@@ -639,6 +641,7 @@ impl Supervisor<'_> {
                     id: child,
                     host: 0,
                     alive: true,
+                    wait_status: None,
                     group,
                     call: DescriptorCall::new(),
                     pending: Pending::None,
@@ -1261,7 +1264,7 @@ impl Supervisor<'_> {
                     let id = self.task(child).id;
                     if self
                         .processes
-                        .wait(self.task(index).id, Some(id.pid))
+                        .wait(self.task(index).id, WaitTarget::Specific(id.pid), 0)
                         .is_err()
                     {
                         self.fail(domain, b"virtual child reap failed")
@@ -1313,7 +1316,10 @@ impl Supervisor<'_> {
         }
         let selected = (selector > 0).then_some(selector as u32);
         let parent = self.task(index).id;
-        match self.processes.peek_wait(parent, selected) {
+        match self.processes.peek_wait(
+            parent,
+            selected.map_or(WaitTarget::Any, WaitTarget::Specific),
+        ) {
             Ok(result) => {
                 let child = self
                     .tasks
@@ -1330,7 +1336,11 @@ impl Supervisor<'_> {
                     return;
                 }
                 if r.rsi != 0 {
-                    let mut status = result.status.to_ne_bytes();
+                    let mut status = self
+                        .task(child)
+                        .wait_status
+                        .expect("reportable child status")
+                        .to_ne_bytes();
                     if copy_memory(self.task(index).host, r.rsi, &mut status, true) != Ok(4) {
                         self.emulate(index, r, -14, domain);
                         return;
@@ -1378,6 +1388,14 @@ impl Supervisor<'_> {
             self.entry(index, &mut r, domain);
         }
     }
+    fn record_death(&mut self, id: TaskId, status: i32) -> Result<(), ProcessError> {
+        if status & 0x7f == 0 {
+            self.processes.exit(id, (status >> 8) & 0xff)
+        } else {
+            self.processes.signaled(id, (status & 0x7f) as u8)
+        }
+    }
+
     fn died(&mut self, index: usize, status: i32, domain: &mut Domain) {
         self.wake_needed = true;
         if !self.task(index).alive {
@@ -1422,6 +1440,7 @@ impl Supervisor<'_> {
             }
         }
         self.task_mut(index).alive = false;
+        self.task_mut(index).wait_status = Some(status);
         self.task_mut(index).blocked = None;
         if let Err(reason) = self.tasks[index]
             .as_mut()
@@ -1434,9 +1453,7 @@ impl Supervisor<'_> {
         if id == self.groups[group].as_ref().unwrap().leader {
             self.groups[group].as_mut().unwrap().status = Some(status);
         } else {
-            if self.processes.exit(id, status).is_err()
-                || self.processes.reap_exited_thread(id).is_err()
-            {
+            if self.record_death(id, status).is_err() || self.processes.reap_thread(id).is_err() {
                 self.fail(domain, b"virtual thread exit failed");
             }
         }
@@ -1444,7 +1461,7 @@ impl Supervisor<'_> {
             let Some(status) = status else {
                 self.fail(domain, b"process ended without leader status");
             };
-            if self.processes.exit(leader, status).is_err() {
+            if self.record_death(leader, status).is_err() {
                 self.fail(domain, b"virtual process exit failed");
             }
             if leader.pid == 1 {

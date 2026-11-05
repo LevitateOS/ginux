@@ -36,11 +36,12 @@ pub enum Command {
     KernelViews(*const u8),
     Launch(*const u8, *const u8, *const u8),
     LaunchUsage,
-    InvalidArguments,
+    Usage,
 }
 
-/// Decode `argv`; only an invocation without arguments selects the default
-/// interception demonstration. Invalid commands must not run a different workload.
+/// Decode `argv`. `None` (no arguments) selects the default interception
+/// demonstration; an unknown or incomplete command is a usage error and never
+/// falls through to the demonstration.
 pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
     if argc < 2 {
         return None;
@@ -50,7 +51,7 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
         return Some(Command::LaunchUsage);
     }
     if argc < 3 {
-        return Some(Command::InvalidArguments);
+        return Some(Command::Usage);
     }
     if c_string_equals(command, b"runtime") {
         let path = unsafe { *argv.add(2) as *const u8 };
@@ -115,7 +116,7 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
             Some(Command::LaunchUsage)
         }
     } else {
-        Some(Command::InvalidArguments)
+        Some(Command::Usage)
     }
 }
 
@@ -589,14 +590,21 @@ fn print_launch_config(config: &DomainConfig) {
     line_stderr(b"ginux: effective config end");
 }
 
-pub fn launch_usage() -> ! {
-    line_stderr(b"ginux: launch usage: launch <config> <root> [--result-file <fresh host path>]");
+pub fn usage() -> ! {
+    line_stderr(b"ginux: usage: ginux (no arguments: interception demonstration)");
+    line_stderr(b"ginux: usage: ginux config|lifecycle|process|kernel-views <config>");
+    line_stderr(b"ginux: usage: ginux runtime <elf>");
+    line_stderr(b"ginux: usage: ginux domain|process-native <config> <fixture>");
+    line_stderr(b"ginux: usage: ginux native <config> <root> [hold|probe]");
+    line_stderr(b"ginux: usage: ginux devices <config> <block>");
+    line_stderr(b"ginux: usage: ginux device-bench <config> <block> <kind>");
+    line_stderr(b"ginux: usage: ginux vfs <config> <rootfs> <index>");
+    line_stderr(b"ginux: usage: ginux launch <config> <root> [--result-file <fresh host path>]");
     exit_process(2)
 }
 
-pub fn invalid_arguments() -> ! {
-    line_stderr(b"ginux: unknown or incomplete command; no workload started");
-    line_stderr(b"ginux: configured workload usage: launch <config> <root> [--result-file <fresh host path>]");
+pub fn launch_usage() -> ! {
+    line_stderr(b"ginux: launch usage: launch <config> <root> [--result-file <fresh host path>]");
     exit_process(2)
 }
 
