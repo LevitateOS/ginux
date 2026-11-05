@@ -13,6 +13,7 @@ pub const O_TRUNC: u32 = 8;
 pub const O_CLOEXEC: u32 = 16;
 pub const O_APPEND: u32 = 32;
 pub const O_EXCLUSIVE: u32 = 64;
+pub const O_NONBLOCK: u32 = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -29,6 +30,7 @@ pub enum VfsError {
     NotFound,
     NotDirectory,
     IsDirectory,
+    DirectoryNotEmpty,
     SymlinkLoop,
     PermissionDenied,
     InvalidDescriptor,
@@ -302,6 +304,29 @@ pub struct FileMetadata {
     pub size: u64,
 }
 
+pub struct DirectoryEntry<'a> {
+    pub name: &'a [u8],
+    pub inode: u64,
+    pub kind: NodeKind,
+    pub next: u64,
+}
+
+fn beneath(path: &[u8], parent: &[u8]) -> bool {
+    path == parent
+        || path
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.first() == Some(&b'/'))
+}
+
+fn child_name<'a>(directory: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
+    let name = if directory == b"/" {
+        path.strip_prefix(b"/")?
+    } else {
+        path.strip_prefix(directory)?.strip_prefix(b"/")?
+    };
+    (!name.is_empty() && !name.contains(&b'/')).then_some(name)
+}
+
 #[derive(Clone, Copy)]
 struct OverlayFile {
     state: u8,
@@ -331,6 +356,8 @@ struct Descriptor {
     writable: bool,
     close_on_exec: bool,
     append: bool,
+    directory: bool,
+    nonblocking: bool,
 }
 
 impl Descriptor {
@@ -344,6 +371,8 @@ impl Descriptor {
             writable: false,
             close_on_exec: false,
             append: false,
+            directory: false,
+            nonblocking: false,
         }
     }
 }
@@ -527,8 +556,132 @@ impl<
             writable,
             close_on_exec: flags & O_CLOEXEC != 0,
             append: flags & O_APPEND != 0,
+            directory: false,
+            nonblocking: flags & O_NONBLOCK != 0,
         };
         Ok(slot as i32 + 3)
+    }
+
+    /// Open a directory description. Enumeration cookies share this object
+    /// through the launcher's aliases, just like ordinary file offsets.
+    pub fn open_directory(&mut self, path: &[u8], flags: u32) -> Result<i32, VfsError> {
+        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+            return Err(VfsError::InvalidPath);
+        }
+        let path = normalize(path)?;
+        let metadata = self.metadata(path.as_bytes())?;
+        if metadata.kind != NodeKind::Directory {
+            return Err(VfsError::NotDirectory);
+        }
+        let slot = self
+            .descriptors
+            .iter()
+            .position(|fd| !fd.open)
+            .ok_or(VfsError::DescriptorLimit)?;
+        let overlay = self.find_overlay(path.as_bytes());
+        let object = match overlay {
+            Some(index) => index,
+            None => self
+                .find_base_record(self.index.resolve(path.as_bytes())?.path)
+                .ok_or(VfsError::InvalidIndex)?,
+        };
+        self.descriptors[slot] = Descriptor {
+            open: true,
+            overlay: overlay.is_some(),
+            object,
+            offset: 0,
+            readable: true,
+            writable: false,
+            close_on_exec: flags & O_CLOEXEC != 0,
+            append: false,
+            directory: true,
+            nonblocking: flags & O_NONBLOCK != 0,
+        };
+        Ok(slot as i32 + 3)
+    }
+
+    pub fn directory_path(&self, descriptor: i32) -> Result<&[u8], VfsError> {
+        let state = self.descriptors[self.descriptor(descriptor)?];
+        if !state.directory {
+            return Err(VfsError::NotDirectory);
+        }
+        if state.overlay {
+            let file = &self.overlay[state.object];
+            if file.state == 2 {
+                return Err(VfsError::NotFound);
+            }
+            Ok(file.path.as_bytes())
+        } else {
+            Ok(self.index.entry(state.object)?.path)
+        }
+    }
+
+    /// Inspect without consuming a cookie. The ABI adapter commits the next
+    /// cookie only after complete directory records reach caller memory.
+    pub fn directory_entry(
+        &self,
+        descriptor: i32,
+        cookie: u64,
+    ) -> Result<Option<DirectoryEntry<'_>>, VfsError> {
+        let state = self.descriptors[self.descriptor(descriptor)?];
+        if !state.directory {
+            return Err(VfsError::NotDirectory);
+        }
+        if state.overlay && self.overlay[state.object].state == 2 {
+            return Ok(None);
+        }
+        let path = self.directory_path(descriptor)?;
+        if cookie < 2 {
+            let inode = if cookie == 0 {
+                self.fstat(descriptor)?.inode
+            } else {
+                let split = path.iter().rposition(|byte| *byte == b'/').unwrap_or(0);
+                self.metadata(if split == 0 { b"/" } else { &path[..split] })?
+                    .inode
+            };
+            return Ok(Some(DirectoryEntry {
+                name: if cookie == 0 { b"." } else { b".." },
+                inode,
+                kind: NodeKind::Directory,
+                next: cookie + 1,
+            }));
+        }
+        let start = usize::try_from(cookie - 2).map_err(|_| VfsError::InvalidPath)?;
+        for ordinal in start..self.index.len() + FILES {
+            if ordinal < self.index.len() {
+                let entry = self.index.entry(ordinal)?;
+                if self.find_overlay(entry.path).is_some() {
+                    continue;
+                }
+                if let Some(name) = child_name(path, entry.path) {
+                    return Ok(Some(DirectoryEntry {
+                        name,
+                        inode: (ordinal + 1) as u64,
+                        kind: entry.kind,
+                        next: ordinal as u64 + 3,
+                    }));
+                }
+            } else {
+                let object = ordinal - self.index.len();
+                let entry = &self.overlay[object];
+                if !matches!(entry.state, 1 | 3) {
+                    continue;
+                }
+                if let Some(name) = child_name(path, entry.path.as_bytes()) {
+                    return Ok(Some(DirectoryEntry {
+                        name,
+                        inode: (self.index.len() + object + 1) as u64,
+                        kind: if entry.state == 3 {
+                            NodeKind::Directory
+                        } else {
+                            NodeKind::File
+                        },
+                        next: ordinal as u64 + 3,
+                    }));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn read(&mut self, descriptor: i32, output: &mut [u8]) -> Result<usize, VfsError> {
@@ -537,6 +690,9 @@ impl<
             return Err(VfsError::PermissionDenied);
         }
         let state = self.descriptors[slot];
+        if state.directory {
+            return Err(VfsError::IsDirectory);
+        }
         let available = if state.overlay {
             self.overlay[state.object].len.saturating_sub(state.offset)
         } else {
@@ -713,7 +869,11 @@ impl<
             let file = &self.overlay[descriptor.object];
             Ok(FileMetadata {
                 inode: (self.index.len() + descriptor.object + 1) as u64,
-                kind: NodeKind::File,
+                kind: if descriptor.directory {
+                    NodeKind::Directory
+                } else {
+                    NodeKind::File
+                },
                 mode: file.mode,
                 size: file.len as u64,
             })
@@ -745,7 +905,136 @@ impl<
         Ok(())
     }
 
+    fn has_children(&self, path: &[u8]) -> Result<bool, VfsError> {
+        if self.overlay.iter().any(|entry| {
+            matches!(entry.state, 1 | 3) && child_name(path, entry.path.as_bytes()).is_some()
+        }) {
+            return Ok(true);
+        }
+        for i in 0..self.index.len() {
+            let entry = self.index.entry(i)?;
+            if child_name(path, entry.path).is_some() && self.find_overlay(entry.path).is_none() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Mutate overlay-created directories only. Image subtree mutation needs
+    /// a unified resolver/whiteout model and must not be approximated here.
+    pub fn remove_directory(&mut self, path: &[u8]) -> Result<(), VfsError> {
+        let path = normalize(path)?;
+        if self.metadata(path.as_bytes())?.kind != NodeKind::Directory {
+            return Err(VfsError::NotDirectory);
+        }
+        let slot = self
+            .find_overlay(path.as_bytes())
+            .ok_or(VfsError::PermissionDenied)?;
+        if self.index.lookup_exact(path.as_bytes()).is_ok() {
+            return Err(VfsError::PermissionDenied);
+        }
+        if self.has_children(path.as_bytes())? {
+            return Err(VfsError::DirectoryNotEmpty);
+        }
+        self.overlay[slot].state = 2;
+        self.release_unlinked(slot);
+        Ok(())
+    }
+
+    /// Atomic namespace move of overlay-created objects. Open descriptions
+    /// keep their object identity; replacing a name does not replace its OFD.
+    pub fn rename(
+        &mut self,
+        source: &[u8],
+        destination: &[u8],
+        no_replace: bool,
+    ) -> Result<(), VfsError> {
+        let source = normalize(source)?;
+        let destination = normalize(destination)?;
+        let metadata = self.metadata(source.as_bytes())?;
+        if source.as_bytes() == destination.as_bytes() {
+            return if no_replace {
+                Err(VfsError::AlreadyExists)
+            } else {
+                Ok(())
+            };
+        }
+        let source_slot = self
+            .find_overlay(source.as_bytes())
+            .ok_or(VfsError::PermissionDenied)?;
+        if metadata.kind == NodeKind::Directory
+            && beneath(destination.as_bytes(), source.as_bytes())
+        {
+            return Err(VfsError::InvalidPath);
+        }
+        self.require_parent(destination.as_bytes())?;
+        // Do not leave a visible image name behind or expose hidden base
+        // descendants when moving a tree. Configured empty memory namespaces
+        // have no base entries beneath them and can use the full operation.
+        for i in 0..self.index.len() {
+            let path = self.index.entry(i)?.path;
+            if beneath(path, source.as_bytes()) || beneath(path, destination.as_bytes()) {
+                return Err(VfsError::PermissionDenied);
+            }
+        }
+        let target = match self.metadata(destination.as_bytes()) {
+            Ok(target) => {
+                if no_replace {
+                    return Err(VfsError::AlreadyExists);
+                }
+                match (metadata.kind, target.kind) {
+                    (NodeKind::Directory, NodeKind::Directory) => {
+                        if self.has_children(destination.as_bytes())? {
+                            return Err(VfsError::DirectoryNotEmpty);
+                        }
+                    }
+                    (NodeKind::Directory, _) => return Err(VfsError::NotDirectory),
+                    (_, NodeKind::Directory) => return Err(VfsError::IsDirectory),
+                    _ => {}
+                }
+                Some(
+                    self.find_overlay(destination.as_bytes())
+                        .ok_or(VfsError::PermissionDenied)?,
+                )
+            }
+            Err(VfsError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        // Check every new descendant path before changing any namespace entry.
+        for entry in &self.overlay {
+            if matches!(entry.state, 1 | 3) && beneath(entry.path.as_bytes(), source.as_bytes()) {
+                let suffix = entry.path.len - source.len;
+                if destination
+                    .len
+                    .checked_add(suffix)
+                    .is_none_or(|n| n > MAX_PATH)
+                {
+                    return Err(VfsError::InvalidPath);
+                }
+            }
+        }
+        if let Some(target) = target {
+            self.overlay[target].state = 2;
+            self.release_unlinked(target);
+        }
+        for entry in &mut self.overlay {
+            if matches!(entry.state, 1 | 3) && beneath(entry.path.as_bytes(), source.as_bytes()) {
+                let mut path = destination;
+                path.extend(&entry.path.as_bytes()[source.len..])?; // Preflight above guarantees capacity.
+                entry.path = path;
+            }
+        }
+        debug_assert_eq!(
+            self.overlay[source_slot].path.as_bytes(),
+            destination.as_bytes()
+        );
+        Ok(())
+    }
+
     pub fn chmod(&mut self, path: &[u8], mode: u32) -> Result<(), VfsError> {
+        // Callers may pass a full st_mode. File-type bits are not permissions;
+        // ignore them, while retaining the existing denial of special bits.
+        let mode = mode & 0o7777;
         let path = normalize(path)?;
         let slot = self
             .find_overlay(path.as_bytes())
@@ -761,6 +1050,7 @@ impl<
     }
 
     pub fn fchmod(&mut self, descriptor: i32, mode: u32) -> Result<(), VfsError> {
+        let mode = mode & 0o7777;
         let descriptor = self.descriptors[self.descriptor(descriptor)?];
         if !descriptor.overlay || mode & !0o777 != 0 {
             return Err(VfsError::PermissionDenied);
@@ -794,7 +1084,8 @@ impl<
             _ => 2,
         };
         Ok((
-            mode | if state.append { 0o2000 } else { 0 },
+            mode | if state.append { 0o2000 } else { 0 }
+                | if state.nonblocking { 0o4000 } else { 0 },
             state.close_on_exec,
         ))
     }
@@ -1247,5 +1538,125 @@ mod tests {
         assert_eq!(vfs.fstat(fd).unwrap().size, 0);
         assert_eq!(vfs.seek(fd, 0, 1), Ok(5000));
         vfs.close(truncating).unwrap();
+    }
+
+    #[test]
+    fn directory_records_merge_names_and_keep_cookies_explicit() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 4, 32, 4> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        vfs.mkdir(b"/work", 0o755).unwrap();
+        let file = vfs.open(b"/work/file", O_CREATE | O_WRITE).unwrap();
+        vfs.close(file).unwrap();
+        vfs.mkdir(b"/work/nested", 0o755).unwrap();
+        let leaf = vfs.open(b"/work/nested/leaf", O_CREATE | O_WRITE).unwrap();
+        vfs.close(leaf).unwrap();
+        let dir = vfs
+            .open_directory(b"/work", O_CLOEXEC | O_NONBLOCK)
+            .unwrap();
+        assert_eq!(vfs.fstat(dir).unwrap().kind, NodeKind::Directory);
+        assert_eq!(vfs.descriptor_flags(dir), Ok((0o4000, true)));
+        assert_eq!(vfs.read(dir, &mut [0; 4]), Err(VfsError::IsDirectory));
+        let mut names = Vec::new();
+        let mut cookie = 0;
+        while let Some(entry) = vfs.directory_entry(dir, cookie).unwrap() {
+            assert!(entry.next > cookie);
+            names.push(entry.name.to_vec());
+            cookie = entry.next;
+        }
+        assert_eq!(
+            names,
+            std::vec![
+                b".".to_vec(),
+                b"..".to_vec(),
+                b"file".to_vec(),
+                b"nested".to_vec()
+            ]
+        );
+        assert_eq!(vfs.seek(dir, 0, 1), Ok(0)); // Peeking did not consume anything.
+        vfs.seek(dir, cookie as i64, 0).unwrap();
+        assert!(vfs.directory_entry(dir, cookie).unwrap().is_none());
+        assert_eq!(vfs.directory_path(dir), Ok(b"/work".as_slice()));
+        vfs.close_on_exec();
+        assert_eq!(vfs.fstat(dir), Err(VfsError::InvalidDescriptor));
+        let root = vfs.open_directory(b"/", 0).unwrap();
+        let mut cookie = 2;
+        let mut names = Vec::new();
+        while let Some(entry) = vfs.directory_entry(root, cookie).unwrap() {
+            names.push(entry.name.to_vec());
+            cookie = entry.next;
+        }
+        assert!(names.contains(&b"work".to_vec()));
+        assert!(!names.contains(&b"leaf".to_vec()));
+    }
+
+    #[test]
+    fn rename_and_remove_preserve_open_objects_and_validate_before_mutation() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 16, 32, 8> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        vfs.mkdir(b"/work", 0o755).unwrap();
+        let a = vfs.open(b"/work/a", O_READ | O_WRITE | O_CREATE).unwrap();
+        vfs.write(a, b"new").unwrap();
+        let b = vfs.open(b"/work/b", O_READ | O_WRITE | O_CREATE).unwrap();
+        vfs.write(b, b"old").unwrap();
+        let inode = vfs.fstat(a).unwrap().inode;
+        assert_eq!(
+            vfs.rename(b"/work/a", b"/work/b", true),
+            Err(VfsError::AlreadyExists)
+        );
+        vfs.rename(b"/work/a", b"/work/b", false).unwrap();
+        assert_eq!(vfs.metadata(b"/work/a"), Err(VfsError::NotFound));
+        assert_eq!(vfs.metadata(b"/work/b").unwrap().inode, inode);
+        let mut output = [0; 3];
+        vfs.seek(b, 0, 0).unwrap();
+        vfs.read(b, &mut output).unwrap();
+        assert_eq!(&output, b"old");
+        vfs.seek(a, 0, 0).unwrap();
+        vfs.read(a, &mut output).unwrap();
+        assert_eq!(&output, b"new");
+        vfs.close(a).unwrap();
+        vfs.close(b).unwrap();
+        vfs.mkdir(b"/work/tree", 0o755).unwrap();
+        vfs.mkdir(b"/work/tree/sub", 0o755).unwrap();
+        let dir = vfs.open_directory(b"/work/tree", 0).unwrap();
+        vfs.rename(b"/work/tree", b"/work/moved", false).unwrap();
+        assert_eq!(vfs.directory_path(dir), Ok(b"/work/moved".as_slice()));
+        assert!(vfs.metadata(b"/work/moved/sub").is_ok());
+        assert_eq!(
+            vfs.remove_directory(b"/work/moved"),
+            Err(VfsError::DirectoryNotEmpty)
+        );
+        assert_eq!(
+            vfs.rename(b"/work/moved", b"/work/moved/sub/bad", false),
+            Err(VfsError::InvalidPath)
+        );
+        assert!(vfs.metadata(b"/work/moved/sub").is_ok());
+        vfs.remove_directory(b"/work/moved/sub").unwrap();
+        vfs.remove_directory(b"/work/moved").unwrap();
+        assert_eq!(vfs.fstat(dir).unwrap().kind, NodeKind::Directory);
+        assert!(vfs.directory_entry(dir, 0).unwrap().is_none());
+        assert_eq!(vfs.directory_path(dir), Err(VfsError::NotFound));
+        vfs.close(dir).unwrap();
+        vfs.mkdir(b"/work/short", 0o755).unwrap();
+        let mut long = b"/work/short/".to_vec();
+        long.extend_from_slice(&[b'x'; 220]);
+        let fd = vfs.open(&long, O_CREATE | O_WRITE).unwrap();
+        vfs.close(fd).unwrap();
+        let mut dest = b"/work/".to_vec();
+        dest.extend_from_slice(&[b'd'; 40]);
+        assert_eq!(
+            vfs.rename(b"/work/short", &dest, false),
+            Err(VfsError::InvalidPath)
+        );
+        assert!(vfs.metadata(&long).is_ok());
+        assert_eq!(vfs.metadata(&dest), Err(VfsError::NotFound));
+        let root = vfs.open_directory(b"/", 0).unwrap();
+        assert_eq!(vfs.remove_directory(b"/"), Err(VfsError::PermissionDenied));
+        assert_eq!(
+            vfs.rename(b"/work/short", b"/", false),
+            Err(VfsError::PermissionDenied)
+        );
+        vfs.close(root).unwrap();
     }
 }

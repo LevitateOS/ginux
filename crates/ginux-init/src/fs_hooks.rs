@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use ginux_domain::{DomainConfig, Text};
 use ginux_vfs::{
     BaseReader, Entry, FileMetadata, Index, NodeKind, VfsError, VirtualFs, HEADER_SIZE, MAX_PATH,
-    O_APPEND, O_CLOEXEC, O_CREATE, O_EXCLUSIVE, O_READ, O_TRUNC, O_WRITE, RECORD_SIZE,
+    O_APPEND, O_CLOEXEC, O_CREATE, O_EXCLUSIVE, O_NONBLOCK, O_READ, O_TRUNC, O_WRITE, RECORD_SIZE,
 };
 
 pub const FD_BASE: usize = 1 << 20;
@@ -146,17 +146,24 @@ impl LaunchFs {
             return Err(-2);
         }
         let absolute = text.as_bytes().first() == Some(&b'/');
-        if !absolute && dirfd as i32 != -100 {
-            return Err(if dirfd as i32 >= FD_BASE as i32 {
-                -20
-            } else {
-                -9
-            });
+        let base = if absolute {
+            b"/".as_slice()
+        } else if dirfd as i32 == -100 {
+            self.cwd.as_bytes()
+        } else {
+            let fd = (dirfd as u32)
+                .checked_sub(FD_BASE as u32)
+                .filter(|n| *n < 64)
+                .ok_or(-9)?;
+            self.fs.directory_path(fd as i32 + 3).map_err(errno)?
+        };
+        let path = normalize(base, text.as_bytes())?;
+        if !absolute && dirfd as i32 != -100 && !self.owns_path(path.as_bytes()) {
+            // The image does not share this directory descriptor. Never pass
+            // the private integer to a native open outside assigned storage.
+            return Err(-95);
         }
-        normalize(
-            if absolute { b"/" } else { self.cwd.as_bytes() },
-            text.as_bytes(),
-        )
+        Ok(path)
     }
 
     /// Image execution must not fall through an assigned writable namespace.
@@ -181,10 +188,30 @@ impl LaunchFs {
         if !self.enabled() {
             return None;
         }
+        if matches!(r.orig_rax, 82 | 264 | 316) {
+            return Some(self.rename(pid, r).unwrap_or_else(|error| error));
+        }
         let fd = r.rdi as i32;
         if matches!(
             r.orig_rax,
-            0 | 1 | 3 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 32 | 33 | 72 | 74 | 75 | 77 | 91 | 292
+            0 | 1
+                | 3
+                | 5
+                | 8
+                | 16
+                | 17
+                | 18
+                | 19
+                | 20
+                | 32
+                | 33
+                | 72
+                | 74
+                | 75
+                | 77
+                | 91
+                | 217
+                | 292
         ) && fd >= FD_BASE as i32
         {
             return Some(self.descriptor_call(pid, r, fd - FD_BASE as i32 + 3));
@@ -200,7 +227,7 @@ impl LaunchFs {
             }
         }
         let (address, dirfd) = match r.orig_rax {
-            2 | 4 | 6 | 83 | 87 | 90 => (r.rdi, (-100i64) as u64),
+            2 | 4 | 6 | 83 | 84 | 87 | 90 => (r.rdi, (-100i64) as u64),
             257 | 258 | 262 | 263 | 268 | 332 => (r.rsi, r.rdi),
             _ => return None,
         };
@@ -240,8 +267,11 @@ impl LaunchFs {
                 .map(|_| 0)
                 .map_err(errno),
             87 => self.fs.unlink(path.as_bytes()).map(|_| 0).map_err(errno),
+            84 => self.remove_directory(path.as_bytes()),
             263 => {
-                if r.rdx != 0 {
+                if r.rdx == 0x200 {
+                    self.remove_directory(path.as_bytes())
+                } else if r.rdx != 0 {
                     Err(-95)
                 } else {
                     self.fs.unlink(path.as_bytes()).map(|_| 0).map_err(errno)
@@ -265,9 +295,34 @@ impl LaunchFs {
     fn open(&mut self, path: &[u8], flags: u64, mode: u64) -> Result<i64, i64> {
         // NOFOLLOW is valid because this backend has no symlinks. Unsupported
         // directory/path-only behavior never falls through to native storage.
-        const ALLOWED: u64 = 3 | 0o100 | 0o200 | 0o1000 | 0o2000 | 0o100000 | 0o400000 | 0o2000000;
+        const ALLOWED: u64 = 3
+            | 0o100
+            | 0o200
+            | 0o1000
+            | 0o2000
+            | 0o4000
+            | 0o100000
+            | 0o200000
+            | 0o400000
+            | 0o2000000;
         if flags & !ALLOWED != 0 || flags & 3 == 3 {
             return Err(-95);
+        }
+        if flags & (0o200000 | 0o100) == (0o200000 | 0o100) {
+            return Err(-22);
+        }
+        let metadata = self.fs.metadata(path);
+        if metadata.is_ok_and(|m| m.kind == NodeKind::Directory) {
+            if flags & (3 | 0o100 | 0o1000 | 0o2000) != 0 {
+                return Err(-21);
+            }
+            let status = if flags & 0o2000000 != 0 { O_CLOEXEC } else { 0 }
+                | if flags & 0o4000 != 0 { O_NONBLOCK } else { 0 };
+            let fd = self.fs.open_directory(path, status).map_err(errno)?;
+            return Ok(FD_BASE as i64 + fd as i64 - 3);
+        }
+        if flags & 0o200000 != 0 {
+            return Err(metadata.err().map(errno).unwrap_or(-20));
         }
         let mut translated = match flags & 3 {
             0 => O_READ,
@@ -279,6 +334,7 @@ impl LaunchFs {
             (0o200, O_EXCLUSIVE),
             (0o1000, O_TRUNC),
             (0o2000, O_APPEND),
+            (0o4000, O_NONBLOCK),
             (0o2000000, O_CLOEXEC),
         ] {
             if flags & native != 0 {
@@ -291,6 +347,55 @@ impl LaunchFs {
             self.fs.fchmod(fd, mode as u32 & 0o755).map_err(errno)?;
         }
         Ok(FD_BASE as i64 + fd as i64 - 3)
+    }
+
+    fn remove_directory(&mut self, path: &[u8]) -> Result<i64, i64> {
+        if self.assignment_root(path) {
+            return Err(-16);
+        }
+        self.fs.remove_directory(path).map(|_| 0).map_err(errno)
+    }
+
+    fn assignment_root(&self, path: &[u8]) -> bool {
+        self.prefixes[..self.count]
+            .iter()
+            .any(|p| p.as_bytes() == path)
+            && !self.prefixes[..self.count]
+                .iter()
+                .any(|p| p.as_bytes() != path && within(path, p.as_bytes()))
+    }
+
+    fn rename(&mut self, pid: usize, r: &UserRegs) -> Result<i64, i64> {
+        let (source, destination, flags) = if r.orig_rax == 82 {
+            (
+                self.path(pid, r.rdi, (-100i64) as u64)?,
+                self.path(pid, r.rsi, (-100i64) as u64)?,
+                0,
+            )
+        } else {
+            (
+                self.path(pid, r.rsi, r.rdi)?,
+                self.path(pid, r.r10, r.rdx)?,
+                if r.orig_rax == 316 { r.r8 } else { 0 },
+            )
+        };
+        if flags > 1 {
+            return Err(-95);
+        }
+        if !self.owns_path(source.as_bytes()) || !self.owns_path(destination.as_bytes()) {
+            return Err(-18);
+        }
+        if self.prefixes[..self.count].iter().any(|prefix| {
+            self.assignment_root(prefix.as_bytes())
+                && (within(prefix.as_bytes(), source.as_bytes())
+                    || within(prefix.as_bytes(), destination.as_bytes()))
+        }) {
+            return Err(-16);
+        }
+        self.fs
+            .rename(source.as_bytes(), destination.as_bytes(), flags == 1)
+            .map(|_| 0)
+            .map_err(errno)
     }
 
     fn stat(&self, pid: usize, path: &[u8], destination: u64, statx: bool) -> Result<i64, i64> {
@@ -321,6 +426,7 @@ impl LaunchFs {
             91 => self.fs.fchmod(fd, r.rsi as u32).map(|_| 0).map_err(errno),
             77 if r.rsi as i64 >= 0 => self.fs.truncate(fd, r.rsi).map(|_| 0).map_err(errno),
             77 => Err(-22),
+            217 => self.getdents(pid, fd, r.rsi, r.rdx),
             72 => self
                 .fs
                 .descriptor_flags(fd)
@@ -393,6 +499,42 @@ impl LaunchFs {
             .map(|n| n as i64)
             .map_err(errno)
     }
+
+    fn getdents(&mut self, pid: usize, fd: i32, address: u64, length: u64) -> Result<i64, i64> {
+        if self.fs.fstat(fd).map_err(errno)?.kind != NodeKind::Directory {
+            return Err(-20);
+        }
+        let mut cookie = self.fs.seek(fd, 0, 1).map_err(errno)?;
+        let mut buffer = [0u8; IO_SIZE];
+        let capacity = length.min(IO_SIZE as u64) as usize;
+        let mut used = 0;
+        while let Some(entry) = self.fs.directory_entry(fd, cookie).map_err(errno)? {
+            let size = (19 + entry.name.len() + 1 + 7) & !7;
+            if size > capacity - used {
+                if used == 0 {
+                    return Err(-22);
+                }
+                break;
+            }
+            let record = &mut buffer[used..used + size];
+            record[..8].copy_from_slice(&entry.inode.to_ne_bytes());
+            record[8..16].copy_from_slice(&entry.next.to_ne_bytes());
+            record[16..18].copy_from_slice(&(size as u16).to_ne_bytes());
+            record[18] = match entry.kind {
+                NodeKind::File => 8,
+                NodeKind::Directory => 4,
+                NodeKind::Symlink => 10,
+            };
+            record[19..19 + entry.name.len()].copy_from_slice(entry.name);
+            used += size;
+            cookie = entry.next;
+        }
+        if copy_memory(pid, address, &mut buffer[..used], true)? != used as i64 {
+            return Err(-14);
+        }
+        self.fs.seek(fd, cookie as i64, 0).map_err(errno)?;
+        Ok(used as i64)
+    }
 }
 
 fn within(path: &[u8], prefix: &[u8]) -> bool {
@@ -463,6 +605,7 @@ fn errno(error: VfsError) -> i64 {
         VfsError::NotFound => -2,
         VfsError::NotDirectory => -20,
         VfsError::IsDirectory => -21,
+        VfsError::DirectoryNotEmpty => -39,
         VfsError::AlreadyExists => -17,
         VfsError::PermissionDenied => -13,
         VfsError::InvalidDescriptor => -9,

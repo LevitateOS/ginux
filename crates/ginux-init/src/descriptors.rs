@@ -410,6 +410,10 @@ impl DescriptorTable {
                     Err(e) => Err(e),
                 }
             }
+            264 | 316 => {
+                call.save(r);
+                self.rename_paths(pid, r, backends)
+            }
             258 | 262 | 263 | 268 | 269 | 332 | 439 => {
                 call.save(r);
                 self.path_descriptor(pid, r, backends)
@@ -426,27 +430,37 @@ impl DescriptorTable {
         r: &mut UserRegs,
         backends: &mut Backends,
     ) -> Result<NativeDecision, i64> {
-        let path = read_path(pid, r.rsi)?;
+        r.rdi = self.path_handle(pid, r.rdi, r.rsi)?;
+        Ok(backends.claim(pid, r))
+    }
+
+    fn path_handle(&self, pid: usize, dirfd: u64, address: u64) -> Result<u64, i64> {
+        let path = read_path(pid, address)?;
         if path.as_bytes().first() == Some(&b'/') {
-            r.rdi = (-100i64) as u64;
-        } else if r.rdi as i32 != -100 {
-            let entry = self.get(r.rdi)?;
-            if path.is_empty() {
-                match entry.handle {
-                    Handle::Native { fd, .. } => r.rdi = fd as u64,
-                    Handle::Owned(handle) => r.rdi = handle as u64,
-                    Handle::Reserved => return Err(-9),
-                }
-            } else {
-                // Relative directory descriptors require resolved directory
-                // views; never interpret a backend integer as a public fd.
-                return Err(if matches!(entry.handle, Handle::Native { .. }) {
-                    -95
-                } else {
-                    -20
-                });
-            }
+            return Ok((-100i64) as u64);
         }
+        if dirfd as i32 == -100 {
+            return Ok(dirfd);
+        }
+        match self.get(dirfd)?.handle {
+            Handle::Owned(handle) if path.is_empty() || (1048576..1048640).contains(&handle) => {
+                Ok(handle as u64)
+            }
+            Handle::Native { fd, .. } if path.is_empty() => Ok(fd as u64),
+            Handle::Owned(_) => Err(-20),
+            Handle::Native { .. } => Err(-95),
+            Handle::Reserved => Err(-9),
+        }
+    }
+
+    fn rename_paths(
+        &self,
+        pid: usize,
+        r: &mut UserRegs,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        r.rdi = self.path_handle(pid, r.rdi, r.rsi)?;
+        r.rdx = self.path_handle(pid, r.rdx, r.r10)?;
         Ok(backends.claim(pid, r))
     }
 

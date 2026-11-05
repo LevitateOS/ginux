@@ -228,3 +228,11 @@ build-launch-poll-fixture:
 
 test-launch-poll:
 	python3 scripts/test-launch-poll.py $(GINUX) .artifacts/launch/launch-poll-fixture
+
+.PHONY: build-launch-directory-fixture test-launch-directories
+build-launch-directory-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-directory-fixture.c -o .artifacts/launch/launch-directory-fixture
+
+test-launch-directories:
+	python3 scripts/test-launch-directories.py $(GINUX) .artifacts/launch/launch-directory-fixture

@@ -250,11 +250,22 @@ storage. Paths must be canonical, unique, and cannot cover init, `/`, `/proc`,
 Without assignments, native image access remains read-only.
 
 This backend supports regular-file open/create/exclusive-create/truncate/append,
-read/write/pread, ftruncate, seek, close, basic descriptor flags, mkdir, file unlink, chmod,
-and stat/fstat/fstatat/statx metadata. Relative paths use the configured workdir;
-directory descriptors, directory enumeration/removal, symlinks, hardlinks,
-rename, file mappings and execution of generated files
-are unsupported. Path normalization is lexical; this is not a complete unified
+read/write/pread, ftruncate, seek, close, basic descriptor flags, mkdir, unlink,
+chmod and stat/fstat/fstatat/statx metadata. Owned directory descriptions support
+getdents64, rewind/cookies and relative openat/mkdirat/fstatat/unlinkat/chmodat.
+Aliases and fork share directory offsets; failed directory copyout does not
+consume records. Enumeration returns only direct children and domain inode IDs.
+Rename/renameat and renameat2 (zero flags or NOREPLACE) move overlay files/trees,
+preserving open objects across replacement. Nonempty directory removal and
+invalid replacements fail before mutation. Empty directories can be removed
+while open; their handles retain metadata but cannot create new children.
+Minimal assignment roots remain busy; overlapping assignments merely seed
+ordinary nested directories. Normal fchmod/chmod accept full st_mode values
+while special permission bits remain unsupported.
+Relative paths without a directory fd use the configured workdir. Native-image
+relative directory-fd access and image subtree mutation remain unsupported, as
+do symlinks, hardlinks, file mappings and execution of generated files.
+Path normalization is lexical; this is not a complete unified
 image/overlay filesystem. IO is bounded to 4096 bytes per call. Metadata supports
 4096 objects (including seeded directories) and 64 independently opened file
 handles. File bytes grow on demand in anonymous supervisor mappings rather than
@@ -281,10 +292,11 @@ Bootstrap constrains the real descriptor soft/hard limits to 256 while keeping
 lower operator limits. Allocation respects that lower soft limit; runtime
 NOFILE-limit changes are currently denied. Reported limits are not inflated to
 accommodate backend handle ranges. Libc spawn preflight now accepts the public
-numbers. Relative directory-fd access remains unfinished.
+numbers. Relative operations on owned directory handles stay within assigned
+storage; attempts to use a private handle or mutate an unassigned tree fail.
 Guest-memory copies respect page protections, including partial read copyout.
 No writable host descriptor is exposed. Data disappears at domain teardown;
-there is no retention, export, storage generation or configured storage quota.
+there is no retention, export or storage generation.
 
 The configured `/dev` view is an immutable virtual directory, empty by default;
 image entries beneath it are hidden. `[devices].assignments = ["null"]` exposes
@@ -397,4 +409,6 @@ make build-launch-thread-fixture
 sudo make test-launch-threads
 make build-launch-poll-fixture
 sudo make test-launch-poll
+make build-launch-directory-fixture
+sudo make test-launch-directories
 ```
