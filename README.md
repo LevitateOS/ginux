@@ -191,6 +191,10 @@ Ginux is available under the Apache License 2.0. See [`LICENSE`](LICENSE) and
 
 ## Configured native launch
 
+Running `ginux` without arguments selects the interception demonstration.
+Unknown or incomplete commands exit 2 with diagnostics on stderr and no workload
+output; they do not select the demonstration.
+
 On x86-64 Linux, `ginux launch <config> <root> [--result-file <fresh host path>]`
 executes `[domain].init` with the configured arguments and environment inside
 the supplied host root directory. The bootstrap requires chroot and credential

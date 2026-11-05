@@ -42,10 +42,11 @@ pub enum Command {
     KernelViews(*const u8),
     Launch(*const u8, *const u8, *const u8),
     LaunchUsage,
+    InvalidArguments,
 }
 
-/// Decode `argv` exactly as the previous inline chain did; `None` selects the
-/// default interception demonstration.
+/// Decode `argv`; only an invocation without arguments selects the default
+/// interception demonstration. Invalid commands must not run a different workload.
 pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
     if argc < 2 {
         return None;
@@ -55,7 +56,7 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
         return Some(Command::LaunchUsage);
     }
     if argc < 3 {
-        return None;
+        return Some(Command::InvalidArguments);
     }
     if c_string_equals(command, b"runtime") {
         let path = unsafe { *argv.add(2) as *const u8 };
@@ -120,7 +121,7 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
             Some(Command::LaunchUsage)
         }
     } else {
-        None
+        Some(Command::InvalidArguments)
     }
 }
 
@@ -582,6 +583,12 @@ fn print_launch_config(config: &DomainConfig) {
 
 pub fn launch_usage() -> ! {
     line_stderr(b"ginux: launch usage: launch <config> <root> [--result-file <fresh host path>]");
+    exit_process(2)
+}
+
+pub fn invalid_arguments() -> ! {
+    line_stderr(b"ginux: unknown or incomplete command; no workload started");
+    line_stderr(b"ginux: configured workload usage: launch <config> <root> [--result-file <fresh host path>]");
     exit_process(2)
 }
 

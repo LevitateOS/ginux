@@ -164,6 +164,20 @@ def main():
             if proc.returncode != 2 or proc.stdout or b"launch usage" not in proc.stderr:
                 raise RuntimeError(f"invalid launch argv ran a workload: {proc!r}")
         print("PASS incomplete launch commands report usage without running a demo")
+        unused_result = work / "invalid-command-result.json"
+        for args in (["--config"], ["--config", str(config_path), "--result-file", str(unused_result)],
+                     ["unknown"], ["unknown", str(config_path)], [""],
+                     ["runtime"], ["config"], ["lifecycle"], ["process"], ["kernel-views"],
+                     ["vfs", "config", "root"], ["native", "config"], ["domain", "config"],
+                     ["process-native", "config"], ["devices", "config"],
+                     ["device-bench", "config", "block"]):
+            proc = subprocess.run([binary, *args], capture_output=True, timeout=10)
+            if (proc.returncode != 2 or proc.stdout
+                    or b"unknown or incomplete command" not in proc.stderr):
+                raise RuntimeError(f"invalid command {args!r} ran a workload: {proc!r}")
+            if unused_result.exists():
+                raise RuntimeError("invalid command created a result file")
+        print("PASS unknown and incomplete commands fail without demo output or result files")
         # Exercise the bootstrap failure in a real unprivileged process.
         work.chmod(0o755)
         config_path = work / "unprivileged.toml"

@@ -168,6 +168,7 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
             launch_main(config_path, root_path, result_path)
         }
         Some(Command::LaunchUsage) => launch_usage(),
+        Some(Command::InvalidArguments) => crate::launch::invalid_arguments(),
         None => gate1_main(),
     }
 }
