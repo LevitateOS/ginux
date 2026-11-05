@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run real launch workloads against an existing binary and fixture (Linux/root)."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import shutil
@@ -33,7 +34,7 @@ def main():
         (root / "work/a..b").mkdir()
         counter = 0
 
-        def invoke(args, expected, outcome, *, stdout=b"", changes=None, env=None, pass_fds=()):
+        def invoke(args, expected, outcome, *, stdout=b"", changes=None, env=None, pass_fds=(), cloexec_stdin=False):
             nonlocal counter
             counter += 1
             config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
@@ -46,7 +47,8 @@ def main():
             result_path = work / f"{counter}.json"
             proc = subprocess.run([binary, "launch", str(config_path), str(root),
                                    "--result-file", str(result_path)], capture_output=True,
-                                  timeout=20, pass_fds=pass_fds)
+                                  timeout=20, pass_fds=pass_fds,
+                                  preexec_fn=(lambda: fcntl.fcntl(0, fcntl.F_SETFD, fcntl.FD_CLOEXEC)) if cloexec_stdin else None)
             record = json.loads(result_path.read_text())
             wanted = {"version": 1, "outcome": outcome, "code": None,
                       "signal": None, "generation": None}
@@ -76,6 +78,7 @@ def main():
         invoke(["poll"], 0, "exited")
         invoke(["int80"], 1, "supervisor-error")
         invoke(["descriptor"], 0, "exited")
+        invoke(["descriptor", "0"], 0, "exited", cloexec_stdin=True)
         with (work / "secret").open("w+b") as secret:
             secret.write(b"host-only data")
             secret.flush()

@@ -213,8 +213,8 @@ arguments of 128 bytes each and eight `NAME=value` environment entries of
 Workload stdout stays separate from supervisor diagnostics on stderr. Only
 stdin, stdout, and stderr are inherited by the workload. The launcher returns
 the workload exit code, or `128 + signal` for signal termination. Startup
-failure returns 2; supervision or result-writing failure returns 1. Subsequent
-exec remains unsupported. Non-x86-64 syscall ABIs and job-control
+failure returns 2; supervision or result-writing failure returns 1. Non-x86-64
+syscall ABIs and job-control
 group stops fail explicitly. Audit output is capped at 64 KiB plus a truncation
 notice. This path does not implement resource quotas from the domain metadata.
 
@@ -264,7 +264,7 @@ lower operator limits. Allocation respects that lower soft limit; runtime
 NOFILE-limit changes are currently denied. Reported limits are not inflated to
 accommodate backend handle ranges. Libc spawn preflight now accepts the public
 numbers. Relative directory-fd access, poll on remapped stdio or non-bootstrap
-descriptors and exec-time close-on-exec remain unfinished.
+descriptors remain unfinished.
 Guest-memory copies respect page protections, including partial read copyout.
 No writable host descriptor is exposed. Data disappears at domain teardown;
 there is no retention, export, storage generation or configured storage quota.
@@ -314,8 +314,21 @@ resets an inherited ignored SIGCHLD to its default disposition. Job control,
 interruption/restart of parked calls and SIGCHLD notification for adopted
 children remain incomplete. Root exit or supervision failure kills and reaps all remaining
 descendants and releases owned descriptors before reporting completion.
-Exec and exec-time close-on-exec remain unsupported, so ordinary command helpers
-still fail at exec after supervised child setup. This is not compiler support.
+Image execve and execveat are supervised, including relative paths from the
+configured workdir, absolute execveat paths, and AT_EMPTY_PATH on image
+file descriptors. Relative directory-fd execution remains unsupported. Generated
+files and virtual devices cannot execute through the native image path.
+Before exec, controlled fcntl syscalls synchronize each native handle's CLOEXEC
+bit: any surviving public alias keeps its native handle. The supervisor replays
+the original verified x86-64 syscall instruction; no executable bytes change.
+Only PTRACE_EVENT_EXEC retires public CLOEXEC descriptors and owned references.
+Failed exec preserves every public descriptor and its flags. Successful exec
+keeps task identity and advances the existing process owner's exec state.
+Signals interrupting descriptor synchronization fail the domain explicitly;
+restart/deferred delivery for that preparation remains incomplete. Path checking
+uses the current lexical view rather than a unified image/overlay resolver.
+Normal command helpers still require tracked threads and broader readiness
+support. This is not compiler support.
 
 When requested, the result file is reserved exclusively before launch, with
 mode 0600 and a maximum path length of 512 bytes. Existing files are never
@@ -347,4 +360,6 @@ make build-launch-fd-fixture
 sudo make test-launch-fds
 make build-launch-task-fixture
 sudo make test-launch-tasks
+make build-launch-exec-fixture
+sudo make test-launch-exec
 ```

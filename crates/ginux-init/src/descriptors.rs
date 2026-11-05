@@ -115,8 +115,9 @@ impl DescriptorTable {
             saved_args: None,
         };
         for fd in 0..3 {
-            // Closed bootstrap stdio must not invent an open public handle.
-            if unsafe { syscall3(72, fd, 1, 0) } >= 0 {
+            // Bootstrap exec closes CLOEXEC stdio just like an already closed
+            // descriptor. Neither may invent a live public console handle.
+            if unsafe { syscall3(72, fd, 1, 0) } == 0 {
                 table.entries[fd] = Some(Descriptor {
                     handle: Handle::Native {
                         fd: fd as u32,
@@ -144,6 +145,48 @@ impl DescriptorTable {
             pending: None,
             saved_args: None,
         })
+    }
+
+    /// One native handle can back public aliases with different FD_CLOEXEC.
+    /// Synchronize the kernel bit only when all aliases will be retired.
+    pub fn next_exec_native(&self, first: usize) -> Option<(usize, bool)> {
+        for fd in first..LIMIT {
+            let mut aliases = self
+                .entries
+                .iter()
+                .flatten()
+                .filter(
+                    |d| matches!(d.handle, Handle::Native { fd: raw, .. } if raw as usize == fd),
+                )
+                .peekable();
+            if aliases.peek().is_some() {
+                return Some((fd, aliases.all(|d| d.cloexec)));
+            }
+        }
+        None
+    }
+
+    pub fn exec_native_descriptor(&self, fd: u64) -> Result<u32, i64> {
+        match self.get(fd)?.handle {
+            Handle::Native { fd, console: false } => Ok(fd),
+            _ => Err(-95),
+        }
+    }
+
+    /// PTRACE_EVENT_EXEC is the commit point. Failed exec never calls this.
+    pub fn exec_completed(&mut self, backends: &mut Backends) -> Result<(), &'static [u8]> {
+        if self.pending.is_some() || self.saved_args.is_some() {
+            return Err(b"exec overlapped unfinished descriptor syscall");
+        }
+        for entry in &mut self.entries {
+            if entry.is_some_and(|d| d.cloexec) {
+                if let Handle::Owned(handle) = entry.take().unwrap().handle {
+                    backends.release(handle)?;
+                }
+                // Kernel closed native handles with no surviving aliases.
+            }
+        }
+        Ok(())
     }
 
     pub fn release_exited(&mut self, backends: &mut Backends) -> Result<(), &'static [u8]> {

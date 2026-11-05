@@ -27,6 +27,22 @@ enum Pending {
     Wait { child: usize, original: [u64; 7] },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExecStage {
+    Sync,
+    Reenter,
+    Kernel,
+    Completed,
+}
+
+#[derive(Clone, Copy)]
+struct Exec {
+    original: UserRegs,
+    native_dirfd: u64,
+    next_native: usize,
+    stage: ExecStage,
+}
+
 struct Task {
     id: TaskId,
     host: usize,
@@ -36,6 +52,7 @@ struct Task {
     override_result: Option<i64>,
     blocked: Option<UserRegs>,
     sequence: u64,
+    exec: Option<Exec>,
 }
 
 struct Supervisor<'a> {
@@ -98,6 +115,7 @@ pub fn supervise(
         override_result: None,
         blocked: None,
         sequence: 0,
+        exec: None,
     });
     if ptrace(PTRACE_SETOPTIONS, root, 0, OPTIONS) < 0 {
         s.fail(domain, b"launch ptrace setup failed");
@@ -164,11 +182,21 @@ pub fn supervise(
             s.birth(index, domain);
             continue;
         }
+        if event == 4 {
+            s.exec_completed(index, domain);
+            continue;
+        }
         if event != 0 {
             s.fail(domain, b"unsupported task transition")
         }
         let signal = ((status >> 8) & 255) as usize;
         if signal != 133 {
+            if s.task(index)
+                .exec
+                .is_some_and(|e| matches!(e.stage, ExecStage::Sync | ExecStage::Reenter))
+            {
+                s.fail(domain, b"signal interrupted exec descriptor setup");
+            }
             let mut info = [0u64; 16];
             if ptrace(0x4202, host, 0, info.as_mut_ptr() as usize) < 0 {
                 s.fail(domain, b"launch group stops are unsupported")
@@ -273,6 +301,21 @@ impl Supervisor<'_> {
         self.run(index, r, domain);
     }
     fn entry(&mut self, index: usize, r: &mut UserRegs, domain: &mut Domain) {
+        if let Some(exec) = self.task(index).exec {
+            match exec.stage {
+                ExecStage::Reenter => {
+                    if r.orig_rax != exec.original.orig_rax || r.rip != exec.original.rip {
+                        self.fail(domain, b"exec replay left its syscall instruction");
+                    }
+                    self.exec_step(index, r, domain);
+                    return;
+                }
+                ExecStage::Completed => {
+                    self.task_mut(index).exec = None;
+                }
+                _ => self.fail(domain, b"unexpected entry during exec"),
+            }
+        }
         self.sequence += 1;
         self.task_mut(index).sequence = self.sequence;
         audit_write(b"ginux: audit sequence=");
@@ -285,6 +328,16 @@ impl Supervisor<'_> {
         let original = *r;
         let id = self.task(index).id;
         match r.orig_rax {
+            59 | 322 => {
+                let result = self.prepare_exec(index, r);
+                if let Err(errno) = result {
+                    self.emulate(index, r, errno, domain);
+                } else {
+                    audit_write(b"mediate surface=owned-exec\n");
+                    self.exec_step(index, r, domain);
+                }
+                return;
+            }
             13 if r.rdi == 17 && r.rsi != 0 && r.r10 == 8 => {
                 // Native auto-reaping would bypass the explicit virtual wait
                 // lifecycle. Keep unsupported dispositions fail-closed.
@@ -352,6 +405,7 @@ impl Supervisor<'_> {
                     override_result: None,
                     blocked: None,
                     sequence: 0,
+                    exec: None,
                 });
                 self.task_mut(index).pending = Pending::Fork(slot);
                 audit_write(b"mediate surface=owned-process-create\n");
@@ -432,6 +486,102 @@ impl Supervisor<'_> {
             },
         }
     }
+    fn prepare_exec(&mut self, index: usize, r: &UserRegs) -> Result<(), i64> {
+        let host = self.task(index).host;
+        let mut native_dirfd = r.rdi;
+        if r.orig_rax == 59 {
+            self.objects.filesystem.native_exec_path(host, r.rdi)?;
+        } else {
+            if r.r8 & !0x1100 != 0 {
+                return Err(-22);
+            }
+            let path = crate::tracee_io::read_path(host, r.rsi)?;
+            if path.is_empty() {
+                if r.r8 & 0x1000 == 0 {
+                    return Err(-2);
+                }
+                native_dirfd = self.task(index).descriptors.exec_native_descriptor(r.rdi)? as u64;
+            } else {
+                if path.as_bytes()[0] != b'/' && r.rdi as i32 != -100 {
+                    return Err(-95);
+                }
+                self.objects.filesystem.native_exec_path(host, r.rsi)?;
+                native_dirfd = (-100i64) as u64;
+            }
+        }
+        let mut instruction = [0u8; 2];
+        let address = r.rip.checked_sub(2).ok_or(-95)?;
+        if copy_memory(host, address, &mut instruction, false) != Ok(2)
+            || instruction != [0x0f, 0x05]
+        {
+            return Err(-95);
+        }
+        self.task_mut(index).exec = Some(Exec {
+            original: *r,
+            native_dirfd,
+            next_native: 0,
+            stage: ExecStage::Reenter,
+        });
+        Ok(())
+    }
+
+    fn exec_step(&mut self, index: usize, r: &mut UserRegs, domain: &mut Domain) {
+        let exec = self.task(index).exec.unwrap();
+        if let Some((fd, cloexec)) = self
+            .task(index)
+            .descriptors
+            .next_exec_native(exec.next_native)
+        {
+            let state = self.task_mut(index).exec.as_mut().unwrap();
+            state.next_native = fd + 1;
+            state.stage = ExecStage::Sync;
+            // This replaces the stopped exec syscall with a supervisor-chosen
+            // fcntl. Its exit replays the verified original syscall instruction.
+            r.orig_rax = 72;
+            r.rax = 72;
+            r.rdi = fd as u64;
+            r.rsi = 2;
+            r.rdx = cloexec as u64;
+            audit_write(b"ginux: exec native-fd=");
+            audit_u64(fd as u64);
+            audit_write(b" close-on-exec=");
+            audit_u64(cloexec as u64);
+            audit_write(b"\n");
+        } else {
+            *r = exec.original;
+            r.rdi = exec.native_dirfd;
+            self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::Kernel;
+        }
+        self.run(index, r, domain);
+    }
+
+    fn exec_completed(&mut self, index: usize, domain: &mut Domain) {
+        if !self
+            .task(index)
+            .exec
+            .is_some_and(|e| e.stage == ExecStage::Kernel)
+        {
+            self.fail(domain, b"unreserved exec transition");
+        }
+        let result = self.tasks[index]
+            .as_mut()
+            .unwrap()
+            .descriptors
+            .exec_completed(&mut self.objects);
+        if let Err(reason) = result {
+            self.fail(domain, reason);
+        }
+        if self.processes.exec(self.task(index).id).is_err() {
+            self.fail(domain, b"virtual exec transition failed");
+        }
+        self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::Completed;
+        self.wake_needed = true;
+        audit_write(b"ginux: task exec virtual-pid=");
+        audit_u64(self.task(index).id.pid as u64);
+        audit_write(b"\n");
+        self.resume(index, 0, domain);
+    }
+
     fn birth(&mut self, parent: usize, domain: &mut Domain) {
         let Pending::Fork(slot) = self.task(parent).pending else {
             self.fail(domain, b"unreserved child event")
@@ -470,6 +620,40 @@ impl Supervisor<'_> {
         self.resume(parent, 0, domain);
     }
     fn syscall_exit(&mut self, index: usize, r: &mut UserRegs, domain: &mut Domain) {
+        if let Some(exec) = self.task(index).exec {
+            match exec.stage {
+                ExecStage::Sync => {
+                    if r.orig_rax != 72 || r.rax != 0 {
+                        self.fail(domain, b"exec native descriptor synchronization failed");
+                    }
+                    let mut replay = exec.original;
+                    replay.rip -= 2;
+                    replay.rax = replay.orig_rax;
+                    self.task_mut(index).exec.as_mut().unwrap().stage = ExecStage::Reenter;
+                    self.run(index, &replay, domain);
+                    return;
+                }
+                ExecStage::Kernel => {
+                    if r.rax as i64 >= 0 {
+                        self.fail(domain, b"exec success missing its ownership event");
+                    }
+                    let old = exec.original;
+                    r.rdi = old.rdi;
+                    r.rsi = old.rsi;
+                    r.rdx = old.rdx;
+                    r.r10 = old.r10;
+                    r.r8 = old.r8;
+                    r.r9 = old.r9;
+                    r.orig_rax = old.orig_rax;
+                    // Public descriptors, aliases and owned refs are unchanged.
+                    self.task_mut(index).exec = None;
+                }
+                ExecStage::Completed => {
+                    self.task_mut(index).exec = None;
+                }
+                ExecStage::Reenter => self.fail(domain, b"unexpected exit during exec replay"),
+            }
+        }
         let pending = self.task(index).pending;
         match pending {
             Pending::Fork(child) => {

@@ -1,6 +1,7 @@
 //! Configured-launch ephemeral memory storage. Bytes and descriptors belong to
 //! the supervisor; no writable host descriptor is installed in the workload.
-//! Retained storage, directory descriptors, mappings and exec are not provided.
+//! Retained storage, directory descriptors, mappings and generated-file exec
+//! are not provided.
 
 use crate::supervisor::UserRegs;
 use crate::tracee_io::{copy_memory, read_path};
@@ -135,6 +136,23 @@ impl LaunchFs {
             if absolute { b"/" } else { self.cwd.as_bytes() },
             text.as_bytes(),
         )
+    }
+
+    /// Image execution must not fall through an assigned writable namespace.
+    /// This shares the current lexical path view; generated-file exec awaits
+    /// a storage backend capable of providing executable mappings.
+    pub fn native_exec_path(&self, pid: usize, address: u64) -> Result<(), i64> {
+        let path = self.path(pid, address, (-100i64) as u64)?;
+        if self.owns_path(path.as_bytes()) {
+            return Err(-95);
+        }
+        if [b"/dev".as_slice(), b"/proc", b"/sys"]
+            .iter()
+            .any(|p| within(path.as_bytes(), p))
+        {
+            return Err(-13);
+        }
+        Ok(())
     }
 
     /// Configured-launch dispatch only; demo paths keep their existing contract.
