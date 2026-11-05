@@ -37,19 +37,21 @@ enum Pending {
 
 /// Owned backend handles are domain-wide; native kernel numbers are per task.
 pub struct ObjectReferences {
-    counts: [u16; 128 + crate::channel_hooks::FDS],
+    counts: [u16; 128 + crate::channel_hooks::FDS + crate::network_hooks::FDS],
 }
 impl ObjectReferences {
     pub const fn new() -> Self {
         Self {
-            counts: [0; 128 + crate::channel_hooks::FDS],
+            counts: [0; 128 + crate::channel_hooks::FDS + crate::network_hooks::FDS],
         }
     }
     pub fn active(&self) -> usize {
         self.counts.iter().filter(|n| **n != 0).count()
     }
     fn index(handle: u32) -> usize {
-        if (0x4000_0000..0x4000_0040).contains(&handle) {
+        if crate::network_hooks::LaunchNetwork::owns(handle) {
+            128 + crate::channel_hooks::FDS + (handle - crate::network_hooks::FD_BASE) as usize
+        } else if (0x4000_0000..0x4000_0040).contains(&handle) {
             64 + crate::channel_hooks::FDS + (handle - 0x4000_0000) as usize
         } else if (0x2000_0000..0x2000_0000 + crate::channel_hooks::FDS as u32).contains(&handle) {
             64 + (handle - 0x2000_0000) as usize
@@ -390,6 +392,10 @@ impl DescriptorTable {
                 call.save(r);
                 self.open(pid, r, backends, call)
             }
+            41 => {
+                call.save(r);
+                self.socket(pid, r, backends)
+            }
             22 | 53 | 293 => {
                 call.save(r);
                 self.pipe(pid, r, backends)
@@ -422,7 +428,8 @@ impl DescriptorTable {
                     },
                 }
             }
-            0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 44 | 45 | 74 | 75 | 77 | 78 | 91 | 217 => {
+            0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55 | 74
+            | 75 | 77 | 78 | 91 | 217 => {
                 call.save(r);
                 call.pinned
                     .map(Ok)
@@ -458,10 +465,30 @@ impl DescriptorTable {
                 call.save(r);
                 self.path_descriptor(pid, r, backends)
             }
-            7 => self.poll(pid, r, backends, call),
+            7 | 271 => self.poll(pid, r, backends, call),
             _ => Ok(backends.claim(pid, r)),
         };
         result.unwrap_or_else(ready)
+    }
+
+    fn socket(
+        &mut self,
+        pid: usize,
+        r: &UserRegs,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        let slot = self.reserve(r.rsi & CLOEXEC != 0)?;
+        match backends.claim(pid, r) {
+            NativeDecision::Hooked { result, .. } if result >= 0 => {
+                backends.refs.retain(result as u32);
+                self.entries[slot].as_mut().unwrap().handle = Handle::Owned(result as u32);
+                Ok(ready(slot as i64))
+            }
+            decision => {
+                self.entries[slot] = None;
+                Ok(decision)
+            }
+        }
     }
 
     fn path_descriptor(
@@ -666,6 +693,9 @@ impl DescriptorTable {
         let public_fd = r.rdi as u32;
         match entry.handle {
             Handle::Native { fd, console } => {
+                if matches!(r.orig_rax, 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55) {
+                    return Err(-88);
+                }
                 if console && matches!(r.orig_rax, 78 | 217) {
                     return Err(-20);
                 }
@@ -689,8 +719,29 @@ impl DescriptorTable {
             Handle::Owned(handle) => r.rdi = handle as u64,
             Handle::Reserved => return Err(-9),
         }
+        if let Handle::Owned(handle) = entry.handle {
+            if crate::network_hooks::LaunchNetwork::owns(handle)
+                && call
+                    .poll_deadline
+                    .is_some_and(|end| monotonic_nanoseconds().is_ok_and(|now| now >= end))
+            {
+                return Ok(ready(-11));
+            }
+        }
         Ok(match backends.claim(pid, r) {
             NativeDecision::Park { .. } => {
+                if let Handle::Owned(handle) = entry.handle {
+                    if crate::network_hooks::LaunchNetwork::owns(handle) {
+                        call.poll_tick = true;
+                        if call.pinned.is_none() {
+                            let timeout = backends.devices.network.timeout(handle, r.orig_rax);
+                            if timeout != 0 {
+                                call.poll_deadline =
+                                    Some(monotonic_nanoseconds()?.saturating_add(timeout));
+                            }
+                        }
+                    }
+                }
                 if call.pinned.is_none() {
                     if let Handle::Owned(handle) = entry.handle {
                         backends.refs.retain(handle);
@@ -794,10 +845,30 @@ impl DescriptorTable {
         &self,
         pid: usize,
         r: &UserRegs,
-        backends: &Backends,
+        backends: &mut Backends,
         call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
-        let timeout = r.rdx as i32;
+        let timeout = if r.orig_rax == 271 {
+            if r.r10 != 0 {
+                return Err(-95);
+            }
+            if r.rdx == 0 {
+                -1
+            } else {
+                let mut time = [0u8; 16];
+                if copy_memory(pid, r.rdx, &mut time, false)? != 16 {
+                    return Err(-14);
+                }
+                let sec = i64::from_ne_bytes(time[..8].try_into().unwrap());
+                let ns = i64::from_ne_bytes(time[8..].try_into().unwrap());
+                if sec < 0 || !(0..1_000_000_000).contains(&ns) || sec > 300 {
+                    return Err(-22);
+                }
+                (sec * 1000 + (ns + 999999) / 1000000) as i32
+            }
+        } else {
+            r.rdx as i32
+        };
         if r.rsi > 16 || timeout > 300000 {
             return Err(-1);
         }
@@ -816,6 +887,7 @@ impl DescriptorTable {
             revents: 0,
         }; 16];
         let mut ready_count = 0;
+        let mut network_wait = false;
         for i in 0..count {
             let entry = &mut bytes[i * 8..i * 8 + 8];
             let fd = i32::from_ne_bytes(entry[..4].try_into().unwrap());
@@ -847,6 +919,7 @@ impl DescriptorTable {
                 }) => {
                     // Assigned regular memory files/directories and null are
                     // immediately ready. Pipes supply their own live state.
+                    network_wait |= crate::network_hooks::LaunchNetwork::owns(handle);
                     let available = backends
                         .channels
                         .readiness(handle)
@@ -885,7 +958,8 @@ impl DescriptorTable {
         call.poll_wait = true;
         // Infinite owned-object waits need no timer: object progress/death
         // already wakes them. External console IO needs periodic observation.
-        call.poll_tick = timeout > 0 || consoles[..count].iter().any(|fd| fd.fd >= 0);
+        call.poll_tick =
+            network_wait || timeout > 0 || consoles[..count].iter().any(|fd| fd.fd >= 0);
         Ok(NativeDecision::ParkPoll)
     }
 }

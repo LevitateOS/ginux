@@ -278,3 +278,11 @@ test-launch-checkpoints:
 	python3 scripts/test-launch-checkpoints.py $(GINUX) .artifacts/launch/launch-storage-fixture
 test-native-supervision:
 	python3 scripts/test-native-supervision.py $(GINUX) .artifacts/launch/native-fixture
+
+.PHONY: build-launch-network-fixture test-launch-network
+build-launch-network-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-network-fixture.c -o .artifacts/launch/launch-network-fixture
+
+test-launch-network:
+	python3 scripts/test-launch-network.py $(GINUX) .artifacts/launch/launch-network-fixture

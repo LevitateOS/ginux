@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: rustup target add x86_64-unknown-linux-gnu
-      - run: make build build-process-fixtures build-launch-fixture build-launch-storage-fixture build-launch-device-fixture build-launch-pipe-fixture build-launch-fd-fixture build-launch-task-fixture build-launch-exec-fixture build-launch-thread-fixture build-launch-poll-fixture build-launch-directory-fixture build-launch-owned-exec-fixture build-launch-script-fixture build-gate1-fixture
+      - run: make build build-process-fixtures build-launch-fixture build-launch-storage-fixture build-launch-device-fixture build-launch-pipe-fixture build-launch-fd-fixture build-launch-task-fixture build-launch-exec-fixture build-launch-thread-fixture build-launch-poll-fixture build-launch-directory-fixture build-launch-owned-exec-fixture build-launch-script-fixture build-gate1-fixture build-launch-network-fixture
       - run: sudo make test-launch
       - run: sudo make test-launch-storage
       - run: sudo make test-launch-devices
@@ -36,6 +36,7 @@ jobs:
       - run: sudo make test-launch-poll
       - run: sudo make test-launch-directories
       - run: sudo make test-launch-owned-exec
+      - run: sudo make test-launch-network
       - run: sudo make test-launch-scripts
       - run: sudo make test-native-supervision
       - run: make test-process-native

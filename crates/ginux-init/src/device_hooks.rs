@@ -17,10 +17,14 @@ pub struct LaunchDevices {
     registry: DeviceRegistry<1, FDS>,
     flags: [Option<u32>; FDS],
     enabled: bool,
+    pub network: crate::network_hooks::LaunchNetwork,
 }
 
 impl LaunchDevices {
-    pub fn readiness(&self, handle: u32) -> Option<u16> {
+    pub fn readiness(&mut self, handle: u32) -> Option<u16> {
+        if crate::network_hooks::LaunchNetwork::owns(handle) {
+            return self.network.readiness(handle);
+        }
         let slot = handle.checked_sub(FD_BASE)? as usize;
         // Configured launch currently assigns only null, whose reads/writes
         // never wait. Future device kinds must supply their own readiness.
@@ -44,6 +48,7 @@ impl LaunchDevices {
         }
         Ok(Self {
             registry,
+            network: crate::network_hooks::LaunchNetwork::prepare(config)?,
             flags: [None; FDS],
             enabled: !config.devices.as_slice().is_empty(),
         })

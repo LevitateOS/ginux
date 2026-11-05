@@ -104,6 +104,16 @@ pub fn decide_objects(
             },
             crate::channel_hooks::ChannelResult::Blocked { fd } => NativeDecision::Park { fd },
         }
+    } else if let Some(result) = devices.network.claim(pid, registers) {
+        match result {
+            crate::network_hooks::Result::Ready(result) => NativeDecision::Hooked {
+                lane: Lane::Device,
+                result,
+            },
+            crate::network_hooks::Result::Blocked => NativeDecision::Park {
+                fd: registers.rdi as u32,
+            },
+        }
     } else if let Some(result) = devices.claim(pid, registers, filesystem) {
         NativeDecision::Hooked {
             lane: Lane::Device,

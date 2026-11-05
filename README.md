@@ -329,8 +329,8 @@ Anonymous `pipe`/`pipe2` are emulated with supervisor-owned memory and virtual
 handles. Up to sixteen channel buffers hold 65536 bytes each; aliases use the common table.
 A local `AF_UNIX` / `SOCK_SEQPACKET` pair consumes two buffers and supports
 messages up to 4096 bytes, duplex read/write, nonblocking IO, polling and
-close-on-exec. Socket names, network connections and descriptor transfer are
-not supported.
+close-on-exec. Local socket names and descriptor transfer are unsupported.
+Configured TCP connections have a separate bounded owner described below.
 `pipe2` accepts only `O_CLOEXEC|O_NONBLOCK`. IO is bounded to 4096 bytes per call;
 writes of up to 4096 bytes are atomic. Reads consume only bytes successfully
 copied out, so invalid/partially inaccessible destinations do not lose data.
@@ -495,6 +495,28 @@ make build-launch-script-fixture
 sudo make test-launch-scripts
 sudo make test-native-supervision
 ```
+
+## Configured TCP grants
+
+Networking is disabled with `[network].backend = "none"`. A configured launch
+may select `backend = "mediated"` with up to eight numeric `endpoints`, such as
+`["192.0.2.10:443", "[2001:db8::1]:443"]`, `max_connections` between 1 and 16,
+and a positive `max_bytes` aggregate sent/received budget. Hostname resolution
+and TLS verification belong to the caller and workload respectively; Ginux
+never expands the endpoint grant. IP/port grants do not isolate HTTP paths or
+hostnames sharing an address. Connect outside the set fails before a host
+connection is created. Datagram, listening and arbitrary socket operations
+remain denied.
+
+TCP descriptors share the existing public descriptor, alias and fork owners.
+Their private nonblocking host sockets remain in the supervisor. Blocking and
+nonblocking connect/read/write, vectored IO, poll/ppoll, SO_ERROR, socket names,
+TCP_NODELAY, receive/send timeouts and shutdown use the bounded backend and task
+scheduler. Transfer accounting counts successful bytes once across all aliases;
+exhaustion is EDQUOT, socket capacity exhaustion is EMFILE, and teardown closes
+connecting and connected sockets. Live sockets are never exported or restored.
+The focused scenario is `make build-launch-network-fixture` followed by
+`sudo make test-launch-network`.
 
 ## Native process scenarios
 

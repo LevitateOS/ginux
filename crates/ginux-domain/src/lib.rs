@@ -134,8 +134,27 @@ pub struct DomainConfig {
     pub storage_max_bytes: u64,
     pub devices: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     pub network_backend: NetworkBackend,
+    pub network_endpoints: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
+    pub network_max_connections: u64,
+    pub network_max_bytes: u64,
     pub audit_mode: AuditMode,
     pub failure_policy: FailurePolicy,
+}
+
+/// Numeric destination parsing does not consult host DNS or interface state.
+pub fn parse_network_endpoint(text: &[u8]) -> Result<core::net::SocketAddr, ConfigError> {
+    let text = core::str::from_utf8(text).map_err(|_| ConfigError::InvalidValue)?;
+    let endpoint = text
+        .parse::<core::net::SocketAddr>()
+        .map_err(|_| ConfigError::InvalidValue)?;
+    if endpoint.port() == 0
+        || endpoint.ip().is_unspecified()
+        || endpoint.ip().is_multicast()
+        || matches!(endpoint, core::net::SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.flowinfo() != 0)
+    {
+        return Err(ConfigError::InvalidValue);
+    }
+    Ok(endpoint)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,6 +233,9 @@ struct ConfigBuilder {
     storage_max_bytes: u64,
     devices: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     network_backend: NetworkBackend,
+    network_endpoints: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
+    network_max_connections: u64,
+    network_max_bytes: u64,
     audit_mode: AuditMode,
     failure_policy: FailurePolicy,
 }
@@ -239,6 +261,9 @@ impl ConfigBuilder {
             storage_max_bytes: 0,
             devices: TextList::empty(),
             network_backend: NetworkBackend::None,
+            network_endpoints: TextList::empty(),
+            network_max_connections: 0,
+            network_max_bytes: 0,
             audit_mode: AuditMode::Stderr,
             failure_policy: FailurePolicy::Stop,
         }
@@ -281,6 +306,9 @@ impl ConfigBuilder {
             storage_max_bytes: self.storage_max_bytes,
             devices: self.devices,
             network_backend: self.network_backend,
+            network_endpoints: self.network_endpoints,
+            network_max_connections: self.network_max_connections,
+            network_max_bytes: self.network_max_bytes,
             audit_mode: self.audit_mode,
             failure_policy: self.failure_policy,
         };
@@ -329,6 +357,32 @@ impl DomainConfig {
             validate_domain_path(self.workdir.as_bytes())?;
         }
         validate_identifier(self.contract_profile.as_bytes())?;
+        let endpoints = self.network_endpoints.as_slice();
+        if self.network_backend == NetworkBackend::None
+            && (!endpoints.is_empty()
+                || self.network_max_connections != 0
+                || self.network_max_bytes != 0)
+        {
+            return Err(ConfigError::InvalidValue);
+        }
+        if !endpoints.is_empty() || self.network_max_connections != 0 || self.network_max_bytes != 0
+        {
+            if endpoints.is_empty()
+                || !(1..=16).contains(&self.network_max_connections)
+                || self.network_max_bytes == 0
+            {
+                return Err(ConfigError::InvalidValue);
+            }
+            for (index, text) in endpoints.iter().enumerate() {
+                let endpoint = parse_network_endpoint(text.as_bytes())?;
+                if endpoints[..index]
+                    .iter()
+                    .any(|prior| parse_network_endpoint(prior.as_bytes()) == Ok(endpoint))
+                {
+                    return Err(ConfigError::InvalidValue);
+                }
+            }
+        }
         if !(1..=1_000_000).contains(&self.storage_max_objects)
             || self
                 .memory_mib
@@ -419,6 +473,14 @@ impl DomainConfig {
             NetworkBackend::None => b"none",
             NetworkBackend::Mediated => b"mediated",
         })?;
+        if !self.network_endpoints.as_slice().is_empty() {
+            output.raw(b"\nendpoints = ")?;
+            output.list(self.network_endpoints.as_slice())?;
+            output.raw(b"\nmax_connections = ")?;
+            output.number(self.network_max_connections)?;
+            output.raw(b"\nmax_bytes = ")?;
+            output.number(self.network_max_bytes)?;
+        }
         output.raw(b"\n\n[audit]\nmode = ")?;
         output.quoted(match self.audit_mode {
             AuditMode::Stderr => b"stderr",
@@ -443,7 +505,7 @@ const CONFIG_TEXT_BYTES: usize = IDENTIFIER_BYTES
     + ENVIRONMENT_ITEMS * ENVIRONMENT_BYTES
     + PATH_BYTES
     + IDENTIFIER_BYTES
-    + 2 * ASSIGNMENT_ITEMS * ASSIGNMENT_BYTES;
+    + 3 * ASSIGNMENT_ITEMS * ASSIGNMENT_BYTES;
 /// Upper bound of `normalized()`: each text byte may be escaped to two
 /// bytes; 1 KiB covers quotes, list separators, numbers, keys and enums
 /// (about 500 bytes).
@@ -634,6 +696,18 @@ fn parse_field(
                 b"mediated" => NetworkBackend::Mediated,
                 _ => return Err(ConfigError::InvalidValue),
             };
+        }
+        (Section::Network, b"endpoints") => {
+            builder.mark(1 << 19)?;
+            builder.network_endpoints = parse_list(value)?;
+        }
+        (Section::Network, b"max_connections") => {
+            builder.mark(1 << 20)?;
+            builder.network_max_connections = parse_u64(value)?;
+        }
+        (Section::Network, b"max_bytes") => {
+            builder.mark(1 << 21)?;
+            builder.network_max_bytes = parse_u64(value)?;
         }
         (Section::Audit, b"mode") => {
             builder.mark(1 << 14)?;
@@ -955,6 +1029,37 @@ mode = "stderr"
 [failure]
 policy = "stop"
 "#;
+
+    #[test]
+    fn tcp_grants_are_numeric_bounded_and_complete() {
+        let fields = "backend = \"mediated\"\nendpoints = [\"127.0.0.1:443\", \"[::1]:8443\"]\nmax_connections = 2\nmax_bytes = 4096";
+        let text = VALID.replace("backend = \"none\"", fields);
+        let config = DomainConfig::parse(text.as_bytes()).unwrap();
+        assert_eq!(
+            DomainConfig::parse(config.normalized().unwrap().as_bytes()).unwrap(),
+            config
+        );
+        for field in [
+            "endpoints = [\"example.com:443\"]",
+            "endpoints = [\"127.0.0.1:0\"]",
+            "endpoints = [\"127.0.0.1:443\",\"127.0.0.1:443\"]",
+            "max_connections = 17",
+            "max_bytes = 0",
+        ] {
+            let original = if field.starts_with("endpoints") {
+                "endpoints = [\"127.0.0.1:443\", \"[::1]:8443\"]"
+            } else if field.starts_with("max_connections") {
+                "max_connections = 2"
+            } else {
+                "max_bytes = 4096"
+            };
+            let text = VALID.replace("backend = \"none\"", &fields.replace(original, field));
+            assert!(DomainConfig::parse(text.as_bytes()).is_err());
+        }
+        assert!(parse_network_endpoint(b"example.com:443").is_err());
+        assert!(parse_network_endpoint(b"[fe80::1%1]:443").is_err());
+        assert!(parse_network_endpoint(b"0.0.0.0:443").is_err());
+    }
 
     #[test]
     fn storage_bounds_are_explicit_and_round_trip() {
