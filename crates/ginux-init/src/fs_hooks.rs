@@ -42,6 +42,20 @@
 //! every write at end-of-file. Failures map to faithful errnos through
 //! [`IoError::errno`].
 //!
+//! G07b adds the stat family through the merged view: [`stat_at`] follows
+//! a final symlink, [`lstat_at`] reports it, [`fstat_fd`] reports the
+//! object an open descriptor pinned, and [`statat`] covers `newfstatat`
+//! with flags `0` (stat-style) or [`AT_SYMLINK_NOFOLLOW`] (lstat-style) —
+//! any other flag fails explicitly with [`StatError::Invalid`]. Modes add
+//! the `S_IFMT` file-type bits to the stored permission bits, sizes count
+//! domain bytes (link-target bytes for a final symlink), and inode numbers
+//! are deterministic path hashes: no host metadata leaks. [`stat_write`]
+//! serializes the Linux x86-64 `struct stat` layout (`fstat`/`newfstatat`
+//! write-back) and [`old_stat_write`] the legacy layout (`stat`/`lstat`
+//! write-back); both layouts were verified byte-for-byte against raw
+//! host syscalls. Failures map to faithful errnos through
+//! [`StatError::errno`].
+//!
 //! Everything here is pure `core` logic over caller buffers: no host calls,
 //! so a denial has zero host effect by construction. The supervision loop
 //! cannot feed tracee path/memory bytes or persist per-task cwd/fd tables
@@ -112,6 +126,29 @@ pub const SYS_WRITE: u64 = 1;
 /// the balanced contract would mediate the number to the host. Denied on
 /// domain fds until the supervisor can route it to [`lseek_fd`].
 pub const SYS_LSEEK: u64 = 8;
+/// `stat(2)`: legacy domain file metadata query. Claimed for G07b: the
+/// balanced contract would mediate the domain path to the host, reporting
+/// host metadata as managed results. The register channel carries no path
+/// bytes, so the entry is denied until the supervisor can hand the bytes
+/// to [`stat_at`] and write back the legacy layout via [`old_stat_write`].
+pub const SYS_STAT: u64 = 4;
+/// `fstat(2)`: domain descriptor metadata query. Claimed for G07b for the
+/// same reason; numbers at or above [`DOMAIN_FD_BASE`] are denied until
+/// the supervisor can route them to [`fstat_fd`], while stdio falls
+/// through to the existing mediation byte-identically (see [`SYS_READ`]).
+pub const SYS_FSTAT: u64 = 5;
+/// `lstat(2)`: legacy domain file metadata query without final-symlink
+/// following. Claimed for G07b on the same terms as [`SYS_STAT`], backing
+/// onto [`lstat_at`] plus [`old_stat_write`].
+pub const SYS_LSTAT: u64 = 6;
+/// `newfstatat(2)` (aka `fstatat`): domain file metadata query relative to
+/// a directory fd, with or without [`AT_SYMLINK_NOFOLLOW`]. Claimed for
+/// G07b: this is the syscall the domain libc actually emits for
+/// `stat`/`lstat`/`fstatat` (verified with `strace`), and the balanced
+/// contract would mediate the domain path to the host. Denied until the
+/// supervisor can hand the bytes to [`statat`] and write back via
+/// [`stat_write`].
+pub const SYS_NEWFSTATAT: u64 = 262;
 
 /// `AT_FDCWD`: a relative path resolves against the domain working
 /// directory. Matches the Linux `AT_FDCWD` value (`-100`).
@@ -204,13 +241,51 @@ pub const SEEK_CUR: u32 = 1;
 #[allow(dead_code)]
 pub const SEEK_END: u32 = 2;
 
+/// `AT_SYMLINK_NOFOLLOW` for [`statat`]: lstat-style query. The only
+/// accepted non-zero `newfstatat` flag; `AT_EMPTY_PATH`/`AT_NO_AUTOMOUNT`
+/// and the rest fail explicitly with [`StatError::Invalid`] until an
+/// observed follow-up implements them.
+///
+/// Consumed by [`statat`], which the supervisor wiring calls once it
+/// lands — hence the scoped allows below, matching the G07 API surface.
+#[allow(dead_code)]
+pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+
+/// Synthetic `st_mode` file-type bits (Linux x86-64). The index packs
+/// permission bits only, so [`stat_from_meta`] adds these from the
+/// resolved kind. Allowed until supervisor wiring calls [`statat`].
+#[allow(dead_code)]
+pub const S_IFREG: u32 = 0o100000;
+#[allow(dead_code)]
+pub const S_IFDIR: u32 = 0o040000;
+#[allow(dead_code)]
+pub const S_IFLNK: u32 = 0o120000;
+
+/// Single synthetic device number reported in `st_dev`: the domain is one
+/// filesystem, so a constant keeps every entry on it without naming any
+/// host device. Allowed until supervisor wiring calls [`stat_write`].
+#[allow(dead_code)]
+pub const STAT_DEV: u64 = 1;
+/// Conventional block size reported in `st_blksize` (a preferred-I/O
+/// width, not a measured host value). Allowed with [`STAT_DEV`].
+#[allow(dead_code)]
+pub const STAT_BLKSIZE: u64 = 4096;
+/// Linux x86-64 `struct stat` size: the [`stat_write`] write-back buffer
+/// for `fstat`/`newfstatat`. Allowed with [`STAT_DEV`].
+#[allow(dead_code)]
+pub const STAT_SIZE: usize = 144;
+/// Legacy `struct __old_kernel_stat` size: the [`old_stat_write`]
+/// write-back buffer for `stat`/`lstat`. Allowed with [`STAT_DEV`].
+#[allow(dead_code)]
+pub const OLD_STAT_SIZE: usize = 80;
+
 /// First domain descriptor number: the VFS allocates from 3, so fds below
 /// it are process stdio, never domain objects.
 pub const DOMAIN_FD_BASE: u64 = 3;
 
 /// Lane membership by syscall number: directory creation, enumeration,
-/// working-directory operations, descriptor open/close (G07), and
-/// descriptor data I/O (G07a).
+/// working-directory operations, descriptor open/close (G07), descriptor
+/// data I/O (G07a), and file metadata queries (G07b).
 pub fn claims(syscall: u64) -> bool {
     matches!(
         syscall,
@@ -226,6 +301,10 @@ pub fn claims(syscall: u64) -> bool {
             | SYS_READ
             | SYS_WRITE
             | SYS_LSEEK
+            | SYS_STAT
+            | SYS_FSTAT
+            | SYS_LSTAT
+            | SYS_NEWFSTATAT
     )
 }
 
@@ -241,9 +320,14 @@ pub fn claims(syscall: u64) -> bool {
 /// (see [`read_fd`]/[`write_fd`]/[`lseek_fd`]) — except below the domain
 /// numbering base: stdio (`read` on fd 0–2, `write`/`lseek` on fd 0–2)
 /// falls through to the existing balanced-contract mediation
-/// byte-identically, so console I/O keeps working. Claiming still
-/// matters — it stops the balanced contract from mediating domain
-/// descriptor numbers to the host — and every other syscall behaves
+/// byte-identically, so console I/O keeps working. G07b keeps the stat
+/// family denied on the same terms — emulation needs the tracee path
+/// bytes plus per-task cwd/VFS state (see [`stat_at`]/[`lstat_at`]/
+/// [`fstat_fd`]/[`statat`]) — with the same stdio fallthrough for
+/// `fstat` on fd 0–2, so console metadata queries keep working.
+/// Claiming still matters — it stops the balanced contract from mediating
+/// domain paths and descriptor numbers to the host (which would report
+/// host metadata as managed results) — and every other syscall behaves
 /// byte-identically to before.
 pub fn claim(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> Option<i64> {
     let _ = (rsi, rdx);
@@ -251,7 +335,7 @@ pub fn claim(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> Option<i64> {
         return None;
     }
     match syscall {
-        SYS_READ | SYS_WRITE | SYS_LSEEK if rdi < DOMAIN_FD_BASE => None,
+        SYS_READ | SYS_WRITE | SYS_LSEEK | SYS_FSTAT if rdi < DOMAIN_FD_BASE => None,
         _ => Some(-EPERM),
     }
 }
@@ -721,7 +805,7 @@ fn append_all(dst: &mut [u8; MAX_CWD], len: usize, src: &[u8]) -> Result<usize, 
 
 // ─── G07: native open and descriptor lifetime ────────────────────────────
 
-use ginux_vfs::{BaseReader, MergedKind, VfsError, VirtualFs};
+use ginux_vfs::{BaseReader, FileMetadata, MergedKind, VfsError, VirtualFs};
 
 /// Why an [`open_at`]/[`close_fd`] emulation failed.
 ///
@@ -1114,4 +1198,250 @@ fn map_io_error(error: VfsError) -> IoError {
         | VfsError::InvalidIndex
         | VfsError::Io => IoError::Io,
     }
+}
+
+// ─── G07b: file metadata queries ────────────────────────────────────────
+
+/// Domain file metadata for one stat-family query.
+///
+/// Built from the merged domain view only: `mode` already carries the
+/// `S_IFMT` file-type bits, `size` counts domain bytes (link-target bytes
+/// for a final symlink), and `ino` is a deterministic path hash — never
+/// host metadata. Times stay zero at write-back: index records carry no
+/// timestamps, and a zero clock leaks nothing. Returned to the supervisor
+/// wiring once tracee-memory write-back lands; allowed until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Stat {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub ino: u64,
+    pub nlink: u64,
+}
+
+/// Why a [`stat_at`]/[`lstat_at`]/[`fstat_fd`]/[`statat`] emulation failed.
+/// Returned to the supervisor wiring once tracee-memory write-back lands;
+/// allowed until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatError {
+    /// Path resolution failed (escape, missing entry, loop, bad dirfd…).
+    Resolve(ResolveError),
+    /// `fstat` of a number the bounded table has not allocated. Direct
+    /// calls also fail closed on the stdio range: live stdio queries fall
+    /// through at the [`claim`] entry, never here.
+    BadDescriptor,
+    /// A `newfstatat` flag outside `0` / [`AT_SYMLINK_NOFOLLOW`]
+    /// (`AT_EMPTY_PATH`, `AT_NO_AUTOMOUNT`, garbage): explicit failure
+    /// until an observed follow-up implements the variant.
+    Invalid,
+    /// Backing-store inconsistency, or a directory slot where only a file
+    /// slot can stand (unreachable through [`open_at`], which refuses
+    /// directories). A metadata miss after a successful resolution of the
+    /// same view falls here: nothing mutates between the two reads, so a
+    /// miss is inconsistency, never a fresh lookup failure.
+    Io,
+}
+
+impl StatError {
+    /// Faithful negative errno for supervisor wiring. Allowed until that
+    /// wiring lands.
+    #[allow(dead_code)]
+    pub const fn errno(self) -> i64 {
+        match self {
+            StatError::Resolve(error) => error.errno(),
+            StatError::BadDescriptor => -EBADF,
+            StatError::Invalid => -EINVAL,
+            StatError::Io => -EIO,
+        }
+    }
+}
+
+/// Emulate `stat(path)` against the domain: resolve with final-symlink
+/// following and report the merged-view metadata. Pure `core` logic: the
+/// supervisor calls this once tracee path bytes and per-task `cwd`/VFS
+/// handles are plumbed through. Allowed until then.
+#[allow(dead_code)]
+pub fn stat_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    path: &[u8],
+) -> Result<Stat, StatError> {
+    statat(vfs, cwd, dirfd, path, 0)
+}
+
+/// Emulate `lstat(path)` against the domain: like [`stat_at`] but a final
+/// symlink reports itself instead of its target. Pure `core` logic, wired
+/// like [`stat_at`]. Allowed until then.
+#[allow(dead_code)]
+pub fn lstat_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    path: &[u8],
+) -> Result<Stat, StatError> {
+    statat(vfs, cwd, dirfd, path, AT_SYMLINK_NOFOLLOW)
+}
+
+/// Emulate `fstat(fd)` against the domain: report the object the open path
+/// pinned, at its live size. Pure `core` logic, wired like [`stat_at`].
+/// Allowed until then.
+#[allow(dead_code)]
+pub fn fstat_fd<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    fd: i32,
+) -> Result<Stat, StatError> {
+    Ok(stat_from_meta(&vfs.fstat(fd).map_err(map_stat_error)?))
+}
+
+/// Emulate `newfstatat(dirfd, path, flags)` (`fstatat`) against the domain:
+/// `flags == 0` stats like [`stat_at`], `flags ==
+/// AT_SYMLINK_NOFOLLOW` stats like [`lstat_at`]; any other flag fails
+/// explicitly with [`StatError::Invalid`]. A trailing slash addresses a
+/// directory: an lstat-style final link re-follows (Linux does), then a
+/// non-directory final fails with `ENOTDIR`. Pure `core` logic, wired like
+/// [`stat_at`]. Allowed until then.
+#[allow(dead_code)]
+pub fn statat<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    path: &[u8],
+    flags: u32,
+) -> Result<Stat, StatError> {
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return Err(StatError::Invalid);
+    }
+    if path.is_empty() || path.contains(&0) {
+        return Err(StatError::Resolve(ResolveError::Malformed));
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let trailing_slash = path.len() > 1 && path[path.len() - 1] == b'/';
+    let mut canonical = [0u8; MAX_CWD];
+    let (mut len, mut kind) = resolve_at_full(
+        cwd.path(),
+        dirfd,
+        path,
+        follow,
+        &mut VfsDomainView::new(vfs),
+        &mut canonical,
+    )
+    .map_err(StatError::Resolve)?;
+    if trailing_slash && kind != ResolvedKind::Directory {
+        if kind == ResolvedKind::Symlink && !follow {
+            (len, kind) = resolve_at_full(
+                cwd.path(),
+                dirfd,
+                path,
+                true,
+                &mut VfsDomainView::new(vfs),
+                &mut canonical,
+            )
+            .map_err(StatError::Resolve)?;
+        }
+        if kind != ResolvedKind::Directory {
+            return Err(StatError::Resolve(ResolveError::NotDirectory));
+        }
+    }
+    Ok(stat_from_meta(
+        &vfs.metadata_merged(&canonical[..len])
+            .map_err(map_stat_error)?,
+    ))
+}
+
+/// Assemble a [`Stat`] from merged-view metadata: the `S_IFMT` file-type
+/// bits join the stored permission bits, directories link twice (`.`),
+/// everything else once. Reached only through the stat emulations above;
+/// allowed with them.
+#[allow(dead_code)]
+fn stat_from_meta(meta: &FileMetadata) -> Stat {
+    let file_type = match meta.kind {
+        ginux_vfs::NodeKind::File => S_IFREG,
+        ginux_vfs::NodeKind::Directory => S_IFDIR,
+        ginux_vfs::NodeKind::Symlink => S_IFLNK,
+    };
+    Stat {
+        mode: file_type | (meta.mode & 0o7777),
+        uid: meta.uid,
+        gid: meta.gid,
+        size: meta.size,
+        ino: meta.ino,
+        nlink: if meta.kind == ginux_vfs::NodeKind::Directory {
+            2
+        } else {
+            1
+        },
+    }
+}
+
+/// Map a VFS failure onto the faithful [`StatError`]. Only
+/// [`VfsError::InvalidDescriptor`] (unknown `fstat` number) is a caller
+/// error; everything else off the metadata path is a backing-store
+/// inconsistency (see [`StatError::Io`]). Allowed with the stat
+/// emulations.
+#[allow(dead_code)]
+fn map_stat_error(error: VfsError) -> StatError {
+    match error {
+        VfsError::InvalidDescriptor => StatError::BadDescriptor,
+        _ => StatError::Io,
+    }
+}
+
+/// Serialize [`Stat`] into the Linux x86-64 `struct stat` layout for the
+/// supervisor's `fstat`/`newfstatat` tracee-memory write-back. Offsets
+/// verified against raw `fstat(5)` bytes on the build host: dev@0 ino@8
+/// nlink@16 mode@24 uid@28 gid@32 rdev@40 size@48 blksize@56 blocks@64,
+/// then time pairs (atime@72/80 mtime@88/96 ctime@104/112) plus 24
+/// reserved zero bytes. `st_blocks` counts 512-byte units; times stay
+/// zero (the index carries no timestamps). Pure `core`, wired with the
+/// supervisor entries; allowed until then.
+#[allow(dead_code)]
+pub fn stat_write(stat: &Stat, out: &mut [u8; STAT_SIZE]) {
+    out.fill(0);
+    write_u64_le(out, 0, STAT_DEV);
+    write_u64_le(out, 8, stat.ino);
+    write_u64_le(out, 16, stat.nlink);
+    write_u32_le(out, 24, stat.mode);
+    write_u32_le(out, 28, stat.uid);
+    write_u32_le(out, 32, stat.gid);
+    write_u64_le(out, 48, stat.size);
+    write_u64_le(out, 56, STAT_BLKSIZE);
+    write_u64_le(out, 64, stat.size.saturating_add(511) / 512);
+}
+
+/// Serialize [`Stat`] into the legacy `struct __old_kernel_stat` layout
+/// for the supervisor's `stat`/`lstat` write-back. Offsets verified
+/// against raw `syscall(4)` bytes on the build host: dev@0 ino@8 nlink@16
+/// mode@24 uid@28 gid@32 pad@36 rdev@40 size@48, then seconds-only
+/// atime@56 mtime@64 ctime@72 (zeroed, as above). Pure `core`, wired with
+/// the supervisor entries; allowed until then.
+#[allow(dead_code)]
+pub fn old_stat_write(stat: &Stat, out: &mut [u8; OLD_STAT_SIZE]) {
+    out.fill(0);
+    write_u64_le(out, 0, STAT_DEV);
+    write_u64_le(out, 8, stat.ino);
+    write_u64_le(out, 16, stat.nlink);
+    write_u32_le(out, 24, stat.mode);
+    write_u32_le(out, 28, stat.uid);
+    write_u32_le(out, 32, stat.gid);
+    write_u64_le(out, 48, stat.size);
+}
+
+/// Little-endian stores for the stat serializers above. `off` is a
+/// compile-time-known layout offset; the caller guarantees room.
+/// Allowed with the serializers.
+#[allow(dead_code)]
+fn write_u32_le(out: &mut [u8], off: usize, value: u32) {
+    out[off..off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Little-endian stores for the stat serializers above. `off` is a
+/// compile-time-known layout offset; the caller guarantees room.
+/// Allowed with the serializers.
+#[allow(dead_code)]
+fn write_u64_le(out: &mut [u8], off: usize, value: u64) {
+    out[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }

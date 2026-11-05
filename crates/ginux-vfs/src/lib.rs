@@ -325,6 +325,24 @@ pub enum MergedKind {
     TargetTooLong,
 }
 
+/// File metadata for one exact merged-view path, as reported by
+/// [`VirtualFs::metadata_merged`] and [`VirtualFs::fstat`] (G07b stat
+/// family). Paths reaching here are already canonical: callers resolve
+/// symlinks first, so this reports the final entry as stored — including
+/// a final symlink itself for `lstat`-style queries. `mode` carries the
+/// stored permission bits only (the index packs the raw archive mode, so
+/// file-type bits are added by the caller from `kind`); `ino` is a
+/// deterministic path hash, never host state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileMetadata {
+    pub kind: NodeKind,
+    pub mode: u32,
+    pub size: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub ino: u64,
+}
+
 // Overlay slot states: 0 = free, 1 = live file, 2 = tombstone (a removed base
 // entry reads as absent and its slot may be reused), 3 = live directory
 // created by [`VirtualFs::mkdir`]. Directories reuse the file slot; `len` and
@@ -361,6 +379,9 @@ struct Descriptor {
     close_on_exec: bool,
     /// Every write starts at end-of-file (G07a `O_APPEND`).
     append: bool,
+    /// Pseudo-inode pinned at open from the resolved path (G07b `fstat`),
+    /// so an open file reports the same `st_ino` as a path query.
+    ino: u64,
 }
 
 impl Descriptor {
@@ -374,6 +395,7 @@ impl Descriptor {
             writable: false,
             close_on_exec: false,
             append: false,
+            ino: 0,
         }
     }
 }
@@ -407,6 +429,10 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         let overlay_index = self.find_overlay(path.as_bytes());
         let object: usize;
         let overlay: bool;
+        // Pseudo-inode for G07b `fstat`: the stored object path, so an
+        // open file reports the same `st_ino` as a path query. The base
+        // read-only arm below overrides this with the resolved path.
+        let mut ino = path_ino(path.as_bytes());
         match overlay_index {
             Some(index) if self.overlay[index].state == 2 => {
                 if flags & O_CREATE == 0 {
@@ -438,6 +464,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                             .find_base_record(entry.path)
                             .ok_or(VfsError::InvalidIndex)?;
                         overlay = false;
+                        ino = path_ino(entry.path);
                     }
                 }
                 Err(VfsError::NotFound) if flags & O_CREATE != 0 => {
@@ -465,6 +492,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             writable,
             close_on_exec: flags & O_CLOEXEC != 0,
             append: flags & O_APPEND != 0,
+            ino,
         };
         Ok(slot as i32 + 3)
     }
@@ -779,6 +807,70 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         }
     }
 
+    /// Report metadata for one exact canonical path in the merged domain
+    /// view (G07b `stat`/`lstat`/`newfstatat`): live overlay entries win,
+    /// tombstones read as absent. No symlink following — the caller
+    /// resolves first and passes the canonical path, so a final symlink
+    /// reports itself. Overlay files report root ownership until
+    /// permission handling (G08a) lands.
+    pub fn metadata_merged(&self, path: &[u8]) -> Result<FileMetadata, VfsError> {
+        if let Some(index) = self.find_overlay(path) {
+            let slot = &self.overlay[index];
+            if slot.state == 2 {
+                return Err(VfsError::NotFound);
+            }
+            if slot.state == 3 {
+                return Ok(FileMetadata {
+                    kind: NodeKind::Directory,
+                    mode: slot.mode,
+                    size: 0,
+                    uid: 0,
+                    gid: 0,
+                    ino: path_ino(path),
+                });
+            }
+            return Ok(FileMetadata {
+                kind: NodeKind::File,
+                mode: slot.mode,
+                size: slot.len as u64,
+                uid: 0,
+                gid: 0,
+                ino: path_ino(path),
+            });
+        }
+        base_metadata(self.index.lookup_exact(path)?)
+    }
+
+    /// Report metadata for a live descriptor (G07b `fstat`): the object the
+    /// open path pinned, so no path lookup runs here. Overlay files report
+    /// the live overlay length and root ownership; an unlinked-but-open
+    /// file still reports, matching Linux. A directory slot (unreachable
+    /// through `open`, which refuses directories) fails explicitly.
+    pub fn fstat(&self, descriptor: i32) -> Result<FileMetadata, VfsError> {
+        let slot = self.descriptor(descriptor)?;
+        let state = self.descriptors[slot];
+        if state.overlay {
+            let file = &self.overlay[state.object];
+            if file.state == 3 {
+                return Err(VfsError::IsDirectory);
+            }
+            if file.state == 0 {
+                return Err(VfsError::InvalidIndex);
+            }
+            return Ok(FileMetadata {
+                kind: NodeKind::File,
+                mode: file.mode,
+                size: file.len as u64,
+                uid: 0,
+                gid: 0,
+                ino: state.ino,
+            });
+        }
+        // `open` pins `ino` from this same record path, so the base
+        // mapping below already agrees with path queries.
+        base_metadata(self.index.entry(state.object)?)
+    }
+
     pub fn overlay_files(&self) -> usize {
         self.overlay.iter().filter(|entry| entry.state == 1).count()
     }
@@ -931,6 +1023,42 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             }
         }
         Err(VfsError::SymlinkLoop)
+    }
+}
+
+/// Map one base-image record onto [`FileMetadata`] (G07b). A symlink
+/// reports its stored link-target length as `size`, matching Linux
+/// `lstat` (`st_size` counts the link-target bytes); directories report
+/// the stored size.
+fn base_metadata(entry: Entry<'_>) -> Result<FileMetadata, VfsError> {
+    let size = match entry.kind {
+        NodeKind::File => entry.size,
+        NodeKind::Symlink => entry.link.len() as u64,
+        NodeKind::Directory => entry.size,
+    };
+    Ok(FileMetadata {
+        kind: entry.kind,
+        mode: entry.mode,
+        size,
+        uid: entry.uid,
+        gid: entry.gid,
+        ino: path_ino(entry.path),
+    })
+}
+
+/// Deterministic pseudo-inode for one canonical path (G07b): FNV-1a over
+/// the path bytes, so every view of one entry agrees without host state.
+/// Zero maps to 1 (`st_ino` 0 reads as "unknown" to some tools).
+fn path_ino(path: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in path {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
     }
 }
 
