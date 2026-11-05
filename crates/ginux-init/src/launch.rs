@@ -302,6 +302,7 @@ pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *c
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     let mut filesystem = crate::fs_hooks::LaunchFs::prepare(&config)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
+    let mut channels = crate::channel_hooks::LaunchChannels::new();
     print_launch_config(&config);
     let mut domain = Domain::create(config);
     if domain.start().is_err() {
@@ -313,9 +314,15 @@ pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *c
         launch_domain_fail(&mut domain, b"launch tracee fork failed");
     }
     if child == 0 {
-        launch_tracee(root_path, &filesystem, devices.enabled());
+        launch_tracee(root_path);
     }
-    supervise_launch(child as usize, &mut domain, &mut filesystem, &mut devices)
+    supervise_launch(
+        child as usize,
+        &mut domain,
+        &mut filesystem,
+        &mut devices,
+        &mut channels,
+    )
 }
 
 fn launch_validate(config: &DomainConfig) {
@@ -755,16 +762,12 @@ fn finish_signaled(signal: u64) {
     exit_process(128 + signal as usize)
 }
 
-fn launch_tracee(
-    root_path: *const u8,
-    filesystem: &crate::fs_hooks::LaunchFs,
-    devices_enabled: bool,
-) -> ! {
+fn launch_tracee(root_path: *const u8) -> ! {
     static ROOT: &[u8] = b"/\0";
     // Host descriptors (including the result file) must not grant the
     // workload authority outside the supplied root. Only stdio is shared.
     const SYS_CLOSE_RANGE: usize = 436;
-    if !filesystem.reserve_descriptors(devices_enabled) {
+    if !crate::tracee_io::reserve_native_descriptors(crate::fs_hooks::FD_BASE) {
         tracee_setup_fail(
             b"ginux: launch bootstrap failed: descriptor namespace unavailable\n",
             130,
@@ -854,6 +857,7 @@ fn supervise_launch(
     domain: &mut Domain,
     filesystem: &mut crate::fs_hooks::LaunchFs,
     devices: &mut crate::device_hooks::LaunchDevices,
+    channels: &mut crate::channel_hooks::LaunchChannels,
 ) -> ! {
     let mut status = 0i32;
     if wait(pid, &mut status) < 0 {
@@ -958,8 +962,20 @@ fn supervise_launch(
         }
         sequence += 1;
         let syscall = registers.orig_rax;
-        let dispatched = decide_launch(pid, &registers, filesystem, devices);
+        let dispatched = decide_launch(pid, &registers, filesystem, devices, channels);
         let decision = match dispatched {
+            NativeDecision::Park { fd } => {
+                audit_write(b"ginux: park surface=lane-channel fd=");
+                audit_u64(fd as u64);
+                audit_write(b" syscall=");
+                audit_u64(syscall);
+                audit_write(b"\n");
+                // No effects or result yet. The current configured loop has
+                // one task: a self-pipe with no runnable peer remains blocked.
+                // SIGKILL still produces the ordinary terminal wait status.
+                // Multi-task scheduling must retry this entry after peer IO.
+                continue;
+            }
             NativeDecision::Contract(mut decision) => {
                 // Native process ownership is not implemented on this path.
                 // A host fork would create an unsupervised child.

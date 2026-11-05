@@ -251,8 +251,11 @@ image/overlay filesystem. IO is bounded to 4096 bytes per call. Capacity is
 32 objects (including seeded directories), 65536 bytes per file and 64 open
 descriptors. Exhaustion returns `ENOSPC`, `EFBIG`, or `EMFILE` as appropriate.
 
-Virtual descriptors start at 1048576; bootstrap clamps the native descriptor
-soft/hard limits below that namespace while preserving lower inherited limits.
+Writable-file descriptors currently start at 1048576; bootstrap clamps native
+descriptor soft/hard limits below that namespace on every configured launch,
+preserving lower inherited limits. This range-based adapter is provisional:
+libc spawn checks reject these high handles against the reported limit. A shared
+table of small public descriptors is required before ordinary spawn can work.
 Guest-memory copies respect page protections, including partial read copyout.
 No writable host descriptor is exposed. Data disappears at domain teardown;
 there is no retention, export, storage generation or configured storage quota.
@@ -265,10 +268,29 @@ device with domain-owned identity and major/minor 1:3. Open access modes,
 close-on-exec descriptor flags, seek, close and basic access queries are
 supported; device metadata cannot be changed. There are 64 open-device slots.
 Unknown and duplicate assignments fail before launch. Device descriptors start
-at 1073741824, above the reserved native namespace; device-only configurations
-also clamp native descriptor limits. No host device node or descriptor is used.
-Pipes, descriptor duplication, device polling, and additional device types are
+at 1073741824, above the reserved native namespace. No host device node or
+descriptor is used. Device duplication/polling and additional device types are
 not implemented by configured launch yet.
+
+Anonymous `pipe`/`pipe2` are emulated with supervisor-owned memory and virtual
+handles. Up to eight pipes hold 65536 bytes each, with 64 pipe descriptors.
+`pipe2` accepts only `O_CLOEXEC|O_NONBLOCK`. IO is bounded to 4096 bytes per call;
+writes of up to 4096 bytes are atomic. Reads consume only bytes successfully
+copied out, so invalid/partially inaccessible destinations do not lose data.
+Read/write direction, EOF, SIGPIPE, metadata, seek rejection, descriptor/status
+flags, pipe-size queries and aliases within the pipe handle table are supported.
+Alias status flags and endpoint lifetimes are shared; close-on-exec flags are
+per descriptor. No native pipe or host descriptor is given to the workload.
+
+Nonblocking empty/full operations return `EAGAIN`. Blocking operations stay
+stopped at entry until progress is possible. The current single-task launch
+loop cannot run a peer or implement signal-driven restart; a parked self-pipe
+waits indefinitely unless the workload is killed. SIGKILL termination and reaping
+are tested. Pipe polling, cross-owner/stdio aliases, multi-task wakeup, inherited
+descriptor tables, and actual exec-time close-on-exec still require process
+integration. Pipe public handles currently start at 536870912 and share the
+libc limitation above. Pipe allocation/byte-flow evidence alone does not prove
+ordinary child commands work.
 
 When requested, the result file is reserved exclusively before launch, with
 mode 0600 and a maximum path length of 512 bytes. Existing files are never
@@ -294,4 +316,6 @@ make build-launch-storage-fixture
 sudo make test-launch-storage
 make build-launch-device-fixture
 sudo make test-launch-devices
+make build-launch-pipe-fixture
+sudo make test-launch-pipes
 ```

@@ -2,7 +2,7 @@
 //! the supervisor; no writable host descriptor is installed in the workload.
 //! Retained storage, directory descriptors, mappings and exec are not provided.
 
-use crate::supervisor::{syscall4, UserRegs};
+use crate::supervisor::UserRegs;
 use crate::tracee_io::{copy_memory, read_path};
 use core::sync::atomic::{AtomicBool, Ordering};
 use ginux_domain::{DomainConfig, Text};
@@ -110,20 +110,6 @@ impl LaunchFs {
 
     pub fn enabled(&self) -> bool {
         self.count != 0
-    }
-
-    /// Native open/dup cannot obtain descriptors in the virtual namespace.
-    pub fn reserve_descriptors(&self, extra_objects: bool) -> bool {
-        if !self.enabled() && !extra_objects {
-            return true;
-        }
-        let mut limits = [0u64; 2];
-        if unsafe { syscall4(302, 0, 7, 0, limits.as_mut_ptr() as usize) } < 0 {
-            return false;
-        }
-        limits[0] = limits[0].min(FD_BASE as u64);
-        limits[1] = limits[1].min(FD_BASE as u64);
-        unsafe { syscall4(302, 0, 7, limits.as_ptr() as usize, 0) == 0 }
     }
 
     fn owns_path(&self, path: &[u8]) -> bool {

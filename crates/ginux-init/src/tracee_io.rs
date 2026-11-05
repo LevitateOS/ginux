@@ -1,5 +1,5 @@
 //! Controlled copies and x86-64 metadata serialization for native tracees.
-use crate::supervisor::syscall6;
+use crate::supervisor::{syscall4, syscall6};
 use ginux_domain::Text;
 use ginux_vfs::MAX_PATH;
 type Path = Text<MAX_PATH>;
@@ -103,4 +103,16 @@ pub fn write_stat(pid: usize, address: u64, metadata: Stat, statx: bool) -> Resu
         return Err(-14);
     }
     Ok(0)
+}
+
+/// Native open/dup cannot obtain descriptors reserved for domain objects.
+/// Keep an operator's lower soft/hard limits, and never raise either bound.
+pub fn reserve_native_descriptors(limit: usize) -> bool {
+    let mut limits = [0u64; 2];
+    if unsafe { syscall4(302, 0, 7, 0, limits.as_mut_ptr() as usize) } < 0 {
+        return false;
+    }
+    limits[0] = limits[0].min(limit as u64);
+    limits[1] = limits[1].min(limit as u64);
+    unsafe { syscall4(302, 0, 7, limits.as_ptr() as usize, 0) == 0 }
 }

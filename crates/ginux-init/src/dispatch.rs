@@ -35,6 +35,8 @@ pub fn classify(syscall: u64) -> Lane {
 
 /// Outcome of dispatching one native entry.
 pub enum NativeDecision {
+    /// An owned channel cannot progress yet. Keep this task at entry.
+    Park { fd: u32 },
     /// A lane hook claimed the entry; emulate it with this result.
     Hooked { lane: Lane, result: i64 },
     /// No hook claimed the entry; apply the shared contract decision.
@@ -80,8 +82,17 @@ pub fn decide_launch(
     registers: &UserRegs,
     filesystem: &mut crate::fs_hooks::LaunchFs,
     devices: &mut crate::device_hooks::LaunchDevices,
+    channels: &mut crate::channel_hooks::LaunchChannels,
 ) -> NativeDecision {
-    if let Some(result) = devices.claim(pid, registers, filesystem) {
+    if let Some(result) = channels.claim(pid, registers) {
+        match result {
+            crate::channel_hooks::ChannelResult::Ready(result) => NativeDecision::Hooked {
+                lane: Lane::Channel,
+                result,
+            },
+            crate::channel_hooks::ChannelResult::Blocked { fd } => NativeDecision::Park { fd },
+        }
+    } else if let Some(result) = devices.claim(pid, registers, filesystem) {
         NativeDecision::Hooked {
             lane: Lane::Device,
             result,

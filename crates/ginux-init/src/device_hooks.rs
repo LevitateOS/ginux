@@ -42,10 +42,6 @@ impl LaunchDevices {
         })
     }
 
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
     pub fn claim(&mut self, pid: usize, r: &UserRegs, fs: &LaunchFs) -> Option<i64> {
         let fd = r.rdi as u32;
         if self.enabled
