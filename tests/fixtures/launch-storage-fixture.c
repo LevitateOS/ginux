@@ -70,9 +70,16 @@ long storage_main(word *stack)
     CHECK(DO(2, "/out/missing", 0, 0) == -2, 15);
     CHECK(DO(2, 1, 0, 0) == -14, 16);
     CHECK(DO(83, "/work/build/nested", 0755, 0) == 0, 17);
-    long fd = call(257, -100, (word)"build/nested/file", 0102|02000000, 0644, 0, 0);
+    long fd = call(257, -100, (word)"build/nested/file", 0102|0400|02000000, 0644, 0, 0);
     CHECK(fd == 3, 18);
     CHECK(DO(1, fd, "hello", 5) == 5, 19);
+    // O_NOCTTY must not reject regular files, including descriptor reopening.
+    long reader = DO(2, "/work/build/nested/file", 0400, 0);
+    CHECK(reader >= 3 && DO(0, reader, output, 5) == 5, 99);
+    CHECK(output[0] == 'h' && DO(3, reader, 0, 0) == 0, 100);
+    reader = DO(2, "/dev/fd/3", 0400, 0);
+    CHECK(reader >= 3 && DO(0, reader, output, 5) == 5, 101);
+    CHECK(output[4] == 'o' && DO(3, reader, 0, 0) == 0, 102);
     CHECK(DO(72, fd, 1, 0) == 1, 20);
     CHECK(DO(72, fd, 2, 0) == 0, 21);
     CHECK(DO(72, fd, 1, 0) == 0, 22);

@@ -211,7 +211,7 @@ impl LaunchFs {
             .filter(|n| *n < 64)
             .ok_or(-95)? as i32
             + 3;
-        const ALLOWED: u64 = 0o4000 | 0o100000 | 0o200000 | 0o400000 | 0o2000000;
+        const ALLOWED: u64 = 0o400 | 0o4000 | 0o100000 | 0o200000 | 0o400000 | 0o2000000;
         if flags & !ALLOWED != 0 {
             return Err(-13);
         }
@@ -427,11 +427,13 @@ impl LaunchFs {
     }
 
     fn open(&mut self, path: &[u8], flags: u64, mode: u64) -> Result<i64, i64> {
-        // NOFOLLOW is valid because this backend has no symlinks. Unsupported
+        // NOCTTY and NOFOLLOW are valid: this backend has no terminals or symlinks.
+        // Unsupported
         // path-only behavior never falls through to native storage.
         const ALLOWED: u64 = 3
             | 0o100
             | 0o200
+            | 0o400
             | 0o1000
             | 0o2000
             | 0o4000
