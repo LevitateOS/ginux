@@ -20,6 +20,11 @@ long storage_main(word *stack)
 {
     word argc = *stack;
     char **argv = (char **)(stack + 1);
+    if (argc > 1 && argv[1][0] == 'l') {
+        for (word i=0;i<10000;++i) CHECK(DO(39,0,0,0)>0,164);
+        CHECK(DO(1,1,"events: PASS\n",13)==13,165);
+        return 0;
+    }
     if (argc > 2 && argv[1][0] == 'r') {
         long fd=DO(2,"/work/checkpoint",0,0);
         CHECK(fd==3,153);

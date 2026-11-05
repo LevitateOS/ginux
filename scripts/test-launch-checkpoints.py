@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import select
 import shutil
+import signal
+import time
 import socket
 import struct
 import subprocess
@@ -87,6 +89,26 @@ def main():
                     if proc.poll() is None:
                         proc.kill()
                         proc.communicate(timeout=5)
+        # An idle control socket must not impose a timer tick per syscall stop.
+        # Also cover callers that ignore SIGCHLD: the private event wait must
+        # establish its own signal disposition without changing guest semantics.
+        config_path.write_text(config.replace('args = ["checkpoint"]', 'args = ["latency"]'))
+        for controlled in (False, True):
+            client, server = socket.socketpair()
+            try:
+                command = [binary, 'launch', str(config_path), str(root)]
+                if controlled:
+                    command += ['--control-fd', str(server.fileno())]
+                start = time.monotonic()
+                proc = subprocess.run(command, pass_fds=(server.fileno(),) if controlled else (),
+                    preexec_fn=lambda: signal.signal(signal.SIGCHLD, signal.SIG_IGN),
+                    capture_output=True, timeout=10)
+                assert proc.returncode == 0, proc.stderr.decode()
+                assert proc.stdout == b'events: PASS\n', proc.stdout
+                print(f'10000 syscalls, control={controlled}: {time.monotonic()-start:.3f}s')
+            finally:
+                client.close()
+                server.close()
         def restore(archive, expected='first', failure=False, assignments='memory:/work'):
             result = work / 'restore-result.json'
             result.unlink(missing_ok=True)

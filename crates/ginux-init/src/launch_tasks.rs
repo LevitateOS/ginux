@@ -107,6 +107,94 @@ struct Supervisor<'a> {
     tearing_down: bool,
 }
 
+// Created only after the tracee's initial exec stop, so neither the blocked
+// signal nor this private descriptor can enter the workload. SIGCHLD remains
+// blocked between wait4(WNOHANG) and poll: a new ptrace stop cannot be lost in
+// that interval. wait4 owns statuses; signalfd is only a wakeup notification.
+fn task_events() -> Result<usize, &'static [u8]> {
+    let mask = 1u64 << (SIGCHLD - 1);
+    let action = [0u64; 4];
+    if unsafe {
+        syscall4(
+            SYS_RT_SIGPROCMASK,
+            SIG_BLOCK,
+            &mask as *const _ as usize,
+            0,
+            8,
+        )
+    } < 0
+        || unsafe { syscall4(13, SIGCHLD, action.as_ptr() as usize, 0, 8) } < 0
+    {
+        return Err(b"task event signal setup failed");
+    }
+    let fd = unsafe {
+        syscall4(
+            SYS_SIGNALFD4,
+            usize::MAX,
+            &mask as *const _ as usize,
+            8,
+            0x80800,
+        )
+    };
+    if fd < 0 {
+        return Err(b"task event descriptor setup failed");
+    }
+    Ok(fd as usize)
+}
+
+fn wait_events(signal_fd: usize, timer: bool) -> Result<(), &'static [u8]> {
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    let (control, events) = crate::checkpoint_control::readiness();
+    let mut fds = [
+        PollFd {
+            fd: signal_fd as i32,
+            events: 1,
+            revents: 0,
+        },
+        PollFd {
+            fd: control,
+            events,
+            revents: 0,
+        },
+    ];
+    // Owned finite polls need a millisecond tick; otherwise either descriptor
+    // wakes us immediately, including control requests while all tasks sleep.
+    let result = unsafe {
+        syscall3(
+            7,
+            fds.as_mut_ptr() as usize,
+            fds.len(),
+            if timer { 1 } else { usize::MAX },
+        )
+    };
+    if result < 0 && result != -4 {
+        return Err(b"task event wait failed");
+    }
+    if fds[0].revents & !1 != 0 {
+        return Err(b"task event descriptor failed");
+    }
+    if fds[0].revents & 1 != 0 {
+        let mut info = [0u8; 128];
+        let count = unsafe {
+            syscall3(
+                SYS_READ_HOST,
+                signal_fd,
+                info.as_mut_ptr() as usize,
+                info.len(),
+            )
+        };
+        if count != 128 && count != -4 && count != -11 {
+            return Err(b"task event read failed");
+        }
+    }
+    Ok(())
+}
+
 pub fn supervise(
     root: usize,
     domain: &mut Domain,
@@ -178,6 +266,7 @@ pub fn supervise(
     }
     line_stderr(b"ginux: launch backend=ptrace-native profile=balanced elf-loader=host");
     line_stderr(b"ginux: launch tracee-uid=1000 tracee-gid=1000 root=host-path-read-only");
+    let signal_fd = task_events().unwrap_or_else(|reason| s.fail(domain, reason));
     s.resume(0, 0, domain);
     let mut poll_tick = 0;
     loop {
@@ -186,11 +275,11 @@ pub fn supervise(
         if let Err(reason) = crate::checkpoint_control::poll(s.objects.filesystem) {
             s.fail(domain, reason);
         }
-        let polling = crate::checkpoint_control::enabled()
-            || s.tasks
-                .iter()
-                .flatten()
-                .any(|t| t.blocked.is_some() && t.call.needs_poll_tick());
+        let polling = s
+            .tasks
+            .iter()
+            .flatten()
+            .any(|t| t.blocked.is_some() && t.call.needs_poll_tick());
         if polling {
             let now = crate::descriptors::monotonic_nanoseconds()
                 .unwrap_or_else(|_| s.fail(domain, b"readiness clock failed"))
@@ -207,7 +296,7 @@ pub fn supervise(
                 SYS_WAIT4,
                 usize::MAX,
                 &mut status as *mut _ as usize,
-                WALL | usize::from(polling), // WNOHANG while readiness/timers await progress.
+                WALL | 1, // WNOHANG; private event descriptors provide the blocking wait.
                 0,
             )
         };
@@ -215,12 +304,8 @@ pub fn supervise(
             continue;
         }
         if host == 0 {
-            // No trace stop is pending. Sleep for one readiness tick instead
-            // of spinning or blocking wait4 beyond a finite poll deadline.
-            let delay = [0u64, 1_000_000];
-            let result = unsafe { syscall2(35, delay.as_ptr() as usize, 0) };
-            if result < 0 && result != -4 {
-                s.fail(domain, b"readiness sleep failed");
+            if let Err(reason) = wait_events(signal_fd, polling) {
+                s.fail(domain, reason);
             }
             continue;
         }

@@ -74,9 +74,13 @@ pub fn prepare(fd: Option<usize>) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn enabled() -> bool {
-    let fd = unsafe { CONTROL.fd };
-    fd.is_some()
+/// Readiness interest for the supervisor's private event wait.
+pub fn readiness() -> (i32, i16) {
+    let state = unsafe { &*core::ptr::addr_of!(CONTROL) };
+    (
+        state.fd.map_or(-1, |fd| fd as i32),
+        if state.sent < state.reply.len() { 4 } else { 1 },
+    )
 }
 
 pub fn poll(files: &LaunchFs) -> Result<(), Error> {
