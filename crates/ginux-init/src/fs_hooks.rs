@@ -65,6 +65,22 @@
 //! touching the host. Failures map to faithful errnos through
 //! [`StatError::errno`].
 //!
+//! G08a adds installation permissions and link operations over the same
+//! merged view: [`chmod_at`]/[`fchmod_at`]/[`fchmod_fd`] set plain
+//! permission bits (including the executable bit) on files and directories,
+//! following a final symlink like `chmod(2)`; setuid/setgid/sticky requests
+//! fail with [`PermError::NotPermitted`] and the chown family stays
+//! claimed-but-denied with no emulation (ownership stays root — there is no
+//! privilege model to grant it). [`link_at`] hard-links a file within the
+//! domain (content copy; the pair shares no later writes, a stated bound),
+//! [`symlink_at`] plants a symlink whose raw target stays uninterpreted
+//! until resolution, and [`readlink_at`] reports that raw target without
+//! following. Directories never link, links never replace, and confinement,
+//! nofollow, tombstone, and base-immutability rules carry over from G08.
+//! Failures map to faithful errnos through [`PermError::errno`],
+//! [`LinkError::errno`], [`SymlinkError::errno`], and
+//! [`ReadlinkError::errno`].
+//!
 //! Everything here is pure `core` logic over caller buffers: no host calls,
 //! so a denial has zero host effect by construction. The supervision loop
 //! cannot feed tracee path/memory bytes or persist per-task cwd/fd tables
@@ -185,6 +201,63 @@ pub const SYS_UNLINKAT: u64 = 263;
 /// [`SYS_RENAME`]. Denied until the supervisor can hand the bytes to
 /// [`rename_at`].
 pub const SYS_RENAMEAT: u64 = 264;
+/// `link(2)`: domain file hard link. Claimed for G08a: the balanced
+/// contract would mediate both domain paths to the host, linking unrelated
+/// supervisor files. `link` is `linkat` with `AT_FDCWD` and no flags.
+/// Denied until the supervisor can hand the bytes to [`link_at`].
+pub const SYS_LINK: u64 = 86;
+/// `symlink(2)`: domain symlink creation. Claimed for G08a on the same
+/// terms as [`SYS_LINK`]: `symlink` is `symlinkat` with `AT_FDCWD`.
+/// Denied until the supervisor can hand the bytes to [`symlink_at`].
+pub const SYS_SYMLINK: u64 = 88;
+/// `readlink(2)`: domain symlink target query. Claimed for G08a: the
+/// balanced contract would mediate the domain path to the host (syscall 89
+/// sits on its image-read surface), reporting host link contents as managed
+/// results. Denied until the supervisor can hand the bytes to
+/// [`readlink_at`].
+pub const SYS_READLINK: u64 = 89;
+/// `chmod(2)`: domain permission-bit change. Claimed for G08a on the same
+/// terms as [`SYS_LINK`]. `chmod` is `fchmodat` with `AT_FDCWD` and no
+/// flags. Denied until the supervisor can hand the bytes to [`chmod_at`].
+pub const SYS_CHMOD: u64 = 90;
+/// `fchmod(2)`: domain permission-bit change on a descriptor. Claimed for
+/// G08a: without the claim the balanced contract would hand a domain fd
+/// number to the host `fchmod`. Denied until the supervisor can route the
+/// number to [`fchmod_fd`].
+pub const SYS_FCHMOD: u64 = 91;
+/// `chown(2)`: domain ownership change. Claimed for G08a as an explicit
+/// denial with no emulation: the domain has no privilege model, so
+/// ownership stays root and there is no [`chmod_at`]-style counterpart.
+/// Leaving the entry unclaimed would mediate the domain path to the host.
+pub const SYS_CHOWN: u64 = 92;
+/// `fchown(2)`: domain ownership change on a descriptor. Claimed for G08a
+/// as an explicit denial on the same terms as [`SYS_CHOWN`].
+pub const SYS_FCHOWN: u64 = 93;
+/// `lchown(2)`: domain ownership change without following. Claimed for
+/// G08a as an explicit denial on the same terms as [`SYS_CHOWN`].
+pub const SYS_LCHOWN: u64 = 94;
+/// `fchownat(2)`: domain ownership change relative to a directory fd.
+/// Claimed for G08a as an explicit denial on the same terms as
+/// [`SYS_CHOWN`].
+pub const SYS_FCHOWNAT: u64 = 260;
+/// `linkat(2)`: domain file hard link with independent directory fds for
+/// the source and target. Claimed for G08a on the same terms as
+/// [`SYS_LINK`]. Only flags `0` is emulated ([`link_at`]); the rest fail
+/// explicitly. Denied until the supervisor can hand the bytes over.
+pub const SYS_LINKAT: u64 = 265;
+/// `symlinkat(2)`: domain symlink creation relative to a directory fd.
+/// Claimed for G08a on the same terms as [`SYS_LINK`]. Denied until the
+/// supervisor can hand the bytes to [`symlink_at`].
+pub const SYS_SYMLINKAT: u64 = 266;
+/// `readlinkat(2)`: domain symlink target query relative to a directory
+/// fd. Claimed for G08a on the same terms as [`SYS_READLINK`]. Denied
+/// until the supervisor can hand the bytes to [`readlink_at`].
+pub const SYS_READLINKAT: u64 = 267;
+/// `fchmodat(2)`: domain permission-bit change relative to a directory fd.
+/// Claimed for G08a on the same terms as [`SYS_CHMOD`]. Only flags `0` is
+/// emulated ([`fchmod_at`]); the rest fail explicitly. Denied until the
+/// supervisor can hand the bytes over.
+pub const SYS_FCHMODAT: u64 = 268;
 
 /// `AT_FDCWD`: a relative path resolves against the domain working
 /// directory. Matches the Linux `AT_FDCWD` value (`-100`).
@@ -336,7 +409,8 @@ pub const DOMAIN_FD_BASE: u64 = 3;
 
 /// Lane membership by syscall number: directory creation, enumeration,
 /// working-directory operations, descriptor open/close (G07), descriptor
-/// data I/O (G07a), file metadata queries (G07b), and rename/removal (G08).
+/// data I/O (G07a), file metadata queries (G07b), rename/removal (G08),
+/// and permissions/links (G08a).
 pub fn claims(syscall: u64) -> bool {
     matches!(
         syscall,
@@ -361,6 +435,19 @@ pub fn claims(syscall: u64) -> bool {
             | SYS_UNLINK
             | SYS_UNLINKAT
             | SYS_RENAMEAT
+            | SYS_LINK
+            | SYS_SYMLINK
+            | SYS_READLINK
+            | SYS_CHMOD
+            | SYS_FCHMOD
+            | SYS_CHOWN
+            | SYS_FCHOWN
+            | SYS_LCHOWN
+            | SYS_FCHOWNAT
+            | SYS_LINKAT
+            | SYS_SYMLINKAT
+            | SYS_READLINKAT
+            | SYS_FCHMODAT
     )
 }
 
@@ -384,7 +471,13 @@ pub fn claims(syscall: u64) -> bool {
 /// the rename/removal entries denied on the same terms — emulation needs
 /// the tracee path bytes plus per-task cwd/VFS state (see [`rename_at`]/
 /// [`unlink_at`]) — with no fd-based fallthrough: every claimed rename or
-/// removal names domain paths, never host descriptors.
+/// removal names domain paths, never host descriptors. G08a keeps the
+/// permission/link entries denied on the same terms — emulation needs the
+/// tracee path bytes (plus data buffers for `readlink`, plus per-task
+/// cwd/VFS state) for [`chmod_at`]/[`fchmod_at`]/[`link_at`]/[`symlink_at`]/
+/// [`readlink_at`], and the descriptor number for
+/// [`fchmod_fd`] — again with no fd-based fallthrough for the path entries
+/// (the chown family has no emulation at all: ownership stays root).
 /// Claiming still matters — it stops the balanced contract from mediating
 /// domain paths and descriptor numbers to the host (which would report
 /// host metadata as managed results, or rename and unlink host files) —
@@ -1822,5 +1915,562 @@ fn map_remove_error(error: VfsError) -> RemoveError {
         | VfsError::InvalidOffset
         | VfsError::InvalidIndex
         | VfsError::Io => RemoveError::Io,
+    }
+}
+
+// ─── G08a: installation permissions and link operations ───────────────────
+
+/// Why a [`chmod_at`]/[`fchmod_at`]/[`fchmod_fd`] emulation failed.
+///
+/// Returned to the supervisor wiring once tracee-memory/fd-table plumbing
+/// lands; allowed until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermError {
+    /// Path resolution failed (escape, missing entry, loop, bad dirfd…).
+    Resolve(ResolveError),
+    /// A trailing slash addressed a non-directory.
+    NotDirectory,
+    /// A setuid/setgid/sticky bit request: the domain keeps root ownership
+    /// with plain permission bits, so anything outside `0o777` is refused.
+    NotPermitted,
+    /// `fchmod` of a number the bounded table has not allocated.
+    BadDescriptor,
+    /// A `fchmodat` flag outside `0`.
+    Invalid,
+    /// No free slot for the materialized overlay copy.
+    NoSpace,
+    /// A materialized base file is larger than the overlay file capacity.
+    TooLarge,
+    /// Corrupt image index or a backing-store failure.
+    Io,
+}
+
+impl PermError {
+    /// Faithful negative errno for supervisor wiring. Bit-policy refusals
+    /// report `-EPERM`, matching the lane's denial convention. Allowed
+    /// until that wiring lands.
+    #[allow(dead_code)]
+    pub const fn errno(self) -> i64 {
+        match self {
+            PermError::Resolve(error) => error.errno(),
+            PermError::NotDirectory => -ENOTDIR,
+            PermError::NotPermitted => -EPERM,
+            PermError::BadDescriptor => -EBADF,
+            PermError::Invalid => -EINVAL,
+            PermError::NoSpace => -ENOSPC,
+            PermError::TooLarge => -EFBIG,
+            PermError::Io => -EIO,
+        }
+    }
+}
+
+/// Why a [`link_at`] emulation failed.
+///
+/// Returned to the supervisor wiring once tracee-memory/fd-table plumbing
+/// lands; allowed until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkError {
+    /// Path resolution failed (escape, missing entry, loop, bad dirfd…).
+    Resolve(ResolveError),
+    /// The target parent is not a directory, or a trailing slash addressed
+    /// a non-directory.
+    NotDirectory,
+    /// The source is a directory: Linux refuses directory hard links with
+    /// `EPERM`, and this lane has no directory-link support to offer.
+    NotPermitted,
+    /// The target name already resolves to a live entry: links never
+    /// replace, whatever the existing kind.
+    Exists,
+    /// Malformed target name (`.`/`..`/empty final component) or a `linkat`
+    /// flag outside `0` (`AT_SYMLINK_FOLLOW`/`AT_EMPTY_PATH` stay explicitly
+    /// unsupported: following is the only behavior, empty paths never link).
+    Invalid,
+    /// No free slot for the linked copy in the overlay.
+    NoSpace,
+    /// A linked base file is larger than the overlay file capacity.
+    TooLarge,
+    /// Corrupt image index or a backing-store failure.
+    Io,
+}
+
+impl LinkError {
+    /// Faithful negative errno for supervisor wiring. Allowed until that
+    /// wiring lands.
+    #[allow(dead_code)]
+    pub const fn errno(self) -> i64 {
+        match self {
+            LinkError::Resolve(error) => error.errno(),
+            LinkError::NotDirectory => -ENOTDIR,
+            LinkError::NotPermitted => -EPERM,
+            LinkError::Exists => -EEXIST,
+            LinkError::Invalid => -EINVAL,
+            LinkError::NoSpace => -ENOSPC,
+            LinkError::TooLarge => -EFBIG,
+            LinkError::Io => -EIO,
+        }
+    }
+}
+
+/// Why a [`symlink_at`] emulation failed.
+///
+/// Returned to the supervisor wiring once tracee-memory/fd-table plumbing
+/// lands; allowed until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SymlinkError {
+    /// Path resolution failed (escape, missing entry, loop, bad dirfd…),
+    /// or the link target is empty, NUL-bearing, or overlong.
+    Resolve(ResolveError),
+    /// The new parent is not a directory, or a trailing slash addressed a
+    /// non-directory.
+    NotDirectory,
+    /// The new name already resolves to a live entry: links never replace.
+    Exists,
+    /// Malformed new name (`.`/`..`/empty final component).
+    Invalid,
+    /// No free slot for the planted link in the overlay.
+    NoSpace,
+    /// The link target is larger than the overlay file capacity.
+    TooLarge,
+    /// Corrupt image index or a backing-store failure.
+    Io,
+}
+
+impl SymlinkError {
+    /// Faithful negative errno for supervisor wiring. Allowed until that
+    /// wiring lands.
+    #[allow(dead_code)]
+    pub const fn errno(self) -> i64 {
+        match self {
+            SymlinkError::Resolve(error) => error.errno(),
+            SymlinkError::NotDirectory => -ENOTDIR,
+            SymlinkError::Exists => -EEXIST,
+            SymlinkError::Invalid => -EINVAL,
+            SymlinkError::NoSpace => -ENOSPC,
+            SymlinkError::TooLarge => -EFBIG,
+            SymlinkError::Io => -EIO,
+        }
+    }
+}
+
+/// Why a [`readlink_at`] emulation failed.
+///
+/// Returned to the supervisor wiring once tracee-memory plumbing lands;
+/// allowed until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadlinkError {
+    /// Path resolution failed (escape, missing entry, loop, bad dirfd…).
+    Resolve(ResolveError),
+    /// A trailing slash addressed a non-directory.
+    NotDirectory,
+    /// The final entry is not a symlink (Linux `EINVAL`).
+    Invalid,
+    /// Corrupt image index or a backing-store failure.
+    Io,
+}
+
+impl ReadlinkError {
+    /// Faithful negative errno for supervisor wiring. Allowed until that
+    /// wiring lands.
+    #[allow(dead_code)]
+    pub const fn errno(self) -> i64 {
+        match self {
+            ReadlinkError::Resolve(error) => error.errno(),
+            ReadlinkError::NotDirectory => -ENOTDIR,
+            ReadlinkError::Invalid => -EINVAL,
+            ReadlinkError::Io => -EIO,
+        }
+    }
+}
+
+/// Emulate `chmod(path, mode)` against the domain: `chmod` is `fchmodat`
+/// with `AT_FDCWD` and flags `0`. Pure `core` logic, wired like
+/// [`rename_at`]. Allowed until then.
+#[allow(dead_code)]
+pub fn chmod_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    path: &[u8],
+    mode: u32,
+) -> Result<(), PermError> {
+    fchmod_at(vfs, cwd, dirfd, path, mode, 0)
+}
+
+/// Emulate `fchmodat(dirfd, path, mode, flags)` against the domain:
+/// resolve with final-symlink following and set plain permission bits with
+/// [`VirtualFs::chmod`]. Only flags `0` is emulated; anything else
+/// (`AT_SYMLINK_NOFOLLOW` included) fails explicitly with
+/// [`PermError::Invalid`], a bounded G08a cut. A trailing slash addresses
+/// a directory: a present non-directory fails with `-ENOTDIR`, matching
+/// Linux. Pure `core` logic, wired like [`rename_at`]. Allowed until then.
+#[allow(dead_code)]
+pub fn fchmod_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    path: &[u8],
+    mode: u32,
+    flags: u32,
+) -> Result<(), PermError> {
+    if flags != 0 {
+        return Err(PermError::Invalid);
+    }
+    if path.is_empty() || path.contains(&0) {
+        return Err(PermError::Resolve(ResolveError::Malformed));
+    }
+    let trailing = path.len() > 1 && path[path.len() - 1] == b'/';
+    let mut canonical = [0u8; MAX_CWD];
+    let (len, kind) = resolve_at(
+        cwd.path(),
+        dirfd,
+        path,
+        &mut VfsDomainView::new(vfs),
+        &mut canonical,
+    )
+    .map_err(PermError::Resolve)?;
+    if trailing && kind != ResolvedKind::Directory {
+        return Err(PermError::NotDirectory);
+    }
+    vfs.chmod(&canonical[..len], mode).map_err(map_perm_error)
+}
+
+/// Emulate `fchmod(fd, mode)` against the domain: set plain permission
+/// bits on the object the open path pinned. Unknown numbers — including
+/// the process stdio range — fail with [`PermError::BadDescriptor`].
+/// Pure `core` logic, wired like [`rename_at`]. Allowed until then.
+#[allow(dead_code)]
+pub fn fchmod_fd<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    fd: i32,
+    mode: u32,
+) -> Result<(), PermError> {
+    vfs.chmod_fd(fd, mode).map_err(map_perm_error)
+}
+
+/// Emulate `link(old_path, new_path)` /
+/// `linkat(old_dirfd, old_path, new_dirfd, new_path, flags)` against the
+/// domain: resolve the source with final-symlink following (a link names
+/// the target file, never the link) and plant the target name with
+/// [`VirtualFs::link`].
+///
+/// * Only flags `0` is emulated; any `linkat` flag fails explicitly with
+///   [`LinkError::Invalid`], a bounded G08a cut.
+/// * A directory source fails with [`LinkError::NotPermitted`], matching
+///   Linux `EPERM`; the target side never replaces (see [`LinkError::Exists`]).
+/// * A trailing slash on a non-directory source fails with `-ENOTDIR`,
+///   matching Linux; a trailing slash on the target side demands an
+///   existing directory, which then blocks the link with `EEXIST`.
+/// * Denied mutations change nothing: confinement failures return before
+///   the VFS call, and the VFS link itself consumes at most one slot after
+///   all fallible checks.
+///
+/// Pure `core` logic: the supervisor calls this once tracee path bytes and
+/// per-task `cwd`/VFS handles are plumbed through. Allowed until then.
+#[allow(dead_code)]
+pub fn link_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    old_dirfd: i64,
+    old_path: &[u8],
+    new_dirfd: i64,
+    new_path: &[u8],
+    flags: u32,
+) -> Result<(), LinkError> {
+    if flags != 0 {
+        return Err(LinkError::Invalid);
+    }
+    if old_path.is_empty()
+        || old_path.contains(&0)
+        || new_path.is_empty()
+        || new_path.contains(&0)
+    {
+        return Err(LinkError::Resolve(ResolveError::Malformed));
+    }
+    let old_trailing = old_path.len() > 1 && old_path[old_path.len() - 1] == b'/';
+    let mut old_canon = [0u8; MAX_CWD];
+    let (old_len, old_kind) = resolve_at(
+        cwd.path(),
+        old_dirfd,
+        old_path,
+        &mut VfsDomainView::new(vfs),
+        &mut old_canon,
+    )
+    .map_err(LinkError::Resolve)?;
+    if old_trailing && old_kind != ResolvedKind::Directory {
+        return Err(LinkError::Resolve(ResolveError::NotDirectory));
+    }
+    if old_kind == ResolvedKind::Directory {
+        return Err(LinkError::NotPermitted);
+    }
+    let new_trailing = new_path.len() > 1 && new_path[new_path.len() - 1] == b'/';
+    let mut new_abs = [0u8; MAX_CWD];
+    let new_len = if new_trailing {
+        let (len, kind) = resolve_at(
+            cwd.path(),
+            new_dirfd,
+            new_path,
+            &mut VfsDomainView::new(vfs),
+            &mut new_abs,
+        )
+        .map_err(LinkError::Resolve)?;
+        if kind != ResolvedKind::Directory {
+            return Err(LinkError::Resolve(ResolveError::NotDirectory));
+        }
+        len
+    } else {
+        build_link_target(vfs, cwd, new_dirfd, new_path, &mut new_abs)?
+    };
+    if new_trailing {
+        // A trailing slash resolved to an existing directory, which blocks
+        // the link exactly like any other live entry.
+        return Err(LinkError::Exists);
+    }
+    vfs.link(&old_canon[..old_len], &new_abs[..new_len])
+        .map_err(map_link_error)
+}
+
+/// Emulate `symlink(target, path)` / `symlinkat(dirfd, target, path)`
+/// against the domain: join the resolved parent with the final name and
+/// plant the raw target with [`VirtualFs::symlink`]. The target is never
+/// resolved here — dangling and absolute targets plant fine, and
+/// confinement applies when the link resolves, not when it is created.
+/// Pure `core` logic, wired like [`link_at`]. Allowed until then.
+#[allow(dead_code)]
+pub fn symlink_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    target: &[u8],
+    path: &[u8],
+) -> Result<(), SymlinkError> {
+    if target.is_empty() || target.contains(&0) {
+        return Err(SymlinkError::Resolve(ResolveError::Malformed));
+    }
+    if target.len() > MAX_LINK {
+        return Err(SymlinkError::Resolve(ResolveError::TooLong));
+    }
+    if path.is_empty() || path.contains(&0) {
+        return Err(SymlinkError::Resolve(ResolveError::Malformed));
+    }
+    if path.len() > 1 && path[path.len() - 1] == b'/' {
+        let mut probe = [0u8; MAX_CWD];
+        match resolve_at(
+            cwd.path(),
+            dirfd,
+            path,
+            &mut VfsDomainView::new(vfs),
+            &mut probe,
+        ) {
+            Ok((_, kind)) if kind == ResolvedKind::Directory => {
+                return Err(SymlinkError::Exists);
+            }
+            Ok(_) => return Err(SymlinkError::Resolve(ResolveError::NotDirectory)),
+            Err(error) => return Err(SymlinkError::Resolve(error)),
+        }
+    }
+    let mut canonical = [0u8; MAX_CWD];
+    let len = build_link_target(vfs, cwd, dirfd, path, &mut canonical).map_err(map_link_target)?;
+    vfs.symlink(target, &canonical[..len])
+        .map_err(map_symlink_error)
+}
+
+/// Emulate `readlink(path, out)` / `readlinkat(dirfd, path, out)` against
+/// the domain: resolve without following a final symlink and report the
+/// raw target into `out`, returning the placed count. A non-symlink final
+/// fails with [`ReadlinkError::Invalid`]; a target longer than `out`
+/// truncates like Linux. Pure `core` logic, wired like [`link_at`].
+/// Allowed until then.
+#[allow(dead_code)]
+pub fn readlink_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    path: &[u8],
+    out: &mut [u8],
+) -> Result<usize, ReadlinkError> {
+    if path.is_empty() || path.contains(&0) {
+        return Err(ReadlinkError::Resolve(ResolveError::Malformed));
+    }
+    let trailing = path.len() > 1 && path[path.len() - 1] == b'/';
+    let mut canonical = [0u8; MAX_CWD];
+    let (len, kind) = resolve_at_full(
+        cwd.path(),
+        dirfd,
+        path,
+        false,
+        &mut VfsDomainView::new(vfs),
+        &mut canonical,
+    )
+    .map_err(ReadlinkError::Resolve)?;
+    if trailing && kind != ResolvedKind::Directory {
+        return Err(ReadlinkError::Resolve(ResolveError::NotDirectory));
+    }
+    if kind == ResolvedKind::Directory {
+        return Err(ReadlinkError::Invalid);
+    }
+    vfs.readlink(&canonical[..len], out)
+        .map_err(map_readlink_error)
+}
+
+/// Join the resolved target parent with the final name for [`link_at`]
+/// (and, through [`map_link_target`], [`symlink_at`]): the stored path is
+/// canonical, never hiding an unexpanded link in the parent. Mirrors the
+/// [`create_at`] slow path: the parent resolves with following (it must be
+/// a live directory) while the name itself stays uninterpreted. Reached
+/// only through [`link_at`]/[`symlink_at`]; allowed with them.
+#[allow(dead_code)]
+fn build_link_target<
+    R: BaseReader,
+    const FILES: usize,
+    const FILE_SIZE: usize,
+    const FDS: usize,
+>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    path: &[u8],
+    out: &mut [u8; MAX_CWD],
+) -> Result<usize, LinkError> {
+    let dot: &[u8] = b".";
+    let (parent, name) = match path.iter().rposition(|byte| *byte == b'/') {
+        Some(0) => (&path[..1], &path[1..]),
+        Some(index) => (&path[..index], &path[index + 1..]),
+        None => (dot, path),
+    };
+    if name.is_empty() || name == b"." || name == b".." {
+        return Err(LinkError::Invalid);
+    }
+    let mut parent_out = [0u8; MAX_CWD];
+    let (parent_len, parent_kind) = resolve_at(
+        cwd.path(),
+        dirfd,
+        parent,
+        &mut VfsDomainView::new(vfs),
+        &mut parent_out,
+    )
+    .map_err(LinkError::Resolve)?;
+    if parent_kind != ResolvedKind::Directory {
+        return Err(LinkError::Resolve(ResolveError::NotDirectory));
+    }
+    let mut len =
+        append_all(out, 0, &parent_out[..parent_len]).map_err(LinkError::Resolve)?;
+    if len > 1 {
+        len = append_all(out, len, b"/").map_err(LinkError::Resolve)?;
+    }
+    len = append_all(out, len, name).map_err(LinkError::Resolve)?;
+    Ok(len)
+}
+
+/// Map a VFS failure onto the faithful [`PermError`]. `NotFound` after a
+/// successful pre-resolution is unreachable through [`chmod_at`] — the view
+/// cannot change between the two reads — so it reports the missing name
+/// rather than an inconsistency. Allowed with the chmod emulations.
+#[allow(dead_code)]
+fn map_perm_error(error: VfsError) -> PermError {
+    match error {
+        VfsError::NotFound => PermError::Resolve(ResolveError::NotFound),
+        VfsError::NotDirectory => PermError::NotDirectory,
+        VfsError::PermissionDenied => PermError::NotPermitted,
+        VfsError::InvalidDescriptor => PermError::BadDescriptor,
+        VfsError::InvalidPath => PermError::Invalid,
+        VfsError::OverlayLimit => PermError::NoSpace,
+        VfsError::FileTooLarge => PermError::TooLarge,
+        VfsError::SymlinkLoop => PermError::Resolve(ResolveError::SymlinkLoop),
+        VfsError::IsDirectory
+        | VfsError::InvalidOffset
+        | VfsError::DescriptorLimit
+        | VfsError::AlreadyExists
+        | VfsError::InvalidIndex
+        | VfsError::Io => PermError::Io,
+    }
+}
+
+/// Map a VFS failure onto the faithful [`LinkError`]. A directory report
+/// can only name the source here — the target side never replaces, so any
+/// live target already failed with `AlreadyExists` inside the VFS.
+/// Allowed with [`link_at`].
+#[allow(dead_code)]
+fn map_link_error(error: VfsError) -> LinkError {
+    match error {
+        VfsError::NotFound => LinkError::Resolve(ResolveError::NotFound),
+        VfsError::NotDirectory => LinkError::NotDirectory,
+        VfsError::IsDirectory => LinkError::NotPermitted,
+        VfsError::AlreadyExists => LinkError::Exists,
+        VfsError::SymlinkLoop => LinkError::Resolve(ResolveError::SymlinkLoop),
+        VfsError::InvalidPath => LinkError::Invalid,
+        VfsError::OverlayLimit => LinkError::NoSpace,
+        VfsError::FileTooLarge => LinkError::TooLarge,
+        VfsError::PermissionDenied
+        | VfsError::InvalidDescriptor
+        | VfsError::DescriptorLimit
+        | VfsError::InvalidOffset
+        | VfsError::InvalidIndex
+        | VfsError::Io => LinkError::Io,
+    }
+}
+
+/// Map a [`build_link_target`] failure onto the faithful [`SymlinkError`].
+/// The builder only produces resolution, directory, and name errors, so
+/// the mapping is total. Allowed with [`symlink_at`].
+#[allow(dead_code)]
+fn map_link_target(error: LinkError) -> SymlinkError {
+    match error {
+        LinkError::Resolve(error) => SymlinkError::Resolve(error),
+        LinkError::NotDirectory => SymlinkError::NotDirectory,
+        LinkError::Invalid => SymlinkError::Invalid,
+        LinkError::Exists => SymlinkError::Exists,
+        LinkError::NotPermitted
+        | LinkError::NoSpace
+        | LinkError::TooLarge
+        | LinkError::Io => SymlinkError::Io,
+    }
+}
+
+/// Map a VFS failure onto the faithful [`SymlinkError`]. Allowed with
+/// [`symlink_at`].
+#[allow(dead_code)]
+fn map_symlink_error(error: VfsError) -> SymlinkError {
+    match error {
+        VfsError::NotFound => SymlinkError::Resolve(ResolveError::NotFound),
+        VfsError::NotDirectory => SymlinkError::NotDirectory,
+        VfsError::AlreadyExists => SymlinkError::Exists,
+        VfsError::SymlinkLoop => SymlinkError::Resolve(ResolveError::SymlinkLoop),
+        VfsError::InvalidPath => SymlinkError::Invalid,
+        VfsError::OverlayLimit => SymlinkError::NoSpace,
+        VfsError::FileTooLarge => SymlinkError::TooLarge,
+        VfsError::PermissionDenied
+        | VfsError::InvalidDescriptor
+        | VfsError::DescriptorLimit
+        | VfsError::IsDirectory
+        | VfsError::InvalidOffset
+        | VfsError::InvalidIndex
+        | VfsError::Io => SymlinkError::Io,
+    }
+}
+
+/// Map a VFS failure onto the faithful [`ReadlinkError`]. A non-symlink
+/// final surfaces as [`VfsError::InvalidPath`] and reads as `EINVAL`,
+/// matching Linux. Allowed with [`readlink_at`].
+#[allow(dead_code)]
+fn map_readlink_error(error: VfsError) -> ReadlinkError {
+    match error {
+        VfsError::NotFound => ReadlinkError::Resolve(ResolveError::NotFound),
+        VfsError::NotDirectory => ReadlinkError::NotDirectory,
+        VfsError::InvalidPath => ReadlinkError::Invalid,
+        VfsError::SymlinkLoop => ReadlinkError::Resolve(ResolveError::SymlinkLoop),
+        VfsError::PermissionDenied
+        | VfsError::InvalidDescriptor
+        | VfsError::DescriptorLimit
+        | VfsError::IsDirectory
+        | VfsError::FileTooLarge
+        | VfsError::AlreadyExists
+        | VfsError::OverlayLimit
+        | VfsError::InvalidOffset
+        | VfsError::InvalidIndex
+        | VfsError::Io => ReadlinkError::Io,
     }
 }

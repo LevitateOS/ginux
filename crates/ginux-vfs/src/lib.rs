@@ -472,6 +472,15 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                 return Err(VfsError::IsDirectory);
             }
             Some(index) => {
+                // G08a: a writable open honors cleared write bits on overlay
+                // files too, matching the base-image rule below. Created
+                // files stay `0o600`, so existing writers are unaffected.
+                if writable
+                    && self.overlay[index].state == 1
+                    && self.overlay[index].mode & 0o222 == 0
+                {
+                    return Err(VfsError::PermissionDenied);
+                }
                 object = index;
                 overlay = true;
             }
@@ -1006,6 +1015,285 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             }
         }
         Ok(())
+    }
+
+    /// Set permission bits on one domain file or directory, following a
+    /// final symlink exactly like Linux `chmod(2)`. Only the plain
+    /// permission bits (`0o777`, including the executable bit installers
+    /// need) are accepted: setuid/setgid/sticky requests fail with
+    /// [`VfsError::PermissionDenied`], and ownership stays root — there is
+    /// no privilege model to grant it, so the chown family has no VFS
+    /// counterpart. A live overlay entry takes the mode directly; a base
+    /// entry is materialized into the overlay first (a directory as a
+    /// shadowing directory slot, which keeps its children resolving
+    /// through to the base), so the immutable image never changes.
+    pub fn chmod(&mut self, path: &[u8], mode: u32) -> Result<(), VfsError> {
+        if mode & !0o777 != 0 {
+            return Err(VfsError::PermissionDenied);
+        }
+        let mode = mode & 0o777;
+        let (kind, _, canon, overlay) = self.resolve_merged(path, true)?;
+        if let Some(index) = overlay {
+            match self.overlay[index].state {
+                1 | 3 | 4 => {
+                    self.overlay[index].mode = mode;
+                    return Ok(());
+                }
+                _ => return Err(VfsError::InvalidIndex),
+            }
+        }
+        match kind {
+            NodeKind::File => {
+                let entry = self.index.lookup_exact(canon.as_bytes())?;
+                let index = self.copy_to_overlay(canon, entry)?;
+                self.overlay[index].mode = mode;
+                Ok(())
+            }
+            NodeKind::Directory => {
+                let index = self.allocate_overlay()?;
+                self.overlay[index].state = 3;
+                self.overlay[index].path = canon;
+                self.overlay[index].mode = mode;
+                self.overlay[index].len = 0;
+                Ok(())
+            }
+            // Following resolution never reports a final symlink.
+            NodeKind::Symlink => Err(VfsError::InvalidIndex),
+        }
+    }
+
+    /// Set permission bits on the object an open descriptor pinned
+    /// (`fchmod`). The same bit policy as [`VirtualFs::chmod`] applies. A
+    /// base-backed descriptor is materialized into the overlay and repointed
+    /// there, so the mode change — like any permitted write — never touches
+    /// the immutable image. The pinned path hash is unchanged.
+    pub fn chmod_fd(&mut self, descriptor: i32, mode: u32) -> Result<(), VfsError> {
+        if mode & !0o777 != 0 {
+            return Err(VfsError::PermissionDenied);
+        }
+        let slot = self.descriptor(descriptor)?;
+        let state = self.descriptors[slot];
+        if state.overlay {
+            if self.overlay[state.object].state != 1 {
+                return Err(VfsError::InvalidIndex);
+            }
+            self.overlay[state.object].mode = mode & 0o777;
+            return Ok(());
+        }
+        let entry = self.index.entry(state.object)?;
+        if entry.kind != NodeKind::File {
+            return Err(VfsError::InvalidIndex);
+        }
+        let mut target = Path::new();
+        target.extend(entry.path)?;
+        let index = self.copy_to_overlay(target, entry)?;
+        self.overlay[index].mode = mode & 0o777;
+        self.descriptors[slot].overlay = true;
+        self.descriptors[slot].object = index;
+        Ok(())
+    }
+
+    /// Create a hard link: `new` names the same content `old` resolves to.
+    /// The source follows a final symlink (like `link(2)`); directories are
+    /// refused and the target must be absent — links never replace, so a
+    /// live entry of any kind fails with [`VfsError::AlreadyExists`] while a
+    /// tombstone reads as absent and takes the new name. Content is copied
+    /// into the overlay (the base image never changes); the copy shares no
+    /// writes with the source afterward, a stated G08a bound, and both names
+    /// report link count 1. At most one overlay slot is consumed, reusing a
+    /// dead target slot when one is there, and a failed content read leaves
+    /// the previous view intact.
+    pub fn link(&mut self, old: &[u8], new: &[u8]) -> Result<(), VfsError> {
+        let old = normalize(old)?;
+        let new = normalize(new)?;
+        if old.as_bytes() == b"/" || new.as_bytes() == b"/" {
+            return Err(VfsError::InvalidPath);
+        }
+        let (old_kind, _, old_canon, old_overlay) = self.resolve_merged(old.as_bytes(), true)?;
+        if old_kind == NodeKind::Directory {
+            return Err(VfsError::IsDirectory);
+        }
+        let split = new
+            .as_bytes()
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .ok_or(VfsError::InvalidPath)?;
+        let parent = if split == 0 {
+            b"/".as_slice()
+        } else {
+            &new.as_bytes()[..split]
+        };
+        let name = &new.as_bytes()[split + 1..];
+        if name.is_empty() || name == b"." || name == b".." {
+            return Err(VfsError::InvalidPath);
+        }
+        let (parent_kind, _, parent_canon, _) = self.resolve_merged(parent, true)?;
+        if parent_kind != NodeKind::Directory {
+            return Err(VfsError::NotDirectory);
+        }
+        let mut full = parent_canon;
+        if full.as_bytes() != b"/" {
+            full.extend(b"/")?;
+        }
+        full.extend(name)?;
+        let tombstone = match self.find_overlay(full.as_bytes()) {
+            Some(index) if self.overlay[index].state == 2 => Some(index),
+            Some(_) => return Err(VfsError::AlreadyExists),
+            None => None,
+        };
+        match self.index.lookup_exact(full.as_bytes()) {
+            Ok(_) => return Err(VfsError::AlreadyExists),
+            Err(VfsError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        // Fetch the source content while the view is still untouched.
+        let mut base_size = 0usize;
+        let mut base_offset = 0u64;
+        let source_mode;
+        let mut source_data = [0u8; FILE_SIZE];
+        let mut source_len = 0usize;
+        let old_is_base = old_overlay.is_none();
+        if old_is_base {
+            let entry = self.index.lookup_exact(old_canon.as_bytes())?;
+            if entry.kind != NodeKind::File {
+                return Err(VfsError::InvalidIndex);
+            }
+            let size = usize::try_from(entry.size).map_err(|_| VfsError::FileTooLarge)?;
+            if size > FILE_SIZE {
+                return Err(VfsError::FileTooLarge);
+            }
+            base_size = size;
+            base_offset = entry.data_offset;
+            source_mode = entry.mode;
+        } else {
+            let index = old_overlay.ok_or(VfsError::InvalidIndex)?;
+            if self.overlay[index].state != 1 {
+                return Err(VfsError::InvalidIndex);
+            }
+            source_mode = self.overlay[index].mode;
+            source_len = self.overlay[index].len;
+            source_data = self.overlay[index].data;
+        }
+        if tombstone.is_none()
+            && self.overlay.iter().filter(|entry| entry.state == 0).count() == 0
+        {
+            return Err(VfsError::OverlayLimit);
+        }
+        let index = match tombstone {
+            Some(index) => index,
+            None => self.allocate_overlay()?,
+        };
+        if old_is_base {
+            if base_size > 0 {
+                if let Err(error) = self
+                    .reader
+                    .read_at(base_offset, &mut self.overlay[index].data[..base_size])
+                {
+                    if tombstone.is_none() {
+                        self.overlay[index].state = 0;
+                    }
+                    return Err(error);
+                }
+            }
+            self.overlay[index].state = 1;
+            self.overlay[index].path = full;
+            self.overlay[index].mode = source_mode;
+            self.overlay[index].len = base_size;
+        } else {
+            self.overlay[index].state = 1;
+            self.overlay[index].path = full;
+            self.overlay[index].mode = source_mode;
+            self.overlay[index].len = source_len;
+            self.overlay[index].data = source_data;
+        }
+        Ok(())
+    }
+
+    /// Plant a symlink: `new` reads as a link whose raw target is `target`
+    /// (absolute or relative, uninterpreted — confinement applies when the
+    /// link resolves, not when it is created, so dangling and absolute
+    /// targets are legal here exactly as on Linux). The target must fit
+    /// `MAX_LINK`; the name must be absent (a tombstone takes the name, a
+    /// live entry blocks it). Links take mode `0o777`, matching the
+    /// conventional `lrwxrwxrwx` report.
+    pub fn symlink(&mut self, target: &[u8], new: &[u8]) -> Result<(), VfsError> {
+        if target.is_empty() || target.len() > MAX_LINK || target.contains(&0) {
+            return Err(VfsError::InvalidPath);
+        }
+        if target.len() > FILE_SIZE {
+            return Err(VfsError::FileTooLarge);
+        }
+        let new = normalize(new)?;
+        if new.as_bytes() == b"/" {
+            return Err(VfsError::InvalidPath);
+        }
+        let split = new
+            .as_bytes()
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .ok_or(VfsError::InvalidPath)?;
+        let parent = if split == 0 {
+            b"/".as_slice()
+        } else {
+            &new.as_bytes()[..split]
+        };
+        let name = &new.as_bytes()[split + 1..];
+        if name.is_empty() || name == b"." || name == b".." {
+            return Err(VfsError::InvalidPath);
+        }
+        let (parent_kind, _, parent_canon, _) = self.resolve_merged(parent, true)?;
+        if parent_kind != NodeKind::Directory {
+            return Err(VfsError::NotDirectory);
+        }
+        let mut full = parent_canon;
+        if full.as_bytes() != b"/" {
+            full.extend(b"/")?;
+        }
+        full.extend(name)?;
+        let tombstone = match self.find_overlay(full.as_bytes()) {
+            Some(index) if self.overlay[index].state == 2 => Some(index),
+            Some(_) => return Err(VfsError::AlreadyExists),
+            None => None,
+        };
+        match self.index.lookup_exact(full.as_bytes()) {
+            Ok(_) => return Err(VfsError::AlreadyExists),
+            Err(VfsError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let index = match tombstone {
+            Some(index) => index,
+            None => self.allocate_overlay()?,
+        };
+        self.overlay[index].state = 4;
+        self.overlay[index].path = full;
+        self.overlay[index].mode = 0o777;
+        self.overlay[index].len = target.len();
+        self.overlay[index].data[..target.len()].copy_from_slice(target);
+        Ok(())
+    }
+
+    /// Read a symlink's raw target (`readlink`): the final component never
+    /// follows, so this reports the link itself — including a dangling one
+    /// or one pointing at a directory — while leaving the target untouched.
+    /// Anything but a symlink fails with [`VfsError::InvalidPath`], matching
+    /// Linux `EINVAL`. Like Linux, a target longer than `output` truncates
+    /// to what fits and the placed count is returned.
+    pub fn readlink(&self, path: &[u8], output: &mut [u8]) -> Result<usize, VfsError> {
+        let (kind, _, canon, overlay) = self.resolve_merged(path, false)?;
+        if kind != NodeKind::Symlink {
+            return Err(VfsError::InvalidPath);
+        }
+        let target: &[u8] = if let Some(index) = overlay {
+            if self.overlay[index].state != 4 {
+                return Err(VfsError::InvalidIndex);
+            }
+            &self.overlay[index].data[..self.overlay[index].len]
+        } else {
+            self.index.lookup_exact(canon.as_bytes())?.link
+        };
+        let count = target.len().min(output.len());
+        output[..count].copy_from_slice(&target[..count]);
+        Ok(count)
     }
 
     pub fn teardown(&mut self) {
