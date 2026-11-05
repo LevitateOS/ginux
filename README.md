@@ -200,8 +200,8 @@ executes `[domain].init` with the configured arguments and environment inside
 the supplied host root directory. The bootstrap requires chroot and credential
 change privileges, and a kernel with `close_range` (Linux 5.9 or later).
 It drops to UID/GID 1000 before executing the workload. The configuration must
-select `profile = "balanced"` and `backend = "ptrace-native"`; storage and device
-assignments are not implemented by this command and are rejected.
+select `profile = "balanced"` and `backend = "ptrace-native"`. Device assignments
+and storage backends other than the memory backend below are rejected.
 
 `[domain].workdir` is optional and defaults to `/work`; `/` is also supported.
 The bootstrap creates the working directory if its parent exists, then enters
@@ -226,6 +226,37 @@ supervisor validates the descriptor array before continuation. Timeouts from
 unreadable arrays, and oversized queries are denied. Closed
 descriptors retain the kernel's `POLLNVAL` result.
 
+Optional `[storage].assignments` entries of the form `"memory:/absolute/path"`
+declare empty, ephemeral writable namespaces. For example:
+
+```toml
+[storage]
+assignments = ["memory:/work", "memory:/work/build", "memory:/out"]
+```
+
+Each assignment creates its directory and parents in supervisor-owned memory.
+Overlapping assignments can precreate nested directories. Image files beneath
+an assigned path are hidden; missing files there never fall through to native
+storage. Paths must be canonical, unique, and cannot cover init, `/`, `/proc`,
+`/sys`, or `/dev`. Up to eight assignments fit the existing 64-byte entry bound.
+Without assignments, native image access remains read-only.
+
+This backend supports regular-file open/create/exclusive-create/truncate/append,
+read/write/pread, seek, close, basic descriptor flags, mkdir, file unlink, chmod,
+and stat/fstat/fstatat/statx metadata. Relative paths use the configured workdir;
+directory descriptors, directory enumeration/removal, symlinks, hardlinks,
+rename, duplicate descriptors, file mappings and execution of generated files
+are unsupported. Path normalization is lexical; this is not a complete unified
+image/overlay filesystem. IO is bounded to 4096 bytes per call. Capacity is
+32 objects (including seeded directories), 65536 bytes per file and 64 open
+descriptors. Exhaustion returns `ENOSPC`, `EFBIG`, or `EMFILE` as appropriate.
+
+Virtual descriptors start at 1048576; bootstrap clamps the native descriptor
+soft/hard limits below that namespace while preserving lower inherited limits.
+Guest-memory copies respect page protections, including partial read copyout.
+No writable host descriptor is exposed. Data disappears at domain teardown;
+there is no retention, export, storage generation or configured storage quota.
+
 When requested, the result file is reserved exclusively before launch, with
 mode 0600 and a maximum path length of 512 bytes. Existing files are never
 overwritten. After completion, it contains one synced JSON object:
@@ -246,4 +277,6 @@ The focused Linux integration scenario consumes existing binaries:
 make build
 make build-launch-fixture
 sudo make test-launch
+make build-launch-storage-fixture
+sudo make test-launch-storage
 ```

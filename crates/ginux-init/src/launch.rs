@@ -285,7 +285,7 @@ pub const MAX_LAUNCH_ARG_LEN: usize = 128;
 pub const MAX_LAUNCH_ENV_LEN: usize = 256;
 pub const MAX_LAUNCH_PATH_LEN: usize = 128;
 
-const SYS_MKDIRAT: usize = 259;
+const SYS_MKDIRAT: usize = 258;
 
 static mut LAUNCH_EXEC: [u8; 129] = [0; 129];
 static mut LAUNCH_ARGS: [u8; 7 * 129] = [0; 7 * 129];
@@ -298,6 +298,8 @@ pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *c
     stage_result_path(result_path);
     let config = launch_load_config(config_path);
     launch_validate(&config);
+    let mut filesystem = crate::fs_hooks::LaunchFs::prepare(&config)
+        .unwrap_or_else(|reason| launch_startup_fail(reason));
     print_launch_config(&config);
     let mut domain = Domain::create(config);
     if domain.start().is_err() {
@@ -309,9 +311,9 @@ pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *c
         launch_domain_fail(&mut domain, b"launch tracee fork failed");
     }
     if child == 0 {
-        launch_tracee(root_path);
+        launch_tracee(root_path, &filesystem);
     }
-    supervise_launch(child as usize, &mut domain)
+    supervise_launch(child as usize, &mut domain, &mut filesystem)
 }
 
 fn launch_validate(config: &DomainConfig) {
@@ -320,8 +322,8 @@ fn launch_validate(config: &DomainConfig) {
     {
         launch_startup_fail(b"launch requires profile=balanced backend=ptrace-native");
     }
-    if !config.storage.as_slice().is_empty() || !config.devices.as_slice().is_empty() {
-        launch_startup_fail(b"launch does not support storage or device assignments");
+    if !config.devices.as_slice().is_empty() {
+        launch_startup_fail(b"launch does not support device assignments");
     }
     if config.id.as_bytes().is_empty() || config.id.as_bytes().len() > 64 {
         launch_startup_fail(b"domain id length invalid");
@@ -754,11 +756,17 @@ fn finish_signaled(signal: u64) {
     exit_process(128 + signal as usize)
 }
 
-fn launch_tracee(root_path: *const u8) -> ! {
+fn launch_tracee(root_path: *const u8, filesystem: &crate::fs_hooks::LaunchFs) -> ! {
     static ROOT: &[u8] = b"/\0";
     // Host descriptors (including the result file) must not grant the
     // workload authority outside the supplied root. Only stdio is shared.
     const SYS_CLOSE_RANGE: usize = 436;
+    if !filesystem.reserve_descriptors() {
+        tracee_setup_fail(
+            b"ginux: launch bootstrap failed: descriptor namespace unavailable\n",
+            130,
+        );
+    }
     if unsafe { syscall3(SYS_CLOSE_RANGE, 3, u32::MAX as usize, 0) } < 0 {
         tracee_setup_fail(
             b"ginux: launch bootstrap failed: descriptor cleanup failed\n",
@@ -838,7 +846,11 @@ fn tracee_setup_fail(message: &[u8], code: usize) -> ! {
     }
 }
 
-fn supervise_launch(pid: usize, domain: &mut Domain) -> ! {
+fn supervise_launch(
+    pid: usize,
+    domain: &mut Domain,
+    filesystem: &mut crate::fs_hooks::LaunchFs,
+) -> ! {
     let mut status = 0i32;
     if wait(pid, &mut status) < 0 {
         launch_fail(domain, pid, b"launch tracee wait after exec failed");
@@ -942,7 +954,14 @@ fn supervise_launch(pid: usize, domain: &mut Domain) -> ! {
         }
         sequence += 1;
         let syscall = registers.orig_rax;
-        let decision = match decide_native(syscall, registers.rdi, registers.rsi, registers.rdx) {
+        let dispatched = match filesystem.claim(pid, &registers) {
+            Some(result) => NativeDecision::Hooked {
+                lane: crate::dispatch::Lane::Filesystem,
+                result,
+            },
+            None => decide_native(syscall, registers.rdi, registers.rsi, registers.rdx),
+        };
+        let decision = match dispatched {
             NativeDecision::Contract(mut decision) => {
                 // Native process ownership is not implemented on this path.
                 // A host fork would create an unsupervised child.
@@ -1071,6 +1090,7 @@ fn launch_exit_reason(code: i32) -> &'static [u8] {
         127 => b"exec of configured domain init failed",
         128 => b"configured domain workdir unavailable",
         129 => b"descriptor cleanup failed",
+        130 => b"descriptor namespace unavailable",
         _ => b"tracee exited before supervision",
     }
 }

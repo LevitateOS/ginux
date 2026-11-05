@@ -296,6 +296,7 @@ pub trait BaseReader {
 /// Metadata from the domain image/overlay, without host inode identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileMetadata {
+    pub inode: u64,
     pub kind: NodeKind,
     pub mode: u32,
     pub size: u64,
@@ -577,6 +578,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                 return Err(VfsError::NotFound);
             }
             return Ok(FileMetadata {
+                inode: (self.index.len() + index + 1) as u64,
                 kind: if file.state == 3 {
                     NodeKind::Directory
                 } else {
@@ -588,6 +590,10 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         }
         let entry = self.index.resolve(path.as_bytes())?;
         Ok(FileMetadata {
+            inode: (self
+                .find_base_record(entry.path)
+                .ok_or(VfsError::InvalidIndex)?
+                + 1) as u64,
             kind: entry.kind,
             mode: entry.mode,
             size: entry.size,
@@ -599,6 +605,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         if descriptor.overlay {
             let file = &self.overlay[descriptor.object];
             Ok(FileMetadata {
+                inode: (self.index.len() + descriptor.object + 1) as u64,
                 kind: NodeKind::File,
                 mode: file.mode,
                 size: file.len as u64,
@@ -606,6 +613,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         } else {
             let entry = self.index.entry(descriptor.object)?;
             Ok(FileMetadata {
+                inode: (descriptor.object + 1) as u64,
                 kind: entry.kind,
                 mode: entry.mode,
                 size: entry.size,

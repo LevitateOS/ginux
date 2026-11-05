@@ -164,10 +164,17 @@ clean:
 	cargo clean
 	@./scripts/clean-build.sh
 
-.PHONY: build-launch-fixture test-launch
+.PHONY: build-launch-fixture test-launch build-launch-storage-fixture test-launch-storage
 build-launch-fixture:
 	mkdir -p .artifacts/launch
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fixture.c -o .artifacts/launch/launch-fixture
 
 test-launch:
 	python3 scripts/test-launch.py $(GINUX) .artifacts/launch/launch-fixture
+
+build-launch-storage-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-storage-fixture.c -o .artifacts/launch/launch-storage-fixture
+
+test-launch-storage:
+	python3 scripts/test-launch-storage.py $(GINUX) .artifacts/launch/launch-storage-fixture

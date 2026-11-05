@@ -263,3 +263,24 @@ pub unsafe fn syscall5(
     );
     result
 }
+
+#[inline(always)]
+pub unsafe fn syscall6(
+    number: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+) -> isize {
+    let result: isize;
+    asm!(
+        "syscall",
+        inlateout("rax") number as isize => result,
+        in("rdi") a1, in("rsi") a2, in("rdx") a3,
+        in("r10") a4, in("r8") a5, in("r9") a6,
+        lateout("rcx") _, lateout("r11") _, options(nostack)
+    );
+    result
+}
