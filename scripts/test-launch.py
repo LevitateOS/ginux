@@ -73,6 +73,7 @@ def main():
         invoke(["trap"], 133, "signaled")
         invoke(["segv"], 139, "signaled")
         invoke(["fork"], 0, "exited")
+        invoke(["poll"], 0, "exited")
         invoke(["int80"], 1, "supervisor-error")
         invoke(["descriptor"], 0, "exited")
         with (work / "secret").open("w+b") as secret:
