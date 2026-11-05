@@ -24,7 +24,9 @@ use crate::launch::{
     Command, ELF_BYTES, VFS_INDEX_BYTES,
 };
 use crate::process_hooks::{
-    exec_mediated, PTRACE_EVENT_CLONE, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEVFORK,
+    exec_mediated, thread_supported, PTRACE_EVENT_CLONE, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE,
+    PTRACE_O_TRACEVFORK, SYS_ARCH_PRCTL, SYS_FUTEX, SYS_GETTID, SYS_GET_ROBUST_LIST, SYS_RSEQ,
+    SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS,
 };
 use crate::supervisor::{
     exit_process, line, ptrace, read_tracee_word, stopped, syscall0, syscall1, syscall2, syscall3,
@@ -471,6 +473,9 @@ struct NativeProcessTask {
     exec_pending: bool,
     exec_event_seen: bool,
     tracing: bool,
+    thread_pending: bool,
+    clone_ptid: usize,
+    set_tid_pending: bool,
 }
 
 fn process_native_main(config_path: *const u8, fixture_path: *const u8) -> ! {
@@ -552,7 +557,12 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         exec_pending: false,
         exec_event_seen: false,
         tracing: true,
+        thread_pending: false,
+        clone_ptid: 0,
+        set_tid_pending: false,
     });
+    let mut root_exited = false;
+    let mut root_failed = false;
     if ptrace(PTRACE_SYSCALL, root_host_pid, 0, 0) < 0 {
         process_native_fail(domain, root_host_pid, b"process initial resume failed");
     }
@@ -590,18 +600,44 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             if processes.exit(task.virtual_id, exit_status).is_err() {
                 process_native_fail(domain, root_host_pid, b"virtual exit failed");
             }
-            if let Some(entry) = tasks[task_index].as_mut() {
+            // Thread exit with cleanup: a task whose tgid differs from its
+            // pid is a thread-group member. Threads are joined over a futex
+            // on shared memory, never reaped by `wait4`, so the host slot is
+            // dropped now; the virtual exit stays in the table for the final
+            // reap. The host kernel already performed the
+            // `CLONE_CHILD_CLEARTID` clear and wakeup as part of this exit.
+            let thread_exit = processes
+                .view(task.virtual_id)
+                .is_ok_and(|view| view.tgid != view.id.pid);
+            if thread_exit {
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: thread-exit virtual-tid=");
+                write_u64(task.virtual_id.pid as u64);
+                write_all(b" status=");
+                write_i64(exit_status as i64);
+                write_all(b"\n");
+                tasks[task_index] = None;
+            } else if let Some(entry) = tasks[task_index].as_mut() {
                 entry.tracing = false;
             }
             if task.virtual_id == root_virtual {
-                if exit_status != 0 || tasks.iter().flatten().any(|entry| entry.tracing) {
-                    write_all(b"GINUX_NATIVE_PROCESS: root-exit=");
-                    write_i64(exit_status as i64);
-                    write_all(b" tracing-remaining=");
-                    write_u64(tasks.iter().flatten().filter(|entry| entry.tracing).count() as u64);
-                    write_all(b"\n");
-                    process_native_fail(domain, root_host_pid, b"native process fixture failed");
+                root_exited = true;
+                if exit_status != 0 {
+                    root_failed = true;
                 }
+            }
+            // The main thread may exit while joined-or-detached siblings are
+            // still draining (thread death reports arrive in kernel order, not
+            // creation order), so a zero root exit waits for the remaining
+            // traced tasks instead of failing. A nonzero root exit fails fast.
+            if root_failed {
+                write_all(b"GINUX_NATIVE_PROCESS: root-exit=");
+                write_i64(exit_status as i64);
+                write_all(b" tracing-remaining=");
+                write_u64(tasks.iter().flatten().filter(|entry| entry.tracing).count() as u64);
+                write_all(b"\n");
+                process_native_fail(domain, root_host_pid, b"native process fixture failed");
+            }
+            if root_exited && !tasks.iter().flatten().any(|entry| entry.tracing) {
                 if processes.reap_all() == 0 || processes.active() != 0 {
                     process_native_fail(domain, root_host_pid, b"native process cleanup failed");
                 }
@@ -631,9 +667,23 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             {
                 process_native_fail(domain, root_host_pid, b"fork event read failed");
             }
-            let child_virtual = processes.fork(task.virtual_id).unwrap_or_else(|_| {
-                process_native_fail(domain, root_host_pid, b"virtual fork failed")
-            });
+            // A creation whose entry carried a supported `CLONE_THREAD`
+            // shape shares the existing managed-task path as a thread-group
+            // member (same tgid, fresh virtual tid); every other shape is an
+            // ordinary parent/child process pair. The entry arm recorded
+            // which one this is before the host call executed.
+            let is_thread = tasks[task_index]
+                .as_ref()
+                .is_some_and(|parent| parent.thread_pending);
+            let child_virtual = if is_thread {
+                processes.clone_thread(task.virtual_id).unwrap_or_else(|_| {
+                    process_native_fail(domain, root_host_pid, b"virtual thread failed")
+                })
+            } else {
+                processes.fork(task.virtual_id).unwrap_or_else(|_| {
+                    process_native_fail(domain, root_host_pid, b"virtual fork failed")
+                })
+            };
             let Some(child_slot) = tasks.iter().position(Option::is_none) else {
                 process_native_fail(domain, root_host_pid, b"host task table full");
             };
@@ -652,6 +702,9 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 exec_pending: false,
                 exec_event_seen: false,
                 tracing: true,
+                thread_pending: false,
+                clone_ptid: 0,
+                set_tid_pending: false,
             });
             if event == PTRACE_EVENT_FORK {
                 // Separate address space (raw fork, or clone without address
@@ -891,7 +944,11 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 // Creation exit on the SYSCALL-resumed vfork/clone path (no
                 // breakpoint could be planted in shared text): the kernel
                 // reports the host child pid, which maps to the virtual
-                // child created at the fork-event stop.
+                // child created at the fork-event stop. Thread creation
+                // shares this path: the parent observes the virtual tid, and
+                // the parent-tid cell (which the host kernel filled with the
+                // host tid) is republished with the virtual tid so every tid
+                // observation agrees.
                 let host_child = registers.rax as usize;
                 if let Some(child) = tasks
                     .iter()
@@ -900,7 +957,9 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 {
                     let virtual_pid = child.virtual_id.pid;
                     write_all(b"GINUX_NATIVE_PROCESS_AUDIT: fork variant=");
-                    if current.fork_variant_event == PTRACE_EVENT_VFORK as u32 {
+                    if current.thread_pending {
+                        write_all(b"thread");
+                    } else if current.fork_variant_event == PTRACE_EVENT_VFORK as u32 {
                         write_all(b"vfork");
                     } else {
                         write_all(b"clone");
@@ -912,7 +971,29 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     write_all(b"\n");
                     registers.rax = virtual_pid as u64;
                     current.override_result = true;
+                    if current.thread_pending && current.clone_ptid != 0 {
+                        if store_tracee_tid(host_pid, current.clone_ptid, virtual_pid).is_err() {
+                            process_native_fail(domain, root_host_pid, b"thread tid store failed");
+                        }
+                        write_all(b"GINUX_NATIVE_PROCESS_AUDIT: thread-tid virtual-tid=");
+                        write_u64(virtual_pid as u64);
+                        write_all(b"\n");
+                    }
                 }
+                current.thread_pending = false;
+                current.clone_ptid = 0;
+            } else if current.syscall == SYS_SET_TID_ADDRESS
+                && current.set_tid_pending
+                && registers.rax as i64 > 0
+            {
+                // `set_tid_address` returns the caller's tid: publish the
+                // virtual tid instead of the host one.
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: set-tid virtual-tid=");
+                write_u64(current.virtual_id.pid as u64);
+                write_all(b"\n");
+                registers.rax = current.virtual_id.pid as u64;
+                current.override_result = true;
+                current.set_tid_pending = false;
             } else if (current.syscall == 59 || current.syscall == 322) && current.exec_pending {
                 // Replacement exit: a recorded EXEC event means the new image
                 // is already running under supervision and this stop (return
@@ -982,19 +1063,54 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             registers.orig_rax = u64::MAX;
         } else {
             match registers.orig_rax {
-                39 | 110 => {
+                39 | 110 | SYS_GETTID => {
                     let view = processes.view(current.virtual_id).unwrap_or_else(|_| {
                         process_native_fail(domain, root_host_pid, b"identity lookup failed")
                     });
-                    current.result = if registers.orig_rax == 39 {
+                    // `getpid` reports the thread-group id (the leader's pid
+                    // for every member), `gettid` the virtual tid (leader pid
+                    // for the main thread, the fresh virtual tid for created
+                    // threads), `getppid` the virtual parent. Host tids never
+                    // leak.
+                    current.result = if registers.orig_rax == 110 {
+                        view.parent as i64
+                    } else if registers.orig_rax == SYS_GETTID {
                         view.id.pid as i64
                     } else {
-                        view.parent as i64
+                        view.tgid as i64
                     };
                     current.override_result = true;
                     registers.orig_rax = u64::MAX;
                 }
-                56..=58 => {}
+                56..=58 => {
+                    // A supported thread creation records its parent-tid cell
+                    // so the creation exit stop can publish the virtual tid
+                    // there. Unsupported thread shapes never reach this arm:
+                    // the lane entry already emulated `-ENOSYS` for them, so
+                    // they never execute. Any other creation shape resets the
+                    // pending thread state.
+                    if registers.orig_rax == 56 && thread_supported(registers.rdi) {
+                        current.thread_pending = true;
+                        current.clone_ptid = registers.rdx as usize;
+                    } else {
+                        current.thread_pending = false;
+                        current.clone_ptid = 0;
+                    }
+                }
+                SYS_ARCH_PRCTL | SYS_FUTEX | SYS_SET_ROBUST_LIST | SYS_GET_ROBUST_LIST
+                | SYS_RSEQ => {
+                    // Thread-local or thread-group-local state: the TLS base
+                    // register, futex wait/wake on the group's own shared
+                    // memory (join/mutex observe real host results), the
+                    // robust-mutex registration, and `rseq`. The host kernel
+                    // performs all of them on tracee-owned state, so the host
+                    // call executes with no translation.
+                }
+                SYS_SET_TID_ADDRESS => {
+                    // Per-thread exit-clear registration; the returned caller
+                    // tid is translated to the virtual tid at the exit stop.
+                    current.set_tid_pending = true;
+                }
                 59 | 322 => {
                     // Executable replacement: the mediated shapes execute on
                     // the host with the tracee still attached, and the EXEC
@@ -1069,6 +1185,32 @@ fn store_tracee_status(host_pid: usize, user_status: usize, child_status: i32) -
     }
     let mask = 0xffff_ffffusize << shift;
     let merged = (word & !mask) | ((encoded as usize) << shift);
+    if ptrace(PTRACE_POKETEXT, host_pid, aligned, merged) < 0 {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Publish the virtual tid into the tracee's parent-tid cell. The host
+/// kernel stored the host tid there during `clone` with
+/// `CLONE_PARENT_SETTID`; thread identity requires the parent to observe the
+/// virtual tid instead. Same aligned-word technique as
+/// [`store_tracee_status`], but for one 4-byte tid cell.
+fn store_tracee_tid(host_pid: usize, user_tid: usize, tid: u32) -> Result<(), ()> {
+    let aligned = user_tid & !0x7;
+    let shift = (user_tid & 0x7) * 8;
+    let mut word = 0usize;
+    if ptrace(
+        PTRACE_PEEKTEXT,
+        host_pid,
+        aligned,
+        &mut word as *mut _ as usize,
+    ) < 0
+    {
+        return Err(());
+    }
+    let mask = 0xffff_ffffusize << shift;
+    let merged = (word & !mask) | ((tid as usize) << shift);
     if ptrace(PTRACE_POKETEXT, host_pid, aligned, merged) < 0 {
         return Err(());
     }
