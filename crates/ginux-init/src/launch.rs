@@ -34,7 +34,7 @@ pub enum Command {
     Devices(*const u8, *const u8),
     DeviceBench(*const u8, *const u8, *const u8),
     KernelViews(*const u8),
-    Launch(*const u8, *const u8, *const u8),
+    Launch(*const u8, *const u8, *const u8, *const u8),
     LaunchUsage,
     Usage,
 }
@@ -104,17 +104,33 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
     } else if argc >= 4 && c_string_equals(command, b"launch") {
         let config_path = unsafe { *argv.add(2) as *const u8 };
         let root_path = unsafe { *argv.add(3) as *const u8 };
-        if argc == 4 {
-            Some(Command::Launch(config_path, root_path, core::ptr::null()))
-        } else if argc == 6
-            && c_string_equals(unsafe { *argv.add(4) as *const u8 }, b"--result-file")
-            && unsafe { *(*argv.add(5) as *const u8) } != 0
-        {
-            let result_path = unsafe { *argv.add(5) as *const u8 };
-            Some(Command::Launch(config_path, root_path, result_path))
-        } else {
-            Some(Command::LaunchUsage)
+        let mut result_path: *const u8 = core::ptr::null();
+        let mut export_path: *const u8 = core::ptr::null();
+        let mut i = 4;
+        while i < argc {
+            if i + 1 >= argc {
+                return Some(Command::LaunchUsage);
+            }
+            let option = unsafe { *argv.add(i) as *const u8 };
+            let value = unsafe { *argv.add(i + 1) as *const u8 };
+            if unsafe { *value } == 0 {
+                return Some(Command::LaunchUsage);
+            }
+            if c_string_equals(option, b"--result-file") && result_path.is_null() {
+                result_path = value;
+            } else if c_string_equals(option, b"--export-file") && export_path.is_null() {
+                export_path = value;
+            } else {
+                return Some(Command::LaunchUsage);
+            }
+            i += 2;
         }
+        Some(Command::Launch(
+            config_path,
+            root_path,
+            result_path,
+            export_path,
+        ))
     } else {
         Some(Command::Usage)
     }
@@ -289,8 +305,15 @@ static mut LAUNCH_WORKDIR: [u8; 129] = [0; 129];
 static mut LAUNCH_ARGV: [*const u8; 9] = [core::ptr::null(); 9];
 static mut LAUNCH_ENVP: [*const u8; 9] = [core::ptr::null(); 9];
 
-pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *const u8) -> ! {
+pub fn launch_main(
+    config_path: *const u8,
+    root_path: *const u8,
+    result_path: *const u8,
+    export_path: *const u8,
+) -> ! {
     stage_result_path(result_path);
+    crate::storage_export::prepare(export_path)
+        .unwrap_or_else(|reason| launch_startup_fail(reason));
     let config = launch_load_config(config_path);
     launch_validate(&config);
     let mut devices = crate::device_hooks::LaunchDevices::prepare(&config)
@@ -599,12 +622,12 @@ pub fn usage() -> ! {
     line_stderr(b"ginux: usage: ginux devices <config> <block>");
     line_stderr(b"ginux: usage: ginux device-bench <config> <block> <kind>");
     line_stderr(b"ginux: usage: ginux vfs <config> <rootfs> <index>");
-    line_stderr(b"ginux: usage: ginux launch <config> <root> [--result-file <fresh host path>]");
+    line_stderr(b"ginux: usage: ginux launch <config> <root> [--result-file <fresh host path>] [--export-file <fresh tar path>]");
     exit_process(2)
 }
 
 pub fn launch_usage() -> ! {
-    line_stderr(b"ginux: launch usage: launch <config> <root> [--result-file <fresh host path>]");
+    line_stderr(b"ginux: launch usage: launch <config> <root> [--result-file <fresh host path>] [--export-file <fresh tar path>]");
     exit_process(2)
 }
 

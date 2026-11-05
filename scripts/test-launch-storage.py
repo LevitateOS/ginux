@@ -8,6 +8,7 @@ import select
 import subprocess
 import sys
 import tempfile
+import tarfile
 
 
 def main():
@@ -25,7 +26,7 @@ def main():
         shutil.copyfile(fixture, root / 'bin/fixture')
         (root / 'bin/fixture').chmod(0o755)
 
-        def invoke(assignments, args, expected=0, memory=256):
+        def invoke(assignments, args, expected=0, memory=256, export=False):
             config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
             config = config.replace('args = []', 'args = ' + json.dumps(args))
             config = config.replace('memory_mib = 256', 'memory_mib = ' + str(memory))
@@ -36,6 +37,10 @@ def main():
             result = work / 'result.json'
             result.unlink(missing_ok=True)
             command = [binary, 'launch', str(path), str(root), '--result-file', str(result)]
+            archive = work / 'export.tar'
+            if export:
+                archive.unlink(missing_ok=True)
+                command += ['--export-file', str(archive)]
             if args == ['mapping']:
                 with (work / 'mapping.audit').open('wb') as audit:
                     proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=audit)
@@ -58,7 +63,7 @@ def main():
             record = json.loads(result.read_text())
             if proc.returncode != expected:
                 sys.exit(f'launch failed: {proc.returncode}\n{proc.stderr.decode()}\n{record}')
-            assert record['outcome'] == ('exited' if expected == 0 else 'supervisor-error'), record
+            assert record['outcome'] == ('supervisor-error' if expected == 2 else 'exited'), record
             if expected == 0:
                 assert record['code'] == 0 and record['generation'] is None, record
                 assert proc.stdout == (b'' if args else b'memory-storage: PASS\n'), proc.stdout
@@ -66,12 +71,32 @@ def main():
             assert (root / 'work/existing').read_bytes() == b'hidden immutable work file'
             assert sorted(p.name for p in (root / 'work').iterdir()) == ['existing']
             assert not (root / 'out').exists()
+            if export:
+                if expected != 0:
+                    assert archive.read_bytes() == b'', 'failed workload exported files'
+                else:
+                    with tarfile.open(archive) as tar:
+                        names = tar.getnames()
+                        assert len(names) == len(set(names)), names
+                        assert 'out/deleted' not in names and 'image' not in names
+                        assert tar.extractfile('out/product').read() == b'result\0data'
+                        assert tar.getmember('out/product').mode == 0o700
+                        assert tar.getmember('out/empty').isdir()
+                        assert tar.extractfile('out/' + 'a'*120 + '/' + 'b'*80).read() == b'long'
+                    # The same destination must fail before starting the workload.
+                    result.unlink()
+                    refused = subprocess.run(command, capture_output=True, timeout=10)
+                    assert refused.returncode == 2 and b'not fresh' in refused.stderr
+                    with tarfile.open(archive) as tar:
+                        assert tar.extractfile('out/product').read() == b'result\0data'
 
         for _ in range(2):
             invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], [])
         invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['quota'])
         invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['bounds'], memory=16)
         invoke(['memory:/work', 'memory:/out'], ['mapping'])
+        invoke(['memory:/work', 'memory:/out'], ['export'], export=True)
+        invoke(['memory:/work', 'memory:/out'], ['failed-export'], expected=7, export=True)
         invoke([], ['no-storage'])
         for assignment in ['disk0', 'memory:/', 'memory:/proc', 'memory:/sys/x', 'memory:/dev',
                            'memory:/bin', 'memory:/work/../out', 'memory:/work/', 'memory:work']:

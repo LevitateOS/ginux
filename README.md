@@ -513,3 +513,15 @@ scratch bytes are retired before the workload resumes. Fixed mappings cannot
 replace the transaction's syscall instruction or scratch stack region. Failure
 or a signal during descriptor transfer stops the domain instead of resuming a
 partially transformed syscall. This adds no retained-storage guarantee.
+
+Configured launch accepts `--export-file <fresh tar path>` to retrieve its owned
+writable files after a successful workload exit. The supervisor first terminates
+and reaps remaining tasks, then writes regular files and directories to the
+caller-selected archive, preserving file modes and long paths. Deleted names and
+immutable image contents are excluded. Guest paths are archive data and never
+select host destinations. The output path is reserved exclusively before launch;
+write, sync or close failures fail the launch. Failed or interrupted workloads do
+not produce a valid successful export. Consumers must require both a successful
+completion result and a validated archive before publishing selected files.
+This is final export only; it does not provide retained storage or checkpoint
+recovery.

@@ -115,6 +115,21 @@ impl LaunchFs {
         self.count != 0
     }
 
+    pub fn export(&self) -> Result<(), &'static [u8]> {
+        crate::storage_export::finish(|archive| {
+            for slot in 0..OBJECTS {
+                if let Some((path, metadata)) = self.fs.overlay_entry(slot) {
+                    archive.entry(path, metadata, |offset, buffer| {
+                        self.fs
+                            .read_overlay(slot, offset, buffer)
+                            .map_err(|_| b"export read failed".as_slice())
+                    })?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub fn teardown(&mut self) {
         assert_eq!(
             self.fs.executable_pins(),

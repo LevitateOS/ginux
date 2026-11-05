@@ -994,6 +994,49 @@ impl<
         self.descriptors.fill(Descriptor::empty());
     }
 
+    /// Enumerate live writable entries while the caller has quiesced mutation.
+    /// Slots are opaque and stable only until the next filesystem mutation.
+    pub fn overlay_entry(&self, slot: usize) -> Option<(&[u8], FileMetadata)> {
+        let entry = self.overlay.get(slot)?;
+        if !matches!(entry.state, 1 | 3) {
+            return None;
+        }
+        Some((
+            entry.path.as_bytes(),
+            FileMetadata {
+                inode: (self.index.len() + slot + 1) as u64,
+                kind: if entry.state == 3 {
+                    NodeKind::Directory
+                } else {
+                    NodeKind::File
+                },
+                mode: entry.mode,
+                size: entry.len as u64,
+            },
+        ))
+    }
+
+    /// Read a live writable regular file without allocating a guest descriptor.
+    pub fn read_overlay(
+        &self,
+        slot: usize,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), VfsError> {
+        let entry = self.overlay.get(slot).ok_or(VfsError::NotFound)?;
+        if entry.state != 1 {
+            return Err(VfsError::NotFound);
+        }
+        if offset
+            .checked_add(output.len())
+            .filter(|end| *end <= entry.len)
+            .is_none()
+        {
+            return Err(VfsError::Io);
+        }
+        self.storage.read(slot, offset, output)
+    }
+
     pub fn overlay_files(&self) -> usize {
         self.overlay.iter().filter(|entry| entry.state == 1).count()
     }

@@ -20,6 +20,20 @@ long storage_main(word *stack)
 {
     word argc = *stack;
     char **argv = (char **)(stack + 1);
+    if (argc > 1 && (argv[1][0] == 'e' || argv[1][0] == 'f')) {
+        CHECK(DO(83,"/out/empty",0755,0)==0,143);
+        long fd=DO(2,"/out/product",0101,0700);
+        CHECK(fd==3 && DO(1,fd,"result\0data",11)==11 && DO(3,fd,0,0)==0,144);
+        CHECK(DO(2,"/out/deleted",0101,0600)==3 && DO(3,3,0,0)==0 && DO(87,"/out/deleted",0,0)==0,145);
+        char longpath[208]="/out/";
+        for (word i=5;i<125;++i) longpath[i]='a';
+        longpath[125]=0; CHECK(DO(83,longpath,0700,0)==0,146);
+        longpath[125]='/';
+        for (word i=126;i<206;++i) longpath[i]='b';
+        longpath[206]=0;
+        CHECK(DO(2,longpath,0101,0600)==3 && DO(1,3,"long",4)==4 && DO(3,3,0,0)==0,147);
+        return argv[1][0]=='f' ? 7 : 0;
+    }
     if (argc > 1 && argv[1][0] == 'm') {
         long fd=DO(2,"/work/mapped",0102,0600);
         CHECK(fd==3 && DO(77,fd,8192,0)==0,110);

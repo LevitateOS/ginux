@@ -244,7 +244,7 @@ pub fn supervise(
         if exited(status) || signaled(status) {
             s.died(index, status, domain);
             if let Some(status) = s.root_status {
-                s.teardown(domain);
+                s.teardown(domain, status == 0);
                 let normal = exited(status);
                 let _ = domain.task_exited(normal);
                 if normal {
@@ -1642,7 +1642,7 @@ impl Supervisor<'_> {
             self.tasks[index] = None;
         }
     }
-    fn teardown(&mut self, domain: &mut Domain) {
+    fn teardown(&mut self, domain: &mut Domain, export: bool) {
         self.tearing_down = true;
         for t in self
             .tasks
@@ -1706,11 +1706,16 @@ impl Supervisor<'_> {
         if self.objects.refs.active() != 0 || self.processes.active() != 0 {
             supervision_error(domain, b"domain teardown retained owned state")
         }
+        if export {
+            if let Err(reason) = self.objects.filesystem.export() {
+                supervision_error(domain, reason);
+            }
+        }
         self.objects.filesystem.teardown();
         line_stderr(b"ginux: teardown tasks=0 owned-handles=0");
     }
     fn fail(&mut self, domain: &mut Domain, reason: &[u8]) -> ! {
-        self.teardown(domain);
+        self.teardown(domain, false);
         supervision_error(domain, reason)
     }
 }
