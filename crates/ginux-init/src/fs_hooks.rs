@@ -331,6 +331,18 @@ impl LaunchFs {
         normalize(b"/", &raw[..length])
     }
 
+    fn mutation_path(&self, path: &[u8], missing: bool) -> Result<Path, i64> {
+        let mut bytes = [0; MAX_PATH];
+        let n = self
+            .fs
+            .canonical_namespace_path(path, missing, &mut bytes)
+            .map_err(errno)?;
+        if !self.owns_path(&bytes[..n]) {
+            return Err(-95);
+        }
+        Path::from_bytes(&bytes[..n]).map_err(|_| -36)
+    }
+
     fn owned_path(&self, path: &[u8], follow: bool, missing: bool) -> Result<Path, i64> {
         let mut bytes = [0; MAX_PATH];
         let n = self
@@ -606,6 +618,7 @@ impl LaunchFs {
         if !self.owns_path(path.as_bytes()) {
             return None;
         }
+        let original_path = path;
         let follow = match r.orig_rax {
             6 | 83 | 84 | 87 | 88 | 89 | 258 | 263 | 266 | 267 => false,
             262 => r.r10 & 0x100 == 0,
@@ -616,7 +629,12 @@ impl LaunchFs {
             _ => true,
         };
         let missing = matches!(r.orig_rax, 2 | 257 | 83 | 258 | 88 | 266);
-        let path = match self.owned_path(path.as_bytes(), follow, missing) {
+        let resolved = if matches!(r.orig_rax, 83 | 84 | 87 | 258 | 263) {
+            self.mutation_path(path.as_bytes(), missing)
+        } else {
+            self.owned_path(path.as_bytes(), follow, missing)
+        };
+        let path = match resolved {
             Ok(path) => path,
             Err(error) => return Some(error),
         };
@@ -680,10 +698,10 @@ impl LaunchFs {
                 .map(|_| 0)
                 .map_err(errno),
             87 => self.fs.unlink(path.as_bytes()).map(|_| 0).map_err(errno),
-            84 => self.remove_directory(path.as_bytes()),
+            84 => self.remove_directory(original_path.as_bytes()),
             263 => {
                 if r.rdx == 0x200 {
-                    self.remove_directory(path.as_bytes())
+                    self.remove_directory(original_path.as_bytes())
                 } else if r.rdx != 0 {
                     Err(-95)
                 } else {
@@ -772,7 +790,8 @@ impl LaunchFs {
     }
 
     fn remove_directory(&mut self, path: &[u8]) -> Result<i64, i64> {
-        if self.assignment_root(path) {
+        let canonical = self.mutation_path(path, false)?;
+        if self.assignment_root(canonical.as_bytes()) {
             return Err(-16);
         }
         self.fs.remove_directory(path).map(|_| 0).map_err(errno)
@@ -807,8 +826,21 @@ impl LaunchFs {
         if !self.owns_path(source.as_bytes()) || !self.owns_path(destination.as_bytes()) {
             return Err(-18);
         }
-        let source = self.owned_path(source.as_bytes(), false, false)?;
-        let destination = self.owned_path(destination.as_bytes(), false, true)?;
+        let original_source = source;
+        let original_destination = destination;
+        let directory_destination = destination.as_bytes().ends_with(b"/");
+        let source = self.mutation_path(source.as_bytes(), false)?;
+        let destination = self.mutation_path(destination.as_bytes(), true)?;
+        if directory_destination
+            && self
+                .fs
+                .metadata_no_follow(source.as_bytes())
+                .map_err(errno)?
+                .kind
+                != NodeKind::Directory
+        {
+            return Err(-20);
+        }
         if self.prefixes[..self.count].iter().any(|prefix| {
             self.assignment_root(prefix.as_bytes())
                 && (within(prefix.as_bytes(), source.as_bytes())
@@ -817,7 +849,11 @@ impl LaunchFs {
             return Err(-16);
         }
         self.fs
-            .rename(source.as_bytes(), destination.as_bytes(), flags == 1)
+            .rename(
+                original_source.as_bytes(),
+                original_destination.as_bytes(),
+                flags == 1,
+            )
             .map(|_| 0)
             .map_err(errno)
     }

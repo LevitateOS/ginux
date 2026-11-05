@@ -338,6 +338,14 @@ fn beneath(path: &[u8], parent: &[u8]) -> bool {
             .is_some_and(|suffix| suffix.first() == Some(&b'/'))
 }
 
+fn terminal_dot(path: &[u8]) -> bool {
+    matches!(
+        path.rsplit(|byte| *byte == b'/')
+            .find(|part| !part.is_empty()),
+        Some(b"." | b"..")
+    )
+}
+
 fn child_name<'a>(directory: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
     let name = if directory == b"/" {
         path.strip_prefix(b"/")?
@@ -873,7 +881,7 @@ impl<
     }
 
     pub fn unlink(&mut self, path: &[u8]) -> Result<(), VfsError> {
-        let path = self.resolved_path(path, false, false)?;
+        let path = self.namespace_path(path, false)?;
         if let Some(index) = self.find_overlay(path.as_bytes()) {
             if self.overlay[index].state == 2 {
                 return Err(VfsError::NotFound);
@@ -1103,10 +1111,46 @@ impl<
         })
     }
 
+    /// Resolve a namespace mutation without following the final entry, including
+    /// when a trailing slash requires that entry itself to be a directory.
+    pub fn canonical_namespace_path(
+        &self,
+        path: &[u8],
+        allow_missing: bool,
+        output: &mut [u8; MAX_PATH],
+    ) -> Result<usize, VfsError> {
+        let resolved = self.namespace_path(path, allow_missing)?;
+        output[..resolved.len].copy_from_slice(resolved.as_bytes());
+        Ok(resolved.len)
+    }
+
+    // Namespace mutations name a directory entry. A trailing slash requires an
+    // actual directory entry, not a symlink to one; resolving it first could
+    // otherwise unlink or rename the target directory by mistake.
+    fn namespace_path(&self, path: &[u8], missing: bool) -> Result<Path, VfsError> {
+        let mut end = path.len();
+        while end > 1 && path[end - 1] == b'/' {
+            end -= 1;
+        }
+        let resolved = self.resolved_path(&path[..end], false, missing)?;
+        if end != path.len() {
+            match self.metadata_exact(resolved.as_bytes()) {
+                Ok(metadata) if metadata.kind == NodeKind::Directory => {}
+                Ok(_) => return Err(VfsError::NotDirectory),
+                Err(VfsError::NotFound) if missing => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(resolved)
+    }
+
     /// Create a symbolic link without interpreting its target.
     pub fn symlink(&mut self, target: &[u8], name: &[u8]) -> Result<(), VfsError> {
         if target.is_empty() || target.len() > MAX_PATH || target.contains(&0) {
             return Err(VfsError::InvalidPath);
+        }
+        if name.ends_with(b"/") {
+            return Err(VfsError::NotFound);
         }
         let path = self.resolved_path(name, false, true)?;
         match self.metadata_no_follow(path.as_bytes()) {
@@ -1195,7 +1239,11 @@ impl<
                 + 1) as u64,
             kind: entry.kind,
             mode: entry.mode,
-            size: entry.size,
+            size: if entry.kind == NodeKind::Symlink {
+                entry.link.len() as u64
+            } else {
+                entry.size
+            },
         })
     }
 
@@ -1225,7 +1273,7 @@ impl<
     }
 
     pub fn mkdir(&mut self, path: &[u8], mode: u32) -> Result<(), VfsError> {
-        let path = self.resolved_path(path, false, true)?;
+        let path = self.namespace_path(path, true)?;
         match self.metadata_no_follow(path.as_bytes()) {
             Ok(_) => return Err(VfsError::AlreadyExists),
             Err(VfsError::NotFound) => {}
@@ -1259,7 +1307,10 @@ impl<
     /// Mutate overlay-created directories only. Image subtree mutation needs
     /// a unified resolver/whiteout model and must not be approximated here.
     pub fn remove_directory(&mut self, path: &[u8]) -> Result<(), VfsError> {
-        let path = self.resolved_path(path, false, false)?;
+        if terminal_dot(path) {
+            return Err(VfsError::InvalidPath);
+        }
+        let path = self.namespace_path(path, false)?;
         if self.metadata_no_follow(path.as_bytes())?.kind != NodeKind::Directory {
             return Err(VfsError::NotDirectory);
         }
@@ -1285,9 +1336,16 @@ impl<
         destination: &[u8],
         no_replace: bool,
     ) -> Result<(), VfsError> {
-        let source = self.resolved_path(source, false, false)?;
-        let destination = self.resolved_path(destination, false, true)?;
+        if terminal_dot(source) || terminal_dot(destination) {
+            return Err(VfsError::InvalidPath);
+        }
+        let directory_destination = destination.ends_with(b"/");
+        let source = self.namespace_path(source, false)?;
+        let destination = self.namespace_path(destination, true)?;
         let metadata = self.metadata_no_follow(source.as_bytes())?;
+        if directory_destination && metadata.kind != NodeKind::Directory {
+            return Err(VfsError::NotDirectory);
+        }
         if source.as_bytes() == destination.as_bytes() {
             return if no_replace {
                 Err(VfsError::AlreadyExists)
@@ -1743,9 +1801,30 @@ mod tests {
         let bytes = index_bytes();
         let mut fs: VirtualFs<'_, Reader, 16, 16, 4> =
             VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        assert_eq!(fs.metadata_no_follow(b"/bin").unwrap().size, 7);
         fs.mkdir(b"/work", 0o755).unwrap();
         fs.mkdir(b"/work/sub", 0o755).unwrap();
         fs.symlink(b"sub", b"/work/dir").unwrap();
+        assert_eq!(
+            fs.remove_directory(b"/work/dir/"),
+            Err(VfsError::NotDirectory)
+        );
+        assert_eq!(
+            fs.rename(b"/work/dir/", b"/work/moved", false),
+            Err(VfsError::NotDirectory)
+        );
+        assert_eq!(fs.metadata(b"/work/sub").unwrap().kind, NodeKind::Directory);
+        assert_eq!(
+            fs.remove_directory(b"/work/dir/."),
+            Err(VfsError::InvalidPath)
+        );
+        assert_eq!(
+            fs.rename(b"/work/dir/.", b"/work/moved", false),
+            Err(VfsError::InvalidPath)
+        );
+        fs.mkdir(b"/work/new/", 0o755).unwrap();
+        fs.remove_directory(b"/work/new/").unwrap();
+
         fs.symlink(b"missing", b"/work/dir/link").unwrap();
         assert_eq!(fs.metadata(b"/work/sub/link"), Err(VfsError::NotFound));
         assert_eq!(

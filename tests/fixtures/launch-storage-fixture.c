@@ -23,6 +23,11 @@ long storage_main(word *stack)
     if (argc > 1 && argv[1][0] == 's') {
         CHECK(DO(83,"/work/dir",0755,0)==0,166);
         CHECK(DO(88,"dir","/work/link",0)==0,167);
+        CHECK(DO(84,"/work/link/",0,0)==-20 && DO(87,"/work/link/",0,0)==-20,199);
+        CHECK(DO(82,"/work/link/","/work/moved",0)==-20 && DO(4,"/work/dir",meta,0)==0,200);
+        CHECK(DO(83,"/work/new/",0755,0)==0 && DO(84,"/work/new/",0,0)==0,201);
+        CHECK(DO(84,"/work/link/.",0,0)==-22 && DO(82,"/work/link/.","/work/moved",0)==-22,202);
+        CHECK(DO(4,"/work/dir",meta,0)==0,203);
         CHECK(DO(2,"/work/link/file",0102,0600)==3 && DO(1,3,"data",4)==4 && DO(3,3,0,0)==0,168);
         CHECK(DO(2,"/work/dir/file",0,0)==3 && DO(0,3,output,4)==4 && output[0]=='d' && DO(3,3,0,0)==0,169);
         CHECK(DO(6,"/work/link",meta,0)==0 && (*(word *)(meta+24)&0170000)==0120000,170);
