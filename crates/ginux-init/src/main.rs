@@ -26,17 +26,20 @@ use crate::launch::{
     Command, ELF_BYTES, VFS_INDEX_BYTES,
 };
 use crate::fs_hooks::{
-    chmod_at, close_fd, open_at, read_fd, resolve_at, DomainCwd, ResolveError, ResolvedKind,
-    VfsDomainView, MAX_CWD as DOMAIN_PATH_MAX, AT_FDCWD as DOMAIN_AT_FDCWD,
+    chmod_at, close_fd, fstat_fd, lseek_fd, open_at, read_fd, resolve_at, stat_write, statat,
+    DomainCwd, ResolveError, ResolvedKind, VfsDomainView, MAX_CWD as DOMAIN_PATH_MAX,
+    AT_FDCWD as DOMAIN_AT_FDCWD,
 };
 use crate::process_hooks::{
     dup3_flags_valid, exec_bit_set, exec_mediated, fcntl_supported, mmap_shape_error,
     mprotect_shape_error, parse_script_interp, pipe2_flags_valid, reserve_error, round_len,
     thread_supported, ScriptInterp, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, FD_CLOEXEC,
-    MMAP_TOTAL_MAX, O_CLOEXEC, PTRACE_EVENT_CLONE, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE,
-    PTRACE_O_TRACEVFORK, SYS_ARCH_PRCTL, SYS_CLOSE, SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_FCNTL,
-    SYS_FUTEX, SYS_GETTID, SYS_GET_ROBUST_LIST, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_RSEQ,
-    SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS, SCRIPT_INTERP_MAX,
+    MAP_ALLOWED_HINTS, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, MAP_SHARED,
+    MMAP_SINGLE_MAX, MMAP_TOTAL_MAX, O_CLOEXEC, PROT_WRITE, PTRACE_EVENT_CLONE,
+    PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEVFORK, SYS_ARCH_PRCTL, SYS_CLOSE,
+    SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_FCNTL, SYS_FUTEX, SYS_GETTID, SYS_GET_ROBUST_LIST,
+    SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_RSEQ, SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS,
+    SCRIPT_INTERP_MAX,
 };
 use crate::supervisor::{
     exit_process, line, ptrace, read_tracee_word, stopped, syscall0, syscall1, syscall2, syscall3,
@@ -45,7 +48,7 @@ use crate::supervisor::{
     PR_SET_NO_NEW_PRIVS, PTRACE_CONT, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_GETEVENTMSG,
     PTRACE_GETREGS, PTRACE_KILL, PTRACE_O_EXITKILL, PTRACE_O_TRACEEXEC, PTRACE_O_TRACEFORK,
     PTRACE_O_TRACESYSGOOD, PTRACE_PEEKTEXT, PTRACE_POKETEXT, PTRACE_SETOPTIONS, PTRACE_SETREGS,
-    PTRACE_SYSCALL, PTRACE_SYSEMU, PTRACE_TRACEME, EBADF, ECHILD, EINVAL, ENOMEM, ESRCH,
+    PTRACE_SYSCALL, PTRACE_SYSEMU, PTRACE_TRACEME, EBADF, ECHILD, EINVAL, ENODEV, ENOMEM, ESRCH,
     SIGCHLD, SIGINT, SIGKILL,
     SIGTERM, SIG_BLOCK, SYS_CHDIR,
     SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC,
@@ -1178,9 +1181,10 @@ fn materialize_domain_file(
 // stats/mmaps) them. This lane claims `openat` for exactly three absolute
 // shapes — `/etc/ld.so.cache`, `/lib64/*`, `/usr/lib64/*` — and serves
 // `read` on the resulting domain fds; everything else keeps its previous
-// behavior byte-identically (non-library `openat` stays `-ENOSYS`, `fstat`
-// stays denied for M3 — the loader cannot advance past it, which is the
-// intended M2 death point).
+// behavior byte-identically (non-library `openat` stays `-ENOSYS`).
+// I04-M3 (below) adds the metadata and file-backed `mmap` shapes over
+// the same view; fixed file-backed mappings stay denied there, which is
+// the intended M3 death point.
 //
 // Backing content is the SAME loop overlay the G09 stage seam populates
 // from `GINUX_DOMAIN_STAGE` (no third loader): a library open resolves by
@@ -1221,6 +1225,19 @@ const LIB_READ_CHUNK: usize = 4096;
 const LIB_O_DIRECTORY: u64 = 0o200000;
 const LIB_O_PATH: u64 = 0o10000000;
 const LIB_O_TMPFILE: u64 = 0o20200000;
+/// I04-M3 loader metadata entries: `fstat` on a domain fd, `newfstatat`
+/// for a domain path, `faccessat` for a domain access check.
+const SYS_FSTAT: u64 = 5;
+const SYS_NEWFSTATAT: u64 = 262;
+const SYS_FACCESSAT: u64 = 269;
+/// `AT_SYMLINK_NOFOLLOW` for `newfstatat` (mirrors the `fs_hooks` value;
+/// the only accepted nonzero flag).
+const LIB_AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+/// `mmap` protection bit for read (no `process_hooks` name; bit `0x1`).
+const LIB_PROT_READ: u64 = 0x1;
+/// `mmap` `MAP_DENYWRITE` hint the loader sets on every file-backed
+/// mapping (`0x800`): an accepted no-op here, like the M1 benign hints.
+const LIB_MAP_DENYWRITE: u64 = 0x800;
 /// Faithful errnos without a `supervisor.rs` constant.
 const EROFS: i64 = 30;
 const EISDIR: i64 = 21;
@@ -1506,6 +1523,345 @@ fn lib_release_group(processes: &ProcessTable<8>, tgid: u32) {
     }
 }
 
+// ─── I04-M3: loader metadata + file-backed mmap ──────────────────────────
+//
+// The loader needs three metadata shapes past the M2 death point: `fstat`
+// on the domain fds it holds open, `newfstatat` for staged paths, and
+// `faccessat` for its access checks — all over the SAME merged domain
+// view the M2 open path serves, serialized with the G07b pure-core
+// layouts. Sizes and modes come only from staged domain objects; paths
+// the domain does not know report `-ENOENT` honestly and never reach the
+// host. Other fds (`fstat` below the domain range) keep the previous
+// `-ENOSYS` denial byte-identically.
+//
+// File-backed `mmap` serves the loader's first mapping of each staged
+// library (private, read-only or read+execute, unfixed): the entry stop
+// rewrites the call to an anonymous mapping the host executes, and the
+// exit stop records it in the MemSpace ledger under the M1 caps and
+// fills it with staged bytes at the requested file offset. Shared and
+// writable file-backed shapes stay denied explicitly; fixed mappings
+// stay `-EPERM` under the M1 caps; an unaligned offset fails `-EINVAL`;
+// a fd that is not a live domain fd keeps the pre-M3 `-ENODEV` denial.
+
+/// Map a tracee metadata path to its staged domain target: claimed
+/// library shapes resolve by basename (the same object an `openat`
+/// would serve); everything else resolves literally. Returns the target
+/// length in `out`. Bare prefixes and trailing slashes are not mappable
+/// and resolve literally (the merged view then reports the honest miss).
+fn domain_stat_target(path: &[u8], out: &mut [u8; DOMAIN_PATH_MAX]) -> usize {
+    let len = path.len();
+    if lib_path_allowed(path) {
+        let mut base = 0;
+        let mut index = 0;
+        while index < len {
+            if path[index] == b'/' {
+                base = index + 1;
+            }
+            index += 1;
+        }
+        if base > 1 && base < len && STAGE_PREFIX.len() + (len - base) <= DOMAIN_PATH_MAX {
+            out[..STAGE_PREFIX.len()].copy_from_slice(STAGE_PREFIX);
+            out[STAGE_PREFIX.len()..STAGE_PREFIX.len() + (len - base)]
+                .copy_from_slice(&path[base..len]);
+            return STAGE_PREFIX.len() + (len - base);
+        }
+    }
+    out[..len].copy_from_slice(path);
+    len
+}
+
+/// Emulate `fstat` on a domain library fd: report the staged object the
+/// open path pinned, serialized with the G07b `struct stat` layout into
+/// tracee memory. `None` means the fd is not a live domain fd for this
+/// task (the caller keeps the old `-ENOSYS` denial).
+fn domain_lib_fstat_entry(host_pid: usize, vpid: u32, fd: u64, buffer: usize) -> Option<i64> {
+    let slot = lib_slot_find(vpid, fd)?;
+    if buffer == 0 {
+        return Some(-EFAULT);
+    }
+    let outcome = with_exec_vfs(|vfs| fstat_fd(&*vfs, unsafe { LIB_OPEN[slot].2 }));
+    match outcome {
+        None => Some(-EIO),
+        Some(Err(error)) => Some(error.errno()),
+        Some(Ok(stat)) => {
+            let mut bytes = [0u8; crate::fs_hooks::STAT_SIZE];
+            stat_write(&stat, &mut bytes);
+            match write_tracee_bytes(host_pid, buffer, &bytes) {
+                Ok(()) => {
+                    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: lib-fstat fd=");
+                    write_u64(fd);
+                    write_all(b" size=");
+                    write_u64(stat.size);
+                    write_all(b"\n");
+                    Some(0)
+                }
+                Err(()) => Some(-EFAULT),
+            }
+        }
+    }
+}
+
+/// Emulate `newfstatat(dirfd, path, buf, flags)`: `flags == 0` stats
+/// like `stat`, `AT_SYMLINK_NOFOLLOW` like `lstat`; any other flag fails
+/// `-EINVAL`. Unstaged or missing paths fail `-ENOENT` from the merged
+/// view, never touching the host.
+fn domain_statat_entry(
+    host_pid: usize,
+    dirfd: i64,
+    path_addr: usize,
+    buffer: usize,
+    flags: u32,
+) -> i64 {
+    if flags & !LIB_AT_SYMLINK_NOFOLLOW != 0 {
+        return -EINVAL;
+    }
+    let mut raw = [0u8; DOMAIN_PATH_MAX];
+    let len = match read_tracee_cstr(host_pid, path_addr, &mut raw) {
+        Ok(len) => len,
+        Err(()) => return -EFAULT,
+    };
+    if buffer == 0 {
+        return -EFAULT;
+    }
+    let mut target = [0u8; DOMAIN_PATH_MAX];
+    let target_len = domain_stat_target(&raw[..len], &mut target);
+    let outcome = with_exec_vfs(|vfs| {
+        let cwd = exec_cwd_snapshot();
+        statat(&mut *vfs, &cwd, dirfd, &target[..target_len], flags)
+    });
+    match outcome {
+        None => -EIO,
+        Some(Err(error)) => {
+            let errno = error.errno();
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: lib-stat-deny errno=");
+            write_i64(-errno);
+            write_all(b" path=");
+            write_all(&raw[..len]);
+            write_all(b"\n");
+            errno
+        }
+        Some(Ok(stat)) => {
+            let mut bytes = [0u8; crate::fs_hooks::STAT_SIZE];
+            stat_write(&stat, &mut bytes);
+            match write_tracee_bytes(host_pid, buffer, &bytes) {
+                Ok(()) => {
+                    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: lib-stat path=");
+                    write_all(&raw[..len]);
+                    write_all(b" size=");
+                    write_u64(stat.size);
+                    write_all(b"\n");
+                    0
+                }
+                Err(()) => -EFAULT,
+            }
+        }
+    }
+}
+
+/// Emulate `faccessat(dirfd, path, mode)`: existence plus the lane's
+/// served policy (reads serve on any staged object, writes never do,
+/// execute needs a stored exec bit). Only the `R_OK`/`W_OK`/`X_OK`
+/// bits are valid past `F_OK`; anything else fails `-EINVAL`.
+fn domain_faccessat_entry(host_pid: usize, dirfd: i64, path_addr: usize, mode: u32) -> i64 {
+    if mode & !7 != 0 {
+        return -EINVAL;
+    }
+    let mut raw = [0u8; DOMAIN_PATH_MAX];
+    let len = match read_tracee_cstr(host_pid, path_addr, &mut raw) {
+        Ok(len) => len,
+        Err(()) => return -EFAULT,
+    };
+    let mut target = [0u8; DOMAIN_PATH_MAX];
+    let target_len = domain_stat_target(&raw[..len], &mut target);
+    let outcome = with_exec_vfs(|vfs| {
+        let cwd = exec_cwd_snapshot();
+        statat(&mut *vfs, &cwd, dirfd, &target[..target_len], 0)
+    });
+    match outcome {
+        None => -EIO,
+        Some(Err(error)) => {
+            let errno = error.errno();
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: lib-access-deny errno=");
+            write_i64(-errno);
+            write_all(b" path=");
+            write_all(&raw[..len]);
+            write_all(b"\n");
+            errno
+        }
+        Some(Ok(stat)) => {
+            // The lane serves reads on any staged object (the M2 open
+            // path grants `O_RDONLY` regardless of mode bits), so `R_OK`
+            // and `F_OK` always succeed here. The surface is read-only
+            // (mutating opens fail `-EROFS`), so `W_OK` always fails
+            // `-EACCES`; `X_OK` needs a stored exec bit, matching what a
+            // later `exec` gate would demand.
+            let denied =
+                (mode & 2 != 0) || (mode & 1 != 0 && stat.mode & 0o111 == 0);
+            if denied {
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: lib-access-deny errno=");
+                write_u64(EACCES as u64);
+                write_all(b" path=");
+                write_all(&raw[..len]);
+                write_all(b"\n");
+                -EACCES
+            } else {
+                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: lib-access path=");
+                write_all(&raw[..len]);
+                write_all(b"\n");
+                0
+            }
+        }
+    }
+}
+
+/// Whether a file-backed `mmap` (callers only reach here with
+/// `MAP_ANONYMOUS` clear) may execute as a supervisor-owned anonymous
+/// mapping filled with staged bytes at the exit stop. `Ok(())` allows:
+/// the caller rewrites the call to anonymous and stashes the domain fd
+/// plus the file offset. `Err(errno)` denies explicitly: an unknown fd
+/// keeps the pre-M3 `-ENODEV` (the host fd is never consulted); shared,
+/// fixed, and writable shapes fail closed; unknown flags and unaligned
+/// offsets fail like the kernel; the M1 single/total caps still bind.
+fn domain_lib_mmap_allowed(
+    vpid: u32,
+    len: u64,
+    prot: u64,
+    flags: u64,
+    fd: u64,
+    offset: u64,
+    mem: &MemSpace<8, 256>,
+    tgid: u32,
+) -> Result<(), i64> {
+    if len == 0 {
+        return Err(EINVAL);
+    }
+    if lib_slot_find(vpid, fd).is_none() {
+        return Err(ENODEV);
+    }
+    if flags & MAP_SHARED != 0 {
+        return Err(EPERM);
+    }
+    if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
+        return Err(EPERM);
+    }
+    if flags & !(MAP_PRIVATE | LIB_MAP_DENYWRITE | MAP_ALLOWED_HINTS) != 0 {
+        return Err(EINVAL);
+    }
+    if len > MMAP_SINGLE_MAX {
+        return Err(ENOMEM);
+    }
+    if let Some(errno) = reserve_error(mem.region_count(tgid), mem.mmap_total(tgid), len) {
+        return Err(errno);
+    }
+    if prot & PROT_WRITE != 0 {
+        return Err(EACCES);
+    }
+    if prot & LIB_PROT_READ == 0 {
+        return Err(EACCES);
+    }
+    if offset & 4095 != 0 {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
+/// Copy `bytes` into tracee memory at `address`: full aligned words go
+/// in one poke each (fresh mappings have no neighbors to preserve);
+/// partial head/tail words reuse the preserving byte path.
+fn write_tracee_span(host_pid: usize, address: usize, bytes: &[u8]) -> Result<(), ()> {
+    let mut index = 0;
+    while index < bytes.len() && address.wrapping_add(index) & 0x7 != 0 {
+        write_tracee_bytes(host_pid, address.wrapping_add(index), &bytes[index..index + 1])?;
+        index += 1;
+    }
+    while index + 8 <= bytes.len() {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bytes[index..index + 8]);
+        if ptrace(
+            PTRACE_POKETEXT,
+            host_pid,
+            address.wrapping_add(index),
+            u64::from_le_bytes(word) as usize,
+        ) < 0
+        {
+            return Err(());
+        }
+        index += 8;
+    }
+    while index < bytes.len() {
+        write_tracee_bytes(host_pid, address.wrapping_add(index), &bytes[index..index + 1])?;
+        index += 1;
+    }
+    Ok(())
+}
+
+/// Fill a freshly mapped file-backed range with staged bytes: seek the
+/// pinned overlay fd to the stashed file offset, copy up to `len` bytes
+/// into tracee memory, and restore the descriptor offset the loader
+/// observes (its later reads continue undisturbed). Short files leave
+/// the tail zero (host anonymous pages are already zero); a lost slot
+/// or a failed write audits and leaves the zeros in place.
+fn domain_lib_mmap_fill(host_pid: usize, vpid: u32, fd: u64, offset: u64, addr: u64, len: u64) {
+    let slot = match lib_slot_find(vpid, fd) {
+        Some(slot) => slot,
+        None => {
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-file-nofill fd=");
+            write_u64(fd);
+            write_all(b"\n");
+            return;
+        }
+    };
+    let overlay = unsafe { LIB_OPEN[slot].2 };
+    let outcome = with_exec_vfs(|vfs| {
+        let saved = match lseek_fd(&mut *vfs, overlay, 0, crate::fs_hooks::SEEK_CUR) {
+            Ok(position) => position,
+            Err(_) => return -EIO,
+        };
+        if lseek_fd(&mut *vfs, overlay, offset as i64, crate::fs_hooks::SEEK_SET).is_err() {
+            return -EIO;
+        }
+        let mut done = 0u64;
+        while done < len {
+            let want = (len - done).min(LIB_READ_CHUNK as u64) as usize;
+            let chunk = unsafe { &mut STAGE_BUF[..want] };
+            let count = match read_fd(&mut *vfs, overlay, chunk) {
+                Ok(count) => count,
+                Err(_) => break,
+            };
+            if count == 0 {
+                break;
+            }
+            if write_tracee_span(
+                host_pid,
+                addr.wrapping_add(done) as usize,
+                &chunk[..count],
+            )
+            .is_err()
+            {
+                let _ = lseek_fd(&mut *vfs, overlay, saved as i64, crate::fs_hooks::SEEK_SET);
+                return -EFAULT;
+            }
+            done += count as u64;
+        }
+        let _ = lseek_fd(&mut *vfs, overlay, saved as i64, crate::fs_hooks::SEEK_SET);
+        done as i64
+    });
+    match outcome {
+        Some(done) if done >= 0 => {
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-file-filled fd=");
+            write_u64(fd);
+            write_all(b" bytes=");
+            write_u64(done as u64);
+            write_all(b"\n");
+        }
+        _ => {
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-file-fill-fail fd=");
+            write_u64(fd);
+            write_all(b"\n");
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NativeProcessTask {
     host_pid: usize,
@@ -1549,6 +1905,12 @@ struct NativeProcessTask {
     /// accounting.
     mem_arg0: u64,
     mem_arg1: u64,
+    /// A mediated file-backed `mmap` stashed for its exit stop: the
+    /// tracee-visible domain fd plus the file offset. Zero when no
+    /// file-backed mapping is in flight (anonymous mappings leave it
+    /// zero); the exit stop re-resolves the overlay fd from the slot.
+    file_arg0: u64,
+    file_arg1: u64,
     tracing: bool,
     thread_pending: bool,
     clone_ptid: usize,
@@ -1687,6 +2049,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         desc_arg2: 0,
         mem_arg0: 0,
         mem_arg1: 0,
+        file_arg0: 0,
+        file_arg1: 0,
         tracing: true,
         thread_pending: false,
         clone_ptid: 0,
@@ -1932,6 +2296,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 desc_arg2: 0,
                 mem_arg0: 0,
                 mem_arg1: 0,
+                file_arg0: 0,
+                file_arg1: 0,
                 tracing: true,
                 thread_pending: false,
                 clone_ptid: 0,
@@ -2368,11 +2734,29 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                         {
                             process_native_fail(domain, root_host_pid, b"memory ledger full");
                         }
-                        write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap addr=");
-                        write_u64(registers.rax);
-                        write_all(b" len=");
-                        write_u64(current.mem_arg0);
-                        write_all(b"\n");
+                        if current.file_arg0 != 0 {
+                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-file addr=");
+                            write_u64(registers.rax);
+                            write_all(b" len=");
+                            write_u64(current.mem_arg0);
+                            write_all(b" fd=");
+                            write_u64(current.file_arg0);
+                            write_all(b"\n");
+                            domain_lib_mmap_fill(
+                                host_pid,
+                                current.virtual_id.pid,
+                                current.file_arg0,
+                                current.file_arg1,
+                                registers.rax,
+                                current.mem_arg0,
+                            );
+                        } else {
+                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap addr=");
+                            write_u64(registers.rax);
+                            write_all(b" len=");
+                            write_u64(current.mem_arg0);
+                            write_all(b"\n");
+                        }
                     } else {
                         write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-fail errno=");
                         write_i64(-mem_result);
@@ -2400,6 +2784,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 }
                 current.mem_arg0 = 0;
                 current.mem_arg1 = 0;
+                current.file_arg0 = 0;
+                current.file_arg1 = 0;
             } else if current.syscall >= 56
                 && current.syscall <= 58
                 && registers.rax as i64 > 0
@@ -2526,6 +2912,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             current.desc_arg2 = 0;
             current.mem_arg0 = 0;
             current.mem_arg1 = 0;
+            current.file_arg0 = 0;
+            current.file_arg1 = 0;
             tasks[task_index] = Some(current);
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
                 process_native_fail(domain, root_host_pid, b"process exit resume failed");
@@ -2906,6 +3294,51 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                         registers.orig_rax = u64::MAX;
                     }
                 }
+                SYS_FSTAT => {
+                    // I04-M3: `fstat` on a live domain library fd reports
+                    // the staged object; every other fd keeps the
+                    // previous `-ENOSYS` denial byte-identically.
+                    match domain_lib_fstat_entry(
+                        host_pid,
+                        current.virtual_id.pid,
+                        registers.rdi,
+                        registers.rsi as usize,
+                    ) {
+                        Some(result) => {
+                            current.result = result;
+                            current.override_result = true;
+                            registers.orig_rax = u64::MAX;
+                        }
+                        None => {
+                            current.result = -ENOSYS;
+                            current.override_result = true;
+                            registers.orig_rax = u64::MAX;
+                        }
+                    }
+                }
+                SYS_NEWFSTATAT => {
+                    // I04-M3: `newfstatat` over the merged domain view.
+                    current.result = domain_statat_entry(
+                        host_pid,
+                        registers.rdi as i64,
+                        registers.rsi as usize,
+                        registers.rdx as usize,
+                        registers.r10 as u32,
+                    );
+                    current.override_result = true;
+                    registers.orig_rax = u64::MAX;
+                }
+                SYS_FACCESSAT => {
+                    // I04-M3: `faccessat` over the merged domain view.
+                    current.result = domain_faccessat_entry(
+                        host_pid,
+                        registers.rdi as i64,
+                        registers.rsi as usize,
+                        registers.rdx as u32,
+                    );
+                    current.override_result = true;
+                    registers.orig_rax = u64::MAX;
+                }
                 SYS_PIPE | SYS_DUP | SYS_DUP2 | SYS_CLOSE | SYS_FCNTL | SYS_DUP3 | SYS_PIPE2 => {
                     // G05a descriptor mediation: flag shapes the mirror
                     // cannot represent fail here before the host runs.
@@ -2966,29 +3399,67 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                             )
                         });
                     if registers.orig_rax == 9 {
-                        let denied = mmap_shape_error(
-                            registers.r10,
-                            registers.rsi,
-                            registers.rdx,
-                        )
-                        .or_else(|| {
-                            reserve_error(
-                                mem.region_count(tgid),
-                                mem.mmap_total(tgid),
+                        if registers.r10 & MAP_ANONYMOUS == 0 {
+                            // I04-M3 file-backed: a live domain library fd
+                            // with a private read-only (or read+execute)
+                            // shape executes as an anonymous mapping the
+                            // exit stop fills with staged bytes. Denied
+                            // shapes fail here with a faithful errno.
+                            match domain_lib_mmap_allowed(
+                                current.virtual_id.pid,
                                 registers.rsi,
-                            )
-                        });
-                        if let Some(errno) = denied {
-                            current.result = -errno;
-                            current.override_result = true;
-                            registers.orig_rax = u64::MAX;
-                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-deny errno=");
-                            write_i64(errno);
-                            write_all(b" len=");
-                            write_u64(registers.rsi);
-                            write_all(b"\n");
+                                registers.rdx,
+                                registers.r10,
+                                registers.r8,
+                                registers.r9,
+                                &mem,
+                                tgid,
+                            ) {
+                                Ok(()) => {
+                                    current.mem_arg0 = registers.rsi;
+                                    current.file_arg0 = registers.r8;
+                                    current.file_arg1 = registers.r9;
+                                    registers.r10 |= MAP_ANONYMOUS;
+                                    registers.r8 = u64::MAX;
+                                }
+                                Err(errno) => {
+                                    current.result = -errno;
+                                    current.override_result = true;
+                                    registers.orig_rax = u64::MAX;
+                                    write_all(
+                                        b"GINUX_NATIVE_PROCESS_AUDIT: mmap-file-deny errno=",
+                                    );
+                                    write_i64(errno);
+                                    write_all(b" len=");
+                                    write_u64(registers.rsi);
+                                    write_all(b"\n");
+                                }
+                            }
                         } else {
-                            current.mem_arg0 = registers.rsi;
+                            let denied = mmap_shape_error(
+                                registers.r10,
+                                registers.rsi,
+                                registers.rdx,
+                            )
+                            .or_else(|| {
+                                reserve_error(
+                                    mem.region_count(tgid),
+                                    mem.mmap_total(tgid),
+                                    registers.rsi,
+                                )
+                            });
+                            if let Some(errno) = denied {
+                                current.result = -errno;
+                                current.override_result = true;
+                                registers.orig_rax = u64::MAX;
+                                write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-deny errno=");
+                                write_i64(errno);
+                                write_all(b" len=");
+                                write_u64(registers.rsi);
+                                write_all(b"\n");
+                            } else {
+                                current.mem_arg0 = registers.rsi;
+                            }
                         }
                     } else if registers.orig_rax == 10 {
                         if let Some(errno) =
