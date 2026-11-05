@@ -42,6 +42,11 @@ static long pinned(void)
     if (DO(0,pair[0],&byte,1)!=1 || byte!='Q') error=21;
     return 0;
 }
+static long busy(void)
+{
+    for (;;) DO(39,0,0,0);
+    __builtin_unreachable();
+}
 static long bounded(void)
 {
     while (!gate) {
@@ -107,7 +112,12 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-95 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='m') {
+    if (mode=='x') {
+        for (word i=0;i<7;++i) CHECK(spawn_thread((word)(stacks[i]+sizeof stacks[i]),&tid[i],busy)>1,87);
+        for (word i=0;i<100;++i) DO(39,0,0,0);
+        CHECK(DO(1,1,"owned-threads: PASS\n",20)==20,88);
+        DO(231,0,0,0); __builtin_unreachable();
+    } else if (mode=='m') {
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],mapped)==2,86);
         join(0);
         CHECK(!error,error);
@@ -115,7 +125,7 @@ long thread_main(word *stack)
         CHECK(DO(22,pair,0,0)==0 && pair[0]==5,49);
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],pinned)==2,50);
         CHECK(DO(1,1,"hold-ready\n",11)==11,51);
-        for (;;) __asm__ volatile("pause");
+        for (;;) DO(39,0,0,0);
     } else if (mode=='s') {
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],native_work)==2,62);
         for (word i=0;i<32;++i) {

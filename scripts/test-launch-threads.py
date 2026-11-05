@@ -28,7 +28,7 @@ def main():
         config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
         config = config.replace('[devices]\nassignments = []', '[devices]\nassignments = ["null"]')
-        for mode in ('basic', 'mapping', 'pin', 'limit', 'stress', 'fork', 'early', 'rollback', 'basic'):
+        for mode in ('basic', 'mapping', 'pin', 'limit', 'stress', 'fork', 'early', 'rollback', 'basic') + ('x-exit-race',) * 30:
             path, result, audit_path = work / f'{mode}.toml', work / f'{mode}.json', work / f'{mode}.audit'
             result.unlink(missing_ok=True)
             path.write_text(config.replace('args = []', 'args = ' + json.dumps([mode])))
@@ -66,8 +66,9 @@ def main():
                         proc.kill()
                         proc.communicate(timeout=5)
             print(f'PASS launch threads: {mode}')
-        for failure in (False, True):
+        for failure in (False,) * 100 + (True,):
             path, result, audit_path = work / f'hold-{failure}.toml', work / f'hold-{failure}.json', work / f'hold-{failure}.audit'
+            result.unlink(missing_ok=True)
             path.write_text(config.replace('args = []', 'args = ["hold"]'))
             with audit_path.open('wb') as audit:
                 proc = subprocess.Popen([binary, 'launch', str(path), str(root), '--result-file', str(result)],

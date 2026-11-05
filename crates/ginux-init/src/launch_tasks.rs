@@ -309,16 +309,24 @@ pub fn supervise(
             s.resume(index, signal, domain);
             continue;
         }
-        let mut r = s.registers(index, domain);
+        let mut r = match s.read_registers(index) {
+            Ok(registers) => registers,
+            Err(-3) => continue, // Keep the task until its actual wait status arrives.
+            Err(_) => s.fail(domain, b"launch register read failed"),
+        };
         let mut info = [0u64; 11];
-        if ptrace(
+        let info_length = ptrace(
             0x420e,
             host,
             core::mem::size_of_val(&info),
             info.as_mut_ptr() as usize,
-        ) < 24
-            || (info[0] >> 32) as u32 != 0xc000003e
-        {
+        );
+        if info_length == -3 {
+            // A peer's exit_group or SIGKILL can invalidate this ptrace stop
+            // after GETREGS. Preserve ownership until wait4 reports its death.
+            continue;
+        }
+        if info_length < 24 || (info[0] >> 32) as u32 != 0xc000003e {
             s.fail(domain, b"launch requires the x86-64 syscall ABI")
         }
         match info[0] as u8 {
@@ -383,18 +391,22 @@ impl Supervisor<'_> {
                     .map(|p| p.1)
             })
     }
-    fn registers(&mut self, index: usize, domain: &mut Domain) -> UserRegs {
+    fn read_registers(&self, index: usize) -> Result<UserRegs, isize> {
         let mut r = core::mem::MaybeUninit::uninit();
-        if ptrace(
+        let result = ptrace(
             PTRACE_GETREGS,
             self.task(index).host,
             0,
             r.as_mut_ptr() as usize,
-        ) < 0
-        {
-            self.fail(domain, b"launch register read failed")
+        );
+        if result < 0 {
+            return Err(result);
         }
-        unsafe { r.assume_init() }
+        Ok(unsafe { r.assume_init() })
+    }
+    fn registers(&mut self, index: usize, domain: &mut Domain) -> UserRegs {
+        self.read_registers(index)
+            .unwrap_or_else(|_| self.fail(domain, b"launch register read failed"))
     }
     fn resume(&mut self, index: usize, signal: usize, domain: &mut Domain) {
         let result = ptrace(PTRACE_SYSCALL, self.task(index).host, 0, signal);
