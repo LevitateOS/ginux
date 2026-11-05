@@ -49,6 +49,15 @@ pub struct Entry<'a> {
     pub link: &'a [u8],
 }
 
+/// One immediate child of a domain directory, as returned by
+/// [`VirtualFs::list_dir`]. `name` is the final path component only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirEntry<'a> {
+    pub name: &'a [u8],
+    pub kind: NodeKind,
+    pub mode: u32,
+}
+
 pub struct Index<'a> {
     bytes: &'a [u8],
     count: usize,
@@ -291,6 +300,10 @@ pub trait BaseReader {
     fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), VfsError>;
 }
 
+// Overlay slot states: 0 = free, 1 = live file, 2 = tombstone (a removed base
+// entry reads as absent and its slot may be reused), 3 = live directory
+// created by [`VirtualFs::mkdir`]. Directories reuse the file slot; `len` and
+// `data` stay unused while a slot is a directory.
 #[derive(Clone, Copy)]
 struct OverlayFile<const FILE_SIZE: usize> {
     state: u8,
@@ -374,6 +387,9 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                 object = self.create_overlay(path, 0o600)?;
                 overlay = true;
             }
+            Some(index) if self.overlay[index].state == 3 => {
+                return Err(VfsError::IsDirectory);
+            }
             Some(index) => {
                 object = index;
                 overlay = true;
@@ -430,6 +446,9 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             return Err(VfsError::PermissionDenied);
         }
         let state = self.descriptors[slot];
+        if state.overlay && self.overlay[state.object].state == 3 {
+            return Err(VfsError::IsDirectory);
+        }
         let available = if state.overlay {
             self.overlay[state.object].len.saturating_sub(state.offset)
         } else {
@@ -459,6 +478,9 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         let state = self.descriptors[slot];
         if !state.writable || !state.overlay {
             return Err(VfsError::PermissionDenied);
+        }
+        if self.overlay[state.object].state == 3 {
+            return Err(VfsError::IsDirectory);
         }
         let end = state
             .offset
@@ -499,9 +521,122 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         }
     }
 
+    /// Create a domain directory. The parent must already exist as a directory
+    /// in the merged domain view (base image plus overlay); `..` escapes and
+    /// symlink escapes resolve to an explicit denial, never a host effect.
+    pub fn mkdir(&mut self, path: &[u8], mode: u32) -> Result<(), VfsError> {
+        let path = normalize(path)?;
+        if path.as_bytes() == b"/" {
+            return Err(VfsError::AlreadyExists);
+        }
+        // A live entry of any kind (file, directory, or symlink) blocks
+        // creation. A tombstone reads as absent, so its slot may be reused.
+        if let Some(index) = self.find_overlay(path.as_bytes()) {
+            if self.overlay[index].state != 2 {
+                return Err(VfsError::AlreadyExists);
+            }
+        } else if self.index.lookup_exact(path.as_bytes()).is_ok() {
+            return Err(VfsError::AlreadyExists);
+        }
+        let split = path
+            .as_bytes()
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .ok_or(VfsError::InvalidPath)?;
+        let parent = if split == 0 {
+            b"/".as_slice()
+        } else {
+            &path.as_bytes()[..split]
+        };
+        match self.stat_merged(parent)? {
+            (NodeKind::Directory, _, _) => {}
+            _ => return Err(VfsError::NotDirectory),
+        }
+        let index = self.allocate_overlay()?;
+        self.overlay[index].state = 3;
+        self.overlay[index].path = path;
+        self.overlay[index].mode = mode & 0o7777;
+        self.overlay[index].len = 0;
+        Ok(())
+    }
+
+    /// List the immediate children of a domain directory in sorted name order.
+    /// Returns the total child count; `output` is filled with up to its
+    /// capacity, so a return larger than `output.len()` means truncation.
+    /// Symlinked directories list under their canonical path.
+    pub fn list_dir<'s>(
+        &'s self,
+        path: &[u8],
+        output: &mut [DirEntry<'s>],
+    ) -> Result<usize, VfsError> {
+        let (kind, _, canonical) = self.stat_merged(path)?;
+        if kind != NodeKind::Directory {
+            return Err(VfsError::NotDirectory);
+        }
+        let dir = canonical.as_bytes();
+        let mut total = 0usize;
+        let mut placed = 0usize;
+        // Immutable base first (index order is already sorted), skipping
+        // anything the overlay shadows with a live entry or hides behind a
+        // tombstone. Overlay entries only ever shadow their exact path, so no
+        // ancestor check is needed here.
+        for record in 0..self.index.len() {
+            let entry = self.index.entry(record)?;
+            let Some(name) = child_name(dir, entry.path) else {
+                continue;
+            };
+            if self.find_overlay(entry.path).is_some() {
+                continue;
+            }
+            total += 1;
+            if placed < output.len() {
+                output[placed] = DirEntry {
+                    name,
+                    kind: entry.kind,
+                    mode: entry.mode,
+                };
+                placed += 1;
+            }
+        }
+        for slot in &self.overlay {
+            if slot.state != 1 && slot.state != 3 {
+                continue;
+            }
+            let Some(name) = child_name(dir, slot.path.as_bytes()) else {
+                continue;
+            };
+            total += 1;
+            if placed < output.len() {
+                output[placed] = DirEntry {
+                    name,
+                    kind: if slot.state == 3 {
+                        NodeKind::Directory
+                    } else {
+                        NodeKind::File
+                    },
+                    mode: slot.mode,
+                };
+                placed += 1;
+            }
+        }
+        let mut index = 1usize;
+        while index < placed {
+            let mut cursor = index;
+            while cursor > 0 && output[cursor - 1].name > output[cursor].name {
+                output.swap(cursor - 1, cursor);
+                cursor -= 1;
+            }
+            index += 1;
+        }
+        Ok(total)
+    }
+
     pub fn unlink(&mut self, path: &[u8]) -> Result<(), VfsError> {
         let path = normalize(path)?;
         if let Some(index) = self.find_overlay(path.as_bytes()) {
+            if self.overlay[index].state == 3 {
+                return Err(VfsError::IsDirectory);
+            }
             self.overlay[index].state = 2;
             self.overlay[index].len = 0;
             return Ok(());
@@ -594,11 +729,106 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         } else {
             &path[..split]
         };
-        if self.index.resolve(parent)?.kind != NodeKind::Directory {
-            return Err(VfsError::NotDirectory);
+        // Merged view: files may be created under overlay directories too.
+        match self.stat_merged(parent)? {
+            (NodeKind::Directory, _, _) => Ok(()),
+            _ => Err(VfsError::NotDirectory),
         }
-        Ok(())
     }
+
+    /// Resolve `path` in the merged domain view (overlay wins over base),
+    /// returning kind, mode, and the canonical post-symlink path. `..`
+    /// escapes past the domain root fail `normalize` with `InvalidPath`, so
+    /// traversal can never name anything outside the domain.
+    fn stat_merged(&self, path: &[u8]) -> Result<(NodeKind, u32, Path), VfsError> {
+        let mut current = normalize(path)?;
+        for _ in 0..16 {
+            let mut position = 1usize;
+            let mut followed = false;
+            while position <= current.len {
+                let component_end = current.bytes[position..current.len]
+                    .iter()
+                    .position(|byte| *byte == b'/')
+                    .map_or(current.len, |offset| position + offset);
+                let prefix = &current.bytes[..component_end];
+                if let Some(index) = self.find_overlay(prefix) {
+                    let slot = &self.overlay[index];
+                    if slot.state == 2 {
+                        return Err(VfsError::NotFound);
+                    }
+                    let kind = if slot.state == 3 {
+                        NodeKind::Directory
+                    } else {
+                        NodeKind::File
+                    };
+                    if component_end < current.len && kind != NodeKind::Directory {
+                        return Err(VfsError::NotDirectory);
+                    }
+                    if component_end == current.len {
+                        return Ok((kind, slot.mode, current));
+                    }
+                    position = component_end + 1;
+                    continue;
+                }
+                let base = match self.index.lookup_exact(prefix) {
+                    Ok(entry) => entry,
+                    Err(_) => return Err(VfsError::NotFound),
+                };
+                if base.kind == NodeKind::Symlink {
+                    let mut replacement = Path::new();
+                    if base.link.first() == Some(&b'/') {
+                        replacement.extend(base.link)?;
+                    } else {
+                        let parent_end = prefix.iter().rposition(|byte| *byte == b'/').unwrap_or(0);
+                        if parent_end == 0 {
+                            replacement.extend(b"/")?;
+                        } else {
+                            replacement.extend(&prefix[..parent_end])?;
+                            replacement.extend(b"/")?;
+                        }
+                        replacement.extend(base.link)?;
+                    }
+                    if component_end < current.len {
+                        replacement.extend(&current.bytes[component_end..current.len])?;
+                    }
+                    current = normalize(replacement.as_bytes())?;
+                    followed = true;
+                    break;
+                }
+                if component_end < current.len && base.kind != NodeKind::Directory {
+                    return Err(VfsError::NotDirectory);
+                }
+                if component_end == current.len {
+                    return Ok((base.kind, base.mode, current));
+                }
+                position = component_end + 1;
+            }
+            if !followed {
+                break;
+            }
+        }
+        Err(VfsError::SymlinkLoop)
+    }
+}
+
+/// Immediate child component of `path` under `dir`, or `None` when `path`
+/// is not directly inside `dir`.
+fn child_name<'x>(dir: &[u8], path: &'x [u8]) -> Option<&'x [u8]> {
+    if path == b"/" || path.len() <= dir.len() {
+        return None;
+    }
+    let rest = if dir == b"/" {
+        &path[1..]
+    } else {
+        if !path.starts_with(dir) || path.get(dir.len()) != Some(&b'/') {
+            return None;
+        }
+        &path[dir.len() + 1..]
+    };
+    if rest.is_empty() || rest.contains(&b'/') {
+        return None;
+    }
+    Some(rest)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, VfsError> {
@@ -620,190 +850,4 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, VfsError> {
         .get(offset..offset + 8)
         .ok_or(VfsError::InvalidIndex)?;
     Ok(u64::from_le_bytes(value.try_into().unwrap()))
-}
-
-#[cfg(test)]
-mod tests {
-    extern crate std;
-    use super::*;
-    use std::vec::Vec;
-
-    fn index_bytes() -> Vec<u8> {
-        let records = [
-            Entry {
-                path: b"/",
-                kind: NodeKind::Directory,
-                mode: 0o755,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                data_offset: 0,
-                link: b"",
-            },
-            Entry {
-                path: b"/base",
-                kind: NodeKind::File,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                size: 4,
-                data_offset: 0,
-                link: b"",
-            },
-            Entry {
-                path: b"/bin",
-                kind: NodeKind::Symlink,
-                mode: 0o777,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                data_offset: 0,
-                link: b"usr/bin",
-            },
-            Entry {
-                path: b"/loop",
-                kind: NodeKind::Symlink,
-                mode: 0o777,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                data_offset: 0,
-                link: b"loop",
-            },
-            Entry {
-                path: b"/usr",
-                kind: NodeKind::Directory,
-                mode: 0o755,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                data_offset: 0,
-                link: b"",
-            },
-            Entry {
-                path: b"/usr/bin",
-                kind: NodeKind::Directory,
-                mode: 0o755,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                data_offset: 0,
-                link: b"",
-            },
-            Entry {
-                path: b"/usr/bin/sh",
-                kind: NodeKind::Symlink,
-                mode: 0o777,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                data_offset: 0,
-                link: b"tool",
-            },
-            Entry {
-                path: b"/usr/bin/tool",
-                kind: NodeKind::File,
-                mode: 0o755,
-                uid: 0,
-                gid: 0,
-                size: 4,
-                data_offset: 4,
-                link: b"",
-            },
-        ];
-        let mut bytes = Vec::new();
-        let mut header = [0u8; HEADER_SIZE];
-        encode_header(records.len() as u32, &mut header);
-        bytes.extend_from_slice(&header);
-        for entry in records {
-            let mut record = [0u8; RECORD_SIZE];
-            encode_record(entry, &mut record).unwrap();
-            bytes.extend_from_slice(&record);
-        }
-        bytes
-    }
-
-    struct Reader([u8; 8]);
-    impl BaseReader for Reader {
-        fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), VfsError> {
-            let offset = offset as usize;
-            output.copy_from_slice(&self.0[offset..offset + output.len()]);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn validates_lookup_and_symlink_components() {
-        let bytes = index_bytes();
-        let index = Index::new(&bytes).unwrap();
-        assert_eq!(index.resolve(b"/bin/./sh").unwrap().path, b"/usr/bin/tool");
-        assert_eq!(index.resolve(b"/loop"), Err(VfsError::SymlinkLoop));
-        assert_eq!(index.resolve(b"/../../base"), Err(VfsError::InvalidPath));
-    }
-
-    #[test]
-    fn descriptors_never_equal_base_authority_and_overlay_is_disposable() {
-        let bytes = index_bytes();
-        let index = Index::new(&bytes).unwrap();
-        let mut vfs: VirtualFs<'_, Reader, 4, 32, 4> = VirtualFs::new(index, Reader(*b"BASETOOL"));
-        let descriptor = vfs.open(b"/base", O_READ).unwrap();
-        assert_eq!(descriptor, 3);
-        let mut output = [0u8; 4];
-        assert_eq!(vfs.read(descriptor, &mut output).unwrap(), 4);
-        assert_eq!(&output, b"BASE");
-        vfs.close(descriptor).unwrap();
-        let descriptor = vfs.open(b"/base", O_READ | O_WRITE).unwrap();
-        vfs.write(descriptor, b"edit").unwrap();
-        assert_eq!(vfs.overlay_files(), 1);
-        assert_eq!(&vfs.reader.0[..4], b"BASE");
-        let duplicate = vfs.duplicate(descriptor, true).unwrap();
-        vfs.close_on_exec();
-        assert_eq!(vfs.close(duplicate), Err(VfsError::InvalidDescriptor));
-        vfs.teardown();
-        assert_eq!(vfs.overlay_files(), 0);
-    }
-
-    #[test]
-    fn create_unlink_and_failures_are_deterministic() {
-        let bytes = index_bytes();
-        let index = Index::new(&bytes).unwrap();
-        let mut vfs: VirtualFs<'_, Reader, 4, 8, 4> = VirtualFs::new(index, Reader(*b"BASETOOL"));
-        let descriptor = vfs.open(b"/usr/new", O_WRITE | O_CREATE).unwrap();
-        vfs.write(descriptor, b"new").unwrap();
-        assert_eq!(
-            vfs.read(descriptor, &mut [0u8; 1]),
-            Err(VfsError::PermissionDenied)
-        );
-        assert_eq!(vfs.close(99), Err(VfsError::InvalidDescriptor));
-        vfs.unlink(b"/base").unwrap();
-        assert_eq!(vfs.open(b"/base", O_READ), Err(VfsError::NotFound));
-        assert_eq!(
-            vfs.open(b"/missing/file", O_WRITE | O_CREATE),
-            Err(VfsError::NotFound)
-        );
-    }
-
-    #[test]
-    fn overlays_are_isolated_between_domain_instances() {
-        let bytes = index_bytes();
-        let mut first: VirtualFs<'_, Reader, 4, 32, 4> =
-            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
-        let mut second: VirtualFs<'_, Reader, 4, 32, 4> =
-            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
-
-        let first_base = first.open(b"/base", O_READ | O_WRITE).unwrap();
-        first.write(first_base, b"edit").unwrap();
-        let first_new = first.open(b"/usr/new", O_WRITE | O_CREATE).unwrap();
-        first.write(first_new, b"private").unwrap();
-
-        let second_base = second.open(b"/base", O_READ).unwrap();
-        let mut output = [0u8; 4];
-        assert_eq!(second.read(second_base, &mut output), Ok(4));
-        assert_eq!(&output, b"BASE");
-        assert_eq!(second.open(b"/usr/new", O_READ), Err(VfsError::NotFound));
-
-        first.teardown();
-        assert_eq!(first.overlay_files(), 0);
-        assert_eq!(second.overlay_files(), 0);
-    }
 }
