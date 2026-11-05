@@ -62,6 +62,12 @@ pub fn read_path(pid: usize, address: u64) -> Result<Path, i64> {
 /// the two proc links does not let a workload select a supervisor host path.
 /// Fork and CLONE_FS sharing retain their native directory semantics.
 pub fn image_cwd(pid: usize) -> Result<Path, i64> {
+    image_link(pid, b"/cwd")
+}
+
+/// Only callers in the supervisor choose the proc member; no host prefix is
+/// returned unless it resolves beneath the tracee's immutable root.
+pub fn image_link(pid: usize, member: &[u8]) -> Result<Path, i64> {
     fn link(pid: usize, suffix: &[u8], output: &mut [u8]) -> Result<usize, i64> {
         let mut name = [0u8; 64];
         name[..6].copy_from_slice(b"/proc/");
@@ -99,7 +105,7 @@ pub fn image_cwd(pid: usize) -> Result<Path, i64> {
     let mut root = [0u8; 4096];
     let mut cwd = [0u8; 4096];
     let root_len = link(pid, b"/root", &mut root)?;
-    let cwd_len = link(pid, b"/cwd", &mut cwd)?;
+    let cwd_len = link(pid, member, &mut cwd)?;
     let relative = cwd[..cwd_len].strip_prefix(&root[..root_len]).ok_or(-13)?;
     if relative.is_empty() {
         return Path::from_bytes(b"/").map_err(|_| -36);

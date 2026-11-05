@@ -317,6 +317,24 @@ impl LaunchFs {
         Ok(true)
     }
 
+    pub fn executable_name(&self, image: Executable) -> Result<Path, i64> {
+        let (name, deleted) = self.fs.executable_name(image).map_err(errno)?;
+        let mut bytes = [0u8; MAX_PATH];
+        let suffix = if deleted {
+            b" (deleted)".as_slice()
+        } else {
+            b""
+        };
+        let len = name
+            .len()
+            .checked_add(suffix.len())
+            .filter(|n| *n <= MAX_PATH)
+            .ok_or(-36)?;
+        bytes[..name.len()].copy_from_slice(name);
+        bytes[name.len()..len].copy_from_slice(suffix);
+        Path::from_bytes(&bytes[..len]).map_err(|_| -36)
+    }
+
     pub fn read_executable(
         &self,
         image: Executable,

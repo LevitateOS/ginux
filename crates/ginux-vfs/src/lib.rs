@@ -961,6 +961,18 @@ impl<
         Ok(count)
     }
 
+    /// Current namespace name of a pinned image, retaining unlink identity.
+    pub fn executable_name(&self, image: Executable) -> Result<(&[u8], bool), VfsError> {
+        let object = self
+            .overlay
+            .get(image.object)
+            .ok_or(VfsError::InvalidDescriptor)?;
+        if object.executions == 0 || object.len != image.size {
+            return Err(VfsError::InvalidDescriptor);
+        }
+        Ok((object.path.as_bytes(), object.state == 2))
+    }
+
     pub fn executable_pins(&self) -> usize {
         self.overlay.iter().map(|object| object.executions).sum()
     }

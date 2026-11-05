@@ -38,6 +38,11 @@ long owned_exec_main(word *stack)
         DO(1,1,"owned-exec: PASS\n",17); return 0;
     }
     if (mode=='a') {
+        const char *expected=argv[2][0]=='u'?"/work/program (deleted)":"/work/program";
+        long length=DO(89,"/proc/self/exe",buffer,sizeof buffer);
+        long wanted=argv[2][0]=='u'?23:13;
+        CHECK(length==wanted,90);
+        for (long i=0;i<length;i++) CHECK(buffer[i]==expected[i],91);
         CHECK(argc==3 && env[0] && env[0][0]=='O' && env[0][6]=='y' && !env[1],14);
         CHECK(DO(72,3,1,0)==-9 && DO(72,5,1,0)==-9 && DO(72,6,1,0)==-9 && DO(72,8,1,0)==-9,15);
         CHECK(DO(8,4,0,0)==0 && DO(0,4,buffer,1)==1 && buffer[0]=='K',16);

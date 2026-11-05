@@ -25,6 +25,12 @@ long exec_main(word *stack)
     word argc=*stack;
     char **argv=(char **)(stack+1), **env=argv+argc+1;
     char mode=argc>1 ? argv[1][0] : 's';
+    char exe[64];
+    long length=DO(89,"/proc/self/exe",exe,sizeof exe);
+    CHECK(length>5 && exe[0]=='/' && exe[1]=='b' && exe[2]=='i' && exe[3]=='n' && exe[4]=='/',90);
+    CHECK(call(267,-100,(word)"/proc/self/exe",(word)exe,4,0,0)==4,91);
+    CHECK(DO(89,"/proc/self/exe",exe,0)==-22,92);
+    CHECK(DO(89,"/proc/self/exe",1,8)==-14,93);
     if (mode=='a') {
         CHECK(DO(39,0,0,0)==(argv[2][0]=='c'?2:1),10);
         CHECK(env[0] && env[0][0]=='E' && env[0][5]=='y' && !env[1],11);

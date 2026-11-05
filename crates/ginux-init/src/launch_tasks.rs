@@ -500,6 +500,45 @@ impl Supervisor<'_> {
             return;
         }
         match r.orig_rax {
+            89 | 267 => {
+                let host = self.task(index).host;
+                let (address, output, size, dirfd) = if r.orig_rax == 89 {
+                    (r.rdi, r.rsi, r.rdx, (-100i64) as u64)
+                } else {
+                    (r.rsi, r.rdx, r.r10, r.rdi)
+                };
+                let path = self.objects.filesystem.path(host, address, dirfd);
+                if path.as_ref().is_ok_and(|p| {
+                    matches!(p.as_bytes(), b"/proc/self/exe" | b"/proc/thread-self/exe")
+                }) {
+                    let result = (|| {
+                        if size == 0 {
+                            return Err(-22);
+                        }
+                        let name =
+                            crate::tracee_io::image_link(host, b"/exe").or_else(|error| {
+                                self.groups[parent_group]
+                                    .as_ref()
+                                    .unwrap()
+                                    .image
+                                    .ok_or(error)
+                                    .and_then(|image| {
+                                        self.objects.filesystem.executable_name(image)
+                                    })
+                            })?;
+                        let mut bytes = [0u8; ginux_vfs::MAX_PATH];
+                        let count = name.as_bytes().len().min(size as usize);
+                        bytes[..count].copy_from_slice(&name.as_bytes()[..count]);
+                        if copy_memory(host, output, &mut bytes[..count], true)? != count as i64 {
+                            return Err(-14);
+                        }
+                        Ok(count as i64)
+                    })()
+                    .unwrap_or_else(|error| error);
+                    self.emulate(index, r, result, domain);
+                    return;
+                }
+            }
             80 => {
                 match self
                     .objects
