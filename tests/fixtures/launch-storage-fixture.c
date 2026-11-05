@@ -20,6 +20,32 @@ long storage_main(word *stack)
 {
     word argc = *stack;
     char **argv = (char **)(stack + 1);
+    if (argc > 1 && argv[1][0] == 's') {
+        CHECK(DO(83,"/work/dir",0755,0)==0,166);
+        CHECK(DO(88,"dir","/work/link",0)==0,167);
+        CHECK(DO(2,"/work/link/file",0102,0600)==3 && DO(1,3,"data",4)==4 && DO(3,3,0,0)==0,168);
+        CHECK(DO(2,"/work/dir/file",0,0)==3 && DO(0,3,output,4)==4 && output[0]=='d' && DO(3,3,0,0)==0,169);
+        CHECK(DO(6,"/work/link",meta,0)==0 && (*(word *)(meta+24)&0170000)==0120000,170);
+        CHECK(DO(4,"/work/link",meta,0)==0 && (*(word *)(meta+24)&0170000)==0040000,171);
+        CHECK(DO(89,"/work/link",output,2)==2 && output[0]=='d' && output[1]=='i',172);
+        CHECK(DO(2,"/work/link",0400000,0)==-40 && DO(2,"/work/link",0301,0600)==-17,173);
+        CHECK(DO(88,"../link","/work/dir/chain",0)==0,174);
+        CHECK(DO(2,"/work/dir/chain/../fresh",0101,0600)==3 && DO(3,3,0,0)==0,175);
+        CHECK(DO(4,"/work/fresh",meta,0)==0 && DO(4,"/work/dir/fresh",meta,0)==-2,176);
+        CHECK(DO(88,"/image","/work/image",0)==0 && DO(2,"/work/image",0,0)<0,177);
+        CHECK(DO(88,"/","/work/root",0)==0 && DO(2,"/work/root/escape",0101,0600)<0,178);
+        CHECK(DO(2,"/work/root/../image",0,0)<0 && DO(2,"/work/link/../../image",0,0)<0,179);
+        CHECK(DO(2,"/work/dir",0200000,0)==3,180);
+        CHECK(DO(266,"file",3,"relative")==0,181);
+        CHECK(call(267,3,(word)"relative",(word)output,64,0,0)==4 && output[0]=='f',182);
+        CHECK(call(262,3,(word)"relative",(word)meta,0x100,0,0)==0 && (*(word *)(meta+24)&0170000)==0120000,183);
+        CHECK(DO(257,3,"relative",0)==4 && DO(0,4,output,4)==4 && output[0]=='d' && DO(3,4,0,0)==0,184);
+        CHECK(DO(3,3,0,0)==0,185);
+        CHECK(DO(82,"/work/link","/work/renamed",0)==0 && DO(87,"/work/renamed",0,0)==0,186);
+        CHECK(DO(4,"/work/dir/file",meta,0)==0,187);
+        CHECK(DO(88,"cycle","/work/cycle",0)==0 && DO(2,"/work/cycle",0,0)==-40,188);
+        return 0;
+    }
     if (argc > 1 && argv[1][0] == 'l') {
         for (word i=0;i<10000;++i) CHECK(DO(39,0,0,0)>0,164);
         CHECK(DO(1,1,"events: PASS\n",13)==13,165);
@@ -39,6 +65,11 @@ long storage_main(word *stack)
         CHECK(DO(2,path,0,0)==3 && DO(0,3,output,4)==4 && output[0]=='l' && DO(3,3,0,0)==0,158);
         CHECK(DO(4,"/work/empty",meta,0)==0 && (*(word *)(meta+24)&0170000)==0040000,159);
         CHECK(DO(2,"/work/checkpoint",01001,0600)==3 && DO(1,3,"changed",7)==7 && DO(3,3,0,0)==0,160);
+        CHECK(DO(89,"/work/check-link",output,sizeof output)==10 && output[0]=='c',189);
+        CHECK(DO(2,"/work/check-link",0,0)==3 && DO(0,3,output,7)==7 && output[0]=='c' && DO(3,3,0,0)==0,190);
+        CHECK(DO(89,"/work/long-link",output,sizeof output)==126 && output[0]=='/',191);
+        CHECK(DO(2,"/work/long-link",0,0)==3 && DO(0,3,output,4)==4 && output[0]=='l' && DO(3,3,0,0)==0,192);
+        CHECK(DO(89,"/work/absolute",output,sizeof output)==10 && output[0]=='/',193);
         CHECK(DO(1,1,"restored: PASS\n",15)==15,161);
         return 0;
     }
@@ -50,6 +81,9 @@ long storage_main(word *stack)
         for (word i=6;i<126;++i) path[i]='a';
         path[126]=0;
         CHECK(DO(2,path,0101,0640)==4 && DO(1,4,"long",4)==4 && DO(3,4,0,0)==0,163);
+        CHECK(DO(88,"checkpoint","/work/check-link",0)==0,194);
+        CHECK(DO(88,path,"/work/long-link",0)==0,195);
+        CHECK(DO(88,"/usr/bin/x","/work/absolute",0)==0,196);
         CHECK(DO(1,1,"checkpoint-ready\n",17)==17 && DO(0,0,output,1)==1,149);
         CHECK(DO(8,fd,0,0)==0 && DO(1,fd,"second",6)==6,150);
         CHECK(DO(1,1,"checkpoint-ready\n",17)==17 && DO(0,0,output,1)==1,151);
@@ -68,6 +102,8 @@ long storage_main(word *stack)
         for (word i=126;i<206;++i) longpath[i]='b';
         longpath[206]=0;
         CHECK(DO(2,longpath,0101,0600)==3 && DO(1,3,"long",4)==4 && DO(3,3,0,0)==0,147);
+        CHECK(DO(88,"product","/out/product-link",0)==0,197);
+        CHECK(DO(88,longpath,"/out/long-link",0)==0,198);
         return argv[1][0]=='f' ? 7 : 0;
     }
     if (argc > 1 && argv[1][0] == 'm') {

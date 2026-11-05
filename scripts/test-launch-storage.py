@@ -71,6 +71,7 @@ def main():
             assert (root / 'work/existing').read_bytes() == b'hidden immutable work file'
             assert sorted(p.name for p in (root / 'work').iterdir()) == ['existing']
             assert not (root / 'out').exists()
+            assert not (root / 'escape').exists()
             if export:
                 if expected != 0:
                     assert archive.read_bytes() == b'', 'failed workload exported files'
@@ -82,6 +83,9 @@ def main():
                         assert tar.extractfile('out/product').read() == b'result\0data'
                         assert tar.getmember('out/product').mode == 0o700
                         assert tar.getmember('out/empty').isdir()
+                        assert tar.getmember('out/product-link').issym()
+                        assert tar.getmember('out/product-link').linkname == 'product'
+                        assert tar.getmember('out/long-link').linkname == '/out/' + 'a'*120 + '/' + 'b'*80
                         assert tar.extractfile('out/' + 'a'*120 + '/' + 'b'*80).read() == b'long'
                     # The same destination must fail before starting the workload.
                     result.unlink()
@@ -94,6 +98,7 @@ def main():
             invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], [])
         invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['quota'])
         invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['bounds'], memory=16)
+        invoke(['memory:/work', 'memory:/out'], ['symlinks'])
         invoke(['memory:/work', 'memory:/out'], ['mapping'])
         invoke(['memory:/work', 'memory:/out'], ['export'], export=True)
         invoke(['memory:/work', 'memory:/out'], ['failed-export'], expected=7, export=True)

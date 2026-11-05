@@ -1,7 +1,8 @@
 //! Bounded startup import of an owned-filesystem snapshot. All entries are
 //! validated before a workload starts; failures discard this new memory view.
-use crate::fs_hooks::{LaunchFs, OBJECTS};
+use crate::fs_hooks::{LaunchFs, RestoreEntry, OBJECTS};
 use crate::supervisor::{syscall1, syscall2, syscall3, syscall4};
+use ginux_vfs::NodeKind;
 type Error = &'static [u8];
 const LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 struct Input(usize);
@@ -82,13 +83,15 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
     let mut seen = [false; OBJECTS];
     let mut long_name = [0u8; 256];
     let mut long_len = 0;
+    let mut long_link = [0u8; 256];
+    let mut link_len = 0;
     let mut total = 0u64;
-    for _ in 0..=OBJECTS * 2 {
+    for _ in 0..=OBJECTS * 3 {
         let mut header = [0u8; 512];
         input.exact(&mut header)?;
         if header.iter().all(|b| *b == 0) {
-            if long_len != 0 {
-                return Err(b"restore long name has no entry");
+            if long_len != 0 || link_len != 0 {
+                return Err(b"restore long name or link has no entry");
             }
             input.exact(&mut header)?;
             if header.iter().any(|b| *b != 0) || input.read(&mut header[..1])? != 0 {
@@ -112,25 +115,40 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
             return Err(b"invalid restore header");
         }
         let size = octal(&header[124..136])?;
-        if header[156] == b'L' {
-            if long_len != 0 || !(2..=256).contains(&size) {
-                return Err(b"invalid restore long name");
+        if matches!(header[156], b'L' | b'K') {
+            let (buffer, length) = if header[156] == b'L' {
+                (&mut long_name, &mut long_len)
+            } else {
+                (&mut long_link, &mut link_len)
+            };
+            if *length != 0 || !(2..=256).contains(&size) {
+                return Err(b"invalid restore long name or link");
             }
-            input.exact(&mut long_name[..size as usize])?;
-            if long_name[size as usize - 1] != 0 {
-                return Err(b"unterminated restore long name");
+            input.exact(&mut buffer[..size as usize])?;
+            if buffer[size as usize - 1] != 0 || buffer[..size as usize - 1].contains(&0) {
+                return Err(b"unterminated restore long name or link");
             }
-            long_len = size as usize - 1;
+            *length = size as usize - 1;
             input.padding(size as usize)?;
             continue;
         }
-        let directory = match header[156] {
-            b'5' => true,
-            b'0' | 0 => false,
+        let kind = match header[156] {
+            b'5' => NodeKind::Directory,
+            b'0' | 0 => NodeKind::File,
+            b'2' => NodeKind::Symlink,
             _ => return Err(b"unsupported restore entry kind"),
         };
+        let directory = kind == NodeKind::Directory;
+        if link_len != 0 && kind != NodeKind::Symlink {
+            return Err(b"restore link target on non-link");
+        }
+        let target = if link_len != 0 {
+            &long_link[..link_len]
+        } else {
+            field(&header[157..257])
+        };
         let mode = octal(&header[100..108])?;
-        if mode & !0o777 != 0 || (directory && size != 0) {
+        if mode & !0o777 != 0 || (kind != NodeKind::File && size != 0) {
             return Err(b"invalid restore metadata");
         }
         total = total
@@ -162,13 +180,17 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
             return Err(b"invalid restore entry path");
         }
         files.restore_entry(
-            &path[..end],
-            directory,
-            mode as u32,
-            size as usize,
+            RestoreEntry {
+                path: &path[..end],
+                kind,
+                link: target,
+                mode: mode as u32,
+                length: size as usize,
+            },
             &mut seen,
             |bytes| input.exact(bytes),
         )?;
+        link_len = 0;
         input.padding(size as usize)?;
     }
     Err(b"restore archive entry bound exceeded")

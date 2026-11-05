@@ -30,6 +30,14 @@ impl BaseReader for EmptyReader {
     }
 }
 
+pub struct RestoreEntry<'a> {
+    pub path: &'a [u8],
+    pub kind: NodeKind,
+    pub link: &'a [u8],
+    pub mode: u32,
+    pub length: usize,
+}
+
 pub struct LaunchFs {
     fs: MemoryFs,
     prefixes: [Path; 8],
@@ -117,13 +125,18 @@ impl LaunchFs {
 
     pub fn restore_entry(
         &mut self,
-        path: &[u8],
-        directory: bool,
-        mode: u32,
-        length: usize,
+        entry: RestoreEntry<'_>,
         seen: &mut [bool; OBJECTS],
         mut read: impl FnMut(&mut [u8]) -> Result<(), &'static [u8]>,
     ) -> Result<(), &'static [u8]> {
+        let RestoreEntry {
+            path,
+            kind,
+            link,
+            mode,
+            length,
+        } = entry;
+        let directory = kind == NodeKind::Directory;
         let canonical = normalize(b"/", path).map_err(|_| b"invalid restore path".as_slice())?;
         if canonical.as_bytes() != path
             || (!self.owns_path(path)
@@ -141,6 +154,15 @@ impl LaunchFs {
                     Ok(()) | Err(VfsError::AlreadyExists) => {}
                     Err(_) => return Err(b"restore parent creation failed"),
                 }
+                if self
+                    .fs
+                    .metadata_no_follow(&path[..end])
+                    .map_err(|_| b"restore parent lookup failed".as_slice())?
+                    .kind
+                    != NodeKind::Directory
+                {
+                    return Err(b"restore parent is not a directory");
+                }
             }
         }
         if directory {
@@ -150,7 +172,7 @@ impl LaunchFs {
             }
             if self
                 .fs
-                .metadata(path)
+                .metadata_no_follow(path)
                 .map_err(|_| b"restore directory lookup failed".as_slice())?
                 .kind
                 != NodeKind::Directory
@@ -160,6 +182,10 @@ impl LaunchFs {
             self.fs
                 .chmod(path, mode)
                 .map_err(|_| b"restore directory mode failed".as_slice())?;
+        } else if kind == NodeKind::Symlink {
+            self.fs
+                .symlink(link, path)
+                .map_err(|_| b"restore link creation failed".as_slice())?;
         } else {
             let fd = self
                 .fs
@@ -196,7 +222,7 @@ impl LaunchFs {
         // numbers are stable slot+2 for the duration of startup import.
         let inode = self
             .fs
-            .metadata(path)
+            .metadata_no_follow(path)
             .map_err(|_| b"restore entry lookup failed".as_slice())?
             .inode;
         let slot = inode
@@ -263,6 +289,60 @@ impl LaunchFs {
             .any(|p| within(path, p.as_bytes()))
     }
 
+    // Stop lexical normalization as soon as traversal enters owned storage.
+    // Everything after that point must be interpreted by the VFS, including ..
+    // after a symlink. Never route a failed owned lookup into the image.
+    fn routed_path(&self, base: &[u8], name: &[u8]) -> Result<Path, i64> {
+        let mut raw = [0; MAX_PATH];
+        let mut length = 0;
+        if name.first() != Some(&b'/') {
+            let n = base.len();
+            raw[..n].copy_from_slice(base);
+            length = n;
+            if length > 1 {
+                if length == MAX_PATH {
+                    return Err(-36);
+                }
+                raw[length] = b'/';
+                length += 1;
+            }
+        }
+        if length + name.len() > MAX_PATH {
+            return Err(-36);
+        }
+        raw[length..length + name.len()].copy_from_slice(name);
+        length += name.len();
+        for end in 1..=length {
+            if end == length || raw[end] == b'/' {
+                let prefix = normalize(b"/", &raw[..end])?;
+                if self.owns_path(prefix.as_bytes()) {
+                    let mut joined = [0; MAX_PATH];
+                    let n = prefix.as_bytes().len();
+                    let size = n + length - end;
+                    if size > MAX_PATH {
+                        return Err(-36);
+                    }
+                    joined[..n].copy_from_slice(prefix.as_bytes());
+                    joined[n..size].copy_from_slice(&raw[end..length]);
+                    return Path::from_bytes(&joined[..size]).map_err(|_| -36);
+                }
+            }
+        }
+        normalize(b"/", &raw[..length])
+    }
+
+    fn owned_path(&self, path: &[u8], follow: bool, missing: bool) -> Result<Path, i64> {
+        let mut bytes = [0; MAX_PATH];
+        let n = self
+            .fs
+            .canonical_path(path, follow, missing, &mut bytes)
+            .map_err(errno)?;
+        if !self.owns_path(&bytes[..n]) {
+            return Err(-95);
+        }
+        Path::from_bytes(&bytes[..n]).map_err(|_| -36)
+    }
+
     pub(crate) fn path(&self, pid: usize, address: u64, dirfd: u64) -> Result<Path, i64> {
         let text = read_path(pid, address)?;
         if text.is_empty() {
@@ -282,7 +362,7 @@ impl LaunchFs {
                 .ok_or(-9)?;
             self.fs.directory_path(fd as i32 + 3).map_err(errno)?
         };
-        let path = normalize(base, text.as_bytes())?;
+        let path = self.routed_path(base, text.as_bytes())?;
         if !absolute && dirfd as i32 != -100 && !self.owns_path(path.as_bytes()) {
             // The image does not share this directory descriptor. Never pass
             // the private integer to a native open outside assigned storage.
@@ -327,13 +407,14 @@ impl LaunchFs {
             cwd = crate::tracee_io::image_cwd(pid)?;
             cwd.as_bytes()
         };
-        let path = normalize(base, name)?;
+        let path = self.routed_path(base, name)?;
         self.exec_resolved(path.as_bytes())
     }
 
     fn exec_resolved(&mut self, path: &[u8]) -> Result<Option<Executable>, i64> {
         if self.owns_path(path) {
-            let image = self.fs.pin_executable(path).map_err(errno)?;
+            let path = self.owned_path(path, true, false)?;
+            let image = self.fs.pin_executable(path.as_bytes()).map_err(errno)?;
             return self.check_exec(image).map(Some);
         }
         if [b"/dev".as_slice(), b"/proc", b"/sys"]
@@ -368,11 +449,18 @@ impl LaunchFs {
         }
         if !suffix.is_empty() {
             let directory = self.fs.directory_path(fd).map_err(errno)?;
-            let path = normalize(directory, suffix)?;
+            let relative = suffix.strip_prefix(b"/").unwrap_or(suffix);
+            let path = self.routed_path(directory, relative)?;
             if !self.owns_path(path.as_bytes()) {
                 return Err(-95);
             }
-            return self.open(path.as_bytes(), flags, 0);
+            return self.open(path.as_bytes(), flags, 0).map_err(|error| {
+                if error == -22 {
+                    -95
+                } else {
+                    error
+                }
+            });
         }
         let metadata = self.fs.fstat(fd).map_err(errno)?;
         if flags & 0o200000 != 0 && metadata.kind != NodeKind::Directory {
@@ -505,6 +593,8 @@ impl LaunchFs {
             }
         }
         let (address, dirfd) = match r.orig_rax {
+            88 => (r.rsi, (-100i64) as u64),
+            266 => (r.rdx, r.rsi),
             2 | 4 | 6 | 21 | 83 | 84 | 87 | 89 | 90 => (r.rdi, (-100i64) as u64),
             257 | 258 | 262 | 263 | 267 | 268 | 269 | 332 | 439 => (r.rsi, r.rdi),
             _ => return None,
@@ -516,22 +606,55 @@ impl LaunchFs {
         if !self.owns_path(path.as_bytes()) {
             return None;
         }
+        let follow = match r.orig_rax {
+            6 | 83 | 84 | 87 | 88 | 89 | 258 | 263 | 266 | 267 => false,
+            262 => r.r10 & 0x100 == 0,
+            332 => r.rdx & 0x100 == 0,
+            439 => r.r10 & 0x100 == 0,
+            // open handles O_EXCL and O_NOFOLLOW before following the final link.
+            2 | 257 => false,
+            _ => true,
+        };
+        let missing = matches!(r.orig_rax, 2 | 257 | 83 | 258 | 88 | 266);
+        let path = match self.owned_path(path.as_bytes(), follow, missing) {
+            Ok(path) => path,
+            Err(error) => return Some(error),
+        };
         let result = match r.orig_rax {
             2 => self.open(path.as_bytes(), r.rsi, r.rdx),
             257 => self.open(path.as_bytes(), r.rdx, r.r10),
             4 | 6 => self.stat(pid, path.as_bytes(), r.rsi, false),
             21 | 269 | 439 => self
                 .fs
-                .metadata(path.as_bytes())
+                .metadata_no_follow(path.as_bytes())
                 .map_err(errno)
                 .and_then(|metadata| access(metadata, r)),
-            // The owned namespace has no symlinks. Existing non-links must
-            // report EINVAL, not leak through to an absent native image path.
-            89 | 267 => self
-                .fs
-                .metadata(path.as_bytes())
-                .map_err(errno)
-                .and(Err(-22)),
+            88 | 266 => read_path(pid, r.rdi).and_then(|target| {
+                self.fs
+                    .symlink(target.as_bytes(), path.as_bytes())
+                    .map(|_| 0)
+                    .map_err(errno)
+            }),
+            89 | 267 => {
+                let (address, length) = if r.orig_rax == 89 {
+                    (r.rsi, r.rdx)
+                } else {
+                    (r.rdx, r.r10)
+                };
+                if length == 0 {
+                    Err(-22)
+                } else {
+                    let mut target = [0; MAX_PATH];
+                    let count = (length as usize).min(target.len());
+                    self.fs
+                        .read_link(path.as_bytes(), &mut target[..count])
+                        .map_err(errno)
+                        .and_then(|n| {
+                            copy_memory(pid, address, &mut target[..n], true)?;
+                            Ok(n as i64)
+                        })
+                }
+            }
             262 => {
                 if r.r10 & !0x900 != 0 {
                     Err(-22)
@@ -583,9 +706,7 @@ impl LaunchFs {
     }
 
     fn open(&mut self, path: &[u8], flags: u64, mode: u64) -> Result<i64, i64> {
-        // NOCTTY and NOFOLLOW are valid: this backend has no terminals or symlinks.
-        // Unsupported
-        // path-only behavior never falls through to native storage.
+        // Unsupported path-only behavior never falls through to native storage.
         const ALLOWED: u64 = 3
             | 0o100
             | 0o200
@@ -603,6 +724,15 @@ impl LaunchFs {
         if flags & (0o200000 | 0o100) == (0o200000 | 0o100) {
             return Err(-22);
         }
+        let entry = self.fs.metadata_no_follow(path);
+        if flags & (0o100 | 0o200) == (0o100 | 0o200) && entry.is_ok() {
+            return Err(-17);
+        }
+        if flags & 0o400000 != 0 && entry.is_ok_and(|m| m.kind == NodeKind::Symlink) {
+            return Err(-40);
+        }
+        let canonical = self.owned_path(path, true, flags & 0o100 != 0)?;
+        let path = canonical.as_bytes();
         let metadata = self.fs.metadata(path);
         if metadata.is_ok_and(|m| m.kind == NodeKind::Directory) {
             if flags & (3 | 0o100 | 0o1000 | 0o2000) != 0 {
@@ -677,6 +807,8 @@ impl LaunchFs {
         if !self.owns_path(source.as_bytes()) || !self.owns_path(destination.as_bytes()) {
             return Err(-18);
         }
+        let source = self.owned_path(source.as_bytes(), false, false)?;
+        let destination = self.owned_path(destination.as_bytes(), false, true)?;
         if self.prefixes[..self.count].iter().any(|prefix| {
             self.assignment_root(prefix.as_bytes())
                 && (within(prefix.as_bytes(), source.as_bytes())
@@ -694,7 +826,7 @@ impl LaunchFs {
         copy_metadata(
             pid,
             destination,
-            self.fs.metadata(path).map_err(errno)?,
+            self.fs.metadata_no_follow(path).map_err(errno)?,
             statx,
         )
     }
@@ -900,10 +1032,10 @@ fn copy_metadata(
         crate::tracee_io::Stat {
             inode: metadata.inode,
             mode: metadata.mode
-                | if metadata.kind == NodeKind::Directory {
-                    0o40000
-                } else {
-                    0o100000
+                | match metadata.kind {
+                    NodeKind::Directory => 0o40000,
+                    NodeKind::Symlink => 0o120000,
+                    _ => 0o100000,
                 },
             size: metadata.size,
             device_major: 0,

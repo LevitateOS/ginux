@@ -76,6 +76,9 @@ def main():
                         assert receive(client, 20) == b'GXA1' + struct.pack('<QQ', sequence, 0)
                         with tarfile.open(archive) as tar:
                             assert tar.extractfile('work/checkpoint').read() == expected
+                            assert tar.getmember('work/check-link').linkname == 'checkpoint'
+                            assert tar.getmember('work/long-link').linkname == '/work/' + 'a'*120
+                            assert tar.getmember('work/absolute').linkname == '/usr/bin/x'
                         proc.stdin.write(b'G')
                         proc.stdin.flush()
                     if failure is None:
@@ -109,13 +112,14 @@ def main():
             finally:
                 client.close()
                 server.close()
-        def restore(archive, expected='first', failure=False, assignments='memory:/work'):
+        def restore(archive, expected='first', failure=False, assignments='memory:/work', error=None):
             result = work / 'restore-result.json'
             result.unlink(missing_ok=True)
             config_path.write_text(config.replace('args = ["checkpoint"]', 'args = ' + json.dumps(['restore', expected])).replace('memory:/work', assignments))
             proc = subprocess.run([binary, 'launch', str(config_path), str(root), '--result-file', str(result),
                                    '--restore-file', str(archive)], capture_output=True, timeout=5)
             assert proc.returncode == (2 if failure else 0), proc.stderr.decode()
+            if error is not None: assert error in proc.stderr, proc.stderr.decode()
             assert proc.stdout == (b'' if failure else b'restored: PASS\n'), proc.stdout
             assert json.loads(result.read_text())['outcome'] == ('supervisor-error' if failure else 'exited')
 
@@ -140,6 +144,18 @@ def main():
                 tar.addfile(entry)
                 if kind == 'duplicate': tar.addfile(entry)
             restore(archive, failure=True)
+        # A syntactically valid link must never redirect later restore entries.
+        archive = work / 'link-parent.tar'
+        with tarfile.open(archive, 'w', format=tarfile.USTAR_FORMAT) as tar:
+            entry = tarfile.TarInfo('work/link')
+            entry.mode = 0o777
+            entry.type = tarfile.SYMTYPE
+            entry.linkname = '/work'
+            tar.addfile(entry)
+            entry = tarfile.TarInfo('work/link/escaped')
+            entry.mode = 0o600
+            tar.addfile(entry)
+        restore(archive, failure=True, error=b'restore parent is not a directory')
         link = work / 'snapshot-link.tar'
         link.symlink_to(work / 'snapshot-None-1.tar')
         restore(link, failure=True)

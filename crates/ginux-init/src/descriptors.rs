@@ -447,6 +447,13 @@ impl DescriptorTable {
                 call.save(r);
                 self.rename_paths(pid, r, backends)
             }
+            266 => {
+                call.save(r);
+                self.path_handle(pid, r.rsi, r.rdx).map(|handle| {
+                    r.rsi = handle;
+                    backends.claim(pid, r)
+                })
+            }
             258 | 262 | 263 | 267 | 268 | 269 | 332 | 439 => {
                 call.save(r);
                 self.path_descriptor(pid, r, backends)

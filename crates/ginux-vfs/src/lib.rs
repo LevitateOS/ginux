@@ -1033,7 +1033,7 @@ impl<
         ))
     }
 
-    /// Read a live writable regular file without allocating a guest descriptor.
+    /// Read live file or symlink bytes without allocating a guest descriptor.
     pub fn read_overlay(
         &self,
         slot: usize,
@@ -1041,7 +1041,7 @@ impl<
         output: &mut [u8],
     ) -> Result<(), VfsError> {
         let entry = self.overlay.get(slot).ok_or(VfsError::NotFound)?;
-        if entry.state != 1 {
+        if !matches!(entry.state, 1 | 4) {
             return Err(VfsError::NotFound);
         }
         if offset

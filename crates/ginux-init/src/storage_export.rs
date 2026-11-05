@@ -126,20 +126,38 @@ impl Archive {
         let (kind, length) = match metadata.kind {
             NodeKind::File => (b'0', metadata.size),
             NodeKind::Directory => (b'5', 0),
-            _ => return Err(b"unsupported export entry kind"),
+            NodeKind::Symlink => (b'2', 0),
         };
         if name.len() > 100 {
             // GNU long names preserve any normalized VFS path, including a
             // single component longer than ustar's 100-byte name field.
-            self.header(b"././@LongLink", 0, (name.len() + 1) as u64, b'L')?;
+            self.header(b"././@LongLink", 0, (name.len() + 1) as u64, b'L', b"")?;
             self.bytes(name)?;
             self.bytes(&[0; 512][..512 - name.len()])?;
+        }
+        let mut target = [0; ginux_vfs::MAX_PATH];
+        let target = if metadata.kind == NodeKind::Symlink {
+            let length =
+                usize::try_from(metadata.size).map_err(|_| b"invalid export link".as_slice())?;
+            if length == 0 || length > target.len() {
+                return Err(b"invalid export link");
+            }
+            read(0, &mut target[..length])?;
+            &target[..length]
+        } else {
+            &[]
+        };
+        if target.len() > 100 {
+            self.header(b"././@LongLink", 0, (target.len() + 1) as u64, b'K', b"")?;
+            self.bytes(target)?;
+            self.bytes(&[0; 512][..512 - target.len()])?;
         }
         self.header(
             &name[..name.len().min(100)],
             (metadata.mode & 0o777) as u64,
             length,
             kind,
+            &target[..target.len().min(100)],
         )?;
         let mut buffer = [0u8; 4096];
         let mut offset = 0usize;
@@ -152,7 +170,14 @@ impl Archive {
         let padding = (512 - (length % 512)) % 512;
         self.bytes(&[0; 512][..padding as usize])
     }
-    fn header(&mut self, name: &[u8], mode: u64, length: u64, kind: u8) -> Result<(), Error> {
+    fn header(
+        &mut self,
+        name: &[u8],
+        mode: u64,
+        length: u64,
+        kind: u8,
+        link: &[u8],
+    ) -> Result<(), Error> {
         let mut header = [0u8; 512];
         header[..name.len()].copy_from_slice(name);
         octal(&mut header[100..108], mode)?;
@@ -162,6 +187,7 @@ impl Archive {
         octal(&mut header[136..148], 0)?;
         header[148..156].fill(b' ');
         header[156] = kind;
+        header[157..157 + link.len()].copy_from_slice(link);
         header[257..263].copy_from_slice(b"ustar\0");
         header[263..265].copy_from_slice(b"00");
         let checksum = header.iter().map(|b| *b as u64).sum();
