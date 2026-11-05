@@ -62,6 +62,10 @@ long pipe_main(word *stack)
     CHECK(DO(0,pair[0],buffer,5) == 3 && buffer[0] == 'l' && buffer[2] == 'o', 41);
     CHECK(DO(1,pair[1],pages+4094,5) == -14, 42);
     CHECK(DO(0,pair[0],buffer,1) == -11, 43);
+    CHECK(DO(16,pair[0],0x5421,1) == -14, 84);
+    CHECK(DO(16,pair[0],0x5421,pages+4094) == -14, 85);
+    CHECK(DO(72,pair[0],3,0) == 04000, 86); // Failed copyin cannot change flags.
+    CHECK(DO(16,pair[0],0x5422,buffer) == -25, 87);
     CHECK(DO(11,pages,8192,0) == 0, 44);
     for (word i=0;i<sizeof data;++i) data[i]=i%251;
     for (word i=0;i<61440;i+=4096) CHECK(DO(1,pair[1],data+i,4096) == 4096, 45);
@@ -76,6 +80,13 @@ long pipe_main(word *stack)
     CHECK(DO(72,alias,1,0) == 0, 53);
     CHECK(DO(72,alias,4,1) == 0 && DO(72,pair[1],3,0) == 1, 54);
     CHECK(DO(72,pair[1],4,04001) == 0 && DO(72,alias,3,0) == 04001, 55);
+    int nonblock = 0;
+    CHECK(DO(72,alias,4,06001) == 0, 88);
+    CHECK(DO(16,alias,0x5421,&nonblock) == 0, 89);
+    CHECK(DO(72,pair[1],3,0) == 02001, 90); // Preserve APPEND and access mode.
+    nonblock = -7; // Any nonzero int enables O_NONBLOCK.
+    CHECK(DO(16,pair[1],0x5421,&nonblock) == 0, 91);
+    CHECK(DO(72,alias,3,0) == 06001 && DO(72,pair[1],1,0) == 1, 92);
     CHECK(DO(3,pair[1],0,0) == 0, 56);
     CHECK(DO(0,pair[0],buffer,1) == -11, 57);
     CHECK(DO(1,alias,"bye",3) == 3, 58);

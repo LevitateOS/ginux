@@ -151,16 +151,33 @@ impl LaunchChannels {
             }
             5 => Self::stat(pid, r.rsi, false, entry.pipe),
             8 | 17 | 18 => Err(-29),
+            16 if r.rsi == 0x5421 => {
+                // FIONBIO changes the shared open-file status, not this
+                // public descriptor's CLOEXEC bit. Copy the complete int
+                // before changing anything; a partial read is EFAULT.
+                let mut value = [0u8; 4];
+                match copy_memory(pid, r.rdx, &mut value, false) {
+                    Ok(4) => {
+                        let flags = self.flags(entry);
+                        self.set_flags(
+                            entry,
+                            if i32::from_ne_bytes(value) == 0 {
+                                flags & !NONBLOCK
+                            } else {
+                                flags | NONBLOCK
+                            },
+                        );
+                        Ok(0)
+                    }
+                    _ => Err(-14),
+                }
+            }
             16 => Err(-25),
             72 => match r.rsi {
                 3 => Ok(self.flags(entry) as i64),
                 4 if r.rdx & !((NONBLOCK | APPEND | 3) as u64) == 0 => {
                     let flags = (r.rdx as u32 & (NONBLOCK | APPEND)) | u32::from(entry.write);
-                    if entry.write {
-                        self.pipes[entry.pipe].write_flags = flags;
-                    } else {
-                        self.pipes[entry.pipe].read_flags = flags;
-                    }
+                    self.set_flags(entry, flags);
                     Ok(0)
                 }
                 1032 => Ok(CAPACITY as i64),
@@ -226,6 +243,14 @@ impl LaunchChannels {
             self.pipes[entry.pipe].write_flags
         } else {
             self.pipes[entry.pipe].read_flags
+        }
+    }
+
+    fn set_flags(&mut self, entry: PipeFd, flags: u32) {
+        if entry.write {
+            self.pipes[entry.pipe].write_flags = flags;
+        } else {
+            self.pipes[entry.pipe].read_flags = flags;
         }
     }
 
