@@ -35,15 +35,26 @@
 //! descriptor. Created files take the VFS-default mode; creation-mode/umask
 //! fidelity belongs to G08a with the rest of permission handling.
 //!
+//! G07a adds the data path through the same descriptor table:
+//! [`read_fd`]/[`write_fd`] move bytes at the descriptor offset with
+//! short-I/O and bounded-transfer semantics, and [`lseek_fd`] repositions
+//! the offset (`SEEK_SET`/`SEEK_CUR`/`SEEK_END`). `O_APPEND` opens position
+//! every write at end-of-file. Failures map to faithful errnos through
+//! [`IoError::errno`].
+//!
 //! Everything here is pure `core` logic over caller buffers: no host calls,
 //! so a denial has zero host effect by construction. The supervision loop
-//! cannot feed tracee path bytes or persist per-task cwd/fd tables through
-//! the `claim(syscall, rdi, rsi, rdx) -> Option<i64>` channel yet (that
-//! needs tracee-memory read/write plumbing in the supervisor, owned by a
-//! later task), so `claim` keeps returning the explicit `-EPERM` denial for
-//! every claimed entry, including the newly claimed
-//! `open`/`openat`/`close`. [`ResolveError::errno`] and [`OpenError::errno`]
-//! already map each failure to its faithful errno for that wiring.
+//! cannot feed tracee path/memory bytes or persist per-task cwd/fd tables
+//! through the `claim(syscall, rdi, rsi, rdx) -> Option<i64>` channel yet
+//! (that needs tracee-memory read/write plumbing in the supervisor, owned
+//! by a later task), so `claim` keeps returning the explicit `-EPERM`
+//! denial for every claimed domain-fd entry, including the newly claimed
+//! `read`/`write`/`lseek`. Standard I/O (`read` on fd 0–2, `write` on fd
+//! 1–2) keeps falling through to the existing balanced-contract mediation
+//! byte-identically — only the domain descriptor range (fd ≥ 3, the VFS
+//! numbering base) is closed against host mediation. [`ResolveError::errno`],
+//! [`OpenError::errno`], and [`IoError::errno`] already map each failure to
+//! its faithful errno for that wiring.
 
 /// `mkdir(2)`: domain directory creation. Claimed for G06.
 pub const SYS_MKDIR: u64 = 83;
@@ -86,6 +97,21 @@ pub const SYS_OPENAT: u64 = 257;
 /// `close`, closing an unrelated supervisor descriptor. Denied until the
 /// supervisor can route the number to [`close_fd`].
 pub const SYS_CLOSE: u64 = 3;
+/// `read(2)`: move bytes from a domain descriptor at its offset. Claimed
+/// for G07a: the balanced contract would mediate a domain fd to the host,
+/// reading unrelated supervisor bytes. The register channel carries no
+/// tracee buffer, so the domain-fd entry is denied until the supervisor
+/// can hand the bytes to [`read_fd`]; fds below the domain numbering base
+/// (stdio) fall through byte-identically.
+pub const SYS_READ: u64 = 0;
+/// `write(2)`: move bytes to a domain descriptor at its offset. Claimed
+/// for G07a for the same reason; console writes (fd 1–2) fall through to
+/// the existing console mediation byte-identically (see [`SYS_READ`]).
+pub const SYS_WRITE: u64 = 1;
+/// `lseek(2)`: reposition a domain descriptor offset. Claimed for G07a:
+/// the balanced contract would mediate the number to the host. Denied on
+/// domain fds until the supervisor can route it to [`lseek_fd`].
+pub const SYS_LSEEK: u64 = 8;
 
 /// `AT_FDCWD`: a relative path resolves against the domain working
 /// directory. Matches the Linux `AT_FDCWD` value (`-100`).
@@ -144,9 +170,9 @@ pub const ENAMETOOLONG: i64 = 36;
 pub const ELOOP: i64 = 40;
 
 /// Native open flag values (Linux x86-64). Only the access mode plus
-/// `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_CLOEXEC` are supported by [`open_at`];
-/// anything else (notably `O_APPEND`, whose end-of-file offset semantics
-/// belong to G07a data I/O) fails with [`OpenError::Invalid`].
+/// `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND`/`O_CLOEXEC` are supported by
+/// [`open_at`]; anything else fails with [`OpenError::Invalid`].
+/// `O_APPEND` positions every [`write_fd`] at end-of-file (G07a).
 ///
 /// Consumed by [`open_at`], which the supervisor wiring calls once it
 /// lands — hence the scoped allows.
@@ -169,8 +195,22 @@ pub const O_APPEND: u32 = 0o2000;
 #[allow(dead_code)]
 pub const O_CLOEXEC: u32 = 0o2000000;
 
+/// Native `lseek` positioning bases (Linux x86-64), matching the
+/// `ginux-vfs` `SEEK_*` values consumed by [`lseek_fd`].
+#[allow(dead_code)]
+pub const SEEK_SET: u32 = 0;
+#[allow(dead_code)]
+pub const SEEK_CUR: u32 = 1;
+#[allow(dead_code)]
+pub const SEEK_END: u32 = 2;
+
+/// First domain descriptor number: the VFS allocates from 3, so fds below
+/// it are process stdio, never domain objects.
+pub const DOMAIN_FD_BASE: u64 = 3;
+
 /// Lane membership by syscall number: directory creation, enumeration,
-/// working-directory operations, and (G07) descriptor open/close.
+/// working-directory operations, descriptor open/close (G07), and
+/// descriptor data I/O (G07a).
 pub fn claims(syscall: u64) -> bool {
     matches!(
         syscall,
@@ -183,6 +223,9 @@ pub fn claims(syscall: u64) -> bool {
             | SYS_OPEN
             | SYS_OPENAT
             | SYS_CLOSE
+            | SYS_READ
+            | SYS_WRITE
+            | SYS_LSEEK
     )
 }
 
@@ -190,18 +233,26 @@ pub fn claims(syscall: u64) -> bool {
 /// the entry explicitly: confinement first — escape is denial, never host
 /// effect. `None` falls through to the shared balanced-contract decision.
 ///
-/// G07 keeps every claimed entry denied here, including `open`/`openat`/
-/// `close`: this channel sees only registers, while emulation needs the
-/// tracee path bytes plus per-task cwd/fd-table state (see [`open_at`]).
-/// Claiming still matters — it stops the balanced contract from mediating
-/// these entries to the host — and every other syscall behaves
+/// G07 keeps every claimed open-path entry denied here, including
+/// `open`/`openat`/`close`: this channel sees only registers, while
+/// emulation needs the tracee path bytes plus per-task cwd/fd-table state
+/// (see [`open_at`]). G07a keeps the data path denied on the same terms —
+/// emulation needs the tracee data buffers plus the per-task fd table
+/// (see [`read_fd`]/[`write_fd`]/[`lseek_fd`]) — except below the domain
+/// numbering base: stdio (`read` on fd 0–2, `write`/`lseek` on fd 0–2)
+/// falls through to the existing balanced-contract mediation
+/// byte-identically, so console I/O keeps working. Claiming still
+/// matters — it stops the balanced contract from mediating domain
+/// descriptor numbers to the host — and every other syscall behaves
 /// byte-identically to before.
 pub fn claim(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> Option<i64> {
-    let _ = (rdi, rsi, rdx);
-    if claims(syscall) {
-        Some(-EPERM)
-    } else {
-        None
+    let _ = (rsi, rdx);
+    if !claims(syscall) {
+        return None;
+    }
+    match syscall {
+        SYS_READ | SYS_WRITE | SYS_LSEEK if rdi < DOMAIN_FD_BASE => None,
+        _ => Some(-EPERM),
     }
 }
 
@@ -787,9 +838,10 @@ impl<'v, 'i, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FD
 ///   copies the file into the overlay first, so neither denied nor
 ///   permitted writes can mutate the base.
 /// * Flags outside the access mode plus
-///   `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_CLOEXEC` fail with
+///   `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND`/`O_CLOEXEC` fail with
 ///   [`OpenError::Invalid`]; `O_TRUNC` without write access is ignored,
 ///   matching Linux, and can only ever truncate the overlay copy.
+///   `O_APPEND` positions every [`write_fd`] at end-of-file.
 ///
 /// Returns the allocated domain descriptor number (VFS numbering from 3).
 /// Pure `core` logic: the supervisor calls this once tracee path bytes and
@@ -809,7 +861,7 @@ pub fn open_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const 
     if accmode != O_RDONLY && accmode != O_WRONLY && accmode != O_RDWR {
         return Err(OpenError::Invalid);
     }
-    if flags & !(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC) != 0 {
+    if flags & !(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_CLOEXEC) != 0 {
         return Err(OpenError::Invalid);
     }
     let vfs_flags = open_vfs_flags(accmode, flags);
@@ -916,10 +968,54 @@ fn open_vfs_flags(accmode: u32, flags: u32) -> u32 {
     if flags & O_TRUNC != 0 {
         vfs_flags |= ginux_vfs::O_TRUNC;
     }
+    if flags & O_APPEND != 0 {
+        vfs_flags |= ginux_vfs::O_APPEND;
+    }
     if flags & O_CLOEXEC != 0 {
         vfs_flags |= ginux_vfs::O_CLOEXEC;
     }
     vfs_flags
+}
+
+/// Why a [`read_fd`]/[`write_fd`]/[`lseek_fd`] emulation failed.
+/// Returned to the supervisor wiring once tracee-memory/fd-table plumbing
+/// lands; allowed until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoError {
+    /// Unknown or closed descriptor number. Also covers reads on a
+    /// write-only descriptor and writes on a read-only one: the VFS
+    /// reports those direction violations as permission refusals, while
+    /// Linux reports `-EBADF`.
+    BadDescriptor,
+    /// The descriptor names a directory (unreachable through [`open_at`],
+    /// which refuses directories, but mapped faithfully regardless).
+    IsDirectory,
+    /// A write that could store nothing past overlay capacity.
+    TooLarge,
+    /// No free overlay slot for the writable copy.
+    NoSpace,
+    /// Unknown `lseek` base or a resulting negative offset.
+    Invalid,
+    /// Corrupt image index, a backing-store failure, or a lookup that a
+    /// live descriptor should have pinned at open.
+    Io,
+}
+
+impl IoError {
+    /// Faithful negative errno for supervisor wiring. Allowed until that
+    /// wiring lands.
+    #[allow(dead_code)]
+    pub const fn errno(self) -> i64 {
+        match self {
+            IoError::BadDescriptor => -EBADF,
+            IoError::IsDirectory => -EISDIR,
+            IoError::TooLarge => -EFBIG,
+            IoError::NoSpace => -ENOSPC,
+            IoError::Invalid => -EINVAL,
+            IoError::Io => -EIO,
+        }
+    }
 }
 
 /// Map a VFS failure onto the faithful [`OpenError`]. `NotFound` and
@@ -938,7 +1034,84 @@ fn map_vfs_error(error: VfsError) -> OpenError {
         VfsError::FileTooLarge => OpenError::TooLarge,
         VfsError::AlreadyExists => OpenError::Exists,
         VfsError::InvalidPath => OpenError::Invalid,
+        VfsError::InvalidOffset => OpenError::Invalid,
         VfsError::SymlinkLoop => OpenError::Resolve(ResolveError::SymlinkLoop),
         VfsError::InvalidIndex | VfsError::Io => OpenError::Io,
+    }
+}
+
+// ─── G07a: file data I/O and offsets ─────────────────────────────────────
+
+/// Emulate `read(fd, buf, count)` against the domain: copy up to
+/// `out.len()` bytes at the descriptor offset into `out`, advancing the
+/// offset by the count returned. Reads at or past end-of-file return a
+/// short count (`Ok(0)` when nothing remains), matching Linux. Pure `core`
+/// logic: the supervisor calls this once tracee data buffers and the
+/// per-task fd table are plumbed through. Allowed until then.
+#[allow(dead_code)]
+pub fn read_fd<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    fd: i32,
+    out: &mut [u8],
+) -> Result<usize, IoError> {
+    vfs.read(fd, out).map_err(map_io_error)
+}
+
+/// Emulate `write(fd, buf, count)` against the domain: store `input` at
+/// the descriptor offset (`O_APPEND` descriptors write at end-of-file),
+/// advancing the offset by the count returned. Oversized writes store what
+/// fits and return that short count; only a write that stores nothing
+/// fails. Pure `core` logic, wired like [`read_fd`]. Allowed until then.
+#[allow(dead_code)]
+pub fn write_fd<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    fd: i32,
+    input: &[u8],
+) -> Result<usize, IoError> {
+    vfs.write(fd, input).map_err(map_io_error)
+}
+
+/// Emulate `lseek(fd, offset, whence)` against the domain, returning the
+/// new offset. `whence` is one of [`SEEK_SET`]/[`SEEK_CUR`]/[`SEEK_END`];
+/// anything else fails with [`IoError::Invalid`], as does a negative
+/// result. Offsets past end-of-file are allowed: reads there return
+/// short and later writes zero-fill the gap. Pure `core` logic, wired
+/// like [`read_fd`]. Allowed until then.
+#[allow(dead_code)]
+pub fn lseek_fd<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    fd: i32,
+    offset: i64,
+    whence: u32,
+) -> Result<u64, IoError> {
+    let base = match whence {
+        SEEK_SET => ginux_vfs::SEEK_SET,
+        SEEK_CUR => ginux_vfs::SEEK_CUR,
+        SEEK_END => ginux_vfs::SEEK_END,
+        _ => return Err(IoError::Invalid),
+    };
+    vfs.seek(fd, offset, base).map_err(map_io_error)
+}
+
+/// Map a VFS failure onto the faithful [`IoError`]. Direction violations
+/// surface as [`VfsError::PermissionDenied`] but read as `-EBADF`, matching
+/// Linux `read` on a write-only descriptor (and the `write` converse).
+/// `NotFound`/`NotDirectory`/`AlreadyExists`/`SymlinkLoop` cannot escape a
+/// live descriptor — the open path pinned the object — so they read as
+/// backing-store failures. Allowed with the G07a emulations.
+#[allow(dead_code)]
+fn map_io_error(error: VfsError) -> IoError {
+    match error {
+        VfsError::InvalidDescriptor | VfsError::PermissionDenied => IoError::BadDescriptor,
+        VfsError::IsDirectory => IoError::IsDirectory,
+        VfsError::FileTooLarge => IoError::TooLarge,
+        VfsError::OverlayLimit | VfsError::DescriptorLimit => IoError::NoSpace,
+        VfsError::InvalidPath | VfsError::InvalidOffset => IoError::Invalid,
+        VfsError::NotFound
+        | VfsError::NotDirectory
+        | VfsError::AlreadyExists
+        | VfsError::SymlinkLoop
+        | VfsError::InvalidIndex
+        | VfsError::Io => IoError::Io,
     }
 }

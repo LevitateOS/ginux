@@ -11,6 +11,14 @@ pub const O_WRITE: u32 = 2;
 pub const O_CREATE: u32 = 4;
 pub const O_TRUNC: u32 = 8;
 pub const O_CLOEXEC: u32 = 16;
+/// Position the offset at end-of-file before every write (G07a data I/O).
+pub const O_APPEND: u32 = 32;
+
+/// `lseek` positioning bases (G07a data I/O; Linux `SEEK_SET`/`SEEK_CUR`/
+/// `SEEK_END` values). Unknown bases fail [`VfsError::InvalidOffset`].
+pub const SEEK_SET: u32 = 0;
+pub const SEEK_CUR: u32 = 1;
+pub const SEEK_END: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -34,6 +42,8 @@ pub enum VfsError {
     OverlayLimit,
     FileTooLarge,
     AlreadyExists,
+    /// Bad `lseek` base or a resulting negative file offset (G07a).
+    InvalidOffset,
     Io,
 }
 
@@ -349,6 +359,8 @@ struct Descriptor {
     readable: bool,
     writable: bool,
     close_on_exec: bool,
+    /// Every write starts at end-of-file (G07a `O_APPEND`).
+    append: bool,
 }
 
 impl Descriptor {
@@ -361,6 +373,7 @@ impl Descriptor {
             readable: false,
             writable: false,
             close_on_exec: false,
+            append: false,
         }
     }
 }
@@ -451,6 +464,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             readable,
             writable,
             close_on_exec: flags & O_CLOEXEC != 0,
+            append: flags & O_APPEND != 0,
         };
         Ok(slot as i32 + 3)
     }
@@ -473,21 +487,34 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                 .saturating_sub(state.offset)
         };
         let length = available.min(output.len());
-        if state.overlay {
-            output[..length].copy_from_slice(
-                &self.overlay[state.object].data[state.offset..state.offset + length],
-            );
-        } else {
-            let entry = self.index.entry(state.object)?;
-            self.reader.read_at(
-                entry.data_offset + state.offset as u64,
-                &mut output[..length],
-            )?;
+        // A zero-length read transfers nothing and reports success without
+        // touching the backend, matching `pread` with count 0 at any
+        // offset (a strict backend must not fail an empty transfer).
+        if length > 0 {
+            if state.overlay {
+                output[..length].copy_from_slice(
+                    &self.overlay[state.object].data[state.offset..state.offset + length],
+                );
+            } else {
+                let entry = self.index.entry(state.object)?;
+                self.reader.read_at(
+                    entry.data_offset + state.offset as u64,
+                    &mut output[..length],
+                )?;
+            }
         }
         self.descriptors[slot].offset += length;
         Ok(length)
     }
 
+    /// Write `input` at the descriptor offset, returning the bytes stored.
+    /// `O_APPEND` descriptors start at end-of-file. Transfers are bounded
+    /// by overlay capacity: an oversized write stores what fits and returns
+    /// that short count instead of failing, so callers observe a bounded
+    /// transfer exactly like a short `write(2)` on a nearly full file. Only
+    /// a write that can store nothing fails with [`VfsError::FileTooLarge`].
+    /// A gap between the previous end and an offset past it reads back as
+    /// zeros. Empty input stores nothing and succeeds.
     pub fn write(&mut self, descriptor: i32, input: &[u8]) -> Result<usize, VfsError> {
         let slot = self.descriptor(descriptor)?;
         let state = self.descriptors[slot];
@@ -497,17 +524,64 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         if self.overlay[state.object].state == 3 {
             return Err(VfsError::IsDirectory);
         }
-        let end = state
-            .offset
-            .checked_add(input.len())
-            .ok_or(VfsError::FileTooLarge)?;
-        if end > FILE_SIZE {
+        let mut offset = state.offset;
+        if state.append {
+            offset = self.overlay[state.object].len;
+        }
+        if input.is_empty() {
+            self.descriptors[slot].offset = offset;
+            return Ok(0);
+        }
+        if offset > FILE_SIZE {
             return Err(VfsError::FileTooLarge);
         }
-        self.overlay[state.object].data[state.offset..end].copy_from_slice(input);
-        self.overlay[state.object].len = self.overlay[state.object].len.max(end);
+        let fitting = (FILE_SIZE - offset).min(input.len());
+        if fitting == 0 {
+            return Err(VfsError::FileTooLarge);
+        }
+        let previous = self.overlay[state.object].len;
+        if offset > previous {
+            self.overlay[state.object].data[previous..offset].fill(0);
+        }
+        let end = offset + fitting;
+        self.overlay[state.object].data[offset..end].copy_from_slice(&input[..fitting]);
+        self.overlay[state.object].len = previous.max(end);
         self.descriptors[slot].offset = end;
-        Ok(input.len())
+        Ok(fitting)
+    }
+
+    /// Reposition a descriptor offset (`SEEK_SET`/`SEEK_CUR`/`SEEK_END`),
+    /// returning the new offset. Offsets past end-of-file are allowed; reads
+    /// there return short and later writes zero-fill the gap. Unknown bases
+    /// and negative results fail with [`VfsError::InvalidOffset`].
+    pub fn seek(&mut self, descriptor: i32, offset: i64, whence: u32) -> Result<u64, VfsError> {
+        let slot = self.descriptor(descriptor)?;
+        let state = self.descriptors[slot];
+        if self.overlay[state.object].state == 3 {
+            return Err(VfsError::IsDirectory);
+        }
+        let size: u64 = if state.overlay {
+            self.overlay[state.object].len as u64
+        } else {
+            let entry = self.index.entry(state.object)?;
+            entry.size
+        };
+        let current = i64::try_from(state.offset).map_err(|_| VfsError::InvalidOffset)?;
+        let end = i64::try_from(size).map_err(|_| VfsError::FileTooLarge)?;
+        let base = match whence {
+            SEEK_SET => 0,
+            SEEK_CUR => current,
+            SEEK_END => end,
+            _ => return Err(VfsError::InvalidOffset),
+        };
+        let position = base
+            .checked_add(offset)
+            .ok_or(VfsError::InvalidOffset)?;
+        if position < 0 {
+            return Err(VfsError::InvalidOffset);
+        }
+        self.descriptors[slot].offset = position as usize;
+        Ok(position as u64)
     }
 
     pub fn duplicate(&mut self, descriptor: i32, close_on_exec: bool) -> Result<i32, VfsError> {
