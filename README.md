@@ -213,9 +213,8 @@ arguments of 128 bytes each and eight `NAME=value` environment entries of
 Workload stdout stays separate from supervisor diagnostics on stderr. Only
 stdin, stdout, and stderr are inherited by the workload. The launcher returns
 the workload exit code, or `128 + signal` for signal termination. Startup
-failure returns 2; supervision or result-writing failure returns 1. Native
-fork, clone, and subsequent exec are unsupported; fork returns `ENOSYS` until
-child supervision is implemented. Non-x86-64 syscall ABIs and job-control
+failure returns 2; supervision or result-writing failure returns 1. Subsequent
+exec remains unsupported. Non-x86-64 syscall ABIs and job-control
 group stops fail explicitly. Audit output is capped at 64 KiB plus a truncation
 notice. This path does not implement resource quotas from the domain metadata.
 
@@ -251,22 +250,21 @@ image/overlay filesystem. IO is bounded to 4096 bytes per call. Capacity is
 32 objects (including seeded directories), 65536 bytes per file and 64
 independently opened file handles. Aliases use the common descriptor table. Exhaustion returns `ENOSPC`, `EFBIG`, or `EMFILE` as appropriate.
 
-Configured launch uses one table of up to 256 public descriptors for bootstrap
+Configured launch gives each process a table of up to 256 public descriptors for bootstrap
 stdio, immutable-image files, writable files, devices and pipes. Allocation uses
 the lowest free number; native opens reserve a slot before running. Backend
 handles stay private, including when the kernel reuses an underlying fd number.
 Dup/dup2/dup3 and fcntl duplication share an open description across owners;
-close-on-exec flags belong to each public descriptor. The backend closes only
-after its last alias. Syscall arguments are translated for native IO/metadata/
+close-on-exec flags belong to each public descriptor. Owned backends close only
+after their last alias across all processes. Syscall arguments are translated for native IO/metadata/
 mmap and restored at exit. Native locks, leases and signal ownership are denied.
 
 Bootstrap constrains the real descriptor soft/hard limits to 256 while keeping
 lower operator limits. Allocation respects that lower soft limit; runtime
 NOFILE-limit changes are currently denied. Reported limits are not inflated to
 accommodate backend handle ranges. Libc spawn preflight now accepts the public
-numbers; child process creation is still denied until supervision is implemented.
-Relative directory-fd access, poll on remapped stdio or non-bootstrap descriptors,
-process inheritance and exec-time close-on-exec remain unfinished.
+numbers. Relative directory-fd access, poll on remapped stdio or non-bootstrap
+descriptors and exec-time close-on-exec remain unfinished.
 Guest-memory copies respect page protections, including partial read copyout.
 No writable host descriptor is exposed. Data disappears at domain teardown;
 there is no retention, export, storage generation or configured storage quota.
@@ -294,12 +292,30 @@ Alias status flags and endpoint lifetimes are shared; close-on-exec flags are
 per descriptor. No native pipe or host descriptor is given to the workload.
 
 Nonblocking empty/full operations return `EAGAIN`. Blocking operations stay
-stopped at entry until progress is possible. The current single-task launch
-loop cannot run a peer or implement signal-driven restart; a parked self-pipe
-waits indefinitely unless the workload is killed. SIGKILL termination and reaping
-are tested. Pipe polling, multi-task wakeup, inherited descriptor tables, and
-actual exec-time close-on-exec still require process integration. Pipe allocation/
-byte-flow evidence alone does not prove ordinary child commands work.
+stopped at entry until a peer changes readiness or exits. No native pipe fd is
+passed through. Byte-flow checks alone do not prove ordinary child commands work.
+
+Configured launch supervises up to 16 processes through the existing process
+owner. Fork and vfork are supported, as are clone flags `SIGCHLD` and
+`CLONE_VM | CLONE_VFORK | SIGCHLD`. Other clone shapes and clone3 return `ENOSYS`;
+threads, shared descriptor tables and namespace creation are unsupported. Each
+child is registered at its ptrace birth stop before it can execute. Public
+process IDs start at 1. Fork returns the virtual child ID; getpid/gettid/getppid/
+getpgrp and SIGCHLD sender identities use domain IDs. Native descriptor tables
+inherit the kernel's shared file offsets; owned files/devices/pipes share backend
+references until the last process closes or exits.
+
+Wait4 supports a positive virtual child ID or -1, with options 0 or WNOHANG and
+no rusage buffer. An invalid status pointer does not consume the child. Orphans
+are adopted by the virtual init, while the supervisor acts as the native
+subreaper. Kill supports positive domain IDs with signals 0 or SIGKILL; other
+signal forms are rejected. SIGCHLD auto-reap dispositions are rejected; bootstrap
+resets an inherited ignored SIGCHLD to its default disposition. Job control,
+interruption/restart of parked calls and SIGCHLD notification for adopted
+children remain incomplete. Root exit or supervision failure kills and reaps all remaining
+descendants and releases owned descriptors before reporting completion.
+Exec and exec-time close-on-exec remain unsupported, so ordinary command helpers
+still fail at exec after supervised child setup. This is not compiler support.
 
 When requested, the result file is reserved exclusively before launch, with
 mode 0600 and a maximum path length of 512 bytes. Existing files are never
@@ -329,4 +345,6 @@ make build-launch-pipe-fixture
 sudo make test-launch-pipes
 make build-launch-fd-fixture
 sudo make test-launch-fds
+make build-launch-task-fixture
+sudo make test-launch-tasks
 ```

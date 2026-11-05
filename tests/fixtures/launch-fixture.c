@@ -53,7 +53,18 @@ long launch_fixture_main(word *stack)
     }
     case 't': __asm__ volatile("int3"); return 93;
     case 's': __asm__ volatile("xor %%rax, %%rax; mov (%%rax), %%rax" ::: "rax", "memory"); return 94;
-    case 'f': return call3(57, 0, 0, 0) == -38 ? 0 : 95;
+    case 'f': {
+        long child = call3(57, 0, 0, 0);
+        if (child == 0) return 31;
+        if (child != 2) return 95;
+        int status = 0;
+        register word r10 __asm__("r10") = 0;
+        long reaped;
+        __asm__ volatile("syscall" : "=a"(reaped)
+            : "a"(61), "D"(child), "S"(&status), "d"(0), "r"(r10)
+            : "rcx", "r11", "memory");
+        return reaped == child && status == (31 << 8) ? 0 : 113;
+    }
     case 'p': {
         struct { int fd; short events, revents; } fds[3] = {
             {0, 0, -1}, {1, 4, -1}, {-1, 0, -1}

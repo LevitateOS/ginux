@@ -116,12 +116,10 @@ pub fn decide_objects(
 pub fn decide_launch(
     pid: usize,
     registers: &mut UserRegs,
-    filesystem: &mut crate::fs_hooks::LaunchFs,
-    devices: &mut crate::device_hooks::LaunchDevices,
-    channels: &mut crate::channel_hooks::LaunchChannels,
     descriptors: &mut crate::descriptors::DescriptorTable,
+    backends: &mut crate::descriptors::Backends,
 ) -> NativeDecision {
-    descriptors.enter(pid, registers, filesystem, devices, channels)
+    descriptors.enter(pid, registers, backends)
 }
 
 /// Dispatch one process-supervision entry through the process-lane hook.

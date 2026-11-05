@@ -31,6 +31,70 @@ enum Pending {
     Close { result: Option<i64> },
 }
 
+/// Owned backend handles are domain-wide; native kernel numbers are per task.
+pub struct ObjectReferences {
+    counts: [u16; 144],
+}
+impl ObjectReferences {
+    pub const fn new() -> Self {
+        Self { counts: [0; 144] }
+    }
+    pub fn active(&self) -> usize {
+        self.counts.iter().filter(|n| **n != 0).count()
+    }
+    fn index(handle: u32) -> usize {
+        if (0x4000_0000..0x4000_0040).contains(&handle) {
+            80 + (handle - 0x4000_0000) as usize
+        } else if (0x2000_0000..0x2000_0010).contains(&handle) {
+            64 + (handle - 0x2000_0000) as usize
+        } else {
+            assert!((1048576..1048640).contains(&handle));
+            (handle - 1048576) as usize
+        }
+    }
+    fn retain(&mut self, handle: u32) {
+        let i = Self::index(handle);
+        self.counts[i] = self.counts[i]
+            .checked_add(1)
+            .expect("owned descriptor reference overflow");
+    }
+    fn release(&mut self, handle: u32) -> bool {
+        let i = Self::index(handle);
+        assert!(self.counts[i] > 0);
+        self.counts[i] -= 1;
+        self.counts[i] == 0
+    }
+}
+
+pub struct Backends<'a> {
+    pub filesystem: &'a mut LaunchFs,
+    pub devices: &'a mut LaunchDevices,
+    pub channels: &'a mut LaunchChannels,
+    pub refs: &'a mut ObjectReferences,
+}
+impl Backends<'_> {
+    fn claim(&mut self, pid: usize, r: &UserRegs) -> NativeDecision {
+        decide_objects(pid, r, self.filesystem, self.devices, self.channels)
+    }
+    fn release(&mut self, handle: u32) -> Result<(), &'static [u8]> {
+        if !self.refs.release(handle) {
+            return Ok(());
+        }
+        // Owned close does not use task memory or a native descriptor.
+        let mut r = empty_regs();
+        r.orig_rax = 3;
+        r.rdi = handle as u64;
+        match self.claim(0, &r) {
+            NativeDecision::Hooked { result: 0, .. } => Ok(()),
+            _ => Err(b"owned backend release failed"),
+        }
+    }
+}
+
+fn empty_regs() -> UserRegs {
+    unsafe { core::mem::zeroed() }
+}
+
 pub struct DescriptorTable {
     entries: [Option<Descriptor>; LIMIT],
     capacity: usize,
@@ -63,6 +127,38 @@ impl DescriptorTable {
             }
         }
         Ok(table)
+    }
+
+    pub fn fork_copy(&self, refs: &mut ObjectReferences) -> Result<Self, &'static [u8]> {
+        if self.pending.is_some() || self.saved_args.is_some() {
+            return Err(b"cannot inherit unfinished descriptor syscall");
+        }
+        for entry in self.entries.iter().flatten() {
+            if let Handle::Owned(handle) = entry.handle {
+                refs.retain(handle);
+            }
+        }
+        Ok(Self {
+            entries: self.entries,
+            capacity: self.capacity,
+            pending: None,
+            saved_args: None,
+        })
+    }
+
+    pub fn release_exited(&mut self, backends: &mut Backends) -> Result<(), &'static [u8]> {
+        for entry in &mut self.entries {
+            if let Some(Descriptor {
+                handle: Handle::Owned(handle),
+                ..
+            }) = entry.take()
+            {
+                backends.release(handle)?;
+            }
+        }
+        self.pending = None;
+        self.saved_args = None;
+        Ok(())
     }
 
     fn get(&self, fd: u64) -> Result<Descriptor, i64> {
@@ -152,9 +248,7 @@ impl DescriptorTable {
         &mut self,
         pid: usize,
         r: &mut UserRegs,
-        fs: &mut LaunchFs,
-        devices: &mut LaunchDevices,
-        channels: &mut LaunchChannels,
+        backends: &mut Backends,
     ) -> NativeDecision {
         // Resource changes cannot silently invalidate the public allocator.
         if r.orig_rax == 302 && r.rsi == 7 && r.rdx != 0 {
@@ -163,27 +257,27 @@ impl DescriptorTable {
         let result = match r.orig_rax {
             2 | 257 => {
                 self.save(r);
-                self.open(pid, r, fs, devices, channels)
+                self.open(pid, r, backends)
             }
             22 | 293 => {
                 self.save(r);
-                self.pipe(pid, r, channels)
+                self.pipe(pid, r, backends)
             }
             3 => {
                 self.save(r);
                 self.get(r.rdi)
-                    .and_then(|_| self.close(r.rdi as u32 as usize, r, pid, fs, devices, channels))
+                    .and_then(|_| self.close(r.rdi as u32 as usize, r, pid, backends))
             }
             32 | 33 | 292 => {
                 self.save(r);
-                self.dup(pid, r, fs, devices, channels)
+                self.dup(pid, r, backends)
             }
             72 => {
                 self.save(r);
                 match self.get(r.rdi) {
                     Err(e) => Err(e),
                     Ok(entry) => match r.rsi {
-                        0 | 1030 => self.dup(pid, r, fs, devices, channels),
+                        0 | 1030 => self.dup(pid, r, backends),
                         1 => Ok(ready(entry.cloexec as i64)),
                         2 if r.rdx & !1 == 0 => {
                             self.entries[r.rdi as u32 as usize]
@@ -193,14 +287,14 @@ impl DescriptorTable {
                             Ok(ready(0))
                         }
                         2 => Err(-22),
-                        _ => self.descriptor(pid, r, entry, fs, devices, channels),
+                        _ => self.descriptor(pid, r, entry, backends),
                     },
                 }
             }
             0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 74 | 75 | 77 | 78 | 91 | 217 => {
                 self.save(r);
                 self.get(r.rdi)
-                    .and_then(|d| self.descriptor(pid, r, d, fs, devices, channels))
+                    .and_then(|d| self.descriptor(pid, r, d, backends))
             }
             9 if r.r10 & 0x20 == 0 => {
                 self.save(r);
@@ -210,7 +304,7 @@ impl DescriptorTable {
                         ..
                     }) => {
                         r.r8 = fd as u64;
-                        Ok(decide_objects(pid, r, fs, devices, channels))
+                        Ok(backends.claim(pid, r))
                     }
                     Ok(_) => Err(-95),
                     Err(e) => Err(e),
@@ -218,10 +312,10 @@ impl DescriptorTable {
             }
             258 | 262 | 263 | 268 | 269 | 332 | 439 => {
                 self.save(r);
-                self.path_descriptor(pid, r, fs, devices, channels)
+                self.path_descriptor(pid, r, backends)
             }
             7 => self.console_poll(pid, r),
-            _ => Ok(decide_objects(pid, r, fs, devices, channels)),
+            _ => Ok(backends.claim(pid, r)),
         };
         result.unwrap_or_else(ready)
     }
@@ -230,9 +324,7 @@ impl DescriptorTable {
         &mut self,
         pid: usize,
         r: &mut UserRegs,
-        fs: &mut LaunchFs,
-        devices: &mut LaunchDevices,
-        channels: &mut LaunchChannels,
+        backends: &mut Backends,
     ) -> Result<NativeDecision, i64> {
         let path = read_path(pid, r.rsi)?;
         if path.as_bytes().first() == Some(&b'/') {
@@ -255,16 +347,14 @@ impl DescriptorTable {
                 });
             }
         }
-        Ok(decide_objects(pid, r, fs, devices, channels))
+        Ok(backends.claim(pid, r))
     }
 
     fn open(
         &mut self,
         pid: usize,
         r: &mut UserRegs,
-        fs: &mut LaunchFs,
-        devices: &mut LaunchDevices,
-        channels: &mut LaunchChannels,
+        backends: &mut Backends,
     ) -> Result<NativeDecision, i64> {
         let flags = if r.orig_rax == 2 { r.rsi } else { r.rdx };
         // Reserve before any create/truncate or native open can occur.
@@ -275,13 +365,14 @@ impl DescriptorTable {
             r.rdx &= !CLOEXEC;
         }
         let decision = if r.orig_rax == 257 {
-            self.path_descriptor(pid, r, fs, devices, channels)
+            self.path_descriptor(pid, r, backends)
         } else {
-            Ok(decide_objects(pid, r, fs, devices, channels))
+            Ok(backends.claim(pid, r))
         };
         match decision {
             Ok(NativeDecision::Hooked { lane, result }) => {
                 if result >= 0 {
+                    backends.refs.retain(result as u32);
                     self.entries[slot].as_mut().unwrap().handle = Handle::Owned(result as u32);
                 } else {
                     self.entries[slot] = None;
@@ -306,7 +397,7 @@ impl DescriptorTable {
         &mut self,
         pid: usize,
         r: &UserRegs,
-        channels: &mut LaunchChannels,
+        backends: &mut Backends,
     ) -> Result<NativeDecision, i64> {
         let flags = if r.orig_rax == 293 { r.rsi } else { 0 };
         if flags & !(CLOEXEC | 0o4000) != 0 {
@@ -320,7 +411,7 @@ impl DescriptorTable {
                 return Err(e);
             }
         };
-        let handles = match channels.allocate(flags & !CLOEXEC) {
+        let handles = match backends.channels.allocate(flags & !CLOEXEC) {
             Ok(handles) => handles,
             Err(e) => {
                 self.entries[first] = None;
@@ -333,12 +424,14 @@ impl DescriptorTable {
         bytes[4..].copy_from_slice(&(second as u32).to_le_bytes());
         let copied = copy_memory(pid, r.rdi, &mut bytes, true);
         if copied != Ok(8) {
-            channels.release(handles[0]);
-            channels.release(handles[1]);
+            backends.channels.release(handles[0]);
+            backends.channels.release(handles[1]);
             self.entries[first] = None;
             self.entries[second] = None;
             return Err(-14);
         }
+        backends.refs.retain(handles[0]);
+        backends.refs.retain(handles[1]);
         self.entries[first].as_mut().unwrap().handle = Handle::Owned(handles[0]);
         self.entries[second].as_mut().unwrap().handle = Handle::Owned(handles[1]);
         Ok(ready(0))
@@ -349,9 +442,7 @@ impl DescriptorTable {
         pid: usize,
         r: &mut UserRegs,
         entry: Descriptor,
-        fs: &mut LaunchFs,
-        devices: &mut LaunchDevices,
-        channels: &mut LaunchChannels,
+        backends: &mut Backends,
     ) -> Result<NativeDecision, i64> {
         let public_fd = r.rdi as u32;
         match entry.handle {
@@ -379,7 +470,7 @@ impl DescriptorTable {
             Handle::Owned(handle) => r.rdi = handle as u64,
             Handle::Reserved => return Err(-9),
         }
-        Ok(match decide_objects(pid, r, fs, devices, channels) {
+        Ok(match backends.claim(pid, r) {
             NativeDecision::Park { .. } => NativeDecision::Park { fd: public_fd },
             decision => decision,
         })
@@ -390,9 +481,7 @@ impl DescriptorTable {
         slot: usize,
         r: &mut UserRegs,
         pid: usize,
-        fs: &mut LaunchFs,
-        devices: &mut LaunchDevices,
-        channels: &mut LaunchChannels,
+        backends: &mut Backends,
     ) -> Result<NativeDecision, i64> {
         let result = if r.orig_rax == 3 {
             None
@@ -400,7 +489,11 @@ impl DescriptorTable {
             Some(slot as i64)
         };
         let entry = self.entries[slot].take().ok_or(-9)?;
-        if self
+        if let Handle::Owned(handle) = entry.handle {
+            if !backends.refs.release(handle) {
+                return Ok(ready(result.unwrap_or(0)));
+            }
+        } else if self
             .entries
             .iter()
             .flatten()
@@ -419,7 +512,7 @@ impl DescriptorTable {
                 let mut close = *r;
                 close.orig_rax = 3;
                 close.rdi = handle as u64;
-                match decide_objects(pid, &close, fs, devices, channels) {
+                match backends.claim(pid, &close) {
                     NativeDecision::Hooked { result: 0, .. } => Ok(ready(result.unwrap_or(0))),
                     _ => Err(-5),
                 }
@@ -432,9 +525,7 @@ impl DescriptorTable {
         &mut self,
         pid: usize,
         r: &mut UserRegs,
-        fs: &mut LaunchFs,
-        devices: &mut LaunchDevices,
-        channels: &mut LaunchChannels,
+        backends: &mut Backends,
     ) -> Result<NativeDecision, i64> {
         let source = r.rdi as i32;
         let mut entry = self.get(r.rdi)?;
@@ -459,10 +550,13 @@ impl DescriptorTable {
         entry.cloexec = cloexec;
         // Preserve the source in its own slot until target retirement completes.
         let decision = if self.entries[target].is_some() {
-            self.close(target, r, pid, fs, devices, channels)?
+            self.close(target, r, pid, backends)?
         } else {
             ready(target as i64)
         };
+        if let Handle::Owned(handle) = entry.handle {
+            backends.refs.retain(handle);
+        }
         self.entries[target] = Some(entry);
         Ok(decision)
     }

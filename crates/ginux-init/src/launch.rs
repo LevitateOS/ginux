@@ -4,19 +4,13 @@
 //! input-file staging. Workload definitions stay with the entry points in
 //! `main.rs`; `launch` runs the executable and arguments from domain config.
 
-use ginux_core::{balanced_identity_result, balanced_surface, Action, SYS_EXIT, SYS_EXIT_GROUP};
 use ginux_domain::{ConfigError, Domain, DomainConfig, ExecutionBackend, ExecutionProfile};
 
-use crate::dispatch::{
-    balanced_surface_name, decide_launch, native_arguments_allowed, NativeDecision,
-};
 use crate::supervisor::{
-    exit_process, line, ptrace, stopped, syscall0, syscall1, syscall2, syscall3, syscall4,
-    syscall5, wait, write_all, UserRegs, AT_FDCWD, DOMAIN_GID, DOMAIN_UID, O_RDONLY,
-    PR_SET_NO_NEW_PRIVS, PTRACE_GETREGS, PTRACE_O_EXITKILL, PTRACE_O_TRACESYSGOOD,
-    PTRACE_SETOPTIONS, PTRACE_SETREGS, PTRACE_SYSCALL, PTRACE_TRACEME, SYS_CHDIR, SYS_CHROOT,
-    SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC, SYS_OPENAT_HOST, SYS_PRCTL,
-    SYS_PTRACE, SYS_READ_HOST, SYS_SETGID, SYS_SETGROUPS, SYS_SETUID, SYS_WRITE_HOST,
+    exit_process, line, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5, write_all,
+    AT_FDCWD, DOMAIN_GID, DOMAIN_UID, O_RDONLY, PR_SET_NO_NEW_PRIVS, PTRACE_TRACEME, SYS_CHDIR,
+    SYS_CHROOT, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC, SYS_OPENAT_HOST,
+    SYS_PRCTL, SYS_PTRACE, SYS_READ_HOST, SYS_SETGID, SYS_SETGROUPS, SYS_SETUID, SYS_WRITE_HOST,
 };
 
 pub const MAX_ELF_SIZE: usize = 64 * 1024;
@@ -303,7 +297,7 @@ pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *c
     let mut filesystem = crate::fs_hooks::LaunchFs::prepare(&config)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     let mut channels = crate::channel_hooks::LaunchChannels::new();
-    let mut descriptors = crate::descriptors::DescriptorTable::new()
+    let descriptors = crate::descriptors::DescriptorTable::new()
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     print_launch_config(&config);
     let mut domain = Domain::create(config);
@@ -311,6 +305,9 @@ pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *c
         launch_domain_fail(&mut domain, b"invalid launch start transition");
     }
     stage_launch(&config);
+    if unsafe { syscall5(SYS_PRCTL, 36, 1, 0, 0, 0) } < 0 {
+        launch_domain_fail(&mut domain, b"domain subreaper setup failed");
+    }
     let child = unsafe { syscall0(SYS_FORK) };
     if child < 0 {
         launch_domain_fail(&mut domain, b"launch tracee fork failed");
@@ -324,7 +321,7 @@ pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *c
         &mut filesystem,
         &mut devices,
         &mut channels,
-        &mut descriptors,
+        descriptors,
     )
 }
 
@@ -603,7 +600,7 @@ pub fn invalid_arguments() -> ! {
     exit_process(2)
 }
 
-fn audit_write(bytes: &[u8]) {
+pub(crate) fn audit_write(bytes: &[u8]) {
     unsafe {
         if AUDIT_CAPPED {
             return;
@@ -618,12 +615,7 @@ fn audit_write(bytes: &[u8]) {
     write_stderr(bytes);
 }
 
-fn audit_line(message: &[u8]) {
-    audit_write(message);
-    audit_write(b"\n");
-}
-
-fn audit_u64(mut value: u64) {
+pub(crate) fn audit_u64(mut value: u64) {
     let mut buffer = [0u8; 20];
     let mut index = buffer.len();
     if value == 0 {
@@ -638,7 +630,7 @@ fn audit_u64(mut value: u64) {
     audit_write(&buffer[index..]);
 }
 
-fn audit_i64(value: i64) {
+pub(crate) fn audit_i64(value: i64) {
     if value < 0 {
         audit_write(b"-");
         audit_u64(value.unsigned_abs());
@@ -747,7 +739,7 @@ fn write_completion_result(outcome: u8, has_code: bool, code: u64, has_signal: b
     }
 }
 
-fn finish_exited(code: u64) {
+pub(crate) fn finish_exited(code: u64) {
     line_stderr(b"ginux: launch supervisor=attached direct-unsupervised-syscalls=0");
     write_stderr(b"ginux: launch complete workload-exit-code=");
     write_stderr_u64(code);
@@ -756,7 +748,7 @@ fn finish_exited(code: u64) {
     exit_process(code as usize)
 }
 
-fn finish_signaled(signal: u64) {
+pub(crate) fn finish_signaled(signal: u64) {
     line_stderr(b"ginux: launch supervisor=attached direct-unsupervised-syscalls=0");
     write_stderr(b"ginux: launch complete workload-signal=");
     write_stderr_u64(signal);
@@ -780,6 +772,15 @@ fn launch_tracee(root_path: *const u8) -> ! {
         tracee_setup_fail(
             b"ginux: launch bootstrap failed: descriptor cleanup failed\n",
             129,
+        );
+    }
+    // A caller's ignored SIGCHLD must not silently enable native auto-reap
+    // in a domain whose child lifetime is owned by the virtual process table.
+    let default_sigchld = [0u64; 4];
+    if unsafe { syscall4(13, 17, default_sigchld.as_ptr() as usize, 0, 8) } < 0 {
+        tracee_setup_fail(
+            b"ginux: launch bootstrap failed: child signal setup failed\n",
+            131,
         );
     }
     if unsafe { syscall1(SYS_CHROOT, root_path as usize) } < 0 {
@@ -861,257 +862,19 @@ fn supervise_launch(
     filesystem: &mut crate::fs_hooks::LaunchFs,
     devices: &mut crate::device_hooks::LaunchDevices,
     channels: &mut crate::channel_hooks::LaunchChannels,
-    descriptors: &mut crate::descriptors::DescriptorTable,
+    descriptors: crate::descriptors::DescriptorTable,
 ) -> ! {
-    let mut status = 0i32;
-    if wait(pid, &mut status) < 0 {
-        launch_fail(domain, pid, b"launch tracee wait after exec failed");
-    }
-    if launch_exited(status) {
-        launch_early_fail(domain, launch_exit_reason(launch_exit_code(status)));
-    }
-    if !stopped(status) || (status >> 8) & 0xff != 5 {
-        launch_fail(domain, pid, b"launch tracee did not stop after exec");
-    }
-    let options = PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL;
-    if ptrace(PTRACE_SETOPTIONS, pid, 0, options) < 0 || ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0 {
-        launch_fail(domain, pid, b"launch ptrace setup failed");
-    }
-    line_stderr(b"ginux: launch backend=ptrace-native profile=balanced elf-loader=host");
-    line_stderr(b"ginux: launch tracee-uid=1000 tracee-gid=1000 root=host-path-read-only");
-
-    let mut sequence = 0u64;
-    let mut awaiting_exit = false;
-    let mut override_exit = false;
-    let mut override_result = 0i64;
-    loop {
-        status = 0;
-        if wait(pid, &mut status) < 0 {
-            launch_fail(domain, pid, b"launch tracee wait failed");
-        }
-        if stopped(status) {
-            let signal = ((status >> 8) & 0xff) as u8;
-            if signal != (5 | 0x80) {
-                // Group stops cannot be resumed with signal reinjection.
-                // Fail explicitly instead of spinning on SIGSTOP forever.
-                const PTRACE_GETSIGINFO: usize = 0x4202;
-                let mut info = [0u64; 16];
-                if ptrace(PTRACE_GETSIGINFO, pid, 0, info.as_mut_ptr() as usize) < 0 {
-                    launch_fail(domain, pid, b"launch group stops are unsupported");
-                }
-                // Signal-delivery stop, not a syscall trap: forward the
-                // signal and keep supervising so a terminating signal is
-                // reported as outcome=signaled below.
-                audit_write(b"ginux: audit phase=signal-forwarded signal=");
-                audit_u64(signal as u64);
-                audit_write(b"\n");
-                if ptrace(PTRACE_SYSCALL, pid, 0, signal as usize) < 0 {
-                    launch_fail(domain, pid, b"launch signal forward failed");
-                }
-                continue;
-            }
-        } else if launch_exited(status) {
-            let code = launch_exit_code(status) as u64;
-            if domain.task_exited(true).is_err() {
-                launch_fail(domain, pid, b"invalid launch exit transition");
-            }
-            finish_exited(code);
-        } else if launch_signaled(status) {
-            let signal = launch_term_signal(status) as u64;
-            let _ = domain.task_exited(false);
-            finish_signaled(signal);
-        } else {
-            launch_fail(domain, pid, b"launch tracee escaped supervision");
-        }
-        let mut registers = core::mem::MaybeUninit::<UserRegs>::uninit();
-        if ptrace(PTRACE_GETREGS, pid, 0, registers.as_mut_ptr() as usize) < 0 {
-            launch_fail(domain, pid, b"launch register read failed");
-        }
-        let mut registers = unsafe { registers.assume_init() };
-
-        if awaiting_exit {
-            if override_exit {
-                registers.rax = override_result as u64;
-            }
-            let descriptor_change = descriptors
-                .finish(&mut registers)
-                .unwrap_or_else(|reason| launch_fail(domain, pid, reason));
-            if (override_exit || descriptor_change)
-                && ptrace(PTRACE_SETREGS, pid, 0, &registers as *const _ as usize) < 0
-            {
-                launch_fail(domain, pid, b"launch result override failed");
-            }
-            audit_write(b"ginux: audit sequence=");
-            audit_u64(sequence);
-            audit_write(b" phase=exit result=");
-            audit_i64(registers.rax as i64);
-            audit_write(b"\n");
-            awaiting_exit = false;
-            override_exit = false;
-            if ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0 {
-                launch_fail(domain, pid, b"launch resume failed");
-            }
-            continue;
-        }
-
-        // int 0x80 uses a different syscall table even from a 64-bit ELF.
-        // Never classify that ABI using the x86-64 contract's numbers.
-        const PTRACE_GET_SYSCALL_INFO: usize = 0x420e;
-        let mut syscall_info = [0u64; 11];
-        if ptrace(
-            PTRACE_GET_SYSCALL_INFO,
-            pid,
-            core::mem::size_of_val(&syscall_info),
-            syscall_info.as_mut_ptr() as usize,
-        ) < 24
-            || syscall_info[0] as u8 != 1
-            || (syscall_info[0] >> 32) as u32 != 0xc000003e
-        {
-            launch_fail(domain, pid, b"launch requires the x86-64 syscall ABI");
-        }
-        sequence += 1;
-        let syscall = registers.orig_rax;
-        let dispatched = decide_launch(
-            pid,
-            &mut registers,
-            filesystem,
-            devices,
-            channels,
-            descriptors,
-        );
-        let decision = match dispatched {
-            NativeDecision::Park { fd } => {
-                audit_write(b"ginux: park surface=lane-channel fd=");
-                audit_u64(fd as u64);
-                audit_write(b" syscall=");
-                audit_u64(syscall);
-                audit_write(b"\n");
-                // No effects or result yet. The current configured loop has
-                // one task: a self-pipe with no runnable peer remains blocked.
-                // SIGKILL still produces the ordinary terminal wait status.
-                // Multi-task scheduling must retry this entry after peer IO.
-                continue;
-            }
-            NativeDecision::Contract(mut decision) => {
-                // Native process ownership is not implemented on this path.
-                // A host fork would create an unsupervised child.
-                if syscall == ginux_core::SYS_FORK {
-                    decision.action = Action::Deny(38);
-                }
-                decision
-            }
-            NativeDecision::Hooked { lane, result } => {
-                let lane_name: &[u8] = match lane {
-                    crate::dispatch::Lane::Process => b"process",
-                    crate::dispatch::Lane::Filesystem => b"filesystem",
-                    crate::dispatch::Lane::Device => b"device",
-                    crate::dispatch::Lane::Channel => b"channel",
-                    crate::dispatch::Lane::Contract => b"contract",
-                };
-                audit_write(b"ginux: emulate surface=lane-");
-                audit_write(lane_name);
-                audit_write(b" result=");
-                audit_i64(result);
-                audit_write(b"\n");
-                registers.orig_rax = u64::MAX;
-                awaiting_exit = true;
-                override_exit = true;
-                override_result = result;
-                if ptrace(PTRACE_SETREGS, pid, 0, &registers as *const _ as usize) < 0
-                    || ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0
-                {
-                    launch_fail(domain, pid, b"launch lane emulation failed");
-                }
-                continue;
-            }
-        };
-        audit_write(b"ginux: audit sequence=");
-        audit_u64(sequence);
-        audit_write(b" phase=entry syscall=");
-        audit_u64(syscall);
-        audit_write(b" action=");
-        match decision.action {
-            Action::Emulate if balanced_identity_result(syscall).is_some() => {
-                let result = balanced_identity_result(syscall).unwrap_or(0);
-                audit_write(b"emulate surface=virtual-identity result=");
-                audit_i64(result);
-                audit_write(b"\n");
-                registers.orig_rax = u64::MAX;
-                awaiting_exit = true;
-                override_exit = true;
-                override_result = result;
-                if ptrace(PTRACE_SETREGS, pid, 0, &registers as *const _ as usize) < 0
-                    || ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0
-                {
-                    launch_fail(domain, pid, b"launch getpid emulation failed");
-                }
-            }
-            Action::Emulate if syscall == SYS_EXIT || syscall == SYS_EXIT_GROUP => {
-                audit_line(b"emulate result=domain-stop");
-                awaiting_exit = true;
-                if ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0 {
-                    launch_fail(domain, pid, b"launch exit resume failed");
-                }
-            }
-            Action::Mediate if native_arguments_allowed(pid, registers.orig_rax, &registers) => {
-                audit_write(b"mediate surface=");
-                audit_line(balanced_surface_name(balanced_surface(registers.orig_rax)));
-                awaiting_exit = true;
-                if ptrace(PTRACE_SETREGS, pid, 0, &registers as *const _ as usize) < 0
-                    || ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0
-                {
-                    launch_fail(domain, pid, b"launch mediated syscall failed");
-                }
-            }
-            Action::Mediate => {
-                audit_line(b"deny result=-1 reason=invalid-arguments");
-                registers.orig_rax = u64::MAX;
-                awaiting_exit = true;
-                override_exit = true;
-                override_result = -1;
-                if ptrace(PTRACE_SETREGS, pid, 0, &registers as *const _ as usize) < 0
-                    || ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0
-                {
-                    launch_fail(domain, pid, b"launch argument denial failed");
-                }
-            }
-            Action::Deny(errno) => {
-                audit_write(b"deny result=-");
-                audit_u64(errno as u64);
-                audit_write(b"\n");
-                registers.orig_rax = u64::MAX;
-                awaiting_exit = true;
-                override_exit = true;
-                override_result = -(errno as i64);
-                if ptrace(PTRACE_SETREGS, pid, 0, &registers as *const _ as usize) < 0
-                    || ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0
-                {
-                    launch_fail(domain, pid, b"launch syscall denial failed");
-                }
-            }
-            _ => launch_fail(domain, pid, b"invalid launch contract decision"),
-        }
-    }
+    let mut refs = crate::descriptors::ObjectReferences::new();
+    let objects = crate::descriptors::Backends {
+        filesystem,
+        devices,
+        channels,
+        refs: &mut refs,
+    };
+    crate::launch_tasks::supervise(pid, domain, objects, descriptors)
 }
 
-fn launch_exited(status: i32) -> bool {
-    status & 0x7f == 0
-}
-
-fn launch_exit_code(status: i32) -> i32 {
-    (status >> 8) & 0xff
-}
-
-fn launch_signaled(status: i32) -> bool {
-    let low = status & 0x7f;
-    low != 0 && low != 0x7f
-}
-
-fn launch_term_signal(status: i32) -> i32 {
-    status & 0x7f
-}
-
-fn launch_exit_reason(code: i32) -> &'static [u8] {
+pub(crate) fn launch_exit_reason(code: i32) -> &'static [u8] {
     match code {
         120 => b"bootstrap unavailable: chroot failed (host privilege required)",
         121 => b"bootstrap failed: root directory unavailable",
@@ -1124,11 +887,12 @@ fn launch_exit_reason(code: i32) -> &'static [u8] {
         128 => b"configured domain workdir unavailable",
         129 => b"descriptor cleanup failed",
         130 => b"descriptor namespace unavailable",
+        131 => b"child signal setup failed",
         _ => b"tracee exited before supervision",
     }
 }
 
-fn launch_early_fail(domain: &mut Domain, reason: &[u8]) -> ! {
+pub(crate) fn launch_early_fail(domain: &mut Domain, reason: &[u8]) -> ! {
     let _ = domain.task_exited(false);
     launch_startup_fail(reason)
 }
@@ -1138,10 +902,7 @@ fn launch_domain_fail(domain: &mut Domain, reason: &[u8]) -> ! {
     launch_startup_fail(reason)
 }
 
-fn launch_fail(domain: &mut Domain, pid: usize, reason: &[u8]) -> ! {
-    let _ = unsafe { syscall2(crate::supervisor::SYS_KILL, pid, crate::supervisor::SIGKILL) };
-    let mut status = 0;
-    let _ = wait(pid, &mut status);
+pub(crate) fn supervision_error(domain: &mut Domain, reason: &[u8]) -> ! {
     let _ = domain.task_exited(false);
     write_stderr(b"ginux: launch supervision failure: ");
     write_stderr(reason);
@@ -1176,7 +937,7 @@ fn write_stderr(bytes: &[u8]) {
     }
 }
 
-fn line_stderr(message: &[u8]) {
+pub(crate) fn line_stderr(message: &[u8]) {
     write_stderr(message);
     write_stderr(b"\n");
 }

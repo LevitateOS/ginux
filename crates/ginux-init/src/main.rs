@@ -14,6 +14,7 @@ mod device_hooks;
 mod dispatch;
 mod fs_hooks;
 mod launch;
+mod launch_tasks;
 mod process_hooks;
 mod supervisor;
 mod tracee_io;

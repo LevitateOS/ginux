@@ -308,6 +308,26 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
         )
     }
 
+    /// Roll back a supervisor-reserved fork that never became a runnable task.
+    /// The caller must use this only before publishing the child to execution.
+    pub fn cancel_fork(&mut self, parent: TaskId, child: TaskId) -> Result<(), ProcessError> {
+        self.index(parent)?;
+        let index = self.index(child)?;
+        let task = self.tasks[index];
+        if task.parent != parent.pid
+            || task.state != TaskState::Running
+            || task.exec_epoch != 0
+            || self
+                .tasks
+                .iter()
+                .any(|t| t.occupied && t.parent == child.pid)
+        {
+            return Err(ProcessError::InvalidState);
+        }
+        self.tasks[index] = Task::empty();
+        Ok(())
+    }
+
     pub fn clone_thread(&mut self, leader: TaskId) -> Result<TaskId, ProcessError> {
         let leader = self.tasks[self.index(leader)?];
         if leader.state != TaskState::Running {
@@ -350,11 +370,33 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
             return Err(ProcessError::InvalidState);
         }
         self.tasks[index].state = TaskState::Exited(status);
+        if self
+            .tasks
+            .iter()
+            .any(|t| t.occupied && t.id.pid == 1 && t.state == TaskState::Running)
+        {
+            for child in &mut self.tasks {
+                if child.occupied && child.parent == id.pid {
+                    child.parent = 1;
+                }
+            }
+        }
         Ok(())
     }
 
     pub fn wait(
         &mut self,
+        parent: TaskId,
+        selected: Option<u32>,
+    ) -> Result<WaitResult, ProcessError> {
+        let result = self.peek_wait(parent, selected)?;
+        let index = self.index(result.child)?;
+        self.tasks[index] = Task::empty();
+        Ok(result)
+    }
+
+    pub fn peek_wait(
+        &self,
         parent: TaskId,
         selected: Option<u32>,
     ) -> Result<WaitResult, ProcessError> {
@@ -374,7 +416,6 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
             let TaskState::Exited(status) = task.state else {
                 return Err(ProcessError::InvalidState);
             };
-            self.tasks[index] = Task::empty();
             return Ok(WaitResult {
                 child: task.id,
                 status,
@@ -965,6 +1006,37 @@ mod tests {
         let replacement = table.fork(init).unwrap();
         assert_ne!(replacement, child);
         assert!(replacement.pid > child.pid);
+    }
+
+    #[test]
+    fn supervisor_reservation_wait_peek_and_orphan_adoption() {
+        let mut table: ProcessTable<4> = ProcessTable::new();
+        let init = table.create_init(Credentials::unprivileged(0, 0)).unwrap();
+        let reserved = table.fork(init).unwrap();
+        table.cancel_fork(init, reserved).unwrap();
+        assert_eq!(table.active(), 1);
+        assert_eq!(table.view(reserved), Err(ProcessError::InvalidTask));
+        let child = table.fork(init).unwrap();
+        let orphan = table.fork(child).unwrap();
+        assert_eq!(
+            table.cancel_fork(init, child),
+            Err(ProcessError::InvalidState)
+        );
+        table.exit(child, 37 << 8).unwrap();
+        assert_eq!(table.view(orphan).unwrap().parent, init.pid);
+        assert_eq!(
+            table.peek_wait(init, Some(child.pid)).unwrap().status,
+            37 << 8
+        );
+        assert_eq!(table.peek_wait(init, Some(child.pid)).unwrap().child, child);
+        assert_eq!(table.wait(init, Some(child.pid)).unwrap().child, child);
+        assert_eq!(
+            table.peek_wait(init, Some(child.pid)),
+            Err(ProcessError::NotChild)
+        );
+        table.exit(orphan, 9).unwrap();
+        assert_eq!(table.wait(init, Some(orphan.pid)).unwrap().status, 9);
+        assert_eq!(table.active(), 1);
     }
 
     #[test]

@@ -164,7 +164,7 @@ clean:
 	cargo clean
 	@./scripts/clean-build.sh
 
-.PHONY: build-launch-fixture test-launch build-launch-storage-fixture test-launch-storage build-launch-device-fixture test-launch-devices build-launch-pipe-fixture test-launch-pipes build-launch-fd-fixture test-launch-fds
+.PHONY: build-launch-fixture test-launch build-launch-storage-fixture test-launch-storage build-launch-device-fixture test-launch-devices build-launch-pipe-fixture test-launch-pipes build-launch-fd-fixture test-launch-fds build-launch-task-fixture test-launch-tasks
 build-launch-fixture:
 	mkdir -p .artifacts/launch
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fixture.c -o .artifacts/launch/launch-fixture
@@ -199,3 +199,10 @@ build-launch-fd-fixture:
 
 test-launch-fds:
 	python3 scripts/test-launch-fds.py $(GINUX) .artifacts/launch/launch-fd-fixture
+
+build-launch-task-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-task-fixture.c -o .artifacts/launch/launch-task-fixture
+
+test-launch-tasks:
+	python3 scripts/test-launch-tasks.py $(GINUX) .artifacts/launch/launch-task-fixture
