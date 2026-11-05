@@ -444,6 +444,36 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         }
     }
 
+    /// Initialize filesystem state in place behind a caller-owned slot.
+    /// No `Self`-sized (or file-sized) temporary is ever built, so
+    /// library-sized `FILE_SIZE` capacities (megabytes of overlay) never
+    /// reserve stack: scalar fields are written one by one and the byte
+    /// arrays fill with zeros, matching [`OverlayFile::empty`] and
+    /// [`Descriptor::empty`] exactly (both are all-zeros by construction;
+    /// keep them so if either gains a field). Supervision loops backing
+    /// a large overlay from a static slot call this once instead of
+    /// [`Self::new`].
+    pub fn init_in(target: &mut core::mem::MaybeUninit<Self>, index: Index<'a>, reader: R) {
+        let slot = target.as_mut_ptr();
+        unsafe {
+            core::ptr::addr_of_mut!((*slot).index).write(index);
+            core::ptr::addr_of_mut!((*slot).reader).write(reader);
+            let overlay = core::ptr::addr_of_mut!((*slot).overlay);
+            let mut file = 0;
+            while file < FILES {
+                let entry = (*overlay).as_mut_ptr().add(file);
+                core::ptr::addr_of_mut!((*entry).state).write(0);
+                core::ptr::addr_of_mut!((*entry).path).write(Path::new());
+                core::ptr::addr_of_mut!((*entry).mode).write(0);
+                core::ptr::addr_of_mut!((*entry).len).write(0);
+                core::ptr::write_bytes(core::ptr::addr_of_mut!((*entry).data), 0, 1);
+                file += 1;
+            }
+            let descriptors = core::ptr::addr_of_mut!((*slot).descriptors);
+            core::ptr::write_bytes(descriptors, 0, 1);
+        }
+    }
+
     pub fn open(&mut self, path: &[u8], flags: u32) -> Result<i32, VfsError> {
         let path = normalize(path)?;
         // Expand overlay symlinks (planted by `rename`) before the base

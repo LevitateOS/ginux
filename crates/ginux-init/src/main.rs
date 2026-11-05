@@ -2,6 +2,7 @@
 #![no_main]
 
 use core::arch::global_asm;
+use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use ginux_core::{
     balanced_identity_result, balanced_surface, decide, Action, SYS_EXIT, SYS_EXIT_GROUP,
@@ -25,8 +26,8 @@ use crate::launch::{
     Command, ELF_BYTES, VFS_INDEX_BYTES,
 };
 use crate::fs_hooks::{
-    chmod_at, resolve_at, DomainCwd, ResolveError, ResolvedKind, VfsDomainView,
-    MAX_CWD as DOMAIN_PATH_MAX, AT_FDCWD as DOMAIN_AT_FDCWD,
+    chmod_at, close_fd, open_at, read_fd, resolve_at, DomainCwd, ResolveError, ResolvedKind,
+    VfsDomainView, MAX_CWD as DOMAIN_PATH_MAX, AT_FDCWD as DOMAIN_AT_FDCWD,
 };
 use crate::process_hooks::{
     dup3_flags_valid, exec_bit_set, exec_mediated, fcntl_supported, mmap_shape_error,
@@ -528,12 +529,15 @@ const STAGE_DIR_MAX: usize = 256;
 /// Domain prefix every staged object lives under, and the only prefix the
 /// loop ever materializes to on the host.
 const STAGE_PREFIX: &[u8] = b"/tmp/g09/";
-/// Overlay file capacity: at most this many staged executables.
+/// Overlay file capacity: at most this many staged domain objects
+/// (executables plus I04-M2 staged libraries, sharing the one loop view).
 const EXEC_OVERLAY_FILES: usize = 8;
-/// Overlay object capacity: staged binaries and scripts fit here.
-const EXEC_FILE_SIZE: usize = 65536;
-/// Overlay descriptor capacity: staging reads hold one at a time.
-const EXEC_FDS: usize = 4;
+/// Overlay object capacity: staged binaries, scripts, and the largest
+/// staged library (libc, ~2.3 MiB) fit here.
+const EXEC_FILE_SIZE: usize = 3145728;
+/// Overlay descriptor capacity: staging reads hold one at a time, and
+/// I04-M2 library opens hold one per live domain fd.
+const EXEC_FDS: usize = 8;
 /// Host directory entries scanned per `getdents64` call while staging.
 const STAGE_READDIR_BYTES: usize = 2048;
 /// Host file bytes moved per read/write call while staging.
@@ -583,7 +587,7 @@ static mut STAGE_LEN: usize = 0;
 /// view. The base is structural only; every staged file is an overlay
 /// (domain-produced) object.
 static mut EXEC_BASE_BYTES: [u8; HEADER_SIZE + 3 * RECORD_SIZE] = [0; HEADER_SIZE + 3 * RECORD_SIZE];
-static mut EXEC_VFS: Option<ExecVfs<'static>> = None;
+static mut EXEC_VFS: MaybeUninit<ExecVfs<'static>> = MaybeUninit::uninit();
 static mut EXEC_READY: bool = false;
 static mut EXEC_CWD: DomainCwd = DomainCwd::new();
 static mut STAGE_BUF: [u8; EXEC_FILE_SIZE] = [0; EXEC_FILE_SIZE];
@@ -591,8 +595,11 @@ static mut STAGE_BUF: [u8; EXEC_FILE_SIZE] = [0; EXEC_FILE_SIZE];
 /// Borrow the loop's domain view. `None` before `exec_domain_init` runs.
 fn with_exec_vfs<R>(op: impl FnOnce(&mut ExecVfs<'_>) -> R) -> Option<R> {
     unsafe {
+        if !core::ptr::addr_of!(EXEC_READY).read() {
+            return None;
+        }
         let slot = &mut *core::ptr::addr_of_mut!(EXEC_VFS);
-        slot.as_mut().map(op)
+        Some(op(slot.assume_init_mut()))
     }
 }
 
@@ -695,7 +702,11 @@ fn exec_domain_init() {
         }
         let bytes: &'static [u8] = &*core::ptr::addr_of!(EXEC_BASE_BYTES);
         if let Ok(index) = Index::new(bytes) {
-            EXEC_VFS = Some(VirtualFs::new(index, EmptyBase));
+            // In-place init: a `VirtualFs::new` value return would reserve
+            // the whole overlay on this stack; field-wise writes land it
+            // directly in the static slot (see `init_in`).
+            let slot = &mut *core::ptr::addr_of_mut!(EXEC_VFS);
+            ExecVfs::init_in(slot, index, EmptyBase);
             EXEC_READY = true;
         }
     }
@@ -1160,6 +1171,341 @@ fn materialize_domain_file(
     write_staged_host(canonical, staged)
 }
 
+// ─── I04-M2: domain library file access ─────────────────────────────────
+//
+// The dynamic loader (before any managed code runs) opens its cache and
+// `DT_NEEDED` libraries at absolute paths, then reads (and, in M3,
+// stats/mmaps) them. This lane claims `openat` for exactly three absolute
+// shapes — `/etc/ld.so.cache`, `/lib64/*`, `/usr/lib64/*` — and serves
+// `read` on the resulting domain fds; everything else keeps its previous
+// behavior byte-identically (non-library `openat` stays `-ENOSYS`, `fstat`
+// stays denied for M3 — the loader cannot advance past it, which is the
+// intended M2 death point).
+//
+// Backing content is the SAME loop overlay the G09 stage seam populates
+// from `GINUX_DOMAIN_STAGE` (no third loader): a library open resolves by
+// basename to the staged file `/tmp/g09/<basename>` through the existing
+// G07 `open_at` pure path, so the bytes served are byte-identical staged
+// bytes. Unresolvable names fail `-ENOENT` honestly and never fall through
+// to host `/lib64` (no host path is ever consulted). Writable or mutating
+// opens (`O_WRONLY`/`O_RDWR`, `O_CREAT`/`O_EXCL`/`O_APPEND`) fail `-EROFS`
+// — the library surface is read-only — matching the balanced profile's
+// mutating-open rejection; `O_PATH`/`O_TMPFILE`/`O_DIRECTORY` shapes the
+// lane does not serve fail `-EINVAL`. `O_TRUNC` without write access is
+// ignored like the kernel (and never reaches the overlay); other no-op
+// bits (`O_CLOEXEC` and the rest) are accepted and ignored — the serve
+// path performs no host I/O, so they change nothing. A bare prefix or a
+// trailing slash names a directory and fails `-EISDIR`.
+//
+// Domain fds are supervisor-virtual (`LIB_FD_BASE` + slot, never a host
+// number, so they cannot collide with the tracee's real descriptors): the
+// host call never executes for them. `read` is emulated at the entry stop
+// (overlay bytes copied into tracee memory, offset advanced); `close`
+// releases the overlay fd and the slot with result 0 and no host effect.
+// Slots are keyed by virtual pid; `exec` drops the whole thread group's
+// slots (every served fd is `O_CLOEXEC`-semantic) and task exit drops the
+// task's, so a replaced image can never read through a stale overlay fd.
+// `fork` does not inherit slots: a child re-opens (the loader always
+// does), and pre-exec use of an inherited number correctly fails closed.
+
+/// First supervisor-virtual library fd: high enough to never collide with
+/// the tracee's real host descriptors (stdio, pipes).
+const LIB_FD_BASE: u64 = 512;
+/// Live library opens per run: the loader holds a handful (cache plus its
+/// `DT_NEEDED` set) and closes them on `exec`/exit.
+const LIB_SLOTS: usize = 8;
+/// Tracee-memory chunk per overlay read while serving a domain `read`.
+const LIB_READ_CHUNK: usize = 4096;
+/// `open` flag shapes this lane refuses outright (never observed from the
+/// loader; Linux x86-64 values).
+const LIB_O_DIRECTORY: u64 = 0o200000;
+const LIB_O_PATH: u64 = 0o10000000;
+const LIB_O_TMPFILE: u64 = 0o20200000;
+/// Faithful errnos without a `supervisor.rs` constant.
+const EROFS: i64 = 30;
+const EISDIR: i64 = 21;
+const ENAMETOOLONG: i64 = 36;
+const EMFILE: i64 = 23;
+
+/// Live domain-library opens: `(virtual pid, virtual fd, overlay fd)`.
+/// A free slot carries overlay fd `-1`.
+static mut LIB_OPEN: [(u32, u64, i32); LIB_SLOTS] = [(0, 0, -1); LIB_SLOTS];
+
+/// Whether an absolute domain path is a claimed library shape. The bare
+/// prefixes (`/lib64`, `/usr/lib64`) are claimed too: they name
+/// directories, so the open fails with `-EISDIR` below.
+fn lib_path_allowed(path: &[u8]) -> bool {
+    path == b"/etc/ld.so.cache"
+        || path == b"/lib64"
+        || path == b"/usr/lib64"
+        || path.len() >= b"/lib64/".len() && &path[..b"/lib64/".len()] == b"/lib64/"
+        || path.len() >= b"/usr/lib64/".len() && &path[..b"/usr/lib64/".len()] == b"/usr/lib64/"
+}
+
+/// Emulate `openat` for a claimed library path: resolve the staged file by
+/// basename and hand out a supervisor-virtual fd. `None` means "not this
+/// lane" (unreadable path or non-library shape): the caller keeps the old
+/// `-ENOSYS` denial. Otherwise the returned `i64` is the entry result
+/// (virtual fd, or a faithful negative errno) and the host call is
+/// skipped.
+fn domain_lib_open_entry(
+    host_pid: usize,
+    vpid: u32,
+    path_addr: usize,
+    flags: u64,
+) -> Option<i64> {
+    let mut raw = [0u8; DOMAIN_PATH_MAX];
+    let len = match read_tracee_cstr(host_pid, path_addr, &mut raw) {
+        Ok(len) => len,
+        Err(()) => return None,
+    };
+    if !lib_path_allowed(&raw[..len]) {
+        return None;
+    }
+    // Mutation shapes fail before any lookup: the surface is read-only.
+    if flags & crate::fs_hooks::O_ACCMODE as u64 != 0
+        || flags & (crate::fs_hooks::O_CREAT as u64
+            | crate::fs_hooks::O_EXCL as u64
+            | crate::fs_hooks::O_APPEND as u64)
+            != 0
+    {
+        lib_deny(&raw[..len], -EROFS);
+        return Some(-EROFS);
+    }
+    if flags & (LIB_O_PATH | LIB_O_TMPFILE | LIB_O_DIRECTORY) != 0 {
+        lib_deny(&raw[..len], -EINVAL);
+        return Some(-EINVAL);
+    }
+    // Basename after the final slash. No slash past the leading one
+    // (a bare prefix) or an empty tail (a trailing slash) names a
+    // directory, which this lane never hands out as a descriptor.
+    let mut base = 0;
+    let mut index = 0;
+    while index < len {
+        if raw[index] == b'/' {
+            base = index + 1;
+        }
+        index += 1;
+    }
+    if base <= 1 || base >= len {
+        lib_deny(&raw[..len], -EISDIR);
+        return Some(-EISDIR);
+    }
+    let mut staged = [0u8; DOMAIN_PATH_MAX];
+    staged[..STAGE_PREFIX.len()].copy_from_slice(STAGE_PREFIX);
+    let base_len = len - base;
+    if STAGE_PREFIX.len() + base_len > DOMAIN_PATH_MAX {
+        lib_deny(&raw[..len], -ENAMETOOLONG);
+        return Some(-ENAMETOOLONG);
+    }
+    staged[STAGE_PREFIX.len()..STAGE_PREFIX.len() + base_len]
+        .copy_from_slice(&raw[base..len]);
+    let staged_len = STAGE_PREFIX.len() + base_len;
+    let opened = with_exec_vfs(|vfs| {
+        let cwd = exec_cwd_snapshot();
+        open_at(
+            &mut *vfs,
+            &cwd,
+            DOMAIN_AT_FDCWD,
+            &staged[..staged_len],
+            crate::fs_hooks::O_CLOEXEC,
+        )
+    });
+    let overlay = match opened {
+        Some(Ok(descriptor)) => descriptor,
+        Some(Err(error)) => {
+            let errno = error.errno();
+            lib_deny(&raw[..len], errno);
+            return Some(errno);
+        }
+        None => return None,
+    };
+    match lib_slot_alloc(vpid, overlay) {
+        Some(virtual_fd) => {
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: lib-open path=");
+            write_all(&raw[..len]);
+            write_all(b" fd=");
+            write_u64(virtual_fd);
+            write_all(b"\n");
+            Some(virtual_fd as i64)
+        }
+        None => {
+            with_exec_vfs(|vfs| {
+                let _ = close_fd(&mut *vfs, overlay);
+            });
+            lib_deny(&raw[..len], -EMFILE);
+            Some(-EMFILE)
+        }
+    }
+}
+
+/// One audit line for a denied library open (the allowed shape logs at
+/// the call site with its fd).
+fn lib_deny(path: &[u8], errno: i64) {
+    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: lib-open-deny errno=");
+    write_i64(-errno);
+    write_all(b" path=");
+    write_all(path);
+    write_all(b"\n");
+}
+
+/// Emulate `read` on a domain library fd: copy overlay bytes at the
+/// descriptor offset into tracee memory. `None` means the fd is not a
+/// live domain fd for this task (the caller keeps `-EBADF`).
+fn domain_lib_read_entry(
+    host_pid: usize,
+    vpid: u32,
+    fd: u64,
+    buffer: usize,
+    count: usize,
+) -> Option<i64> {
+    let slot = lib_slot_find(vpid, fd)?;
+    if count == 0 {
+        return Some(0);
+    }
+    let mut total = 0usize;
+    while total < count {
+        let want = (count - total).min(LIB_READ_CHUNK);
+        let chunk = unsafe { &mut STAGE_BUF[..want] };
+        let moved = with_exec_vfs(|vfs| read_fd(&mut *vfs, unsafe { LIB_OPEN[slot].2 }, chunk))?;
+        let count = match moved {
+            Ok(count) => count,
+            Err(error) => {
+                let errno = match error {
+                    crate::fs_hooks::IoError::BadDescriptor => -EBADF,
+                    _ => -EIO,
+                };
+                return Some(if total == 0 { errno } else { total as i64 });
+            }
+        };
+        if count == 0 {
+            break;
+        }
+        if write_tracee_bytes(host_pid, buffer + total, &chunk[..count]).is_err() {
+            return Some(-EFAULT);
+        }
+        total += count;
+    }
+    Some(total as i64)
+}
+
+/// Emulate `close` on a domain library fd: release the overlay fd and the
+/// slot with result 0 and no host effect. `None` means the fd is not a
+/// live domain fd for this task (the caller keeps descriptor mediation).
+fn domain_lib_close_entry(vpid: u32, fd: u64) -> Option<i64> {
+    let slot = lib_slot_find(vpid, fd)?;
+    with_exec_vfs(|vfs| {
+        let _ = close_fd(&mut *vfs, unsafe { LIB_OPEN[slot].2 });
+    });
+    unsafe {
+        LIB_OPEN[slot] = (0, 0, -1);
+    }
+    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: lib-close fd=");
+    write_u64(fd);
+    write_all(b"\n");
+    Some(0)
+}
+
+/// Copy `bytes` into tracee memory at `address`, one aligned word at a
+/// time, without touching neighboring bytes. Any unreadable word fails
+/// explicitly.
+fn write_tracee_bytes(host_pid: usize, address: usize, bytes: &[u8]) -> Result<(), ()> {
+    let mut index = 0;
+    while index < bytes.len() {
+        let target = address.wrapping_add(index);
+        let aligned = target & !0x7;
+        let shift = (target & 0x7) * 8;
+        let mut word = 0usize;
+        if ptrace(
+            PTRACE_PEEKTEXT,
+            host_pid,
+            aligned,
+            &mut word as *mut _ as usize,
+        ) < 0
+        {
+            return Err(());
+        }
+        let mut merged = word & !(0xffusize << shift);
+        merged |= (bytes[index] as usize) << shift;
+        if ptrace(PTRACE_POKETEXT, host_pid, aligned, merged) < 0 {
+            return Err(());
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+/// Find the live slot for one task's virtual fd.
+fn lib_slot_find(vpid: u32, fd: u64) -> Option<usize> {
+    let mut index = 0;
+    while index < LIB_SLOTS {
+        let live = unsafe { LIB_OPEN[index].2 != -1 };
+        if live && unsafe { LIB_OPEN[index].0 == vpid && LIB_OPEN[index].1 == fd } {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Allocate the next virtual fd for one task's overlay fd.
+fn lib_slot_alloc(vpid: u32, overlay: i32) -> Option<u64> {
+    let mut index = 0;
+    while index < LIB_SLOTS {
+        if unsafe { LIB_OPEN[index].2 == -1 } {
+            let virtual_fd = LIB_FD_BASE + index as u64;
+            unsafe {
+                LIB_OPEN[index] = (vpid, virtual_fd, overlay);
+            }
+            return Some(virtual_fd);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Drop every slot owned by one virtual pid (task exit).
+fn lib_release_task(vpid: u32) {
+    let mut index = 0;
+    while index < LIB_SLOTS {
+        if unsafe { LIB_OPEN[index].2 != -1 && LIB_OPEN[index].0 == vpid } {
+            with_exec_vfs(|vfs| {
+                let _ = close_fd(&mut *vfs, unsafe { LIB_OPEN[index].2 });
+            });
+            unsafe {
+                LIB_OPEN[index] = (0, 0, -1);
+            }
+        }
+        index += 1;
+    }
+}
+
+/// Drop every slot owned by any task in one thread group (executable
+/// replacement closes every served fd: all are `O_CLOEXEC`-semantic), plus
+/// slots whose owner is already gone.
+fn lib_release_group(processes: &ProcessTable<8>, tgid: u32) {
+    let mut index = 0;
+    while index < LIB_SLOTS {
+        let live = unsafe { LIB_OPEN[index].2 != -1 };
+        if live {
+            let owner = unsafe { LIB_OPEN[index].0 };
+            let same_group = processes
+                .lookup(owner)
+                .is_some_and(|view| view.tgid == tgid);
+            let gone = processes.lookup(owner).is_none();
+            if same_group || gone {
+                with_exec_vfs(|vfs| {
+                    let _ = close_fd(&mut *vfs, unsafe { LIB_OPEN[index].2 });
+                });
+                unsafe {
+                    LIB_OPEN[index] = (0, 0, -1);
+                }
+            }
+        }
+        index += 1;
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NativeProcessTask {
     host_pid: usize,
@@ -1428,6 +1774,9 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             // the mirror's ends now, so the pipe objects die their last
             // close here and no stale write end can hide an EOF elsewhere.
             pipes.release_task(task.virtual_id.pid);
+            // I04-M2: same ownership end for this task's domain library
+            // fds; the overlay fds die with their last virtual close.
+            lib_release_task(task.virtual_id.pid);
             // I04-M1: the kernel reclaimed this address space with the
             // task. Release the group ledger when no live member shares
             // the tgid (threads keep the group alive); lookups that fail
@@ -1682,6 +2031,9 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             // I04-M1: the new image owns a fresh address space; the old
             // anonymous ledger dies with the replaced image.
             mem.reset(exec_tgid.tgid);
+            // I04-M2: replacement closes every domain library fd (all
+            // are `O_CLOEXEC`-semantic), so no stale overlay fd survives.
+            lib_release_group(&processes, exec_tgid.tgid);
             write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec syscall=");
             write_u64(task.syscall);
             write_all(b" host-pid=");
@@ -2133,6 +2485,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                         scrub_close_on_exec(&mut pipes, &processes, &tasks, late_tgid.tgid);
                     // I04-M1: same fresh address space as the event path.
                     mem.reset(late_tgid.tgid);
+                    // I04-M2: same close-on-exec drop as the event path.
+                    lib_release_group(&processes, late_tgid.tgid);
                     write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-late virtual-pid=");
                     write_u64(current.virtual_id.pid as u64);
                     write_all(b" epoch=");
@@ -2508,9 +2862,27 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                         .lookup(current.virtual_id.pid, registers.rdi as u32)
                         .is_some();
                     if !tracked && !matches!(registers.rdi, 0 | 1 | 2) {
-                        current.result = -EBADF;
-                        current.override_result = true;
-                        registers.orig_rax = u64::MAX;
+                        // I04-M2: a live domain library fd serves staged
+                        // bytes at the entry stop; anything else is still
+                        // not a domain object.
+                        match domain_lib_read_entry(
+                            host_pid,
+                            current.virtual_id.pid,
+                            registers.rdi,
+                            registers.rsi as usize,
+                            registers.rdx as usize,
+                        ) {
+                            Some(result) => {
+                                current.result = result;
+                                current.override_result = true;
+                                registers.orig_rax = u64::MAX;
+                            }
+                            None => {
+                                current.result = -EBADF;
+                                current.override_result = true;
+                                registers.orig_rax = u64::MAX;
+                            }
+                        }
                     }
                 }
                 1 => {
@@ -2539,7 +2911,19 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     // cannot represent fail here before the host runs.
                     // Everything else executes on the host and the exit stop
                     // below mirrors the outcome.
-                    if registers.orig_rax == SYS_PIPE2
+                    // I04-M2: a live domain library fd releases with no
+                    // host effect; anything else keeps descriptor
+                    // mediation below.
+                    let lib_closed = if registers.orig_rax == SYS_CLOSE {
+                        domain_lib_close_entry(current.virtual_id.pid, registers.rdi)
+                    } else {
+                        None
+                    };
+                    if let Some(result) = lib_closed {
+                        current.result = result;
+                        current.override_result = true;
+                        registers.orig_rax = u64::MAX;
+                    } else if registers.orig_rax == SYS_PIPE2
                         && !pipe2_flags_valid(registers.rsi)
                     {
                         current.result = -EINVAL;
@@ -2646,6 +3030,28 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     }
                 }
                 60 | 231 => {}
+                257 => {
+                    // I04-M2: absolute library paths resolve against staged
+                    // domain content; any other `openat` (or an unreadable
+                    // path) keeps the previous `-ENOSYS` denial.
+                    match domain_lib_open_entry(
+                        host_pid,
+                        current.virtual_id.pid,
+                        registers.rsi as usize,
+                        registers.rdx,
+                    ) {
+                        Some(result) => {
+                            current.result = result;
+                            current.override_result = true;
+                            registers.orig_rax = u64::MAX;
+                        }
+                        None => {
+                            current.result = -ENOSYS;
+                            current.override_result = true;
+                            registers.orig_rax = u64::MAX;
+                        }
+                    }
+                }
                 _ => {
                     current.result = -ENOSYS;
                     current.override_result = true;
