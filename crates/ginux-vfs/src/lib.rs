@@ -1,5 +1,14 @@
 #![no_std]
 
+mod retained;
+
+pub use retained::{
+    durable_generation, stamp_generation, CheckpointError, CheckpointSummary, DurableStore,
+    FlushError, FlushSummary, GenerationReport, GenerationSummary, QuiesceError, QuiesceGate,
+    QuiesceSummary, RecoverSummary, RestoreSummary, RetainedError, RetainedLimits,
+    RETAINED_FIRST_GENERATION, RETAINED_GENERATION_OFFSET, RETAINED_HEADER_LEN, RETAINED_MAGIC,
+};
+
 pub const INDEX_MAGIC: &[u8; 8] = b"GINUXVFS";
 pub const INDEX_VERSION: u32 = 1;
 pub const HEADER_SIZE: usize = 64;
@@ -308,6 +317,16 @@ fn normalize(input: &[u8]) -> Result<Path, VfsError> {
 
 pub trait BaseReader {
     fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), VfsError>;
+}
+
+/// Whether `path` is an absolute, NUL-free, already-normalized domain path.
+/// The retained-image validator uses this so untrusted images name exactly
+/// the record they mean.
+pub(crate) fn is_canonical_path(path: &[u8]) -> bool {
+    match normalize(path) {
+        Ok(canonical) => canonical.as_bytes() == path,
+        Err(_) => false,
+    }
 }
 
 /// One absolute path classified in the merged domain view, as reported by

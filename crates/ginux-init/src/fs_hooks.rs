@@ -959,7 +959,7 @@ fn append_all(dst: &mut [u8; MAX_CWD], len: usize, src: &[u8]) -> Result<usize, 
 
 // ─── G07: native open and descriptor lifetime ────────────────────────────
 
-use ginux_vfs::{BaseReader, FileMetadata, MergedKind, VfsError, VirtualFs};
+use ginux_vfs::{BaseReader, FileMetadata, MergedKind, RetainedError, VfsError, VirtualFs};
 
 /// Why an [`open_at`]/[`close_fd`] emulation failed.
 ///
@@ -1646,6 +1646,31 @@ impl RenameError {
             RenameError::NoSpace => -ENOSPC,
             RenameError::TooLarge => -EFBIG,
             RenameError::Io => -EIO,
+        }
+    }
+}
+
+// ─── G11: retained writable backing ──────────────────────────────────────
+//
+// The retained image carries the overlay across a domain stop/reopen while
+// the VFS open/read/write/seek/close shape stays unchanged. Staging and
+// recovery live on `VirtualFs` (`checkpoint_retained`/`restore_retained`);
+// these mappers are the only backend-hook addition, so exhaustion and
+// corrupt-image failures reach the supervisor wiring with faithful errnos.
+// Durable publish of the staged bytes is the G12 flush seam, not this lane.
+
+/// Map a retained-backing failure onto the faithful [`OpenError`]: the
+/// open/restore path reports exhaustion as no-space/too-large and a foreign
+/// or corrupt image as a backing-store failure. Allowed until supervisor
+/// wiring calls it.
+#[allow(dead_code)]
+fn map_retained_error(error: RetainedError) -> OpenError {
+    match error {
+        RetainedError::TooManyFiles | RetainedError::NoSpace => OpenError::NoSpace,
+        RetainedError::TooLarge => OpenError::TooLarge,
+        RetainedError::InvalidPath => OpenError::Invalid,
+        RetainedError::InvalidRecord | RetainedError::WrongInstance | RetainedError::Io => {
+            OpenError::Io
         }
     }
 }
@@ -2472,5 +2497,19 @@ fn map_readlink_error(error: VfsError) -> ReadlinkError {
         | VfsError::InvalidOffset
         | VfsError::InvalidIndex
         | VfsError::Io => ReadlinkError::Io,
+    }
+}
+/// Map a retained-backing failure onto the faithful [`IoError`] for the
+/// data path, mirroring [`map_retained_error`]. Allowed until supervisor
+/// wiring calls it.
+#[allow(dead_code)]
+fn map_retained_io_error(error: RetainedError) -> IoError {
+    match error {
+        RetainedError::TooManyFiles | RetainedError::NoSpace => IoError::NoSpace,
+        RetainedError::TooLarge => IoError::TooLarge,
+        RetainedError::InvalidPath => IoError::Invalid,
+        RetainedError::InvalidRecord | RetainedError::WrongInstance | RetainedError::Io => {
+            IoError::Io
+        }
     }
 }
