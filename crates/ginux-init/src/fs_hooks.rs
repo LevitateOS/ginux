@@ -53,7 +53,16 @@
 //! serializes the Linux x86-64 `struct stat` layout (`fstat`/`newfstatat`
 //! write-back) and [`old_stat_write`] the legacy layout (`stat`/`lstat`
 //! write-back); both layouts were verified byte-for-byte against raw
-//! host syscalls. Failures map to faithful errnos through
+//! host syscalls.
+//!
+//! G08 adds rename and removal over the same merged view: [`rename_at`]
+//! moves a file or symlink onto a new name with atomic replace semantics
+//! (an existing file or symlink at the target is replaced in the same
+//! step), and [`unlink_at`] removes a file or symlink behind a tombstone.
+//! Directories never move and `rmdir` stays an explicitly unsupported
+//! follow-up: the `rmdir` entry stays denied, and [`unlink_at`] with
+//! [`AT_REMOVEDIR`] fails with [`RemoveError::Unsupported`] instead of
+//! touching the host. Failures map to faithful errnos through
 //! [`StatError::errno`].
 //!
 //! Everything here is pure `core` logic over caller buffers: no host calls,
@@ -149,6 +158,33 @@ pub const SYS_LSTAT: u64 = 6;
 /// supervisor can hand the bytes to [`statat`] and write back via
 /// [`stat_write`].
 pub const SYS_NEWFSTATAT: u64 = 262;
+/// `rename(2)`: domain file/symlink rename. Claimed for G08: the balanced
+/// contract would mediate both domain paths to the host, renaming unrelated
+/// supervisor files. `rename` is `renameat` with `AT_FDCWD`. The register
+/// channel carries no path bytes, so the entry is denied until the
+/// supervisor can hand the bytes to [`rename_at`].
+pub const SYS_RENAME: u64 = 82;
+/// `rmdir(2)`: domain directory removal. Claimed for G08 as an explicit
+/// denial with no emulation yet: there is no VFS `rmdir` (stated follow-up),
+/// and leaving the entry unclaimed would mediate the domain path to the
+/// host. Denied; [`unlink_at`] reports the same refusal explicitly for
+/// `unlinkat` with `AT_REMOVEDIR`.
+pub const SYS_RMDIR: u64 = 84;
+/// `unlink(2)`: domain file/symlink removal. Claimed for G08 for the same
+/// reason as [`SYS_RENAME`]: `unlink` is `unlinkat` with `AT_FDCWD` and no
+/// flags. Denied until the supervisor can hand the bytes to [`unlink_at`].
+pub const SYS_UNLINK: u64 = 87;
+/// `unlinkat(2)`: domain file/symlink removal relative to a directory fd,
+/// or directory removal with `AT_REMOVEDIR`. Claimed for G08 on the same
+/// terms as [`SYS_RENAME`]; the `AT_REMOVEDIR` form stays explicitly
+/// unsupported (see [`RemoveError::Unsupported`]). Denied until the
+/// supervisor can hand the bytes to [`unlink_at`].
+pub const SYS_UNLINKAT: u64 = 263;
+/// `renameat(2)`: domain file/symlink rename with independent directory fds
+/// for the source and target. Claimed for G08 on the same terms as
+/// [`SYS_RENAME`]. Denied until the supervisor can hand the bytes to
+/// [`rename_at`].
+pub const SYS_RENAMEAT: u64 = 264;
 
 /// `AT_FDCWD`: a relative path resolves against the domain working
 /// directory. Matches the Linux `AT_FDCWD` value (`-100`).
@@ -205,6 +241,12 @@ pub const ERANGE: i64 = 34;
 pub const ENAMETOOLONG: i64 = 36;
 #[allow(dead_code)]
 pub const ELOOP: i64 = 40;
+/// Linux errno `ENOSYS` (38): reported by [`RenameError::Unsupported`] and
+/// [`RemoveError::Unsupported`] for the explicitly unsupported directory
+/// forms. The value collides numerically with no claimed syscall number in
+/// this lane (`SYS_LSEEK` is 8); it names an errno, never a syscall.
+#[allow(dead_code)]
+pub const ENOSYS: i64 = 38;
 
 /// Native open flag values (Linux x86-64). Only the access mode plus
 /// `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND`/`O_CLOEXEC` are supported by
@@ -250,6 +292,15 @@ pub const SEEK_END: u32 = 2;
 /// lands — hence the scoped allows below, matching the G07 API surface.
 #[allow(dead_code)]
 pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+/// `AT_REMOVEDIR` for [`unlink_at`]: remove a directory instead of
+/// unlinking a file/symlink. The only accepted non-zero `unlinkat` flag;
+/// the directory form fails explicitly with [`RemoveError::Unsupported`]
+/// until VFS `rmdir` support lands as an observed follow-up.
+///
+/// Consumed by [`unlink_at`], which the supervisor wiring calls once it
+/// lands — hence the scoped allows below, matching the G07 API surface.
+#[allow(dead_code)]
+pub const AT_REMOVEDIR: u32 = 0x200;
 
 /// Synthetic `st_mode` file-type bits (Linux x86-64). The index packs
 /// permission bits only, so [`stat_from_meta`] adds these from the
@@ -285,7 +336,7 @@ pub const DOMAIN_FD_BASE: u64 = 3;
 
 /// Lane membership by syscall number: directory creation, enumeration,
 /// working-directory operations, descriptor open/close (G07), descriptor
-/// data I/O (G07a), and file metadata queries (G07b).
+/// data I/O (G07a), file metadata queries (G07b), and rename/removal (G08).
 pub fn claims(syscall: u64) -> bool {
     matches!(
         syscall,
@@ -305,6 +356,11 @@ pub fn claims(syscall: u64) -> bool {
             | SYS_FSTAT
             | SYS_LSTAT
             | SYS_NEWFSTATAT
+            | SYS_RENAME
+            | SYS_RMDIR
+            | SYS_UNLINK
+            | SYS_UNLINKAT
+            | SYS_RENAMEAT
     )
 }
 
@@ -324,11 +380,15 @@ pub fn claims(syscall: u64) -> bool {
 /// family denied on the same terms — emulation needs the tracee path
 /// bytes plus per-task cwd/VFS state (see [`stat_at`]/[`lstat_at`]/
 /// [`fstat_fd`]/[`statat`]) — with the same stdio fallthrough for
-/// `fstat` on fd 0–2, so console metadata queries keep working.
+/// `fstat` on fd 0–2, so console metadata queries keep working. G08 keeps
+/// the rename/removal entries denied on the same terms — emulation needs
+/// the tracee path bytes plus per-task cwd/VFS state (see [`rename_at`]/
+/// [`unlink_at`]) — with no fd-based fallthrough: every claimed rename or
+/// removal names domain paths, never host descriptors.
 /// Claiming still matters — it stops the balanced contract from mediating
 /// domain paths and descriptor numbers to the host (which would report
-/// host metadata as managed results) — and every other syscall behaves
-/// byte-identically to before.
+/// host metadata as managed results, or rename and unlink host files) —
+/// and every other syscall behaves byte-identically to before.
 pub fn claim(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> Option<i64> {
     let _ = (rsi, rdx);
     if !claims(syscall) {
@@ -346,7 +406,8 @@ pub enum ResolvedKind {
     File,
     Directory,
     /// Final component only, and only when the caller passes
-    /// `follow_final = false` (e.g. `lstat`-style queries owned by G07b).
+    /// `follow_final = false` (`lstat`-style queries owned by G07b, and
+    /// G08 rename/unlink sources, which move the link itself).
     /// G07 opens always follow the final link, so only [`resolve_at_full`]
     /// constructs this; it is wired when supervisor memory plumbing lands.
     #[allow(dead_code)]
@@ -1444,4 +1505,322 @@ fn write_u32_le(out: &mut [u8], off: usize, value: u32) {
 #[allow(dead_code)]
 fn write_u64_le(out: &mut [u8], off: usize, value: u64) {
     out[off..off + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+// ─── G08: rename and removal ────────────────────────────────────────────
+
+/// Why a [`rename_at`] emulation failed.
+///
+/// Returned to the supervisor wiring once tracee-memory/fd-table plumbing
+/// lands; allowed until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenameError {
+    /// Path resolution failed (escape, missing entry, loop, bad dirfd…).
+    Resolve(ResolveError),
+    /// The target parent is not a directory, or a trailing slash addressed
+    /// a non-directory.
+    NotDirectory,
+    /// The target names an existing directory: only files and symlinks are
+    /// replaced, never directories.
+    IsDirectory,
+    /// The source names a directory: directory moves need VFS directory
+    /// support, an observed follow-up.
+    Unsupported,
+    /// Malformed target name (`.`/`..`/empty final component).
+    Invalid,
+    /// No free slot for the moved copy or its tombstones in the overlay.
+    NoSpace,
+    /// A moved base file is larger than the overlay file capacity.
+    TooLarge,
+    /// Corrupt image index or a backing-store failure.
+    Io,
+}
+
+impl RenameError {
+    /// Faithful negative errno for supervisor wiring. Unsupported directory
+    /// moves report `-ENOSYS`: renaming a directory is valid Linux, so the
+    /// refusal names the missing emulation, not the request. Allowed until
+    /// that wiring lands.
+    #[allow(dead_code)]
+    pub const fn errno(self) -> i64 {
+        match self {
+            RenameError::Resolve(error) => error.errno(),
+            RenameError::NotDirectory => -ENOTDIR,
+            RenameError::IsDirectory => -EISDIR,
+            RenameError::Unsupported => -ENOSYS,
+            RenameError::Invalid => -EINVAL,
+            RenameError::NoSpace => -ENOSPC,
+            RenameError::TooLarge => -EFBIG,
+            RenameError::Io => -EIO,
+        }
+    }
+}
+
+/// Why an [`unlink_at`] emulation failed.
+///
+/// Returned to the supervisor wiring once tracee-memory/fd-table plumbing
+/// lands; allowed until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoveError {
+    /// Path resolution failed (escape, missing entry, loop, bad dirfd…).
+    Resolve(ResolveError),
+    /// A trailing slash addressed a non-directory, or `AT_REMOVEDIR`
+    /// addressed one.
+    NotDirectory,
+    /// The path names a directory: removing one needs `rmdir` support, an
+    /// observed follow-up.
+    IsDirectory,
+    /// `AT_REMOVEDIR` on a directory: explicit until VFS `rmdir` lands.
+    Unsupported,
+    /// An `unlinkat` flag outside `AT_REMOVEDIR`.
+    Invalid,
+    /// No free slot for the tombstone in the overlay.
+    NoSpace,
+    /// Corrupt image index or a backing-store failure.
+    Io,
+}
+
+impl RemoveError {
+    /// Faithful negative errno for supervisor wiring. Allowed until that
+    /// wiring lands.
+    #[allow(dead_code)]
+    pub const fn errno(self) -> i64 {
+        match self {
+            RemoveError::Resolve(error) => error.errno(),
+            RemoveError::NotDirectory => -ENOTDIR,
+            RemoveError::IsDirectory => -EISDIR,
+            RemoveError::Unsupported => -ENOSYS,
+            RemoveError::Invalid => -EINVAL,
+            RemoveError::NoSpace => -ENOSPC,
+            RemoveError::Io => -EIO,
+        }
+    }
+}
+
+/// Emulate `rename(old_path, new_path)` /
+/// `renameat(old_dirfd, old_path, new_dirfd, new_path)` against the domain:
+/// resolve both sides through [`resolve_at_full`] over the merged view and
+/// move the entry with [`VirtualFs::rename`].
+///
+/// * Absolute paths ignore their dirfd; relative paths resolve against
+///   `cwd` when their dirfd is `AT_FDCWD` and fail with `-EBADF` otherwise.
+/// * The source resolves without following a final symlink, so renaming a
+///   link moves the link itself; a source directory fails explicitly with
+///   [`RenameError::Unsupported`]. A trailing slash on a non-directory
+///   source fails with `-ENOTDIR`, matching Linux.
+/// * The target joins its resolved parent with the final name; an existing
+///   file or symlink at the target is replaced atomically, while an
+///   existing directory fails with [`RenameError::IsDirectory`]. A
+///   trailing slash demands an existing directory: a missing target fails
+///   with `-ENOENT`, a present non-directory with `-ENOTDIR`.
+/// * Denied mutations change nothing: confinement failures return before
+///   the VFS call, and the VFS move itself is atomic.
+///
+/// Pure `core` logic: the supervisor calls this once tracee path bytes and
+/// per-task `cwd`/VFS handles are plumbed through. Allowed until then.
+#[allow(dead_code)]
+pub fn rename_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    old_dirfd: i64,
+    old_path: &[u8],
+    new_dirfd: i64,
+    new_path: &[u8],
+) -> Result<(), RenameError> {
+    if old_path.is_empty()
+        || old_path.contains(&0)
+        || new_path.is_empty()
+        || new_path.contains(&0)
+    {
+        return Err(RenameError::Resolve(ResolveError::Malformed));
+    }
+    let old_trailing = old_path.len() > 1 && old_path[old_path.len() - 1] == b'/';
+    let mut old_canon = [0u8; MAX_CWD];
+    let (old_len, old_kind) = resolve_at_full(
+        cwd.path(),
+        old_dirfd,
+        old_path,
+        false,
+        &mut VfsDomainView::new(vfs),
+        &mut old_canon,
+    )
+    .map_err(RenameError::Resolve)?;
+    if old_trailing && old_kind != ResolvedKind::Directory {
+        return Err(RenameError::Resolve(ResolveError::NotDirectory));
+    }
+    if old_kind == ResolvedKind::Directory {
+        return Err(RenameError::Unsupported);
+    }
+    let new_trailing = new_path.len() > 1 && new_path[new_path.len() - 1] == b'/';
+    let mut new_abs = [0u8; MAX_CWD];
+    let new_len = if new_trailing {
+        let (len, kind) = resolve_at_full(
+            cwd.path(),
+            new_dirfd,
+            new_path,
+            true,
+            &mut VfsDomainView::new(vfs),
+            &mut new_abs,
+        )
+        .map_err(RenameError::Resolve)?;
+        if kind != ResolvedKind::Directory {
+            return Err(RenameError::Resolve(ResolveError::NotDirectory));
+        }
+        len
+    } else {
+        build_rename_target(vfs, cwd, new_dirfd, new_path, &mut new_abs)?
+    };
+    vfs.rename(&old_canon[..old_len], &new_abs[..new_len])
+        .map_err(map_rename_error)
+}
+
+/// Emulate `unlink(path)` / `unlinkat(dirfd, path, flags)` against the
+/// domain: resolve through [`resolve_at_full`] without following a final
+/// symlink, then remove with [`VirtualFs::unlink`].
+///
+/// * `flags == 0` unlinks a file or symlink, including a dangling link or
+///   one pointing at a directory: the link itself goes, the target stays.
+/// * `flags == AT_REMOVEDIR` on a directory fails explicitly with
+///   [`RemoveError::Unsupported`]; on anything else with `-ENOTDIR`. Any
+///   other flag fails with [`RemoveError::Invalid`].
+/// * Unlinking a directory without the flag fails with
+///   [`RemoveError::IsDirectory`], and a trailing slash on a non-directory
+///   with `-ENOTDIR`, both matching Linux.
+///
+/// Pure `core` logic, wired like [`rename_at`]. Allowed until then.
+#[allow(dead_code)]
+pub fn unlink_at<R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    path: &[u8],
+    flags: u32,
+) -> Result<(), RemoveError> {
+    if flags & !AT_REMOVEDIR != 0 {
+        return Err(RemoveError::Invalid);
+    }
+    if path.is_empty() || path.contains(&0) {
+        return Err(RemoveError::Resolve(ResolveError::Malformed));
+    }
+    let trailing = path.len() > 1 && path[path.len() - 1] == b'/';
+    let mut canon = [0u8; MAX_CWD];
+    let (len, kind) = resolve_at_full(
+        cwd.path(),
+        dirfd,
+        path,
+        false,
+        &mut VfsDomainView::new(vfs),
+        &mut canon,
+    )
+    .map_err(RemoveError::Resolve)?;
+    if trailing && kind != ResolvedKind::Directory {
+        return Err(RemoveError::Resolve(ResolveError::NotDirectory));
+    }
+    if flags & AT_REMOVEDIR != 0 {
+        if kind == ResolvedKind::Directory {
+            return Err(RemoveError::Unsupported);
+        }
+        return Err(RemoveError::Resolve(ResolveError::NotDirectory));
+    }
+    if kind == ResolvedKind::Directory {
+        return Err(RemoveError::IsDirectory);
+    }
+    vfs.unlink(&canon[..len]).map_err(map_remove_error)
+}
+
+/// Join the resolved target parent with the final name for [`rename_at`]:
+/// the stored target path is canonical, never hiding an unexpanded link in
+/// the parent. Mirrors the [`create_at`] slow path: the parent resolves
+/// with following (it must be a live directory) while the name itself stays
+/// uninterpreted. Reached only through [`rename_at`]; allowed with it.
+#[allow(dead_code)]
+fn build_rename_target<
+    R: BaseReader,
+    const FILES: usize,
+    const FILE_SIZE: usize,
+    const FDS: usize,
+>(
+    vfs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS>,
+    cwd: &DomainCwd,
+    dirfd: i64,
+    path: &[u8],
+    out: &mut [u8; MAX_CWD],
+) -> Result<usize, RenameError> {
+    let dot: &[u8] = b".";
+    let (parent, name) = match path.iter().rposition(|byte| *byte == b'/') {
+        Some(0) => (&path[..1], &path[1..]),
+        Some(index) => (&path[..index], &path[index + 1..]),
+        None => (dot, path),
+    };
+    if name.is_empty() || name == b"." || name == b".." {
+        return Err(RenameError::Invalid);
+    }
+    let mut parent_out = [0u8; MAX_CWD];
+    let (parent_len, parent_kind) = resolve_at(
+        cwd.path(),
+        dirfd,
+        parent,
+        &mut VfsDomainView::new(vfs),
+        &mut parent_out,
+    )
+    .map_err(RenameError::Resolve)?;
+    if parent_kind != ResolvedKind::Directory {
+        return Err(RenameError::Resolve(ResolveError::NotDirectory));
+    }
+    let mut len =
+        append_all(out, 0, &parent_out[..parent_len]).map_err(RenameError::Resolve)?;
+    if len > 1 {
+        len = append_all(out, len, b"/").map_err(RenameError::Resolve)?;
+    }
+    len = append_all(out, len, name).map_err(RenameError::Resolve)?;
+    Ok(len)
+}
+
+/// Map a VFS failure onto the faithful [`RenameError`]. `NotFound` after a
+/// successful pre-resolution is unreachable through [`rename_at`] — the
+/// view cannot change between the two reads — so it reports the missing
+/// name rather than an inconsistency. Allowed with [`rename_at`].
+#[allow(dead_code)]
+fn map_rename_error(error: VfsError) -> RenameError {
+    match error {
+        VfsError::NotFound => RenameError::Resolve(ResolveError::NotFound),
+        VfsError::NotDirectory => RenameError::NotDirectory,
+        VfsError::IsDirectory => RenameError::IsDirectory,
+        VfsError::SymlinkLoop => RenameError::Resolve(ResolveError::SymlinkLoop),
+        VfsError::InvalidPath => RenameError::Invalid,
+        VfsError::OverlayLimit => RenameError::NoSpace,
+        VfsError::FileTooLarge => RenameError::TooLarge,
+        VfsError::PermissionDenied
+        | VfsError::InvalidDescriptor
+        | VfsError::DescriptorLimit
+        | VfsError::AlreadyExists
+        | VfsError::InvalidOffset
+        | VfsError::InvalidIndex
+        | VfsError::Io => RenameError::Io,
+    }
+}
+
+/// Map a VFS failure onto the faithful [`RemoveError`]. Only the name and
+/// directory errors escape the pre-resolved [`unlink_at`] path; the rest is
+/// backing-store inconsistency. Allowed with [`unlink_at`].
+#[allow(dead_code)]
+fn map_remove_error(error: VfsError) -> RemoveError {
+    match error {
+        VfsError::NotFound => RemoveError::Resolve(ResolveError::NotFound),
+        VfsError::NotDirectory => RemoveError::NotDirectory,
+        VfsError::IsDirectory => RemoveError::IsDirectory,
+        VfsError::SymlinkLoop => RemoveError::Resolve(ResolveError::SymlinkLoop),
+        VfsError::InvalidPath => RemoveError::Invalid,
+        VfsError::OverlayLimit => RemoveError::NoSpace,
+        VfsError::PermissionDenied
+        | VfsError::InvalidDescriptor
+        | VfsError::DescriptorLimit
+        | VfsError::FileTooLarge
+        | VfsError::AlreadyExists
+        | VfsError::InvalidOffset
+        | VfsError::InvalidIndex
+        | VfsError::Io => RemoveError::Io,
+    }
 }

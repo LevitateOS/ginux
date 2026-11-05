@@ -345,8 +345,9 @@ pub struct FileMetadata {
 
 // Overlay slot states: 0 = free, 1 = live file, 2 = tombstone (a removed base
 // entry reads as absent and its slot may be reused), 3 = live directory
-// created by [`VirtualFs::mkdir`]. Directories reuse the file slot; `len` and
-// `data` stay unused while a slot is a directory.
+// created by [`VirtualFs::mkdir`], 4 = live symlink planted by
+// [`VirtualFs::rename`] (target bytes in `data[..len]`). Directories reuse
+// the file slot; `len` and `data` stay unused while a slot is a directory.
 #[derive(Clone, Copy)]
 struct OverlayFile<const FILE_SIZE: usize> {
     state: u8,
@@ -421,6 +422,32 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
 
     pub fn open(&mut self, path: &[u8], flags: u32) -> Result<i32, VfsError> {
         let path = normalize(path)?;
+        // Expand overlay symlinks (planted by `rename`) before the base
+        // lookup below, which only follows base-image links. The renamed
+        // path stays canonical: absolute targets restart at `/`, relative
+        // targets at the containing directory.
+        let mut current = path;
+        let mut expansions = 0usize;
+        while let Some(index) = self.find_overlay(current.as_bytes()) {
+            if self.overlay[index].state != 4 {
+                break;
+            }
+            if expansions >= 16 {
+                return Err(VfsError::SymlinkLoop);
+            }
+            expansions += 1;
+            let len = self.overlay[index].len;
+            if len > MAX_LINK {
+                return Err(VfsError::InvalidIndex);
+            }
+            current = Self::expand_link(
+                current.as_bytes(),
+                current.len,
+                &current,
+                &self.overlay[index].data[..len],
+            )?;
+        }
+        let path = current;
         let writable = flags & O_WRITE != 0;
         let readable = flags & O_READ != 0;
         if !writable && !readable {
@@ -716,7 +743,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             }
         }
         for slot in &self.overlay {
-            if slot.state != 1 && slot.state != 3 {
+            if slot.state != 1 && slot.state != 3 && slot.state != 4 {
                 continue;
             }
             let Some(name) = child_name(dir, slot.path.as_bytes()) else {
@@ -728,6 +755,8 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                     name,
                     kind: if slot.state == 3 {
                         NodeKind::Directory
+                    } else if slot.state == 4 {
+                        NodeKind::Symlink
                     } else {
                         NodeKind::File
                     },
@@ -748,23 +777,234 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         Ok(total)
     }
 
+    /// Remove one domain file or symlink, leaving directories in place.
+    /// Resolution never follows the final symlink, so unlinking a link —
+    /// including a dangling one or one pointing at a directory — removes
+    /// the link itself and leaves the target untouched. The removal reads
+    /// as a tombstone: the name goes missing while open descriptors keep
+    /// reporting the object they pinned. Directories fail with
+    /// [`VfsError::IsDirectory`]; removing one needs `rmdir` support, an
+    /// observed follow-up.
     pub fn unlink(&mut self, path: &[u8]) -> Result<(), VfsError> {
-        let path = normalize(path)?;
-        if let Some(index) = self.find_overlay(path.as_bytes()) {
-            if self.overlay[index].state == 3 {
-                return Err(VfsError::IsDirectory);
-            }
+        let (kind, _, canon, overlay) = self.resolve_merged(path, false)?;
+        if kind == NodeKind::Directory {
+            return Err(VfsError::IsDirectory);
+        }
+        if let Some(index) = overlay {
             self.overlay[index].state = 2;
             self.overlay[index].len = 0;
             return Ok(());
         }
-        let entry = self.index.resolve(path.as_bytes())?;
-        if entry.kind == NodeKind::Directory {
-            return Err(VfsError::IsDirectory);
-        }
         let index = self.allocate_overlay()?;
         self.overlay[index].state = 2;
-        self.overlay[index].path = path;
+        self.overlay[index].path = canon;
+        self.overlay[index].len = 0;
+        Ok(())
+    }
+
+    /// Move `old` to `new` within the domain, replacing any existing file
+    /// or symlink at `new` in the same step. The replacement is atomic: all
+    /// fallible checks (missing source, directory source or target, overlay
+    /// capacity, oversized content, backing-store reads) complete before
+    /// any live view changes, so a failure leaves the previous view intact.
+    /// Directories never move: an old or new directory fails with
+    /// [`VfsError::IsDirectory`], since directory moves need `rmdir`
+    /// support, an observed follow-up. Renaming a name onto itself succeeds
+    /// once the entry is proven to exist. The target parent must already be
+    /// a directory in the merged view; intermediate symlinks on every side
+    /// expand, but a final symlink on the source side moves the link
+    /// itself, never its target. A moved overlay entry keeps its slot (open
+    /// descriptors follow it to the new name); a moved base entry is copied
+    /// into the overlay and hidden behind a tombstone, so the immutable
+    /// image never changes.
+    pub fn rename(&mut self, old: &[u8], new: &[u8]) -> Result<(), VfsError> {
+        let old = normalize(old)?;
+        let new = normalize(new)?;
+        if old.as_bytes() == b"/" || new.as_bytes() == b"/" {
+            return Err(VfsError::InvalidPath);
+        }
+        let (old_kind, old_mode, old_canon, old_overlay) =
+            self.resolve_merged(old.as_bytes(), false)?;
+        if old_kind == NodeKind::Directory {
+            return Err(VfsError::IsDirectory);
+        }
+        // Canonical target: resolve the parent (through symlinks), then join
+        // the final name, so the stored path never hides an unexpanded link.
+        let split = new
+            .as_bytes()
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .ok_or(VfsError::InvalidPath)?;
+        let parent = if split == 0 {
+            b"/".as_slice()
+        } else {
+            &new.as_bytes()[..split]
+        };
+        let name = &new.as_bytes()[split + 1..];
+        if name.is_empty() || name == b"." || name == b".." {
+            return Err(VfsError::InvalidPath);
+        }
+        let (parent_kind, _, parent_canon, _) = self.resolve_merged(parent, true)?;
+        if parent_kind != NodeKind::Directory {
+            return Err(VfsError::NotDirectory);
+        }
+        let mut full = parent_canon;
+        if full.as_bytes() != b"/" {
+            full.extend(b"/")?;
+        }
+        full.extend(name)?;
+        if full.as_bytes() == old_canon.as_bytes() {
+            return Ok(());
+        }
+        // Classify the target exactly: `full` is canonical, so no symlink
+        // is left to expand. A base directory always blocks, even under a
+        // tombstone; a live overlay entry is replaced below.
+        let target_overlay = self.find_overlay(full.as_bytes());
+        let victim = match target_overlay {
+            Some(index) if self.overlay[index].state == 3 => {
+                return Err(VfsError::IsDirectory);
+            }
+            Some(index) if self.overlay[index].state != 2 => Some(index),
+            _ => None,
+        };
+        let tombstone = match target_overlay {
+            Some(index) if self.overlay[index].state == 2 => Some(index),
+            _ => None,
+        };
+        let target_base_live = match self.index.lookup_exact(full.as_bytes()) {
+            Ok(entry) => {
+                if entry.kind == NodeKind::Directory {
+                    return Err(VfsError::IsDirectory);
+                }
+                true
+            }
+            Err(VfsError::NotFound) => false,
+            Err(error) => return Err(error),
+        };
+        // Fetch the source content while the view is still untouched. Base
+        // files contribute their record span; base symlinks their target.
+        // An overlay source moves in its own slot, so nothing is fetched.
+        let old_is_base = old_overlay.is_none();
+        let mut base_size = 0usize;
+        let mut base_offset = 0u64;
+        let mut link_buf = [0u8; MAX_LINK];
+        let mut link_len = 0usize;
+        if old_is_base {
+            match self.index.lookup_exact(old_canon.as_bytes()) {
+                Ok(entry) if old_kind == NodeKind::File && entry.kind == NodeKind::File => {
+                    let size =
+                        usize::try_from(entry.size).map_err(|_| VfsError::FileTooLarge)?;
+                    if size > FILE_SIZE {
+                        return Err(VfsError::FileTooLarge);
+                    }
+                    base_size = size;
+                    base_offset = entry.data_offset;
+                }
+                Ok(entry)
+                    if old_kind == NodeKind::Symlink && entry.kind == NodeKind::Symlink =>
+                {
+                    if entry.link.len() > FILE_SIZE {
+                        return Err(VfsError::FileTooLarge);
+                    }
+                    link_buf[..entry.link.len()].copy_from_slice(entry.link);
+                    link_len = entry.link.len();
+                }
+                Ok(_) => return Err(VfsError::InvalidIndex),
+                Err(error) => return Err(error),
+            }
+        }
+        // Count fresh slots before mutating: recycled tombstones cost none.
+        // The source tombstone always needs one; the content needs one
+        // unless a dead slot at the target takes it; hiding a live base
+        // target needs one more, taking the dead slot when the content did
+        // not already claim it.
+        let content_in_tomb = old_is_base && victim.is_none() && tombstone.is_some();
+        let tomb_new_in_tomb =
+            target_base_live && victim.is_none() && tombstone.is_some() && !content_in_tomb;
+        let mut need = 1usize;
+        if old_is_base && !content_in_tomb {
+            need += 1;
+        }
+        if target_base_live && victim.is_none() && !tomb_new_in_tomb {
+            need += 1;
+        }
+        let free = self.overlay.iter().filter(|entry| entry.state == 0).count();
+        if free < need {
+            return Err(VfsError::OverlayLimit);
+        }
+        // Place the content. A base source copies into the recycled target
+        // tombstone when one is there, else a fresh slot; a live victim is
+        // never reused, so a backing-store failure below cannot clobber live
+        // data. The read runs before any view change; a fresh slot rolls
+        // back to free on failure.
+        let mut tomb_reused = false;
+        if old_is_base {
+            let index = match tombstone {
+                Some(index) if victim.is_none() => {
+                    tomb_reused = true;
+                    index
+                }
+                _ => self.allocate_overlay()?,
+            };
+            if old_kind == NodeKind::File {
+                if base_size > 0 {
+                    if let Err(error) = self.reader.read_at(
+                        base_offset,
+                        &mut self.overlay[index].data[..base_size],
+                    ) {
+                        if !tomb_reused {
+                            self.overlay[index].state = 0;
+                        }
+                        return Err(error);
+                    }
+                }
+                self.overlay[index].state = 1;
+                self.overlay[index].path = full;
+                self.overlay[index].mode = old_mode;
+                self.overlay[index].len = base_size;
+            } else {
+                self.overlay[index].state = 4;
+                self.overlay[index].path = full;
+                self.overlay[index].mode = old_mode;
+                self.overlay[index].len = link_len;
+                self.overlay[index].data[..link_len].copy_from_slice(&link_buf[..link_len]);
+            }
+        }
+        // A replaced live victim becomes a tombstone, keeping the base it
+        // may shadow hidden; an overlay source moves in its own slot.
+        if let Some(index) = victim {
+            self.overlay[index].state = 2;
+            self.overlay[index].len = 0;
+        }
+        if let Some(index) = old_overlay {
+            self.overlay[index].path = full;
+        }
+        // Hide a replaced live base target behind a tombstone, reusing the
+        // dead target slot when the content did not already claim it.
+        if target_base_live && victim.is_none() {
+            let index = match tombstone {
+                Some(index) if !tomb_reused => {
+                    tomb_reused = true;
+                    index
+                }
+                _ => self.allocate_overlay()?,
+            };
+            self.overlay[index].state = 2;
+            self.overlay[index].path = full;
+            self.overlay[index].len = 0;
+        }
+        // Hide the vacated source name the same way.
+        let index = self.allocate_overlay()?;
+        self.overlay[index].state = 2;
+        self.overlay[index].path = old_canon;
+        self.overlay[index].len = 0;
+        // A superseded target tombstone that neither the content nor a
+        // target tombstone reused is now redundant: free it.
+        if let Some(index) = tombstone {
+            if !tomb_reused {
+                self.overlay[index].state = 0;
+            }
+        }
         Ok(())
     }
 
@@ -784,7 +1024,15 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
     /// guards callers with a smaller buffer.
     pub fn classify_merged(&self, path: &[u8], link: &mut [u8; MAX_LINK]) -> MergedKind {
         if let Some(index) = self.find_overlay(path) {
-            return match self.overlay[index].state {
+            let slot = &self.overlay[index];
+            if slot.state == 4 {
+                if slot.len > link.len() {
+                    return MergedKind::TargetTooLong;
+                }
+                link[..slot.len].copy_from_slice(&slot.data[..slot.len]);
+                return MergedKind::Symlink(slot.len);
+            }
+            return match slot.state {
                 1 => MergedKind::File,
                 3 => MergedKind::Directory,
                 _ => MergedKind::Missing,
@@ -824,6 +1072,16 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                     kind: NodeKind::Directory,
                     mode: slot.mode,
                     size: 0,
+                    uid: 0,
+                    gid: 0,
+                    ino: path_ino(path),
+                });
+            }
+            if slot.state == 4 {
+                return Ok(FileMetadata {
+                    kind: NodeKind::Symlink,
+                    mode: slot.mode,
+                    size: slot.len as u64,
                     uid: 0,
                     gid: 0,
                     ino: path_ino(path),
@@ -885,10 +1143,24 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         Ok(slot)
     }
 
+    /// First live slot at `path`, else the first tombstone there. Rename
+    /// and recreation can leave a tombstone and a live entry sharing one
+    /// path; the live entry always wins so a removed-then-replaced name
+    /// resolves to its replacement, never to the deletion marker.
     fn find_overlay(&self, path: &[u8]) -> Option<usize> {
-        self.overlay
-            .iter()
-            .position(|entry| entry.state != 0 && entry.path.as_bytes() == path)
+        let mut tombstone = None;
+        for (index, entry) in self.overlay.iter().enumerate() {
+            if entry.state != 0 && entry.path.as_bytes() == path {
+                if entry.state == 2 {
+                    if tombstone.is_none() {
+                        tombstone = Some(index);
+                    }
+                } else {
+                    return Some(index);
+                }
+            }
+        }
+        tombstone
     }
 
     fn allocate_overlay(&self) -> Result<usize, VfsError> {
@@ -956,6 +1228,23 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
     /// escapes past the domain root fail `normalize` with `InvalidPath`, so
     /// traversal can never name anything outside the domain.
     fn stat_merged(&self, path: &[u8]) -> Result<(NodeKind, u32, Path), VfsError> {
+        let (kind, mode, canon, _) = self.resolve_merged(path, true)?;
+        Ok((kind, mode, canon))
+    }
+
+    /// [`stat_merged`] with caller-chosen final-symlink behavior, plus the
+    /// overlay index when the final entry is a live overlay entry (`None`
+    /// for base entries). With `follow_final = false` a final symlink
+    /// reports itself instead of expanding, so rename/unlink operate on the
+    /// link itself rather than its target. Overlay symlinks (state 4,
+    /// planted by [`VirtualFs::rename`]) expand like base symlinks when
+    /// followed: absolute targets restart at `/`, relative targets restart
+    /// at the containing directory.
+    fn resolve_merged(
+        &self,
+        path: &[u8],
+        follow_final: bool,
+    ) -> Result<(NodeKind, u32, Path, Option<usize>), VfsError> {
         let mut current = normalize(path)?;
         for _ in 0..16 {
             let mut position = 1usize;
@@ -971,6 +1260,23 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                     if slot.state == 2 {
                         return Err(VfsError::NotFound);
                     }
+                    if slot.state == 4 {
+                        if slot.len > MAX_LINK {
+                            return Err(VfsError::InvalidIndex);
+                        }
+                        let last = component_end == current.len;
+                        if last && !follow_final {
+                            return Ok((NodeKind::Symlink, slot.mode, current, Some(index)));
+                        }
+                        current = Self::expand_link(
+                            prefix,
+                            component_end,
+                            &current,
+                            &slot.data[..slot.len],
+                        )?;
+                        followed = true;
+                        break;
+                    }
                     let kind = if slot.state == 3 {
                         NodeKind::Directory
                     } else {
@@ -980,7 +1286,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                         return Err(VfsError::NotDirectory);
                     }
                     if component_end == current.len {
-                        return Ok((kind, slot.mode, current));
+                        return Ok((kind, slot.mode, current, Some(index)));
                     }
                     position = component_end + 1;
                     continue;
@@ -990,23 +1296,10 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                     Err(_) => return Err(VfsError::NotFound),
                 };
                 if base.kind == NodeKind::Symlink {
-                    let mut replacement = Path::new();
-                    if base.link.first() == Some(&b'/') {
-                        replacement.extend(base.link)?;
-                    } else {
-                        let parent_end = prefix.iter().rposition(|byte| *byte == b'/').unwrap_or(0);
-                        if parent_end == 0 {
-                            replacement.extend(b"/")?;
-                        } else {
-                            replacement.extend(&prefix[..parent_end])?;
-                            replacement.extend(b"/")?;
-                        }
-                        replacement.extend(base.link)?;
+                    if component_end == current.len && !follow_final {
+                        return Ok((NodeKind::Symlink, base.mode, current, None));
                     }
-                    if component_end < current.len {
-                        replacement.extend(&current.bytes[component_end..current.len])?;
-                    }
-                    current = normalize(replacement.as_bytes())?;
+                    current = Self::expand_link(prefix, component_end, &current, base.link)?;
                     followed = true;
                     break;
                 }
@@ -1014,7 +1307,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                     return Err(VfsError::NotDirectory);
                 }
                 if component_end == current.len {
-                    return Ok((base.kind, base.mode, current));
+                    return Ok((base.kind, base.mode, current, None));
                 }
                 position = component_end + 1;
             }
@@ -1023,6 +1316,38 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             }
         }
         Err(VfsError::SymlinkLoop)
+    }
+
+    /// Expand one symlink step: absolute `target` restarts at `/`, relative
+    /// `target` restarts at the directory containing `prefix`; the
+    /// still-unprocessed suffix (`current[component_end..]`) is re-appended
+    /// verbatim for the next walk pass, which normalizes and classifies it.
+    fn expand_link(
+        prefix: &[u8],
+        component_end: usize,
+        current: &Path,
+        target: &[u8],
+    ) -> Result<Path, VfsError> {
+        if target.is_empty() || target.len() > MAX_LINK || target.contains(&0) {
+            return Err(VfsError::InvalidPath);
+        }
+        let mut replacement = Path::new();
+        if target.first() == Some(&b'/') {
+            replacement.extend(target)?;
+        } else {
+            let parent_end = prefix.iter().rposition(|byte| *byte == b'/').unwrap_or(0);
+            if parent_end == 0 {
+                replacement.extend(b"/")?;
+            } else {
+                replacement.extend(&prefix[..parent_end])?;
+                replacement.extend(b"/")?;
+            }
+            replacement.extend(target)?;
+        }
+        if component_end < current.len {
+            replacement.extend(&current.bytes[component_end..current.len])?;
+        }
+        normalize(replacement.as_bytes())
     }
 }
 
