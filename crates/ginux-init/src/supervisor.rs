@@ -49,8 +49,10 @@ pub const PTRACE_SETOPTIONS: usize = 0x4200;
 pub const PTRACE_GETEVENTMSG: usize = 0x4201;
 pub const PTRACE_O_TRACESYSGOOD: usize = 1;
 pub const PTRACE_O_TRACEFORK: usize = 1 << 1;
+pub const PTRACE_O_TRACEEXEC: usize = 1 << 4;
 pub const PTRACE_O_EXITKILL: usize = 1 << 20;
 pub const PTRACE_EVENT_FORK: usize = 1;
+pub const PTRACE_EVENT_EXEC: usize = 4;
 
 pub const EPERM: i64 = 1;
 pub const ENOSYS: i64 = 38;

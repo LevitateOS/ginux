@@ -24,19 +24,20 @@ use crate::launch::{
     Command, ELF_BYTES, VFS_INDEX_BYTES,
 };
 use crate::process_hooks::{
-    PTRACE_EVENT_CLONE, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEVFORK,
+    exec_mediated, PTRACE_EVENT_CLONE, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEVFORK,
 };
 use crate::supervisor::{
     exit_process, line, ptrace, read_tracee_word, stopped, syscall0, syscall1, syscall2, syscall3,
     syscall4, syscall5, wait, write_all, write_i64, write_u64, UserRegs, AT_FDCWD, CLOCK_MONOTONIC,
     CLOCK_PROCESS_CPUTIME_ID, DOMAIN_GID, DOMAIN_UID, ENOSYS, EPERM, O_RDONLY, O_RDWR,
-    PR_SET_NO_NEW_PRIVS, PTRACE_CONT, PTRACE_EVENT_FORK, PTRACE_GETEVENTMSG, PTRACE_GETREGS,
-    PTRACE_KILL, PTRACE_O_EXITKILL, PTRACE_O_TRACEFORK, PTRACE_O_TRACESYSGOOD, PTRACE_PEEKTEXT,
-    PTRACE_POKETEXT, PTRACE_SETOPTIONS, PTRACE_SETREGS, PTRACE_SYSCALL, PTRACE_SYSEMU,
-    PTRACE_TRACEME, SIGKILL, SIGTERM, SIG_BLOCK, SYS_CHDIR, SYS_CHROOT, SYS_CLOCK_GETTIME,
-    SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC, SYS_KILL, SYS_OPENAT_HOST,
-    SYS_PAUSE, SYS_PRCTL, SYS_PREAD64, SYS_PTRACE, SYS_PWRITE64, SYS_READ_HOST, SYS_RT_SIGPROCMASK,
-    SYS_SETGID, SYS_SETGROUPS, SYS_SETUID, SYS_SIGNALFD4, SYS_WAIT4, VIRTUAL_PID,
+    PR_SET_NO_NEW_PRIVS, PTRACE_CONT, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_GETEVENTMSG,
+    PTRACE_GETREGS, PTRACE_KILL, PTRACE_O_EXITKILL, PTRACE_O_TRACEEXEC, PTRACE_O_TRACEFORK,
+    PTRACE_O_TRACESYSGOOD, PTRACE_PEEKTEXT, PTRACE_POKETEXT, PTRACE_SETOPTIONS, PTRACE_SETREGS,
+    PTRACE_SYSCALL, PTRACE_SYSEMU, PTRACE_TRACEME, SIGKILL, SIGTERM, SIG_BLOCK, SYS_CHDIR,
+    SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC,
+    SYS_KILL, SYS_OPENAT_HOST, SYS_PAUSE, SYS_PRCTL, SYS_PREAD64, SYS_PTRACE, SYS_PWRITE64,
+    SYS_READ_HOST, SYS_RT_SIGPROCMASK, SYS_SETGID, SYS_SETGROUPS, SYS_SETUID, SYS_SIGNALFD4,
+    SYS_WAIT4, VIRTUAL_PID,
 };
 use ginux_devices::{
     BlockBackend, DeviceError, DeviceKind, DeviceName, DeviceRegistry, DeviceView, IsolatedNetwork,
@@ -467,6 +468,8 @@ struct NativeProcessTask {
     fork_breakpoint_rip: usize,
     fork_breakpoint_word: usize,
     fork_variant_event: u32,
+    exec_pending: bool,
+    exec_event_seen: bool,
     tracing: bool,
 }
 
@@ -524,6 +527,7 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         | PTRACE_O_TRACEFORK
         | PTRACE_O_TRACEVFORK
         | PTRACE_O_TRACECLONE
+        | PTRACE_O_TRACEEXEC
         | PTRACE_O_EXITKILL;
     if ptrace(PTRACE_SETOPTIONS, root_host_pid, 0, options) < 0 {
         native_fail(domain, root_host_pid, b"process ptrace options failed");
@@ -545,6 +549,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         fork_breakpoint_rip: 0,
         fork_breakpoint_word: 0,
         fork_variant_event: 0,
+        exec_pending: false,
+        exec_event_seen: false,
         tracing: true,
     });
     if ptrace(PTRACE_SYSCALL, root_host_pid, 0, 0) < 0 {
@@ -603,7 +609,9 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     process_native_fail(domain, root_host_pid, b"native domain exit failed");
                 }
                 line(b"GINUX_NATIVE_PROCESS: fork=mediated child=ptrace-attached pid-translation=PASS");
-                line(b"GINUX_NATIVE_PROCESS: wait=translated child-status=real tasks=0 cleanup=PASS");
+                line(
+                    b"GINUX_NATIVE_PROCESS: wait=translated child-status=real tasks=0 cleanup=PASS",
+                );
                 line(b"GATE7_NATIVE_PROCESS: PASS");
                 exit_process(0);
             }
@@ -641,6 +649,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 fork_breakpoint_rip: 0,
                 fork_breakpoint_word: 0,
                 fork_variant_event: 0,
+                exec_pending: false,
+                exec_event_seen: false,
                 tracing: true,
             });
             if event == PTRACE_EVENT_FORK {
@@ -704,6 +714,34 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             parent.fork_variant_event = event as u32;
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
                 process_native_fail(domain, root_host_pid, b"fork parent resume failed");
+            }
+            continue;
+        }
+        if event == PTRACE_EVENT_EXEC {
+            // Executable replacement: the host kernel already performed the
+            // shebang/loader transition. The virtual task keeps its identity
+            // (same host pid, same virtual pid) with a bumped exec epoch and
+            // reset signal state, and stays attached: `awaiting_exit` remains
+            // set so the execve exit stop below only consumes the pending
+            // entry instead of looking like a fresh entry.
+            if !task.exec_pending {
+                process_native_fail(domain, root_host_pid, b"unexpected exec event");
+            }
+            let epoch = processes.exec(task.virtual_id).unwrap_or_else(|_| {
+                process_native_fail(domain, root_host_pid, b"virtual exec failed")
+            });
+            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec syscall=");
+            write_u64(task.syscall);
+            write_all(b" host-pid=");
+            write_u64(host_pid as u64);
+            write_all(b" virtual-pid=");
+            write_u64(task.virtual_id.pid as u64);
+            write_all(b" epoch=");
+            write_u64(epoch as u64);
+            write_all(b"\n");
+            tasks[task_index].as_mut().unwrap().exec_event_seen = true;
+            if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
+                process_native_fail(domain, root_host_pid, b"exec event resume failed");
             }
             continue;
         }
@@ -875,6 +913,38 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     registers.rax = virtual_pid as u64;
                     current.override_result = true;
                 }
+            } else if (current.syscall == 59 || current.syscall == 322) && current.exec_pending {
+                // Replacement exit: a recorded EXEC event means the new image
+                // is already running under supervision and this stop (return
+                // 0) only consumes the pending entry. A negative return is an
+                // explicit failure such as ENOENT and the old image continues
+                // under supervision. Success without a prior event is handled
+                // defensively the same way the event handles it.
+                if current.exec_event_seen {
+                    if registers.rax as i64 != 0 {
+                        process_native_fail(domain, root_host_pid, b"exec event without success");
+                    }
+                    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-complete virtual-pid=");
+                    write_u64(current.virtual_id.pid as u64);
+                    write_all(b"\n");
+                } else if registers.rax as i64 == 0 {
+                    let epoch = processes.exec(current.virtual_id).unwrap_or_else(|_| {
+                        process_native_fail(domain, root_host_pid, b"virtual exec failed")
+                    });
+                    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-late virtual-pid=");
+                    write_u64(current.virtual_id.pid as u64);
+                    write_all(b" epoch=");
+                    write_u64(epoch as u64);
+                    write_all(b"\n");
+                } else {
+                    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-failed errno=");
+                    write_i64(-(registers.rax as i64));
+                    write_all(b" virtual-pid=");
+                    write_u64(current.virtual_id.pid as u64);
+                    write_all(b"\n");
+                }
+                current.exec_pending = false;
+                current.exec_event_seen = false;
             } else if current.override_result {
                 registers.rax = current.result as u64;
             }
@@ -890,6 +960,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             current.override_result = false;
             current.translated_rdi = 0;
             current.fork_variant_event = 0;
+            current.exec_pending = false;
+            current.exec_event_seen = false;
             tasks[task_index] = Some(current);
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
                 process_native_fail(domain, root_host_pid, b"process exit resume failed");
@@ -923,6 +995,20 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     registers.orig_rax = u64::MAX;
                 }
                 56..=58 => {}
+                59 | 322 => {
+                    // Executable replacement: the mediated shapes execute on
+                    // the host with the tracee still attached, and the EXEC
+                    // event records the virtual transition. Shapes needing
+                    // descriptor-table plumbing never execute and fail here.
+                    if exec_mediated(registers.orig_rax, registers.rdi, registers.r8) {
+                        current.exec_pending = true;
+                        current.exec_event_seen = false;
+                    } else {
+                        current.result = -ENOSYS;
+                        current.override_result = true;
+                        registers.orig_rax = u64::MAX;
+                    }
+                }
                 61 => {
                     if registers.rdi != u64::MAX {
                         let virtual_pid = registers.rdi as u32;
