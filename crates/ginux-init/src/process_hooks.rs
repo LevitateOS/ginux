@@ -79,7 +79,7 @@
 //! register-free policy predicates ([`exec_bit_set`], [`parse_script_interp`]);
 //! the tracee-memory and VFS orchestration lives in the loop.
 
-use crate::supervisor::{ENOSYS, SYS_FORK};
+use crate::supervisor::{EACCES, EINVAL, ENODEV, ENOMEM, ENOSYS, EPERM, SYS_FORK};
 
 /// Raw clone entry: what glibc `fork()` and the `posix_spawn` fallback emit.
 pub const SYS_CLONE: u64 = 56;
@@ -213,16 +213,69 @@ pub const PTRACE_EVENT_CLONE: usize = 3;
 pub const PTRACE_O_TRACECLONE: usize = 1 << PTRACE_EVENT_CLONE;
 pub const PTRACE_O_TRACEVFORK: usize = 1 << PTRACE_EVENT_VFORK;
 
-/// Lane membership by syscall number: the three process-creation entries
-/// plus the two executable-replacement entries belong to the process lane.
-/// Other entries stay with the supervision loop's existing match until their
-/// owning tasks claim them.
+/// Raw `mmap` entry: anonymous private mappings only; every other shape
+/// is denied by [`mmap_shape_error`] before the host runs.
+pub const SYS_MMAP: u64 = 9;
+/// Raw `mprotect` entry: protection changes on already-mapped memory.
+pub const SYS_MPROTECT: u64 = 10;
+/// Raw `munmap` entry: releases mappings; reconciled, never denied.
+pub const SYS_MUNMAP: u64 = 11;
+/// Raw `brk` entry: extends or queries the data-segment break.
+pub const SYS_BRK: u64 = 12;
+
+/// `mmap`/`mprotect` protection bits (`linux/mman.h`). Read needs no
+/// gate (bit `0x1`); only the write/execute combination is denied.
+pub const PROT_WRITE: u64 = 0x2;
+pub const PROT_EXEC: u64 = 0x4;
+
+/// `mmap` flag bits (`linux/mman.h`).
+pub const MAP_SHARED: u64 = 0x01;
+pub const MAP_PRIVATE: u64 = 0x02;
+pub const MAP_FIXED: u64 = 0x10;
+pub const MAP_ANONYMOUS: u64 = 0x20;
+pub const MAP_NORESERVE: u64 = 0x4000;
+pub const MAP_POPULATE: u64 = 0x8000;
+pub const MAP_STACK: u64 = 0x20000;
+pub const MAP_FIXED_NOREPLACE: u64 = 0x100000;
+
+/// Benign `mmap` hints a loader or allocator may set on anonymous
+/// private mappings: overcommit and prefetch advice (`NORESERVE`,
+/// `POPULATE`) and the thread-stack marker (`STACK`). Everything else
+/// outside `PRIVATE`/`ANONYMOUS` is denied.
+pub const MAP_ALLOWED_HINTS: u64 = MAP_NORESERVE | MAP_POPULATE | MAP_STACK;
+
+/// I04-M1 bounds. A single mapping may not exceed 64 MiB; one thread
+/// group (one address space, `mmap` ranges plus `brk` growth) may not
+/// exceed 256 MiB, matching the default domain memory declaration; at
+/// most 256 live ranges per group. Past any of them the entry fails
+/// closed with `-ENOMEM` before the host runs.
+pub const MMAP_SINGLE_MAX: u64 = 64 << 20;
+pub const MMAP_TOTAL_MAX: u64 = 256 << 20;
+pub const MMAP_REGION_MAX: usize = 256;
+/// Page granularity for length accounting: the kernel maps whole pages,
+/// so the ledger rounds requests up the same way.
+pub const MMAP_PAGE: u64 = 4096;
+
+/// Round a mapping length up to page granularity. Callers check the raw
+/// length against [`MMAP_SINGLE_MAX`] first, so this cannot overflow.
+pub const fn round_len(len: u64) -> u64 {
+    (len + MMAP_PAGE - 1) & !(MMAP_PAGE - 1)
+}
+
+/// Lane membership by syscall number: the three process-creation entries,
+/// the two executable-replacement entries, and the four anonymous-memory
+/// entries belong to the process lane. Other entries stay with the
+/// supervision loop's existing match until their owning tasks claim them.
 pub fn claims(syscall: u64) -> bool {
     syscall == SYS_FORK as u64
         || syscall == SYS_CLONE
         || syscall == SYS_VFORK
         || syscall == SYS_EXECVE
         || syscall == SYS_EXECVEAT
+        || syscall == SYS_MMAP
+        || syscall == SYS_MPROTECT
+        || syscall == SYS_MUNMAP
+        || syscall == SYS_BRK
 }
 
 /// Whether a `CLONE_THREAD` flag word names the one supported thread shape:
@@ -251,6 +304,75 @@ pub fn thread_supported(flags: u64) -> bool {
         && flags & CLONE_EXIT_SIGNAL_MASK == 0
 }
 
+/// Whether an `mmap` shape may execute on the host. Anonymous private
+/// mappings (with the benign hints in [`MAP_ALLOWED_HINTS`]) return
+/// `None`: the supervision loop checks the lane caps, lets the host map
+/// supervisor-owned anonymous memory, and records the outcome. Every
+/// other shape returns an explicit errno and never executes:
+/// - zero length: `-EINVAL`, like the kernel;
+/// - file-backed (`MAP_ANONYMOUS` clear): `-ENODEV`, because the domain
+///   view holds no mappable file content yet (M2 owns that; file-backed
+///   `mmap` stays denied until it exists);
+/// - shared: `-EPERM`, no shared mappings in the domain;
+/// - fixed (`MAP_FIXED`, `MAP_FIXED_NOREPLACE`): `-EPERM`, fixed
+///   overwrite could clobber loader and library mappings;
+/// - unknown flag bits: `-EINVAL`, like the kernel;
+/// - a single request past [`MMAP_SINGLE_MAX`]: `-ENOMEM`;
+/// - writable-executable protections: `-EACCES`, matching the balanced
+///   contract's existing `mmap`/`mprotect` argument gate and
+///   SELinux-enforcing kernels.
+pub fn mmap_shape_error(flags: u64, len: u64, prot: u64) -> Option<i64> {
+    if len == 0 {
+        return Some(EINVAL);
+    }
+    if flags & MAP_ANONYMOUS == 0 {
+        return Some(ENODEV);
+    }
+    if flags & MAP_SHARED != 0 {
+        return Some(EPERM);
+    }
+    if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
+        return Some(EPERM);
+    }
+    if flags & !(MAP_PRIVATE | MAP_ANONYMOUS | MAP_ALLOWED_HINTS) != 0 {
+        return Some(EINVAL);
+    }
+    if len > MMAP_SINGLE_MAX {
+        return Some(ENOMEM);
+    }
+    if prot & (PROT_WRITE | PROT_EXEC) == (PROT_WRITE | PROT_EXEC) {
+        return Some(EACCES);
+    }
+    None
+}
+
+/// Whether a mapping of `len` bytes still fits the lane caps for a group
+/// already holding `regions` ranges and `total` bytes. Past either cap
+/// the entry fails closed with `-ENOMEM` before the host runs.
+pub fn reserve_error(regions: usize, total: u64, len: u64) -> Option<i64> {
+    if regions >= MMAP_REGION_MAX {
+        return Some(ENOMEM);
+    }
+    if total.saturating_add(round_len(len)) > MMAP_TOTAL_MAX {
+        return Some(ENOMEM);
+    }
+    None
+}
+
+/// Whether an `mprotect` shape may execute: zero length fails with
+/// `-EINVAL`, writable-executable with `-EACCES`, like [`mmap_shape_error`].
+/// Anything else (RELRO, newly executable text) runs on the host and
+/// changes no accounting.
+pub fn mprotect_shape_error(prot: u64, len: u64) -> Option<i64> {
+    if len == 0 {
+        return Some(EINVAL);
+    }
+    if prot & (PROT_WRITE | PROT_EXEC) == (PROT_WRITE | PROT_EXEC) {
+        return Some(EACCES);
+    }
+    None
+}
+
 /// Emulated result when this lane handles the entry. Process creation,
 /// supported thread creation, and executable replacement are mediated, not
 /// emulated: `None` falls through to the supervision loop, which lets the
@@ -262,7 +384,12 @@ pub fn thread_supported(flags: u64) -> bool {
 /// managed-task representation because the child runs alongside the parent
 /// in the same memory). `execveat` shapes beyond the plain variant are gated
 /// by [`exec_mediated`], which the supervision loop consults because it sees
-/// the flags register this hook does not receive.
+/// the flags register this hook does not receive. The memory entries
+/// (`mmap`, `mprotect`, `munmap`, `brk`) likewise always return `None`
+/// here: `mmap` needs its flags from `r10` and its file descriptor from
+/// `r8`, which this hook does not receive, so the loop consults
+/// [`mmap_shape_error`], [`mprotect_shape_error`], and [`reserve_error`]
+/// with the full register set instead — the same split as `exec_mediated`.
 pub fn claim(syscall: u64, rdi: u64, _rsi: u64, _rdx: u64) -> Option<i64> {
     if syscall == SYS_CLONE {
         if (rdi & CLONE_THREAD) != 0 {

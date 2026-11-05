@@ -29,9 +29,10 @@ use crate::fs_hooks::{
     MAX_CWD as DOMAIN_PATH_MAX, AT_FDCWD as DOMAIN_AT_FDCWD,
 };
 use crate::process_hooks::{
-    dup3_flags_valid, exec_bit_set, exec_mediated, fcntl_supported, parse_script_interp,
-    pipe2_flags_valid, thread_supported, ScriptInterp, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD,
-    FD_CLOEXEC, O_CLOEXEC, PTRACE_EVENT_CLONE, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE,
+    dup3_flags_valid, exec_bit_set, exec_mediated, fcntl_supported, mmap_shape_error,
+    mprotect_shape_error, parse_script_interp, pipe2_flags_valid, reserve_error, round_len,
+    thread_supported, ScriptInterp, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, FD_CLOEXEC,
+    MMAP_TOTAL_MAX, O_CLOEXEC, PTRACE_EVENT_CLONE, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE,
     PTRACE_O_TRACEVFORK, SYS_ARCH_PRCTL, SYS_CLOSE, SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_FCNTL,
     SYS_FUTEX, SYS_GETTID, SYS_GET_ROBUST_LIST, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_RSEQ,
     SYS_SET_ROBUST_LIST, SYS_SET_TID_ADDRESS, SCRIPT_INTERP_MAX,
@@ -43,8 +44,8 @@ use crate::supervisor::{
     PR_SET_NO_NEW_PRIVS, PTRACE_CONT, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_GETEVENTMSG,
     PTRACE_GETREGS, PTRACE_KILL, PTRACE_O_EXITKILL, PTRACE_O_TRACEEXEC, PTRACE_O_TRACEFORK,
     PTRACE_O_TRACESYSGOOD, PTRACE_PEEKTEXT, PTRACE_POKETEXT, PTRACE_SETOPTIONS, PTRACE_SETREGS,
-    PTRACE_SYSCALL, PTRACE_SYSEMU, PTRACE_TRACEME, EBADF, ECHILD, EINVAL, ESRCH, SIGCHLD, SIGINT,
-    SIGKILL,
+    PTRACE_SYSCALL, PTRACE_SYSEMU, PTRACE_TRACEME, EBADF, ECHILD, EINVAL, ENOMEM, ESRCH,
+    SIGCHLD, SIGINT, SIGKILL,
     SIGTERM, SIG_BLOCK, SYS_CHDIR,
     SYS_CHROOT, SYS_CLOCK_GETTIME, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC,
     SYS_KILL, SYS_OPENAT_HOST, SYS_PAUSE, SYS_PRCTL, SYS_PREAD64, SYS_PTRACE, SYS_PWRITE64,
@@ -62,9 +63,9 @@ use ginux_kernel_views::{
     ViewError,
 };
 use ginux_process::{
-    ChildStatus, Credentials, EventFd, EventPoll, FutexTable, PipeSpace, ProcessError, ProcessTable,
-    SignalAction, SignalDelivery, TaskState, TimerTable, VirtualClock, WaitTarget, EVENT_READ,
-    EVENT_WRITE, WAIT_ALLOWED_OPTIONS, WNOHANG,
+    ChildStatus, Credentials, EventFd, EventPoll, FutexTable, MemSpace, PipeSpace, ProcessError,
+    ProcessTable, SignalAction, SignalDelivery, TaskState, TimerTable, VirtualClock, WaitTarget,
+    EVENT_READ, EVENT_WRITE, WAIT_ALLOWED_OPTIONS, WNOHANG,
 };
 use ginux_runtime::{execute, AddressSpace, AuditAction, LoadError};
 use ginux_vfs::{
@@ -1195,6 +1196,13 @@ struct NativeProcessTask {
     desc_arg0: u64,
     desc_arg1: u64,
     desc_arg2: u64,
+    /// A mediated memory entry stashed for its exit stop: the requested
+    /// length (`mmap`, also used for the cap check), or the address and
+    /// length (`munmap`), or the requested break (`brk`). Zero when no
+    /// memory call is in flight. `mprotect` needs no stash: it changes no
+    /// accounting.
+    mem_arg0: u64,
+    mem_arg1: u64,
     tracing: bool,
     thread_pending: bool,
     clone_ptid: usize,
@@ -1304,6 +1312,11 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
     // supervisor-owned domain objects, keyed by virtual pid. Every mutation
     // below follows a host outcome the loop observed.
     let mut pipes: PipeSpace<8, 16, 16> = PipeSpace::new();
+    // I04-M1 anonymous-memory ledger: per-thread-group ranges plus brk
+    // growth, keyed by the existing virtual tgid (no parallel task or
+    // memory owner). Host mappings are supervisor-owned anonymous memory
+    // only; the ledger only records what the loop observed succeed.
+    let mut mem: MemSpace<8, 256> = MemSpace::new();
     let root_virtual = processes
         .create_init(Credentials::unprivileged(1000, 1000))
         .unwrap_or_else(|_| process_native_fail(domain, root_host_pid, b"virtual init failed"));
@@ -1326,6 +1339,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         desc_arg0: 0,
         desc_arg1: 0,
         desc_arg2: 0,
+        mem_arg0: 0,
+        mem_arg1: 0,
         tracing: true,
         thread_pending: false,
         clone_ptid: 0,
@@ -1361,6 +1376,7 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 &mut processes,
                 &mut tasks,
                 &mut pipes,
+                &mut mem,
                 TeardownOutcome::Cancelled,
             );
         }
@@ -1385,6 +1401,7 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 &mut processes,
                 &mut tasks,
                 &mut pipes,
+                &mut mem,
                 TeardownOutcome::Cancelled,
             );
         }
@@ -1411,6 +1428,13 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             // the mirror's ends now, so the pipe objects die their last
             // close here and no stale write end can hide an EOF elsewhere.
             pipes.release_task(task.virtual_id.pid);
+            // I04-M1: the kernel reclaimed this address space with the
+            // task. Release the group ledger when no live member shares
+            // the tgid (threads keep the group alive); lookups that fail
+            // keep the slot so the teardown audit trips instead.
+            if let Ok(dead) = processes.view(task.virtual_id) {
+                release_mem_group(&mut mem, &processes, &tasks, task_index, dead.tgid);
+            }
             // Thread exit with cleanup: a task whose tgid differs from its
             // pid is a thread-group member. Threads are joined over a futex
             // on shared memory, never reaped by `wait4`, so the host slot is
@@ -1468,6 +1492,7 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     &mut processes,
                     &mut tasks,
                     &mut pipes,
+                    &mut mem,
                     outcome,
                 );
             }
@@ -1515,6 +1540,26 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             {
                 process_native_fail(domain, root_host_pid, b"descriptor inherit failed");
             }
+            // I04-M1: a fresh address space copies the parent's anonymous
+            // ledger under its own tgid. Threads share the group slot, so
+            // nothing is copied for them.
+            if !is_thread {
+                let parent_tgid = processes
+                    .view(task.virtual_id)
+                    .map(|view| view.tgid)
+                    .unwrap_or_else(|_| {
+                        process_native_fail(domain, root_host_pid, b"memory inherit lookup failed")
+                    });
+                let child_tgid = processes
+                    .view(child_virtual)
+                    .map(|view| view.tgid)
+                    .unwrap_or_else(|_| {
+                        process_native_fail(domain, root_host_pid, b"memory child lookup failed")
+                    });
+                if mem.fork_copy(child_tgid, parent_tgid).is_err() {
+                    process_native_fail(domain, root_host_pid, b"memory inherit failed");
+                }
+            }
             let Some(child_slot) = tasks.iter().position(Option::is_none) else {
                 process_native_fail(domain, root_host_pid, b"host task table full");
             };
@@ -1536,6 +1581,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 desc_arg0: 0,
                 desc_arg1: 0,
                 desc_arg2: 0,
+                mem_arg0: 0,
+                mem_arg1: 0,
                 tracing: true,
                 thread_pending: false,
                 clone_ptid: 0,
@@ -1632,6 +1679,9 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             });
             let scrubbed =
                 scrub_close_on_exec(&mut pipes, &processes, &tasks, exec_tgid.tgid);
+            // I04-M1: the new image owns a fresh address space; the old
+            // anonymous ledger dies with the replaced image.
+            mem.reset(exec_tgid.tgid);
             write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec syscall=");
             write_u64(task.syscall);
             write_all(b" host-pid=");
@@ -1945,6 +1995,59 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 current.desc_arg0 = 0;
                 current.desc_arg1 = 0;
                 current.desc_arg2 = 0;
+            } else if (current.syscall == 9 || current.syscall == 11 || current.syscall == 12)
+                && !current.override_result
+            {
+                // I04-M1 exit: reconcile the ledger with the host outcome.
+                // Entry-denied calls carry `override_result` and skip this;
+                // the host result stands for everything that executed.
+                let tgid = processes
+                    .view(current.virtual_id)
+                    .map(|view| view.tgid)
+                    .unwrap_or_else(|_| {
+                        process_native_fail(domain, root_host_pid, b"memory exit lookup failed")
+                    });
+                let mem_result = registers.rax as i64;
+                if current.syscall == 9 {
+                    if mem_result >= 0 {
+                        if mem
+                            .record_mmap(tgid, registers.rax, round_len(current.mem_arg0))
+                            .is_err()
+                        {
+                            process_native_fail(domain, root_host_pid, b"memory ledger full");
+                        }
+                        write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap addr=");
+                        write_u64(registers.rax);
+                        write_all(b" len=");
+                        write_u64(current.mem_arg0);
+                        write_all(b"\n");
+                    } else {
+                        write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-fail errno=");
+                        write_i64(-mem_result);
+                        write_all(b"\n");
+                    }
+                } else if current.syscall == 11 {
+                    if mem_result == 0 {
+                        mem.record_munmap(tgid, current.mem_arg0, current.mem_arg1);
+                        write_all(b"GINUX_NATIVE_PROCESS_AUDIT: munmap addr=");
+                        write_u64(current.mem_arg0);
+                        write_all(b" len=");
+                        write_u64(current.mem_arg1);
+                        write_all(b"\n");
+                    }
+                } else if registers.rax != 0 {
+                    // `brk` reports the current break on every return; the
+                    // ledger pins the base on first sight. Failures return
+                    // the old break unchanged, which records harmlessly.
+                    if mem.record_brk(tgid, registers.rax).is_err() {
+                        process_native_fail(domain, root_host_pid, b"memory ledger full");
+                    }
+                    write_all(b"GINUX_NATIVE_PROCESS_AUDIT: brk break=");
+                    write_u64(registers.rax);
+                    write_all(b"\n");
+                }
+                current.mem_arg0 = 0;
+                current.mem_arg1 = 0;
             } else if current.syscall >= 56
                 && current.syscall <= 58
                 && registers.rax as i64 > 0
@@ -2028,6 +2131,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     });
                     let late_scrubbed =
                         scrub_close_on_exec(&mut pipes, &processes, &tasks, late_tgid.tgid);
+                    // I04-M1: same fresh address space as the event path.
+                    mem.reset(late_tgid.tgid);
                     write_all(b"GINUX_NATIVE_PROCESS_AUDIT: exec-late virtual-pid=");
                     write_u64(current.virtual_id.pid as u64);
                     write_all(b" epoch=");
@@ -2065,6 +2170,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             current.desc_arg0 = 0;
             current.desc_arg1 = 0;
             current.desc_arg2 = 0;
+            current.mem_arg0 = 0;
+            current.mem_arg1 = 0;
             tasks[task_index] = Some(current);
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
                 process_native_fail(domain, root_host_pid, b"process exit resume failed");
@@ -2457,6 +2564,87 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                         current.desc_arg2 = registers.rdx;
                     }
                 }
+                9 | 10 | 11 | 12 => {
+                    // I04-M1 anonymous memory mediation. Allowed shapes
+                    // execute on the host, so the tracee observes real
+                    // loader-visible memory backed by supervisor-owned
+                    // anonymous pages — never a host file. Denied shapes
+                    // fail here with a faithful errno and never execute.
+                    // `munmap` always executes; the exit stop reconciles.
+                    let tgid = processes
+                        .view(current.virtual_id)
+                        .map(|view| view.tgid)
+                        .unwrap_or_else(|_| {
+                            process_native_fail(
+                                domain,
+                                root_host_pid,
+                                b"memory tgid lookup failed",
+                            )
+                        });
+                    if registers.orig_rax == 9 {
+                        let denied = mmap_shape_error(
+                            registers.r10,
+                            registers.rsi,
+                            registers.rdx,
+                        )
+                        .or_else(|| {
+                            reserve_error(
+                                mem.region_count(tgid),
+                                mem.mmap_total(tgid),
+                                registers.rsi,
+                            )
+                        });
+                        if let Some(errno) = denied {
+                            current.result = -errno;
+                            current.override_result = true;
+                            registers.orig_rax = u64::MAX;
+                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mmap-deny errno=");
+                            write_i64(errno);
+                            write_all(b" len=");
+                            write_u64(registers.rsi);
+                            write_all(b"\n");
+                        } else {
+                            current.mem_arg0 = registers.rsi;
+                        }
+                    } else if registers.orig_rax == 10 {
+                        if let Some(errno) =
+                            mprotect_shape_error(registers.rdx, registers.rsi)
+                        {
+                            current.result = -errno;
+                            current.override_result = true;
+                            registers.orig_rax = u64::MAX;
+                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: mprotect-deny errno=");
+                            write_i64(errno);
+                            write_all(b"\n");
+                        }
+                    } else if registers.orig_rax == 11 {
+                        current.mem_arg0 = registers.rdi;
+                        current.mem_arg1 = registers.rsi;
+                    } else {
+                        // `brk`: fail closed before the host runs only when
+                        // the request provably exceeds the cap past the
+                        // pinned base. An unknown base (usually the first
+                        // `brk(NULL)` query) lets the host answer and the
+                        // exit stop pins it; L02 `RLIMIT_AS` bounds that
+                        // first answer from the other side.
+                        let requested = registers.rdi;
+                        if requested != 0
+                            && mem.heap_known(tgid)
+                            && mem.brk_grant_total(tgid, requested) > MMAP_TOTAL_MAX
+                        {
+                            current.result = -ENOMEM;
+                            current.override_result = true;
+                            registers.orig_rax = u64::MAX;
+                            write_all(b"GINUX_NATIVE_PROCESS_AUDIT: brk-deny errno=");
+                            write_i64(ENOMEM);
+                            write_all(b" requested=");
+                            write_u64(requested);
+                            write_all(b"\n");
+                        } else {
+                            current.mem_arg0 = requested;
+                        }
+                    }
+                }
                 60 | 231 => {}
                 _ => {
                     current.result = -ENOSYS;
@@ -2501,6 +2689,30 @@ fn resolve_wait_target(
 /// Drop the supervisor's host-side slot for a virtually reaped child. The
 /// host child was already reaped by the supervisor's own wait loop when its
 /// outcome was recorded; the slot only lingered so exits could be attributed.
+/// Release one thread group's anonymous-memory ledger when its last live
+/// member dies. Any still-tracing task sharing the tgid (a live thread
+/// while its leader exits) keeps the slot; the kernel still owns that
+/// address space. Slots whose tgid cannot be resolved are kept so the
+/// teardown zero-audit trips instead of silently under-counting.
+fn release_mem_group(
+    mem: &mut MemSpace<8, 256>,
+    processes: &ProcessTable<8>,
+    tasks: &[Option<NativeProcessTask>; 8],
+    dead_index: usize,
+    dead_tgid: u32,
+) {
+    let shared = tasks.iter().enumerate().any(|(index, entry)| {
+        index != dead_index
+            && entry.is_some_and(|entry| entry.tracing)
+            && processes
+                .view(entry.unwrap().virtual_id)
+                .is_ok_and(|view| view.tgid == dead_tgid)
+    });
+    if !shared {
+        mem.release(dead_tgid);
+    }
+}
+
 fn clear_host_slot(
     tasks: &mut [Option<NativeProcessTask>; 8],
     child: ginux_process::TaskId,
@@ -2806,6 +3018,7 @@ fn teardown_domain(
     processes: &mut ProcessTable<8>,
     tasks: &mut [Option<NativeProcessTask>; 8],
     pipes: &mut PipeSpace<8, 16, 16>,
+    mem: &mut MemSpace<8, 256>,
     outcome: TeardownOutcome,
 ) -> ! {
     // Signal every still-traced descendant first so the drain below only
@@ -2825,7 +3038,7 @@ fn teardown_domain(
         write_all(b"\n");
     }
     teardown::kill_remaining(&doomed[..doomed_count]);
-    let degraded = drain_teardown(domain, root_host_pid, processes, tasks, pipes);
+    let degraded = drain_teardown(domain, root_host_pid, processes, tasks, pipes, mem);
     // Seams run after the last descendant is reaped, before reporting.
     teardown::flush_storage_seam();
     let backends_closed = teardown::close_backends_seam();
@@ -2837,14 +3050,19 @@ fn teardown_domain(
     let reaped = processes.reap_all();
     let live_tasks = processes.active();
     let live_pipes = pipes.active_pipes();
+    // I04-M1: the kernel reclaimed every mapping with its task and each
+    // death above released its group slot, so no range may survive.
+    let live_mappings = mem.live_ranges();
     write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown reaped=");
     write_u64(reaped as u64);
     write_all(b" tasks=");
     write_u64(live_tasks as u64);
     write_all(b" live-pipes=");
     write_u64(live_pipes as u64);
+    write_all(b" live-mappings=");
+    write_u64(live_mappings as u64);
     write_all(b"\n");
-    if degraded || live_tasks != 0 || live_pipes != 0 {
+    if degraded || live_tasks != 0 || live_pipes != 0 || live_mappings != 0 {
         let _ = domain.task_exited(false);
         write_all(b"GINUX_NATIVE_PROCESS: outcome=supervisor-error category=supervision reason=");
         if degraded {
@@ -2860,6 +3078,8 @@ fn teardown_domain(
             // close is the last one), so no pipe object may survive.
             write_all(b"GINUX_NATIVE_PROCESS_AUDIT: descriptors live-pipes=");
             write_u64(pipes.active_pipes() as u64);
+            write_all(b" live-mappings=");
+            write_u64(mem.live_ranges() as u64);
             write_all(b"\n");
             if domain.task_exited(true).is_err() {
                 let _ = domain.task_exited(false);
@@ -2916,6 +3136,7 @@ fn drain_teardown(
     processes: &mut ProcessTable<8>,
     tasks: &mut [Option<NativeProcessTask>; 8],
     pipes: &mut PipeSpace<8, 16, 16>,
+    mem: &mut MemSpace<8, 256>,
 ) -> bool {
     let options = PTRACE_O_TRACESYSGOOD
         | PTRACE_O_TRACEFORK
@@ -2987,6 +3208,11 @@ fn drain_teardown(
                         missed += 1;
                     }
                 }
+                // Host children already lost: no per-group release is
+                // attributable, so drop the ledger wholesale. This path
+                // degrades regardless, so the audit below never reads
+                // clean on top of it.
+                mem.clear();
                 processes.shutdown(137);
                 pending_count = 0;
                 degraded = true;
@@ -3014,6 +3240,10 @@ fn drain_teardown(
                     ChildStatus::Signaled(signal) => processes.signaled(virtual_id, signal),
                 };
                 pipes.release_task(virtual_id.pid);
+                // I04-M1: same last-member release as the main loop.
+                if let Ok(dead) = processes.view(virtual_id) {
+                    release_mem_group(mem, processes, tasks, task_index, dead.tgid);
+                }
                 tasks[task_index] = None;
                 write_all(b"GINUX_NATIVE_PROCESS_AUDIT: teardown reaped virtual-pid=");
                 write_u64(virtual_id.pid as u64);

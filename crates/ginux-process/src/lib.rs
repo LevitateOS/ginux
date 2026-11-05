@@ -1495,3 +1495,299 @@ impl<const TASKS: usize, const FDS: usize, const PIPES: usize> PipeSpace<TASKS, 
             .count()
     }
 }
+
+/// One live anonymous mapping: base address plus page-rounded length.
+/// Length is always nonzero; the ledger keeps ranges disjoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemRange {
+    pub addr: u64,
+    pub len: u64,
+}
+
+impl MemRange {
+    pub const fn empty() -> Self {
+        Self { addr: 0, len: 0 }
+    }
+
+    pub const fn end(&self) -> u64 {
+        self.addr.saturating_add(self.len)
+    }
+}
+
+/// Anonymous-memory ledger for one thread group (one address space).
+/// Threads share their leader's slot; a forked child gets a copy under
+/// its own tgid; `exec` clears the slot. The data-segment break rides
+/// along: `heap_base` pins the first observed break so `brk` growth
+/// counts against the same total as `mmap` ranges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemGroup<const RANGES: usize> {
+    used: bool,
+    tgid: u32,
+    ranges: [MemRange; RANGES],
+    regions: usize,
+    mmap_bytes: u64,
+    heap_known: bool,
+    heap_base: u64,
+    heap_break: u64,
+}
+
+impl<const RANGES: usize> MemGroup<RANGES> {
+    pub const fn empty() -> Self {
+        Self {
+            used: false,
+            tgid: 0,
+            ranges: [MemRange::empty(); RANGES],
+            regions: 0,
+            mmap_bytes: 0,
+            heap_known: false,
+            heap_base: 0,
+            heap_break: 0,
+        }
+    }
+
+    /// Data-segment growth past the first observed break. Zero until the
+    /// first `brk` exit stop records the break.
+    pub const fn heap_growth(&self) -> u64 {
+        if self.heap_known {
+            self.heap_break.saturating_sub(self.heap_base)
+        } else {
+            0
+        }
+    }
+
+    /// Total accounted bytes: mapped ranges plus data-segment growth.
+    pub const fn total_bytes(&self) -> u64 {
+        self.mmap_bytes.saturating_add(self.heap_growth())
+    }
+}
+
+/// Per-thread-group anonymous-mapping ledger for the supervision loop.
+/// Keyed by the existing virtual tgid, so no parallel task or memory
+/// owner is introduced: threads share a slot, processes copy on fork,
+/// `exec` resets, and the last member's death releases the slot. Every
+/// mutation follows a host outcome the loop observed; caps are enforced
+/// by the caller before the host runs, so this type only records.
+pub struct MemSpace<const GROUPS: usize, const RANGES: usize> {
+    groups: [MemGroup<RANGES>; GROUPS],
+}
+
+impl<const GROUPS: usize, const RANGES: usize> Default for MemSpace<GROUPS, RANGES> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const GROUPS: usize, const RANGES: usize> MemSpace<GROUPS, RANGES> {
+    pub const fn new() -> Self {
+        Self {
+            groups: [MemGroup::empty(); GROUPS],
+        }
+    }
+
+    fn index(&self, tgid: u32) -> Option<usize> {
+        self.groups
+            .iter()
+            .position(|slot| slot.used && slot.tgid == tgid)
+    }
+
+    fn index_or_alloc(&mut self, tgid: u32) -> Result<usize, ProcessError> {
+        if let Some(index) = self.index(tgid) {
+            return Ok(index);
+        }
+        let index = self
+            .groups
+            .iter()
+            .position(|slot| !slot.used)
+            .ok_or(ProcessError::TableFull)?;
+        self.groups[index].used = true;
+        self.groups[index].tgid = tgid;
+        Ok(index)
+    }
+
+    /// Accounted bytes for one group: mapped ranges plus data-segment
+    /// growth. Unknown groups report zero.
+    pub fn mmap_total(&self, tgid: u32) -> u64 {
+        self.index(tgid)
+            .map(|index| self.groups[index].total_bytes())
+            .unwrap_or(0)
+    }
+
+    /// Live range count for one group. Unknown groups report zero.
+    pub fn region_count(&self, tgid: u32) -> usize {
+        self.index(tgid)
+            .map(|index| self.groups[index].regions)
+            .unwrap_or(0)
+    }
+
+    /// Whether this group's break is known yet.
+    pub fn heap_known(&self, tgid: u32) -> bool {
+        self.index(tgid)
+            .is_some_and(|index| self.groups[index].heap_known)
+    }
+
+    /// Total that would result if `requested` became the break: mapped
+    /// bytes plus `requested` past the pinned base. Zero when the base
+    /// is still unknown, so the caller lets the host answer first.
+    pub fn brk_grant_total(&self, tgid: u32, requested: u64) -> u64 {
+        let Some(index) = self.index(tgid) else {
+            return 0;
+        };
+        let group = &self.groups[index];
+        if !group.heap_known {
+            return 0;
+        }
+        group
+            .mmap_bytes
+            .saturating_add(requested.saturating_sub(group.heap_base))
+    }
+
+    /// Record a successful `mmap`: the host picked `addr` for the
+    /// page-rounded `len` the entry stop already checked against the
+    /// lane caps. Fails only when the range table is full, which the
+    /// entry check makes unreachable; the caller fails closed.
+    pub fn record_mmap(&mut self, tgid: u32, addr: u64, len: u64) -> Result<(), ProcessError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let index = self.index_or_alloc(tgid)?;
+        if self.groups[index].regions >= RANGES {
+            return Err(ProcessError::TableFull);
+        }
+        let slot = self.groups[index].regions;
+        self.groups[index].ranges[slot] = MemRange { addr, len };
+        self.groups[index].regions += 1;
+        self.groups[index].mmap_bytes = self.groups[index].mmap_bytes.saturating_add(len);
+        Ok(())
+    }
+
+    /// Reconcile a successful `munmap`: drop fully covered ranges and
+    /// trim partially covered edges, subtracting exactly the freed
+    /// bytes. A middle split that finds no free slot keeps the whole
+    /// range instead (over-counts, failing closed later) rather than
+    /// under-counting live memory.
+    pub fn record_munmap(&mut self, tgid: u32, addr: u64, len: u64) {
+        let Some(index) = self.index(tgid) else {
+            return;
+        };
+        let unmap_end = addr.saturating_add(len);
+        if len == 0 || unmap_end <= addr {
+            return;
+        }
+        let mut freed = 0u64;
+        let mut slot = 0usize;
+        while slot < self.groups[index].regions {
+            let range = self.groups[index].ranges[slot];
+            let range_end = range.end();
+            if range_end <= addr || range.addr >= unmap_end {
+                slot += 1;
+                continue;
+            }
+            if addr <= range.addr && unmap_end >= range_end {
+                freed = freed.saturating_add(range.len);
+                let last = self.groups[index].regions - 1;
+                self.groups[index].ranges[slot] = self.groups[index].ranges[last];
+                self.groups[index].ranges[last] = MemRange::empty();
+                self.groups[index].regions -= 1;
+                continue;
+            }
+            if addr > range.addr && unmap_end < range_end {
+                let left_len = addr - range.addr;
+                let right_len = range_end - unmap_end;
+                if self.groups[index].regions < RANGES {
+                    freed = freed.saturating_add(range.len - left_len - right_len);
+                    self.groups[index].ranges[slot].len = left_len;
+                    let fresh = self.groups[index].regions;
+                    self.groups[index].ranges[fresh] = MemRange {
+                        addr: unmap_end,
+                        len: right_len,
+                    };
+                    self.groups[index].regions += 1;
+                }
+                slot += 1;
+                continue;
+            }
+            if addr <= range.addr {
+                let cut = unmap_end - range.addr;
+                freed = freed.saturating_add(cut);
+                self.groups[index].ranges[slot].addr = unmap_end;
+                self.groups[index].ranges[slot].len -= cut;
+            } else {
+                let cut = range_end - addr;
+                freed = freed.saturating_add(cut);
+                self.groups[index].ranges[slot].len -= cut;
+            }
+            slot += 1;
+        }
+        self.groups[index].mmap_bytes = self.groups[index].mmap_bytes.saturating_sub(freed);
+    }
+
+    /// Record a `brk` exit: the host reports the current break, which
+    /// pins the base on first sight and tracks growth after that. A
+    /// zero value never names a break and is ignored.
+    pub fn record_brk(&mut self, tgid: u32, value: u64) -> Result<(), ProcessError> {
+        if value == 0 {
+            return Ok(());
+        }
+        let index = self.index_or_alloc(tgid)?;
+        if !self.groups[index].heap_known {
+            self.groups[index].heap_known = true;
+            self.groups[index].heap_base = value;
+        }
+        self.groups[index].heap_break = value;
+        Ok(())
+    }
+
+    /// Fork inheritance: the child address space starts as a copy of
+    /// the parent's ledger under its own tgid. Parents that never
+    /// mapped leave no slot behind, so the child starts empty too.
+    pub fn fork_copy(&mut self, child: u32, parent: u32) -> Result<(), ProcessError> {
+        let Some(parent_index) = self.index(parent) else {
+            return Ok(());
+        };
+        let snapshot = self.groups[parent_index];
+        let index = self.index_or_alloc(child)?;
+        self.groups[index] = snapshot;
+        self.groups[index].tgid = child;
+        Ok(())
+    }
+
+    /// `exec` replacement: the new image owns a fresh address space, so
+    /// the ledger clears while the slot stays reserved for the group.
+    pub fn reset(&mut self, tgid: u32) {
+        let Some(index) = self.index(tgid) else {
+            return;
+        };
+        let tgid_keep = self.groups[index].tgid;
+        self.groups[index] = MemGroup::empty();
+        self.groups[index].used = true;
+        self.groups[index].tgid = tgid_keep;
+    }
+
+    /// Last-member death: the kernel reclaimed the address space with
+    /// the task, so the slot is released. Idempotent.
+    pub fn release(&mut self, tgid: u32) {
+        let Some(index) = self.index(tgid) else {
+            return;
+        };
+        self.groups[index] = MemGroup::empty();
+    }
+
+    /// Drop every slot: only for the teardown path that already lost
+    /// its host children and reports degraded regardless.
+    pub fn clear(&mut self) {
+        self.groups = [MemGroup::empty(); GROUPS];
+    }
+
+    /// Live ranges across all groups, for the teardown zero-audit.
+    pub fn live_ranges(&self) -> usize {
+        self.groups.iter().map(|slot| slot.regions).sum()
+    }
+
+    /// Accounted bytes across all groups, for diagnostics.
+    pub fn live_bytes(&self) -> u64 {
+        self.groups
+            .iter()
+            .map(|slot| slot.total_bytes())
+            .fold(0u64, |sum, bytes| sum.saturating_add(bytes))
+    }
+}
