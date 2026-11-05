@@ -53,8 +53,8 @@ use crate::supervisor::{syscall2, UserRegs, SYS_KILL};
 use crate::tracee_io::{copy_memory, read_path, write_stat, Stat};
 
 pub const PIPE_FD_BASE: u32 = 0x2000_0000;
-const FDS: usize = 2 * PIPES;
-const PIPES: usize = 8;
+pub const FDS: usize = 2 * PIPES;
+const PIPES: usize = 16;
 const CAPACITY: usize = 65536;
 const IO_SIZE: usize = 4096;
 const CLOEXEC: u32 = 0o2000000;

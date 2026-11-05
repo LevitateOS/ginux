@@ -312,7 +312,11 @@ is used. Null is immediately readable/writable for polling. Additional device
 types are not implemented by configured launch yet.
 
 Anonymous `pipe`/`pipe2` are emulated with supervisor-owned memory and virtual
-handles. Up to eight pipes hold 65536 bytes each; aliases use the common table.
+handles. Up to sixteen channel buffers hold 65536 bytes each; aliases use the common table.
+A local `AF_UNIX` / `SOCK_SEQPACKET` pair consumes two buffers and supports
+messages up to 4096 bytes, duplex read/write, nonblocking IO, polling and
+close-on-exec. Socket names, network connections and descriptor transfer are
+not supported.
 `pipe2` accepts only `O_CLOEXEC|O_NONBLOCK`. IO is bounded to 4096 bytes per call;
 writes of up to 4096 bytes are atomic. Reads consume only bytes successfully
 copied out, so invalid/partially inaccessible destinations do not lose data.

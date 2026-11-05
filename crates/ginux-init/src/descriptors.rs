@@ -37,19 +37,21 @@ enum Pending {
 
 /// Owned backend handles are domain-wide; native kernel numbers are per task.
 pub struct ObjectReferences {
-    counts: [u16; 144],
+    counts: [u16; 128 + crate::channel_hooks::FDS],
 }
 impl ObjectReferences {
     pub const fn new() -> Self {
-        Self { counts: [0; 144] }
+        Self {
+            counts: [0; 128 + crate::channel_hooks::FDS],
+        }
     }
     pub fn active(&self) -> usize {
         self.counts.iter().filter(|n| **n != 0).count()
     }
     fn index(handle: u32) -> usize {
         if (0x4000_0000..0x4000_0040).contains(&handle) {
-            80 + (handle - 0x4000_0000) as usize
-        } else if (0x2000_0000..0x2000_0010).contains(&handle) {
+            64 + crate::channel_hooks::FDS + (handle - 0x4000_0000) as usize
+        } else if (0x2000_0000..0x2000_0000 + crate::channel_hooks::FDS as u32).contains(&handle) {
             64 + (handle - 0x2000_0000) as usize
         } else {
             assert!((1048576..1048640).contains(&handle));
