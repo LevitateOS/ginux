@@ -8,8 +8,9 @@
 //! the existing VFS open/read/write/seek/close shape:
 //!
 //! * [`VirtualFs::checkpoint_retained`] serializes every live overlay slot
-//!   (files, created directories, and tombstones for removed base entries,
-//!   so a delete stays deleted after reopen) into caller memory.
+//!   (files, planted symlinks, created directories, and tombstones for
+//!   removed base entries, so a delete stays deleted after reopen) into
+//!   caller memory.
 //! * [`VirtualFs::restore_retained`] validates a published image fully before
 //!   applying anything, then upserts each record into the overlay.
 //!
@@ -68,16 +69,19 @@
 //!
 //! ```text
 //! header: magic[8] = b"GINUXRT1", instance u64, count u32, generation u32
-//! record: kind u8 (1 = file, 2 = directory, 3 = tombstone),
+//! record: kind u8 (1 = file, 2 = directory, 3 = tombstone, 4 = symlink),
 //!         path_len u16, mode u32, data_len u64,
-//!         path[path_len] bytes, data[data_len] bytes (files only)
+//!         path[path_len] bytes, data[data_len] bytes (files hold content,
+//!         symlinks hold the raw target bytes, directories and tombstones
+//!         hold none)
 //! ```
 //!
 //! Only absolute, already-normalized domain paths (`/work/...`, `/out/...`)
 //! round-trip; anything else in an image fails restore explicitly.
 
 use super::{
-    is_canonical_path, read_u16, read_u32, read_u64, BaseReader, VfsError, VirtualFs, MAX_PATH,
+    is_canonical_path, read_u16, read_u32, read_u64, BaseReader, VfsError, VirtualFs, MAX_LINK,
+    MAX_PATH,
 };
 
 /// Image magic, version 1.
@@ -95,6 +99,8 @@ pub const RETAINED_FIRST_GENERATION: u32 = 1;
 const KIND_FILE: u8 = 1;
 const KIND_DIR: u8 = 2;
 const KIND_TOMBSTONE: u8 = 3;
+/// Planted symlink (overlay state 4): `data` holds the raw link target.
+const KIND_SYMLINK: u8 = 4;
 
 /// Per-record header length: kind 1 + path_len 2 + mode 4 + data_len 8.
 const RECORD_HEADER_LEN: usize = 15;
@@ -107,7 +113,8 @@ const RECORD_HEADER_LEN: usize = 15;
 /// [`RetainedError::NoSpace`] instead of truncating.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetainedLimits {
-    /// Maximum overlay records (files plus directories plus tombstones).
+    /// Maximum overlay records (files plus symlinks plus directories plus
+    /// tombstones).
     pub max_files: usize,
     /// Maximum total file-data bytes across the image.
     pub max_bytes: usize,
@@ -320,6 +327,8 @@ pub struct FlushSummary {
     pub bytes: usize,
     /// Live file records published.
     pub files: usize,
+    /// Planted-symlink records published.
+    pub symlinks: usize,
     /// Created-directory records published.
     pub dirs: usize,
     /// Tombstone records published (removals that survive reopen).
@@ -334,6 +343,8 @@ pub struct FlushSummary {
 pub struct RecoverSummary {
     /// File records applied.
     pub files: usize,
+    /// Planted-symlink records applied.
+    pub symlinks: usize,
     /// Created-directory records applied.
     pub dirs: usize,
     /// Tombstone records applied.
@@ -461,6 +472,8 @@ pub struct CheckpointSummary {
     pub bytes: usize,
     /// Live file records staged.
     pub files: usize,
+    /// Planted-symlink records staged.
+    pub symlinks: usize,
     /// Created-directory records staged.
     pub dirs: usize,
     /// Tombstone records staged (removals that must survive reopen).
@@ -472,6 +485,8 @@ pub struct CheckpointSummary {
 pub struct RestoreSummary {
     /// File records applied.
     pub files: usize,
+    /// Planted-symlink records applied.
+    pub symlinks: usize,
     /// Created-directory records applied.
     pub dirs: usize,
     /// Tombstone records applied.
@@ -495,6 +510,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         out: &mut [u8],
     ) -> Result<CheckpointSummary, RetainedError> {
         let mut files = 0usize;
+        let mut symlinks = 0usize;
         let mut dirs = 0usize;
         let mut tombstones = 0usize;
         let mut data_total = 0usize;
@@ -528,10 +544,23 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                         .checked_add(RECORD_HEADER_LEN + slot.path.len)
                         .ok_or(RetainedError::NoSpace)?;
                 }
+                4 => {
+                    // Symlink targets are bounded by MAX_LINK at plant
+                    // time; the FILE_SIZE check pins the restore-slot
+                    // contract. Targets do not count toward max_bytes,
+                    // which budgets file content only.
+                    if slot.len > FILE_SIZE {
+                        return Err(RetainedError::TooLarge);
+                    }
+                    symlinks += 1;
+                    needed = needed
+                        .checked_add(RECORD_HEADER_LEN + slot.path.len + slot.len)
+                        .ok_or(RetainedError::NoSpace)?;
+                }
                 _ => {}
             }
         }
-        let count = files + dirs + tombstones;
+        let count = files + symlinks + dirs + tombstones;
         if count > limits.max_files {
             return Err(RetainedError::TooManyFiles);
         }
@@ -550,6 +579,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                 1 => KIND_FILE,
                 2 => KIND_TOMBSTONE,
                 3 => KIND_DIR,
+                4 => KIND_SYMLINK,
                 _ => continue,
             };
             out[cursor] = kind;
@@ -559,12 +589,16 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                 cursor + 3,
                 if kind == KIND_TOMBSTONE { 0 } else { slot.mode },
             );
-            let data_len = if kind == KIND_FILE { slot.len } else { 0 };
+            let data_len = if kind == KIND_FILE || kind == KIND_SYMLINK {
+                slot.len
+            } else {
+                0
+            };
             write_u64(out, cursor + 7, data_len as u64);
             cursor += RECORD_HEADER_LEN;
             out[cursor..cursor + slot.path.len].copy_from_slice(slot.path.as_bytes());
             cursor += slot.path.len;
-            if kind == KIND_FILE {
+            if kind == KIND_FILE || kind == KIND_SYMLINK {
                 out[cursor..cursor + slot.len].copy_from_slice(&slot.data[..slot.len]);
                 cursor += slot.len;
             }
@@ -572,6 +606,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         Ok(CheckpointSummary {
             bytes: needed,
             files,
+            symlinks,
             dirs,
             tombstones,
         })
@@ -706,6 +741,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         Ok(FlushSummary {
             bytes: summary.bytes,
             files: summary.files,
+            symlinks: summary.symlinks,
             dirs: summary.dirs,
             tombstones: summary.tombstones,
             generation: next,
@@ -740,6 +776,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             .map_err(FlushError::Invalid)?;
         Ok(RecoverSummary {
             files: summary.files,
+            symlinks: summary.symlinks,
             dirs: summary.dirs,
             tombstones: summary.tombstones,
             bytes: summary.bytes,
@@ -835,6 +872,7 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
         let mut cursor = RETAINED_HEADER_LEN;
         let mut summary = RestoreSummary {
             files: 0,
+            symlinks: 0,
             dirs: 0,
             tombstones: 0,
             bytes: 0,
@@ -875,6 +913,16 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                     target.mode = mode;
                     target.len = 0;
                     summary.dirs += 1;
+                }
+                KIND_SYMLINK => {
+                    let slot = self.retained_slot(path)?;
+                    let target = &mut self.overlay[slot];
+                    set_slot_path(target, path);
+                    target.state = 4;
+                    target.mode = mode;
+                    target.data[..data_len].copy_from_slice(data);
+                    target.len = data_len;
+                    summary.symlinks += 1;
                 }
                 KIND_TOMBSTONE => {
                     let slot = self.retained_slot(path)?;
@@ -926,7 +974,11 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
                 return Err(RetainedError::InvalidRecord);
             }
             let kind = image[cursor];
-            if kind != KIND_FILE && kind != KIND_DIR && kind != KIND_TOMBSTONE {
+            if kind != KIND_FILE
+                && kind != KIND_DIR
+                && kind != KIND_TOMBSTONE
+                && kind != KIND_SYMLINK
+            {
                 return Err(RetainedError::InvalidRecord);
             }
             let path_len = read_u16(image, cursor + 1)? as usize;
@@ -934,17 +986,33 @@ impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: u
             if path_len == 0 || path_len > MAX_PATH {
                 return Err(RetainedError::InvalidPath);
             }
-            if kind != KIND_FILE && data_len != 0 {
-                return Err(RetainedError::InvalidRecord);
-            }
-            if data_len > limits.max_file_bytes || data_len > FILE_SIZE {
-                return Err(RetainedError::TooLarge);
-            }
-            data_total = data_total
-                .checked_add(data_len)
-                .ok_or(RetainedError::NoSpace)?;
-            if data_total > limits.max_bytes {
-                return Err(RetainedError::NoSpace);
+            match kind {
+                KIND_FILE => {
+                    if data_len > limits.max_file_bytes || data_len > FILE_SIZE {
+                        return Err(RetainedError::TooLarge);
+                    }
+                    data_total = data_total
+                        .checked_add(data_len)
+                        .ok_or(RetainedError::NoSpace)?;
+                    if data_total > limits.max_bytes {
+                        return Err(RetainedError::NoSpace);
+                    }
+                }
+                KIND_SYMLINK => {
+                    // Raw targets stay small by construction; they budget
+                    // against the restore slot, not against file bytes.
+                    if data_len == 0 || data_len > MAX_LINK {
+                        return Err(RetainedError::InvalidRecord);
+                    }
+                    if data_len > FILE_SIZE {
+                        return Err(RetainedError::TooLarge);
+                    }
+                }
+                _ => {
+                    if data_len != 0 {
+                        return Err(RetainedError::InvalidRecord);
+                    }
+                }
             }
             cursor += RECORD_HEADER_LEN;
             let path = image

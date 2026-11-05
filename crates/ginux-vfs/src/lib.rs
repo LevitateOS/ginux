@@ -1,7 +1,12 @@
 #![no_std]
 
+mod export;
 mod retained;
 
+pub use export::{
+    ExportError, ExportFailure, ExportFileError, ExportLimits, ExportStore, ExportSummary,
+    TOMBSTONE_MARKER_DIR,
+};
 pub use retained::{
     durable_generation, stamp_generation, CheckpointError, CheckpointSummary, DurableStore,
     FlushError, FlushSummary, GenerationReport, GenerationSummary, QuiesceError, QuiesceGate,
