@@ -176,7 +176,7 @@ long storage_main(word *stack)
             path[12] = '0' + i / 10 % 10;
             path[13] = '0' + i % 10;
             long fd = DO(2, path, 0101, 0644);
-            if (fd == -28) return i == 4093 ? 0 : 61;
+            if (fd == -28) return i == 8189 ? 0 : 61;
             CHECK(fd >= 3 && fd < 256, 62);
             CHECK(DO(3, fd, 0, 0) == 0, 63);
         }
@@ -200,6 +200,9 @@ long storage_main(word *stack)
         CHECK(DO(8,d,16*mib-1,0)==16*mib-1 && DO(0,d,output,1)==1 && output[0]==0,86);
         CHECK(DO(1,d,"!",1)==-28 && DO(5,d,meta,0)==0 && *(word *)(meta+48)==16*mib,87);
         CHECK(DO(77,d,-1,0)==-22 && DO(5,d,meta,0)==0 && *(word *)(meta+48)==16*mib,88);
+        CHECK(DO(86,"/out/d","/out/shared",0)==0 && DO(5,d,meta,0)==0 && *(word *)(meta+16)==2,131);
+        long shared=DO(2,"/out/shared",0,0); CHECK(shared>=3,132);
+        CHECK(DO(5,shared,meta,0)==0 && *(word *)(meta+48)==16*mib && DO(3,shared,0,0)==0,133);
         return 0; // Teardown must release a still-linked full-quota mapping.
     }
     word limits[2];

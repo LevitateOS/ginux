@@ -130,6 +130,8 @@ pub struct DomainConfig {
     pub execution_backend: ExecutionBackend,
     pub contract_profile: Text<IDENTIFIER_BYTES>,
     pub storage: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
+    pub storage_max_objects: u64,
+    pub storage_max_bytes: u64,
     pub devices: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     pub network_backend: NetworkBackend,
     pub audit_mode: AuditMode,
@@ -208,6 +210,8 @@ struct ConfigBuilder {
     execution_backend: ExecutionBackend,
     contract_profile: Text<IDENTIFIER_BYTES>,
     storage: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
+    storage_max_objects: u64,
+    storage_max_bytes: u64,
     devices: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     network_backend: NetworkBackend,
     audit_mode: AuditMode,
@@ -231,6 +235,8 @@ impl ConfigBuilder {
             execution_backend: ExecutionBackend::Interpreter,
             contract_profile: Text::empty(),
             storage: TextList::empty(),
+            storage_max_objects: 16384,
+            storage_max_bytes: 0,
             devices: TextList::empty(),
             network_backend: NetworkBackend::None,
             audit_mode: AuditMode::Stderr,
@@ -271,6 +277,8 @@ impl ConfigBuilder {
             execution_backend: self.execution_backend,
             contract_profile: self.contract_profile,
             storage: self.storage,
+            storage_max_objects: self.storage_max_objects,
+            storage_max_bytes: self.storage_max_bytes,
             devices: self.devices,
             network_backend: self.network_backend,
             audit_mode: self.audit_mode,
@@ -321,6 +329,14 @@ impl DomainConfig {
             validate_domain_path(self.workdir.as_bytes())?;
         }
         validate_identifier(self.contract_profile.as_bytes())?;
+        if !(1..=1_000_000).contains(&self.storage_max_objects)
+            || self
+                .memory_mib
+                .checked_mul(1024 * 1024)
+                .is_none_or(|limit| self.storage_max_bytes > limit)
+        {
+            return Err(ConfigError::InvalidValue);
+        }
         if !(1..=64).contains(&self.vcpus) || !(16..=1_048_576).contains(&self.memory_mib) {
             return Err(ConfigError::InvalidValue);
         }
@@ -390,6 +406,12 @@ impl DomainConfig {
         output.quoted(self.contract_profile.as_bytes())?;
         output.raw(b"\n\n[storage]\nassignments = ")?;
         output.list(self.storage.as_slice())?;
+        output.raw(b"\nmax_objects = ")?;
+        output.number(self.storage_max_objects)?;
+        if self.storage_max_bytes != 0 {
+            output.raw(b"\nmax_bytes = ")?;
+            output.number(self.storage_max_bytes)?;
+        }
         output.raw(b"\n\n[devices]\nassignments = ")?;
         output.list(self.devices.as_slice())?;
         output.raw(b"\n\n[network]\nbackend = ")?;
@@ -589,6 +611,17 @@ fn parse_field(
         (Section::Storage, b"assignments") => {
             builder.mark(1 << 11)?;
             builder.storage = parse_list(value)?;
+        }
+        (Section::Storage, b"max_objects") => {
+            builder.mark(1 << 17)?;
+            builder.storage_max_objects = parse_u64(value)?;
+        }
+        (Section::Storage, b"max_bytes") => {
+            builder.mark(1 << 18)?;
+            builder.storage_max_bytes = parse_u64(value)?;
+            if builder.storage_max_bytes == 0 {
+                return Err(ConfigError::InvalidValue);
+            }
         }
         (Section::Devices, b"assignments") => {
             builder.mark(1 << 12)?;
@@ -922,6 +955,32 @@ mode = "stderr"
 [failure]
 policy = "stop"
 "#;
+
+    #[test]
+    fn storage_bounds_are_explicit_and_round_trip() {
+        use std::format;
+        let text = VALID.replace(
+            "[storage]",
+            "[storage]\nmax_objects = 8192\nmax_bytes = 8388608",
+        );
+        let config = DomainConfig::parse(text.as_bytes()).unwrap();
+        assert_eq!(config.storage_max_objects, 8192);
+        assert_eq!(config.storage_max_bytes, 8388608);
+        for field in [
+            "max_objects = 0",
+            "max_objects = 1000001",
+            "max_bytes = 0",
+            "max_bytes = 18446744073709551615",
+            "max_objects = 1\nmax_objects = 2",
+        ] {
+            assert!(DomainConfig::parse(
+                VALID
+                    .replace("[storage]", &format!("[storage]\n{field}"))
+                    .as_bytes()
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn parses_and_normalizes_versioned_config() {

@@ -4,7 +4,7 @@
 //! Retained storage is not provided. File mappings use the supervised backing
 //! transfer in file_mapping; writable shared mappings remain unsupported.
 
-use crate::storage_memory::MemoryStorage;
+use crate::storage_memory::{MappedArray, MemoryStorage};
 use crate::supervisor::UserRegs;
 use crate::tracee_io::{copy_memory, read_path};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -18,8 +18,8 @@ use ginux_vfs::{
 pub const FD_BASE: usize = 1 << 20;
 const IO_SIZE: usize = 4096;
 type Path = Text<MAX_PATH>;
-pub(crate) const OBJECTS: usize = 4096;
-type MemoryFs = VirtualFs<'static, EmptyReader, OBJECTS, 0, 64, MemoryStorage<OBJECTS>>;
+type MemoryFs =
+    VirtualFs<'static, EmptyReader, 0, 0, 64, MemoryStorage, MappedArray<ginux_vfs::OverlayFile>>;
 static mut ROOT_INDEX: [u8; HEADER_SIZE + RECORD_SIZE] = [0; HEADER_SIZE + RECORD_SIZE];
 static ROOT_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -97,10 +97,33 @@ impl LaunchFs {
             record.try_into().unwrap(),
         )
         .map_err(|_| b"invalid storage root index".as_slice())?;
-        let mut fs = MemoryFs::with_storage(
+        let objects = config.storage_max_objects as usize;
+        let metadata = MappedArray::<ginux_vfs::OverlayFile>::bytes_for(objects)
+            .and_then(|n| {
+                MemoryStorage::metadata_bytes(objects)
+                    .and_then(|m| n.checked_add(m).ok_or(VfsError::OverlayLimit))
+            })
+            .map_err(|_| b"storage metadata size overflow".as_slice())?;
+        let available = (config.memory_mib as usize * 1024 * 1024)
+            .checked_sub(metadata)
+            .ok_or(b"storage metadata exceeds memory bound".as_slice())?;
+        let limit = if config.storage_max_bytes == 0 {
+            available
+        } else {
+            let limit = config.storage_max_bytes as usize;
+            if limit > available {
+                return Err(b"storage data and metadata exceed memory bound");
+            }
+            limit
+        };
+        let namespace = MappedArray::new(objects, ginux_vfs::OverlayFile::empty())
+            .map_err(|_| b"storage namespace allocation failed".as_slice())?;
+        let mut fs = MemoryFs::with_namespace(
             Index::new(index_bytes).map_err(|_| b"invalid storage root index".as_slice())?,
             EmptyReader,
-            MemoryStorage::new((config.memory_mib as usize) * 1024 * 1024),
+            MemoryStorage::new(limit, objects)
+                .map_err(|_| b"storage metadata allocation failed".as_slice())?,
+            namespace,
         );
         for prefix in &prefixes[..count] {
             let path = prefix.as_bytes();
@@ -121,6 +144,10 @@ impl LaunchFs {
         })
     }
 
+    pub fn capacity(&self) -> usize {
+        self.fs.namespace_capacity()
+    }
+
     pub fn enabled(&self) -> bool {
         self.count != 0
     }
@@ -128,7 +155,7 @@ impl LaunchFs {
     pub fn restore_entry(
         &mut self,
         entry: RestoreEntry<'_>,
-        seen: &mut [bool; OBJECTS],
+        seen: &mut [bool],
         mut read: impl FnMut(&mut [u8]) -> Result<(), &'static [u8]>,
     ) -> Result<(), &'static [u8]> {
         let RestoreEntry {
@@ -229,7 +256,7 @@ impl LaunchFs {
             .inode;
         let slot = inode
             .checked_sub(2)
-            .filter(|slot| *slot < OBJECTS as u64)
+            .filter(|slot| *slot < self.fs.namespace_capacity() as u64)
             .ok_or(b"invalid restored inode".as_slice())? as usize;
         if seen[slot] {
             return Err(b"duplicate restore entry");
@@ -250,7 +277,7 @@ impl LaunchFs {
         &self,
         archive: &mut crate::storage_export::Archive,
     ) -> Result<(), &'static [u8]> {
-        for slot in 0..OBJECTS {
+        for slot in 0..self.fs.namespace_capacity() {
             if let Some((path, metadata)) = self.fs.overlay_entry(slot) {
                 if metadata.links > 1 {
                     return Err(b"hardlink archive identity is not implemented");

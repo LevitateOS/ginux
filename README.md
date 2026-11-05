@@ -277,8 +277,13 @@ counts. Unlink removes a name; remaining links, open handles and executable
 pins keep its data alive. Capacity failure leaves existing names unchanged.
 Owned execution and private file mappings are described below.
 This is not a complete unified image/overlay filesystem. IO is bounded to 4096 bytes per call. Metadata supports
-4096 objects (including seeded directories) and 64 independently opened file
-handles. File bytes grow on demand in anonymous supervisor mappings rather than
+a configurable namespace and 64 independently opened file handles.
+`[storage].max_objects` defaults to 16384, accepts 1–1000000 and includes seeded
+directories and live or pinned namespace slots. Namespace and backing metadata
+use bounded supervisor allocations rather than stack arrays. Their page-rounded
+size is charged before file bytes. Optional `[storage].max_bytes` sets a positive
+file-data budget; data plus metadata must fit `[resources].memory_mib`. If
+omitted, file bytes use the remaining memory budget. File bytes grow on demand in anonymous supervisor mappings rather than
 fixed per-file arrays. Their total mapped capacity, including page rounding and
 growth reserve, cannot exceed `[resources].memory_mib`; files share that bound
 instead of a 64 KiB per-file ceiling. This accounts for overlay backing, not
@@ -562,7 +567,7 @@ not exposed. This captures filesystem contents, not process memory or live
 handles. Complete coordinator state pairing and recovery are separate capabilities.
 
 `--restore-file <snapshot tar>` imports a snapshot into the newly prepared owned
-filesystem before starting the workload. Import is bounded to 4096 live objects
+filesystem before starting the workload. Import is bounded by the configured namespace capacity
 and 2 GiB of file data, additionally constrained by configured storage capacity.
 It restores regular files, directories, symlinks and permission bits, including
 long names and link targets emitted by Ginux. Absolute link targets are retained

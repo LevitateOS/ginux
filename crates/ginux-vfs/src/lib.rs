@@ -1,5 +1,7 @@
 #![no_std]
 
+use core::ops::{Deref, DerefMut};
+
 pub const INDEX_MAGIC: &[u8; 8] = b"GINUXVFS";
 pub const INDEX_VERSION: u32 = 1;
 pub const HEADER_SIZE: usize = 64;
@@ -357,7 +359,7 @@ fn child_name<'a>(directory: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
 }
 
 #[derive(Clone, Copy)]
-struct OverlayFile {
+pub struct OverlayFile {
     state: u8,
     path: Path,
     mode: u32,
@@ -369,7 +371,7 @@ struct OverlayFile {
 }
 
 impl OverlayFile {
-    const fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             state: 0,
             path: Path::new(),
@@ -468,6 +470,21 @@ impl<const FILES: usize, const FILE_SIZE: usize> OverlayStorage
     }
 }
 
+/// Inline names for freestanding users. Larger adapters may supply a bounded
+/// namespace backed by their own allocation instead of a giant stack array.
+pub struct InlineNamespace<const FILES: usize>([OverlayFile; FILES]);
+impl<const FILES: usize> Deref for InlineNamespace<FILES> {
+    type Target = [OverlayFile];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl<const FILES: usize> DerefMut for InlineNamespace<FILES> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 pub struct VirtualFs<
     'a,
     R,
@@ -475,10 +492,11 @@ pub struct VirtualFs<
     const FILE_SIZE: usize,
     const FDS: usize,
     S = InlineStorage<FILES, FILE_SIZE>,
+    N = InlineNamespace<FILES>,
 > {
     index: Index<'a>,
     reader: R,
-    overlay: [OverlayFile; FILES],
+    overlay: N,
     storage: S,
     descriptors: [Descriptor; FDS],
 }
@@ -505,9 +523,33 @@ impl<
             index,
             reader,
             storage,
-            overlay: [OverlayFile::empty(); FILES],
+            overlay: InlineNamespace([OverlayFile::empty(); FILES]),
             descriptors: [Descriptor::empty(); FDS],
         }
+    }
+}
+
+impl<
+        'a,
+        R: BaseReader,
+        const FILES: usize,
+        const FILE_SIZE: usize,
+        const FDS: usize,
+        S: OverlayStorage,
+        N: Deref<Target = [OverlayFile]> + DerefMut,
+    > VirtualFs<'a, R, FILES, FILE_SIZE, FDS, S, N>
+{
+    pub fn with_namespace(index: Index<'a>, reader: R, storage: S, namespace: N) -> Self {
+        Self {
+            index,
+            reader,
+            storage,
+            overlay: namespace,
+            descriptors: [Descriptor::empty(); FDS],
+        }
+    }
+    pub fn namespace_capacity(&self) -> usize {
+        self.overlay.len()
     }
 
     /// Readable regular-file backing for an adapter-owned mapping reference.
@@ -730,7 +772,7 @@ impl<
             }));
         }
         let start = usize::try_from(cookie - 2).map_err(|_| VfsError::InvalidPath)?;
-        for ordinal in start..self.index.len() + FILES {
+        for ordinal in start..self.index.len() + self.overlay.len() {
             if ordinal < self.index.len() {
                 let entry = self.index.entry(ordinal)?;
                 if self.find_overlay(entry.path).is_some() {
@@ -1042,7 +1084,7 @@ impl<
     }
 
     pub fn teardown(&mut self) {
-        for slot in 0..FILES {
+        for slot in 0..self.overlay.len() {
             self.storage.clear(slot);
         }
         self.overlay.fill(OverlayFile::empty());
@@ -1471,7 +1513,7 @@ impl<
             return Ok(());
         }
         // Check every new descendant path before changing any namespace entry.
-        for entry in &self.overlay {
+        for entry in self.overlay.iter() {
             if matches!(entry.state, 1 | 3 | 4 | 5)
                 && beneath(entry.path.as_bytes(), source.as_bytes())
             {
@@ -1488,7 +1530,7 @@ impl<
         if let Some(target) = target {
             self.remove_name(target);
         }
-        for entry in &mut self.overlay {
+        for entry in self.overlay.iter_mut() {
             if matches!(entry.state, 1 | 3 | 4 | 5)
                 && beneath(entry.path.as_bytes(), source.as_bytes())
             {

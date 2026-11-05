@@ -1,6 +1,7 @@
 //! Bounded startup import of an owned-filesystem snapshot. All entries are
 //! validated before a workload starts; failures discard this new memory view.
-use crate::fs_hooks::{LaunchFs, RestoreEntry, OBJECTS};
+use crate::fs_hooks::{LaunchFs, RestoreEntry};
+use crate::storage_memory::MappedArray;
 use crate::supervisor::{syscall1, syscall2, syscall3, syscall4};
 use ginux_vfs::NodeKind;
 type Error = &'static [u8];
@@ -80,13 +81,14 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
     {
         return Err(b"restore archive is not a bounded regular file");
     }
-    let mut seen = [false; OBJECTS];
+    let mut seen = MappedArray::new(files.capacity(), false)
+        .map_err(|_| b"restore metadata allocation failed".as_slice())?;
     let mut long_name = [0u8; 256];
     let mut long_len = 0;
     let mut long_link = [0u8; 256];
     let mut link_len = 0;
     let mut total = 0u64;
-    for _ in 0..=OBJECTS * 3 {
+    for _ in 0..=files.capacity() * 3 {
         let mut header = [0u8; 512];
         input.exact(&mut header)?;
         if header.iter().all(|b| *b == 0) {

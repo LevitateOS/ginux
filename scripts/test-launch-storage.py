@@ -31,7 +31,11 @@ def main():
             config = config.replace('args = []', 'args = ' + json.dumps(args))
             config = config.replace('memory_mib = 256', 'memory_mib = ' + str(memory))
             config = config.replace('assignments = []', 'assignments = ' + json.dumps(assignments), 1)
-            config = config.replace('id = "gate5-demo"', 'id = "storage-fixture"\nworkdir = "/work"')
+            if args == ['quota']:
+                config = config.replace('[storage]\n', '[storage]\nmax_objects = 8192\n')
+            if args == ['bounds']:
+                config = config.replace('[storage]\n', '[storage]\nmax_bytes = 16777216\n')
+            config = config.replace('id = "gate5-demo"' , 'id = "storage-fixture"\nworkdir = "/work"')
             path = work / 'launch.toml'
             path.write_text(config)
             result = work / 'result.json'
@@ -97,7 +101,7 @@ def main():
         for _ in range(2):
             invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], [])
         invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['quota'])
-        invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['bounds'], memory=16)
+        invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['bounds'], memory=32)
         invoke(['memory:/work', 'memory:/out'], ['symlinks'])
         invoke(['memory:/work', 'memory:/out'], ['mapping'])
         invoke(['memory:/work', 'memory:/out'], ['export'], export=True)

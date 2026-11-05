@@ -23,19 +23,77 @@ impl Mapping {
     };
 }
 
-pub struct MemoryStorage<const FILES: usize> {
-    files: [Mapping; FILES],
+/// Supervisor allocation with an explicit capacity and a small stack footprint.
+/// Every element is initialized before slices are formed; Drop returns pages.
+pub struct MappedArray<T: Copy> {
+    address: *mut T,
+    length: usize,
+    bytes: usize,
+}
+impl<T: Copy> MappedArray<T> {
+    pub fn new(length: usize, initial: T) -> Result<Self, VfsError> {
+        let bytes = Self::bytes_for(length)?;
+        let address = unsafe { syscall6(9, 0, bytes, 3, 0x22, usize::MAX, 0) };
+        if address < 0 {
+            return Err(VfsError::OverlayLimit);
+        }
+        let address = address as *mut T;
+        for index in 0..length {
+            unsafe {
+                address.add(index).write(initial);
+            }
+        }
+        Ok(Self {
+            address,
+            length,
+            bytes,
+        })
+    }
+    pub fn bytes_for(length: usize) -> Result<usize, VfsError> {
+        length
+            .checked_mul(core::mem::size_of::<T>())
+            .and_then(|n| n.checked_add(PAGE - 1))
+            .map(|n| n & !(PAGE - 1))
+            .filter(|n| *n != 0)
+            .ok_or(VfsError::OverlayLimit)
+    }
+}
+impl<T: Copy> core::ops::Deref for MappedArray<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { core::slice::from_raw_parts(self.address, self.length) }
+    }
+}
+impl<T: Copy> core::ops::DerefMut for MappedArray<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { core::slice::from_raw_parts_mut(self.address, self.length) }
+    }
+}
+impl<T: Copy> Drop for MappedArray<T> {
+    fn drop(&mut self) {
+        assert_eq!(
+            unsafe { syscall2(11, self.address as usize, self.bytes) },
+            0
+        );
+    }
+}
+
+pub struct MemoryStorage {
+    files: MappedArray<Mapping>,
     limit: usize,
     allocated: usize,
 }
 
-impl<const FILES: usize> MemoryStorage<FILES> {
-    pub const fn new(limit: usize) -> Self {
-        Self {
-            files: [Mapping::EMPTY; FILES],
+impl MemoryStorage {
+    pub fn metadata_bytes(objects: usize) -> Result<usize, VfsError> {
+        MappedArray::<Mapping>::bytes_for(objects)
+    }
+    pub fn new(limit: usize, objects: usize) -> Result<Self, VfsError> {
+        Ok(Self {
+            files: MappedArray::new(objects, Mapping::EMPTY)?,
             limit,
             allocated: 0,
-        }
+        })
     }
     pub fn allocated_bytes(&self) -> usize {
         self.allocated
@@ -66,7 +124,7 @@ impl<const FILES: usize> MemoryStorage<FILES> {
     }
 }
 
-impl<const FILES: usize> OverlayStorage for MemoryStorage<FILES> {
+impl OverlayStorage for MemoryStorage {
     fn resize(&mut self, slot: usize, old_len: usize, new_len: usize) -> Result<(), VfsError> {
         let old = self.files[slot];
         if old_len != old.length {
