@@ -396,7 +396,7 @@ impl LaunchFs {
         {
             return Some(self.descriptor_call(pid, r, fd - FD_BASE as i32 + 3));
         }
-        if matches!(r.orig_rax, 262 | 332) {
+        if matches!(r.orig_rax, 262 | 332 | 439) {
             match read_path(pid, r.rsi) {
                 Ok(p) if p.is_empty() && fd >= FD_BASE as i32 => {
                     return Some(self.descriptor_call(pid, r, fd - FD_BASE as i32 + 3))
@@ -407,8 +407,8 @@ impl LaunchFs {
             }
         }
         let (address, dirfd) = match r.orig_rax {
-            2 | 4 | 6 | 83 | 84 | 87 | 89 | 90 => (r.rdi, (-100i64) as u64),
-            257 | 258 | 262 | 263 | 267 | 268 | 332 => (r.rsi, r.rdi),
+            2 | 4 | 6 | 21 | 83 | 84 | 87 | 89 | 90 => (r.rdi, (-100i64) as u64),
+            257 | 258 | 262 | 263 | 267 | 268 | 269 | 332 | 439 => (r.rsi, r.rdi),
             _ => return None,
         };
         let path = match self.path(pid, address, dirfd) {
@@ -422,6 +422,11 @@ impl LaunchFs {
             2 => self.open(path.as_bytes(), r.rsi, r.rdx),
             257 => self.open(path.as_bytes(), r.rdx, r.r10),
             4 | 6 => self.stat(pid, path.as_bytes(), r.rsi, false),
+            21 | 269 | 439 => self
+                .fs
+                .metadata(path.as_bytes())
+                .map_err(errno)
+                .and_then(|metadata| access(metadata, r)),
             // The owned namespace has no symlinks. Existing non-links must
             // report EINVAL, not leak through to an absent native image path.
             89 | 267 => self
@@ -630,6 +635,13 @@ impl LaunchFs {
                     3 => Ok(flags as i64),
                     _ => Err(-95),
                 }),
+            439 => {
+                if r.r10 & 0x1000 == 0 {
+                    Err(-2)
+                } else {
+                    self.fs.fstat(fd).map_err(errno).and_then(|m| access(m, r))
+                }
+            }
             262 | 332 => {
                 let flags = if r.orig_rax == 262 { r.r10 } else { r.rdx };
                 if flags != 0x1000 {
@@ -724,6 +736,20 @@ impl LaunchFs {
         self.fs.seek(fd, cookie as i64, 0).map_err(errno)?;
         Ok(used as i64)
     }
+}
+
+// Owned files belong to the domain's virtual uid 0. Read/write checks reflect
+// that authority; executing a regular file still requires an execute bit.
+fn access(metadata: FileMetadata, r: &UserRegs) -> Result<i64, i64> {
+    let mode = if r.orig_rax == 21 { r.rsi } else { r.rdx };
+    let flags = if r.orig_rax == 439 { r.r10 } else { 0 };
+    if mode & !7 != 0 || flags & !0x1300 != 0 {
+        return Err(-22);
+    }
+    if mode & 1 != 0 && metadata.kind != NodeKind::Directory && metadata.mode & 0o111 == 0 {
+        return Err(-13);
+    }
+    Ok(0)
 }
 
 fn within(path: &[u8], prefix: &[u8]) -> bool {

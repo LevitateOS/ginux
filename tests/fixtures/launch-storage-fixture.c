@@ -23,6 +23,13 @@ long storage_main(word *stack)
     if (argc > 1 && argv[1][0] == 'm') {
         long fd=DO(2,"/work/mapped",0102,0600);
         CHECK(fd==3 && DO(77,fd,8192,0)==0,110);
+        CHECK(DO(21,"/work/mapped",0,0)==0 && DO(21,"/work/mapped",6,0)==0,136);
+        CHECK(DO(21,"/work/mapped",1,0)==-13 && DO(21,"/work/absent",0,0)==-2,137);
+        CHECK(DO(269,-100,"/work/mapped",4)==0,138);
+        CHECK(call(439,fd,(word)"",4,0x1000,0,0)==0,139);
+        CHECK(call(439,-100,(word)"/work/mapped",0,0x300,0,0)==0,140);
+        CHECK(DO(21,"/work/mapped",8,0)==-22 && call(439,-100,(word)"/work/mapped",0,0x8000,0,0)==-22,141);
+        CHECK(DO(91,fd,0700,0)==0 && DO(21,"/work/mapped",1,0)==0,142);
         CHECK(DO(1,fd,"old",3)==3 && DO(8,fd,4096,0)==4096 && DO(1,fd,"second",6)==6,111);
         CHECK(call(9,0,8192,3,1,fd,0)==-95,112);
         long shared=call(9,0,4096,1,1,fd,0);
