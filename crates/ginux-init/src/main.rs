@@ -9,6 +9,7 @@ use ginux_core::{
 };
 
 mod channel_hooks;
+mod descriptors;
 mod device_hooks;
 mod dispatch;
 mod fs_hooks;

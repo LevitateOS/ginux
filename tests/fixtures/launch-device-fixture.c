@@ -29,7 +29,7 @@ long device_main(word *stack)
     CHECK(DO(2,"/dev/image-device",0,0) == -2, 15);
     CHECK(DO(2,"/dev/null",0300,0644) == -17, 16);
     long fd = DO(2,"/dev/null",2|02000000,0);
-    CHECK(fd == 0x40000000, 17);
+    CHECK(fd == 3, 17);
     CHECK(DO(0,fd,immutable,10) == 0, 18);
     CHECK(DO(1,fd,immutable,10) == 10, 19);
     CHECK(DO(8,fd,123,0) == 0, 20);
@@ -65,7 +65,7 @@ long device_main(word *stack)
     long fds[64];
     for (word i=0;i<64;++i) {
         fds[i]=DO(2,"/dev/null",0,0);
-        CHECK(fds[i] >= 0x40000000, 45);
+        CHECK(fds[i] >= 3 && fds[i] < 256, 45);
     }
     CHECK(DO(2,"/dev/null",0,0) == -24, 46);
     for (word i=0;i<64;++i) CHECK(DO(3,fds[i],0,0) == 0, 47);
@@ -74,7 +74,7 @@ long device_main(word *stack)
     CHECK(DO(87,"/dev/null",0,0) == -30, 50);
     CHECK(DO(4,"/dev/null",meta,0) == 0, 51);
     fd = DO(2,"/dev/null",01101,0644);
-    CHECK(fd >= 0x40000000, 52);
+    CHECK(fd >= 3 && fd < 256, 52);
     CHECK(DO(1,fd,immutable,10) == 10, 53);
     CHECK(DO(3,fd,0,0) == 0, 54);
     DO(1,1,"null-device: PASS\n",18);

@@ -303,6 +303,8 @@ pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *c
     let mut filesystem = crate::fs_hooks::LaunchFs::prepare(&config)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     let mut channels = crate::channel_hooks::LaunchChannels::new();
+    let mut descriptors = crate::descriptors::DescriptorTable::new()
+        .unwrap_or_else(|reason| launch_startup_fail(reason));
     print_launch_config(&config);
     let mut domain = Domain::create(config);
     if domain.start().is_err() {
@@ -322,6 +324,7 @@ pub fn launch_main(config_path: *const u8, root_path: *const u8, result_path: *c
         &mut filesystem,
         &mut devices,
         &mut channels,
+        &mut descriptors,
     )
 }
 
@@ -767,7 +770,7 @@ fn launch_tracee(root_path: *const u8) -> ! {
     // Host descriptors (including the result file) must not grant the
     // workload authority outside the supplied root. Only stdio is shared.
     const SYS_CLOSE_RANGE: usize = 436;
-    if !crate::tracee_io::reserve_native_descriptors(crate::fs_hooks::FD_BASE) {
+    if !crate::tracee_io::reserve_native_descriptors(crate::descriptors::LIMIT) {
         tracee_setup_fail(
             b"ginux: launch bootstrap failed: descriptor namespace unavailable\n",
             130,
@@ -858,6 +861,7 @@ fn supervise_launch(
     filesystem: &mut crate::fs_hooks::LaunchFs,
     devices: &mut crate::device_hooks::LaunchDevices,
     channels: &mut crate::channel_hooks::LaunchChannels,
+    descriptors: &mut crate::descriptors::DescriptorTable,
 ) -> ! {
     let mut status = 0i32;
     if wait(pid, &mut status) < 0 {
@@ -928,9 +932,14 @@ fn supervise_launch(
         if awaiting_exit {
             if override_exit {
                 registers.rax = override_result as u64;
-                if ptrace(PTRACE_SETREGS, pid, 0, &registers as *const _ as usize) < 0 {
-                    launch_fail(domain, pid, b"launch result override failed");
-                }
+            }
+            let descriptor_change = descriptors
+                .finish(&mut registers)
+                .unwrap_or_else(|reason| launch_fail(domain, pid, reason));
+            if (override_exit || descriptor_change)
+                && ptrace(PTRACE_SETREGS, pid, 0, &registers as *const _ as usize) < 0
+            {
+                launch_fail(domain, pid, b"launch result override failed");
             }
             audit_write(b"ginux: audit sequence=");
             audit_u64(sequence);
@@ -962,7 +971,14 @@ fn supervise_launch(
         }
         sequence += 1;
         let syscall = registers.orig_rax;
-        let dispatched = decide_launch(pid, &registers, filesystem, devices, channels);
+        let dispatched = decide_launch(
+            pid,
+            &mut registers,
+            filesystem,
+            devices,
+            channels,
+            descriptors,
+        );
         let decision = match dispatched {
             NativeDecision::Park { fd } => {
                 audit_write(b"ginux: park surface=lane-channel fd=");
@@ -1037,11 +1053,13 @@ fn supervise_launch(
                     launch_fail(domain, pid, b"launch exit resume failed");
                 }
             }
-            Action::Mediate if native_arguments_allowed(pid, syscall, &registers) => {
+            Action::Mediate if native_arguments_allowed(pid, registers.orig_rax, &registers) => {
                 audit_write(b"mediate surface=");
-                audit_line(balanced_surface_name(balanced_surface(syscall)));
+                audit_line(balanced_surface_name(balanced_surface(registers.orig_rax)));
                 awaiting_exit = true;
-                if ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0 {
+                if ptrace(PTRACE_SETREGS, pid, 0, &registers as *const _ as usize) < 0
+                    || ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0
+                {
                     launch_fail(domain, pid, b"launch mediated syscall failed");
                 }
             }

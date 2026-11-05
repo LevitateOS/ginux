@@ -77,7 +77,7 @@ pub fn decide_native(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> NativeDecisi
 /// Resolve configured domain objects before the immutable native contract.
 /// Device descriptors have a separate reserved range and must resolve before
 /// the filesystem rejects unknown virtual descriptors.
-pub fn decide_launch(
+pub fn decide_objects(
     pid: usize,
     registers: &UserRegs,
     filesystem: &mut crate::fs_hooks::LaunchFs,
@@ -110,6 +110,18 @@ pub fn decide_launch(
             registers.rdx,
         )
     }
+}
+
+/// Configured launch resolves the public descriptor ABI before backend handles.
+pub fn decide_launch(
+    pid: usize,
+    registers: &mut UserRegs,
+    filesystem: &mut crate::fs_hooks::LaunchFs,
+    devices: &mut crate::device_hooks::LaunchDevices,
+    channels: &mut crate::channel_hooks::LaunchChannels,
+    descriptors: &mut crate::descriptors::DescriptorTable,
+) -> NativeDecision {
+    descriptors.enter(pid, registers, filesystem, devices, channels)
 }
 
 /// Dispatch one process-supervision entry through the process-lane hook.

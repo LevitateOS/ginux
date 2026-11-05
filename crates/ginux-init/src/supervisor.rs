@@ -63,6 +63,7 @@ pub const DOMAIN_UID: usize = 1000;
 pub const DOMAIN_GID: usize = 1000;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct UserRegs {
     pub r15: u64,
     pub r14: u64,

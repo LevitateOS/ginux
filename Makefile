@@ -164,7 +164,7 @@ clean:
 	cargo clean
 	@./scripts/clean-build.sh
 
-.PHONY: build-launch-fixture test-launch build-launch-storage-fixture test-launch-storage build-launch-device-fixture test-launch-devices build-launch-pipe-fixture test-launch-pipes
+.PHONY: build-launch-fixture test-launch build-launch-storage-fixture test-launch-storage build-launch-device-fixture test-launch-devices build-launch-pipe-fixture test-launch-pipes build-launch-fd-fixture test-launch-fds
 build-launch-fixture:
 	mkdir -p .artifacts/launch
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fixture.c -o .artifacts/launch/launch-fixture
@@ -192,3 +192,10 @@ build-launch-pipe-fixture:
 
 test-launch-pipes:
 	python3 scripts/test-launch-pipes.py $(GINUX) .artifacts/launch/launch-pipe-fixture
+
+build-launch-fd-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fd-fixture.c -o .artifacts/launch/launch-fd-fixture
+
+test-launch-fds:
+	python3 scripts/test-launch-fds.py $(GINUX) .artifacts/launch/launch-fd-fixture

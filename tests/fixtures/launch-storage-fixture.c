@@ -31,7 +31,7 @@ long storage_main(word *stack)
             path[11] = '0' + i % 10;
             long fd = DO(2, path, 0101, 0644);
             if (fd == -28) return i > 0 && i < 32 ? 0 : 61;
-            CHECK(fd >= 1048576, 62);
+            CHECK(fd >= 3 && fd < 256, 62);
             CHECK(DO(3, fd, 0, 0) == 0, 63);
         }
         return 64;
@@ -49,7 +49,7 @@ long storage_main(word *stack)
     CHECK(DO(2, 1, 0, 0) == -14, 16);
     CHECK(DO(83, "/work/build/nested", 0755, 0) == 0, 17);
     long fd = call(257, -100, (word)"build/nested/file", 0102|02000000, 0644, 0, 0);
-    CHECK(fd == 1048576, 18);
+    CHECK(fd == 3, 18);
     CHECK(DO(1, fd, "hello", 5) == 5, 19);
     CHECK(DO(72, fd, 1, 0) == 1, 20);
     CHECK(DO(72, fd, 2, 0) == 0, 21);
@@ -91,13 +91,13 @@ long storage_main(word *stack)
     long fds[64];
     for (word i = 0; i < 64; ++i) {
         fds[i] = DO(2, "/work/build/nested/file", 2, 0);
-        CHECK(fds[i] >= 1048576, 46);
+        CHECK(fds[i] >= 3 && fds[i] < 256, 46);
     }
     CHECK(DO(2, "/work/build/nested/file", 01002, 0) == -24, 47);
     CHECK(DO(5, fds[0], meta, 0) == 0 && *(word *)(meta+48) == 5, 48);
     for (word i = 0; i < 64; ++i) CHECK(DO(3, fds[i], 0, 0) == 0, 49);
     fd = DO(2, "/out/product", 0102, 0644);
-    CHECK(fd >= 1048576, 50);
+    CHECK(fd >= 3 && fd < 256, 50);
     for (word i = 0; i < sizeof data; ++i) data[i] = i % 251;
     for (word i = 0; i < sizeof data; i += 4096) CHECK(DO(1, fd, data+i, 4096) == 4096, 51);
     CHECK(DO(1, fd, "x", 1) == -27, 52);

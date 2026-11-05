@@ -245,17 +245,28 @@ This backend supports regular-file open/create/exclusive-create/truncate/append,
 read/write/pread, seek, close, basic descriptor flags, mkdir, file unlink, chmod,
 and stat/fstat/fstatat/statx metadata. Relative paths use the configured workdir;
 directory descriptors, directory enumeration/removal, symlinks, hardlinks,
-rename, duplicate descriptors, file mappings and execution of generated files
+rename, file mappings and execution of generated files
 are unsupported. Path normalization is lexical; this is not a complete unified
 image/overlay filesystem. IO is bounded to 4096 bytes per call. Capacity is
-32 objects (including seeded directories), 65536 bytes per file and 64 open
-descriptors. Exhaustion returns `ENOSPC`, `EFBIG`, or `EMFILE` as appropriate.
+32 objects (including seeded directories), 65536 bytes per file and 64
+independently opened file handles. Aliases use the common descriptor table. Exhaustion returns `ENOSPC`, `EFBIG`, or `EMFILE` as appropriate.
 
-Writable-file descriptors currently start at 1048576; bootstrap clamps native
-descriptor soft/hard limits below that namespace on every configured launch,
-preserving lower inherited limits. This range-based adapter is provisional:
-libc spawn checks reject these high handles against the reported limit. A shared
-table of small public descriptors is required before ordinary spawn can work.
+Configured launch uses one table of up to 256 public descriptors for bootstrap
+stdio, immutable-image files, writable files, devices and pipes. Allocation uses
+the lowest free number; native opens reserve a slot before running. Backend
+handles stay private, including when the kernel reuses an underlying fd number.
+Dup/dup2/dup3 and fcntl duplication share an open description across owners;
+close-on-exec flags belong to each public descriptor. The backend closes only
+after its last alias. Syscall arguments are translated for native IO/metadata/
+mmap and restored at exit. Native locks, leases and signal ownership are denied.
+
+Bootstrap constrains the real descriptor soft/hard limits to 256 while keeping
+lower operator limits. Allocation respects that lower soft limit; runtime
+NOFILE-limit changes are currently denied. Reported limits are not inflated to
+accommodate backend handle ranges. Libc spawn preflight now accepts the public
+numbers; child process creation is still denied until supervision is implemented.
+Relative directory-fd access, poll on remapped stdio or non-bootstrap descriptors,
+process inheritance and exec-time close-on-exec remain unfinished.
 Guest-memory copies respect page protections, including partial read copyout.
 No writable host descriptor is exposed. Data disappears at domain teardown;
 there is no retention, export, storage generation or configured storage quota.
@@ -267,18 +278,18 @@ discard up to 4096 bytes per call. Stat/fstat/fstatat/statx report a character
 device with domain-owned identity and major/minor 1:3. Open access modes,
 close-on-exec descriptor flags, seek, close and basic access queries are
 supported; device metadata cannot be changed. There are 64 open-device slots.
-Unknown and duplicate assignments fail before launch. Device descriptors start
-at 1073741824, above the reserved native namespace. No host device node or
-descriptor is used. Device duplication/polling and additional device types are
-not implemented by configured launch yet.
+Unknown and duplicate assignments fail before launch. Device aliases share the
+common descriptor table and handle lifetime. No host device node or descriptor
+is used. Device polling and additional device types are not implemented by
+configured launch yet.
 
 Anonymous `pipe`/`pipe2` are emulated with supervisor-owned memory and virtual
-handles. Up to eight pipes hold 65536 bytes each, with 64 pipe descriptors.
+handles. Up to eight pipes hold 65536 bytes each; aliases use the common table.
 `pipe2` accepts only `O_CLOEXEC|O_NONBLOCK`. IO is bounded to 4096 bytes per call;
 writes of up to 4096 bytes are atomic. Reads consume only bytes successfully
 copied out, so invalid/partially inaccessible destinations do not lose data.
 Read/write direction, EOF, SIGPIPE, metadata, seek rejection, descriptor/status
-flags, pipe-size queries and aliases within the pipe handle table are supported.
+flags, pipe-size queries and aliases across owners are supported.
 Alias status flags and endpoint lifetimes are shared; close-on-exec flags are
 per descriptor. No native pipe or host descriptor is given to the workload.
 
@@ -286,11 +297,9 @@ Nonblocking empty/full operations return `EAGAIN`. Blocking operations stay
 stopped at entry until progress is possible. The current single-task launch
 loop cannot run a peer or implement signal-driven restart; a parked self-pipe
 waits indefinitely unless the workload is killed. SIGKILL termination and reaping
-are tested. Pipe polling, cross-owner/stdio aliases, multi-task wakeup, inherited
-descriptor tables, and actual exec-time close-on-exec still require process
-integration. Pipe public handles currently start at 536870912 and share the
-libc limitation above. Pipe allocation/byte-flow evidence alone does not prove
-ordinary child commands work.
+are tested. Pipe polling, multi-task wakeup, inherited descriptor tables, and
+actual exec-time close-on-exec still require process integration. Pipe allocation/
+byte-flow evidence alone does not prove ordinary child commands work.
 
 When requested, the result file is reserved exclusively before launch, with
 mode 0600 and a maximum path length of 512 bytes. Existing files are never
@@ -318,4 +327,6 @@ make build-launch-device-fixture
 sudo make test-launch-devices
 make build-launch-pipe-fixture
 sudo make test-launch-pipes
+make build-launch-fd-fixture
+sudo make test-launch-fds
 ```
