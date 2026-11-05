@@ -98,6 +98,7 @@ long storage_main(word *stack)
         CHECK(DO(1,1,"checkpoint-ready\n",17)==17 && DO(0,0,output,1)==1,149);
         CHECK(DO(8,fd,0,0)==0 && DO(1,fd,"second",6)==6,150);
         CHECK(DO(1,1,"checkpoint-ready\n",17)==17 && DO(0,0,output,1)==1,151);
+        CHECK(DO(74,fd,0,0)==0 && DO(75,fd,0,0)==0,215);
         CHECK(DO(3,fd,0,0)==0,152);
         return 0;
     }

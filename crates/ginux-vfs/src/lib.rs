@@ -552,6 +552,16 @@ impl<
         self.overlay.len()
     }
 
+    /// Adapter-owned flush/lock operations may use the backing of any open
+    /// regular file, including write-only descriptions.
+    pub fn descriptor_storage(&mut self, descriptor: i32) -> Result<(&mut S, usize), VfsError> {
+        let fd = self.descriptors[self.descriptor(descriptor)?];
+        if !fd.overlay || fd.directory {
+            return Err(VfsError::InvalidDescriptor);
+        }
+        Ok((&mut self.storage, fd.object))
+    }
+
     /// Readable regular-file backing for an adapter-owned mapping reference.
     pub fn readable_storage(&mut self, descriptor: i32) -> Result<(&mut S, usize), VfsError> {
         let fd = self.descriptors[self.descriptor(descriptor)?];

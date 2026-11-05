@@ -1062,6 +1062,16 @@ impl LaunchFs {
                 .map(|n| n as i64)
                 .map_err(errno),
             91 => self.fs.fchmod(fd, r.rsi as u32).map(|_| 0).map_err(errno),
+            74 | 75 => self.fs.fstat(fd).map_err(errno).and_then(|metadata| {
+                if metadata.kind == NodeKind::Directory {
+                    return Ok(0);
+                }
+                let (storage, object) = self.fs.descriptor_storage(fd).map_err(errno)?;
+                storage
+                    .sync(object, r.orig_rax == 75)
+                    .map(|_| 0)
+                    .map_err(errno)
+            }),
             77 if r.rsi as i64 >= 0 => self.fs.truncate(fd, r.rsi).map(|_| 0).map_err(errno),
             77 => Err(-22),
             217 => self.getdents(pid, fd, r.rsi, r.rdx),

@@ -99,6 +99,14 @@ impl MemoryStorage {
         self.allocated
     }
 
+    pub fn sync(&mut self, slot: usize, data_only: bool) -> Result<(), VfsError> {
+        let descriptor = self.backing(slot)?;
+        if unsafe { syscall1(if data_only { 75 } else { 74 }, descriptor as usize) } != 0 {
+            return Err(VfsError::Io);
+        }
+        Ok(())
+    }
+
     fn pages(length: usize) -> Result<usize, VfsError> {
         length
             .checked_add(PAGE - 1)
