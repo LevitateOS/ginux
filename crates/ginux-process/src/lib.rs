@@ -58,6 +58,8 @@ impl TaskId {
 pub enum TaskState {
     Running,
     Exited(i32),
+    /// Terminated by an unhandled signal (number, no core dump tracking).
+    Signaled(u8),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,10 +188,61 @@ pub struct TaskView {
     pub exec_epoch: u32,
 }
 
+/// `wait4` option bits the managed wait path understands. `WNOHANG`,
+/// `WUNTRACED`, and `WCONTINUED` match Linux; the `__W*` thread-selection
+/// bits are accepted and have no effect because thread-group members are
+/// joined over a futex and never reaped by `wait`. Any other bit is an
+/// explicit caller error. Job-control stops are not mediated, so no stopped
+/// or continued child is ever produced; accepting `WUNTRACED`/`WCONTINUED`
+/// only keeps libc callers that pass them from failing.
+pub const WNOHANG: u32 = 1;
+pub const WUNTRACED: u32 = 2;
+pub const WCONTINUED: u32 = 8;
+pub const WAIT_THREAD_FLAGS: u32 = 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+pub const WAIT_ALLOWED_OPTIONS: u32 = WNOHANG | WUNTRACED | WCONTINUED | WAIT_THREAD_FLAGS;
+
+/// Which children a `wait` call selects. Matches `wait4` pid semantics:
+/// any child, the caller's process group (`wait4` pid 0, resolved by the
+/// caller), one process group, or one specific child pid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitTarget {
+    Any,
+    Group(u32),
+    Specific(u32),
+}
+
+/// How a reaped child terminated: an exit code or a fatal signal number.
+/// Encodes to the Linux wait status word with [`ChildStatus::word`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildStatus {
+    Exited(i32),
+    Signaled(u8),
+}
+
+impl ChildStatus {
+    /// Linux wait status word: exit code in bits 8-15, signal number in
+    /// bits 0-6 with no core-dump bit.
+    pub const fn word(self) -> u32 {
+        match self {
+            ChildStatus::Exited(code) => ((code as u32) & 0xff) << 8,
+            ChildStatus::Signaled(signal) => (signal as u32) & 0x7f,
+        }
+    }
+
+    /// Shell-style summary (`128 + signal` for signaled children) for
+    /// diagnostics that previously only carried exit codes.
+    pub const fn shell_code(self) -> i32 {
+        match self {
+            ChildStatus::Exited(code) => code,
+            ChildStatus::Signaled(signal) => 128 + signal as i32,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WaitResult {
     pub child: TaskId,
-    pub status: i32,
+    pub status: ChildStatus,
 }
 
 pub struct ProcessTable<const TASKS: usize> {
@@ -280,6 +333,25 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
         }
     }
 
+    /// Latest view for a virtual pid in any occupied state, or `None` once
+    /// reaped. Selector validation uses this; pids are never reused within
+    /// a table, so no generation check applies.
+    pub fn lookup(&self, pid: u32) -> Option<TaskView> {
+        self.tasks
+            .iter()
+            .find(|task| task.occupied && task.id.pid == pid)
+            .map(|task| TaskView {
+                id: task.id,
+                tgid: task.tgid,
+                parent: task.parent,
+                process_group: task.process_group,
+                session: task.session,
+                state: task.state,
+                credentials: task.credentials,
+                exec_epoch: task.exec_epoch,
+            })
+    }
+
     pub fn view(&self, id: TaskId) -> Result<TaskView, ProcessError> {
         let task = self.tasks[self.index(id)?];
         Ok(TaskView {
@@ -353,10 +425,65 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
         Ok(())
     }
 
+    /// Record termination by an unhandled signal. The task must be running;
+    /// zombies keep whatever outcome they already reported.
+    pub fn signaled(&mut self, id: TaskId, signal: u8) -> Result<(), ProcessError> {
+        if signal == 0 || signal > MAX_SIGNAL {
+            return Err(ProcessError::InvalidSignal);
+        }
+        let index = self.index(id)?;
+        if self.tasks[index].state != TaskState::Running {
+            return Err(ProcessError::InvalidState);
+        }
+        self.tasks[index].state = TaskState::Signaled(signal);
+        Ok(())
+    }
+
+    fn is_waitable_child(&self, task: &Task, parent_pid: u32, target: WaitTarget) -> bool {
+        // Thread-group members are joined over a futex, never reaped: only
+        // leaders (tgid == pid) are waitable children.
+        task.occupied
+            && task.parent == parent_pid
+            && task.id.pid == task.tgid
+            && match target {
+                WaitTarget::Any => true,
+                WaitTarget::Group(group) => task.process_group == group,
+                WaitTarget::Specific(pid) => task.id.pid == pid,
+            }
+    }
+
+    /// Whether the caller has any unwaited-for child matching the target,
+    /// running or already reportable. The supervision loop maps "none" to
+    /// `ECHILD` even for blocking waits, matching the kernel.
+    pub fn has_waitable_child(
+        &self,
+        parent: TaskId,
+        target: WaitTarget,
+    ) -> Result<bool, ProcessError> {
+        let parent_index = self.index(parent)?;
+        if self.tasks[parent_index].state != TaskState::Running {
+            return Err(ProcessError::InvalidState);
+        }
+        let parent_pid = parent.pid;
+        Ok(self
+            .tasks
+            .iter()
+            .any(|task| self.is_waitable_child(task, parent_pid, target)))
+    }
+
+    /// Reap one reportable child: exited or signaled. Threads are never
+    /// reportable (`NotChild` for a specific thread pid). A specific pid
+    /// that names no child is `NotChild`; anything else with nothing
+    /// reportable yet is `NoExitedChild`, which the supervisor turns into a
+    /// parked blocking wait or a zero `WNOHANG` return. `options` is
+    /// accepted for interface symmetry and currently only selects which
+    /// outcomes exist; no stopped or continued state is produced because
+    /// job-control stops are not mediated.
     pub fn wait(
         &mut self,
         parent: TaskId,
-        selected: Option<u32>,
+        target: WaitTarget,
+        _options: u32,
     ) -> Result<WaitResult, ProcessError> {
         let parent_index = self.index(parent)?;
         if self.tasks[parent_index].state != TaskState::Running {
@@ -364,15 +491,18 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
         }
         let parent_pid = parent.pid;
         let child = self.tasks.iter().position(|task| {
-            task.occupied
-                && task.parent == parent_pid
-                && selected.is_none_or(|pid| task.id.pid == pid)
-                && matches!(task.state, TaskState::Exited(_))
+            self.is_waitable_child(task, parent_pid, target)
+                && matches!(
+                    task.state,
+                    TaskState::Exited(_) | TaskState::Signaled(_)
+                )
         });
         if let Some(index) = child {
             let task = self.tasks[index];
-            let TaskState::Exited(status) = task.state else {
-                return Err(ProcessError::InvalidState);
+            let status = match task.state {
+                TaskState::Exited(code) => ChildStatus::Exited(code),
+                TaskState::Signaled(signal) => ChildStatus::Signaled(signal),
+                _ => return Err(ProcessError::InvalidState),
             };
             self.tasks[index] = Task::empty();
             return Ok(WaitResult {
@@ -380,12 +510,10 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
                 status,
             });
         }
-        if let Some(pid) = selected {
-            if !self
-                .tasks
-                .iter()
-                .any(|task| task.occupied && task.parent == parent_pid && task.id.pid == pid)
-            {
+        if let WaitTarget::Specific(pid) = target {
+            if !self.tasks.iter().any(|task| {
+                task.occupied && task.parent == parent_pid && task.id.pid == pid && task.id.pid == task.tgid
+            }) {
                 return Err(ProcessError::NotChild);
             }
         }
@@ -522,7 +650,12 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
     pub fn reap_all(&mut self) -> usize {
         let mut reaped = 0;
         for task in &mut self.tasks {
-            if task.occupied && matches!(task.state, TaskState::Exited(_)) {
+            if task.occupied
+                && matches!(
+                    task.state,
+                    TaskState::Exited(_) | TaskState::Signaled(_)
+                )
+            {
                 *task = Task::empty();
                 reaped += 1;
             }
@@ -960,7 +1093,13 @@ mod tests {
         assert_eq!(table.view(child).unwrap().parent, 1);
         assert_eq!(table.exec(child), Ok(1));
         table.exit(child, 17).unwrap();
-        assert_eq!(table.wait(init, Some(child.pid)).unwrap().status, 17);
+        assert_eq!(
+            table
+                .wait(init, WaitTarget::Specific(child.pid), 0)
+                .unwrap()
+                .status,
+            ChildStatus::Exited(17)
+        );
         assert_eq!(table.view(child), Err(ProcessError::InvalidTask));
         let replacement = table.fork(init).unwrap();
         assert_ne!(replacement, child);
@@ -1057,7 +1196,7 @@ mod tests {
         let child = table.fork(init).unwrap();
         assert_eq!(table.fork(init), Err(ProcessError::TableFull));
         assert_eq!(
-            table.wait(child, Some(init.pid)),
+            table.wait(child, WaitTarget::Specific(init.pid), 0),
             Err(ProcessError::NotChild)
         );
         assert_eq!(table.shutdown(137), 2);

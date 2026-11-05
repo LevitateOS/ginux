@@ -39,6 +39,15 @@
 //! thread or its group's memory, so it is not a host escape. Thread shapes
 //! outside [`thread_supported`] fail explicitly with `-ENOSYS` and never
 //! execute.
+//!
+//! G05 owns child waits and termination signals in the supervision loop
+//! (not in this lane hook, which stays synchronous): `wait4` (61) is fully
+//! emulated against the process table — blocking waits park the caller
+//! until a matching exit or signal death wakes it, `WNOHANG` returns zero,
+//! unknown options fail with `-EINVAL`, stale selectors with `-ECHILD` —
+//! and `kill` (62) forwards the normal termination signals to the
+//! translated host task while signal deaths are recorded as signaled
+//! outcomes with SIGCHLD queued for the parent.
 
 use crate::supervisor::{ENOSYS, SYS_FORK};
 
