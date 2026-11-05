@@ -448,7 +448,7 @@ impl LaunchFs {
                 .fs
                 .metadata(path.as_bytes())
                 .map_err(errno)
-                .and_then(|_| Err(-22)),
+                .and(Err(-22)),
             262 => {
                 if r.r10 & !0x900 != 0 {
                     Err(-22)

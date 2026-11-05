@@ -56,7 +56,7 @@ impl<const FILES: usize> MemoryStorage<FILES> {
             .get_mut(slot)
             .ok_or(VfsError::InvalidDescriptor)?;
         if file.descriptor < 0 {
-            let fd = unsafe { syscall2(319, b"ginux-storage\0".as_ptr() as usize, 1) };
+            let fd = unsafe { syscall2(319, c"ginux-storage".as_ptr() as usize, 1) };
             if fd < 0 {
                 return Err(VfsError::Io);
             }
