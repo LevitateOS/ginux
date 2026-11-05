@@ -23,8 +23,15 @@ const OPTIONS: usize = PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL | 2 | 4 | 8 | 1
 #[derive(Clone, Copy)]
 enum Pending {
     None,
-    Fork(usize),
-    Wait { child: usize, original: [u64; 7] },
+    Fork {
+        child: usize,
+        flags: u64,
+        parent_tid: Option<u64>,
+    },
+    Wait {
+        child: usize,
+        original: [u64; 7],
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -47,17 +54,27 @@ struct Task {
     id: TaskId,
     host: usize,
     alive: bool,
-    descriptors: DescriptorTable,
+    group: usize,
     call: DescriptorCall,
     pending: Pending,
     override_result: Option<i64>,
     blocked: Option<UserRegs>,
     sequence: u64,
     exec: Option<Exec>,
+    waiter: Option<usize>,
+}
+
+struct DescriptorGroup {
+    table: DescriptorTable,
+    owners: usize,
+    leader: TaskId,
+    status: Option<i32>,
+    creating: Option<usize>,
 }
 
 struct Supervisor<'a> {
     tasks: [Option<Task>; TASKS],
+    groups: [Option<DescriptorGroup>; TASKS],
     processes: ProcessTable<TASKS>,
     objects: Backends<'a>,
     unknown_stops: [usize; TASKS],
@@ -65,6 +82,7 @@ struct Supervisor<'a> {
     retired_next: usize,
     sequence: u64,
     wake_needed: bool,
+    root_status: Option<i32>,
 }
 
 pub fn supervise(
@@ -99,6 +117,7 @@ pub fn supervise(
         .unwrap();
     let mut s = Supervisor {
         tasks: core::array::from_fn(|_| None),
+        groups: core::array::from_fn(|_| None),
         processes,
         objects,
         unknown_stops: [0; TASKS],
@@ -106,18 +125,27 @@ pub fn supervise(
         retired_next: 0,
         sequence: 0,
         wake_needed: false,
+        root_status: None,
     };
+    s.groups[0] = Some(DescriptorGroup {
+        table: descriptors,
+        owners: 1,
+        leader: id,
+        status: None,
+        creating: None,
+    });
     s.tasks[0] = Some(Task {
         id,
         host: root,
         alive: true,
-        descriptors,
+        group: 0,
         call: DescriptorCall::new(),
         pending: Pending::None,
         override_result: None,
         blocked: None,
         sequence: 0,
         exec: None,
+        waiter: None,
     });
     if ptrace(PTRACE_SETOPTIONS, root, 0, OPTIONS) < 0 {
         s.fail(domain, b"launch ptrace setup failed");
@@ -164,7 +192,7 @@ pub fn supervise(
         };
         if exited(status) || signaled(status) {
             s.died(index, status, domain);
-            if index == 0 {
+            if let Some(status) = s.root_status {
                 s.teardown(domain);
                 let normal = exited(status);
                 let _ = domain.task_exited(normal);
@@ -242,6 +270,32 @@ pub fn supervise(
 }
 
 impl Supervisor<'_> {
+    fn table(&self, index: usize) -> &DescriptorTable {
+        &self.groups[self.task(index).group].as_ref().unwrap().table
+    }
+    fn release_group(
+        &mut self,
+        index: usize,
+        domain: &mut Domain,
+    ) -> Option<(TaskId, Option<i32>)> {
+        let group = self.task(index).group;
+        self.groups[group].as_mut().unwrap().owners -= 1;
+        if self.groups[group].as_ref().unwrap().owners == 0 {
+            let owner = self.groups[group].as_ref().unwrap();
+            let result = (owner.leader, owner.status);
+            if let Err(reason) = self.groups[group]
+                .as_mut()
+                .unwrap()
+                .table
+                .release_exited(&mut self.objects)
+            {
+                self.fail(domain, reason);
+            }
+            self.groups[group] = None;
+            return Some(result);
+        }
+        None
+    }
     fn task(&self, index: usize) -> &Task {
         self.tasks[index].as_ref().unwrap()
     }
@@ -329,6 +383,18 @@ impl Supervisor<'_> {
         audit_write(b" action=");
         let original = *r;
         let id = self.task(index).id;
+        let parent_group = self.task(index).group;
+        if self.groups[parent_group]
+            .as_ref()
+            .unwrap()
+            .creating
+            .is_some_and(|owner| owner != index)
+            && !matches!(r.orig_rax, 60 | 231 | 62)
+        {
+            self.task_mut(index).blocked = Some(original);
+            audit_write(b"park surface=descriptor-snapshot\n");
+            return;
+        }
         match r.orig_rax {
             59 | 322 => {
                 let result = self.prepare_exec(index, r);
@@ -339,6 +405,18 @@ impl Supervisor<'_> {
                     self.exec_step(index, r, domain);
                 }
                 return;
+            }
+            202 => {
+                let operation = r.rsi & 0x7f;
+                // PI futexes let the kernel publish its native owner TID.
+                // Ordinary wait/wake/requeue operate on caller-owned values.
+                if r.rsi & !0x1ff != 0
+                    || !matches!(operation, 0 | 1 | 3 | 4 | 5 | 9 | 10)
+                    || r.rsi & 0x100 != 0 && operation != 9
+                {
+                    self.emulate(index, r, -95, domain);
+                    return;
+                }
             }
             13 if r.rdi == 17 && r.rsi != 0 && r.r10 == 8 => {
                 // Native auto-reaping would bypass the explicit virtual wait
@@ -356,7 +434,12 @@ impl Supervisor<'_> {
                 }
             }
             39 | 186 => {
-                self.emulate(index, r, id.pid as i64, domain);
+                let value = if r.orig_rax == 39 {
+                    self.processes.view(id).unwrap().tgid
+                } else {
+                    id.pid
+                };
+                self.emulate(index, r, value as i64, domain);
                 return;
             }
             110 | 111 => {
@@ -374,46 +457,95 @@ impl Supervisor<'_> {
                 return;
             }
             56..=58 => {
-                if r.orig_rax == 56 && !matches!(r.rdi, 17 | 0x4111) {
+                let flags = r.rdi;
+                let thread = r.orig_rax == 56 && flags == 0x3d0f00;
+                if r.orig_rax == 56 && !thread && !matches!(flags, 17 | 0x4111) {
                     self.emulate(index, r, -38, domain);
                     return;
                 }
-                if self.task(index).call.native_mutation() {
-                    self.fail(domain, b"fork overlapped descriptor mutation");
+                if !thread
+                    && self
+                        .tasks
+                        .iter()
+                        .flatten()
+                        .any(|t| t.group == parent_group && t.call.native_mutation())
+                {
+                    self.task_mut(index).blocked = Some(original);
+                    audit_write(b"park surface=descriptor-snapshot\n");
+                    return;
+                }
+                if thread {
+                    // Suppress kernel PARENT_SETTID copyout, which would expose
+                    // a native TID to peers sharing memory. Publish the virtual
+                    // TID at the confirmed birth stop before parent/child run.
+                    let mut before = [0u8; 4];
+                    if copy_memory(self.task(index).host, r.rdx, &mut before, false) != Ok(4)
+                        || copy_memory(self.task(index).host, r.rdx, &mut before, true) != Ok(4)
+                    {
+                        self.emulate(index, r, -14, domain);
+                        return;
+                    }
                 }
                 let Some(slot) = self.tasks.iter().position(|t| t.is_none()) else {
                     self.emulate(index, r, -11, domain);
                     return;
                 };
-                let child = match self.processes.fork(id) {
+                let child = match if thread {
+                    self.processes.clone_thread(id)
+                } else {
+                    self.processes.fork(id)
+                } {
                     Ok(id) => id,
                     Err(_) => {
                         self.emulate(index, r, -11, domain);
                         return;
                     }
                 };
-                let table = match self.tasks[index]
-                    .as_ref()
-                    .unwrap()
-                    .descriptors
-                    .fork_copy(self.objects.refs)
-                {
-                    Ok(table) => table,
-                    Err(reason) => self.fail(domain, reason),
+                let group = if thread {
+                    self.groups[parent_group].as_mut().unwrap().owners += 1;
+                    parent_group
+                } else {
+                    let group = self.groups.iter().position(|g| g.is_none()).unwrap();
+                    let table = match self.groups[parent_group]
+                        .as_ref()
+                        .unwrap()
+                        .table
+                        .fork_copy(self.objects.refs)
+                    {
+                        Ok(table) => table,
+                        Err(reason) => self.fail(domain, reason),
+                    };
+                    self.groups[group] = Some(DescriptorGroup {
+                        table,
+                        owners: 1,
+                        leader: child,
+                        status: None,
+                        creating: None,
+                    });
+                    self.groups[parent_group].as_mut().unwrap().creating = Some(index);
+                    group
                 };
                 self.tasks[slot] = Some(Task {
                     id: child,
                     host: 0,
                     alive: true,
-                    descriptors: table,
+                    group,
                     call: DescriptorCall::new(),
                     pending: Pending::None,
                     override_result: None,
                     blocked: None,
                     sequence: 0,
                     exec: None,
+                    waiter: None,
                 });
-                self.task_mut(index).pending = Pending::Fork(slot);
+                self.task_mut(index).pending = Pending::Fork {
+                    child: slot,
+                    flags,
+                    parent_tid: thread.then_some(r.rdx),
+                };
+                if thread {
+                    r.rdi &= !0x100000;
+                }
                 audit_write(b"mediate surface=owned-process-create\n");
                 self.run(index, r, domain);
                 return;
@@ -429,12 +561,18 @@ impl Supervisor<'_> {
                     self.emulate(index, r, -95, domain);
                     return;
                 }
-                let found = self
-                    .tasks
-                    .iter()
-                    .flatten()
-                    .find(|t| t.id.pid == target as u32 && t.alive && t.host != 0)
-                    .map(|t| t.host);
+                let found =
+                    self.tasks
+                        .iter()
+                        .flatten()
+                        .find(|t| {
+                            t.id.pid == target as u32
+                                && t.host != 0
+                                && self.processes.view(t.id).is_ok_and(|v| {
+                                    matches!(v.state, ginux_process::TaskState::Running)
+                                })
+                        })
+                        .map(|t| t.host);
                 let result = found
                     .map(|host| unsafe { syscall2(SYS_KILL, host, signal as usize) } as i64)
                     .unwrap_or(-3);
@@ -447,11 +585,12 @@ impl Supervisor<'_> {
             _ => {}
         }
         let decision = {
+            let group = self.task(index).group;
             let task = self.tasks[index].as_mut().unwrap();
             decide_launch(
                 task.host,
                 r,
-                &mut task.descriptors,
+                &mut self.groups[group].as_mut().unwrap().table,
                 &mut self.objects,
                 &mut task.call,
             )
@@ -499,6 +638,12 @@ impl Supervisor<'_> {
         }
     }
     fn prepare_exec(&mut self, index: usize, r: &UserRegs) -> Result<(), i64> {
+        let group = self.task(index).group;
+        if self.groups[group].as_ref().unwrap().owners != 1
+            || self.task(index).id != self.groups[group].as_ref().unwrap().leader
+        {
+            return Err(-95);
+        }
         let host = self.task(index).host;
         let mut native_dirfd = r.rdi;
         if r.orig_rax == 59 {
@@ -512,7 +657,7 @@ impl Supervisor<'_> {
                 if r.r8 & 0x1000 == 0 {
                     return Err(-2);
                 }
-                native_dirfd = self.task(index).descriptors.exec_native_descriptor(r.rdi)? as u64;
+                native_dirfd = self.table(index).exec_native_descriptor(r.rdi)? as u64;
             } else {
                 if path.as_bytes()[0] != b'/' && r.rdi as i32 != -100 {
                     return Err(-95);
@@ -539,11 +684,7 @@ impl Supervisor<'_> {
 
     fn exec_step(&mut self, index: usize, r: &mut UserRegs, domain: &mut Domain) {
         let exec = self.task(index).exec.unwrap();
-        if let Some((fd, cloexec)) = self
-            .task(index)
-            .descriptors
-            .next_exec_native(exec.next_native)
-        {
+        if let Some((fd, cloexec)) = self.table(index).next_exec_native(exec.next_native) {
             let state = self.task_mut(index).exec.as_mut().unwrap();
             state.next_native = fd + 1;
             state.stage = ExecStage::Sync;
@@ -575,10 +716,11 @@ impl Supervisor<'_> {
         {
             self.fail(domain, b"unreserved exec transition");
         }
-        let result = self.tasks[index]
+        let group = self.task(index).group;
+        let result = self.groups[group]
             .as_mut()
             .unwrap()
-            .descriptors
+            .table
             .exec_completed(&mut self.objects);
         if let Err(reason) = result {
             self.fail(domain, reason);
@@ -595,7 +737,12 @@ impl Supervisor<'_> {
     }
 
     fn birth(&mut self, parent: usize, domain: &mut Domain) {
-        let Pending::Fork(slot) = self.task(parent).pending else {
+        let Pending::Fork {
+            child: slot,
+            flags,
+            parent_tid,
+        } = self.task(parent).pending
+        else {
             self.fail(domain, b"unreserved child event")
         };
         let mut host = 0usize;
@@ -624,6 +771,22 @@ impl Supervisor<'_> {
         }
         if ptrace(PTRACE_SETOPTIONS, host, 0, OPTIONS) < 0 {
             self.fail(domain, b"child supervision setup failed")
+        }
+        if let Some(address) = parent_tid {
+            let mut virtual_tid = self.task(slot).id.pid.to_ne_bytes();
+            if copy_memory(self.task(parent).host, address, &mut virtual_tid, true) != Ok(4) {
+                self.fail(domain, b"thread identity copyout failed");
+            }
+            let mut child_regs = self.registers(slot, domain);
+            child_regs.rdi = flags;
+            if ptrace(PTRACE_SETREGS, host, 0, &child_regs as *const _ as usize) < 0 {
+                self.fail(domain, b"thread birth register update failed");
+            }
+        }
+        let group = self.task(parent).group;
+        if self.groups[group].as_ref().unwrap().creating == Some(parent) {
+            self.groups[group].as_mut().unwrap().creating = None;
+            self.wake_needed = true;
         }
         audit_write(b"ginux: task registered virtual-pid=");
         audit_u64(self.task(slot).id.pid as u64);
@@ -668,22 +831,26 @@ impl Supervisor<'_> {
         }
         let pending = self.task(index).pending;
         match pending {
-            Pending::Fork(child) => {
+            Pending::Fork {
+                child,
+                flags,
+                parent_tid,
+            } => {
+                r.rdi = flags;
                 if (r.rax as i64) < 0 {
-                    let result = self.tasks[child]
-                        .as_mut()
-                        .unwrap()
-                        .descriptors
-                        .release_exited(&mut self.objects);
-                    if let Err(reason) = result {
-                        self.fail(domain, reason)
-                    }
+                    self.release_group(child, domain);
                     let child_id = self.task(child).id;
-                    if self
-                        .processes
-                        .cancel_fork(self.task(index).id, child_id)
-                        .is_err()
-                    {
+                    let rollback = if parent_tid.is_some() {
+                        self.processes.cancel_thread(self.task(index).id, child_id)
+                    } else {
+                        self.processes.cancel_fork(self.task(index).id, child_id)
+                    };
+                    let group = self.task(index).group;
+                    if self.groups[group].as_ref().unwrap().creating == Some(index) {
+                        self.groups[group].as_mut().unwrap().creating = None;
+                        self.wake_needed = true;
+                    }
+                    if rollback.is_err() {
                         self.fail(domain, b"fork rollback failed")
                     }
                     self.tasks[child] = None;
@@ -711,7 +878,10 @@ impl Supervisor<'_> {
                     self.retired_next = (self.retired_next + 1) % TASKS;
                     self.tasks[child] = None;
                     r.rax = id.pid as u64;
+                } else {
+                    self.task_mut(child).waiter = None;
                 }
+                self.wake_needed = true;
                 r.rdi = original[0];
                 r.rsi = original[1];
                 r.rdx = original[2];
@@ -726,10 +896,15 @@ impl Supervisor<'_> {
         if let Some(result) = self.task_mut(index).override_result.take() {
             r.rax = result as u64;
         }
+        let group = self.task(index).group;
         let task = self.tasks[index].as_mut().unwrap();
-        let result = task.call.finish(&mut task.descriptors, r);
-        if let Err(reason) = result {
-            self.fail(domain, reason)
+        match task.call.finish(
+            &mut self.groups[group].as_mut().unwrap().table,
+            r,
+            &mut self.objects,
+        ) {
+            Ok(changed) => self.wake_needed |= changed,
+            Err(reason) => self.fail(domain, reason),
         }
         audit_write(b"ginux: audit sequence=");
         audit_u64(self.task(index).sequence);
@@ -753,6 +928,15 @@ impl Supervisor<'_> {
                     .iter()
                     .position(|t| t.as_ref().is_some_and(|t| t.id == result.child))
                     .unwrap();
+                if self.task(child).waiter.is_some() {
+                    if r.rdx & 1 != 0 {
+                        self.emulate(index, r, 0, domain);
+                    } else {
+                        self.task_mut(index).blocked = Some(*r);
+                        audit_write(b"park surface=owned-child-wait\n");
+                    }
+                    return;
+                }
                 if r.rsi != 0 {
                     let mut status = result.status.to_ne_bytes();
                     if copy_memory(self.task(index).host, r.rsi, &mut status, true) != Ok(4) {
@@ -761,6 +945,7 @@ impl Supervisor<'_> {
                     }
                 }
                 let original = [r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9, r.orig_rax];
+                self.task_mut(child).waiter = Some(index);
                 self.task_mut(index).pending = Pending::Wait { child, original };
                 r.rdi = self.task(child).host as u64;
                 r.rdx = 0;
@@ -771,7 +956,9 @@ impl Supervisor<'_> {
             Err(ProcessError::NoExitedChild) => {
                 let has_child = self.tasks.iter().flatten().any(|t| {
                     self.processes.view(t.id).is_ok_and(|v| {
-                        v.parent == parent.pid && selected.is_none_or(|id| id == t.id.pid)
+                        v.parent == self.processes.view(parent).unwrap().tgid
+                            && v.id.pid == v.tgid
+                            && selected.is_none_or(|id| id == t.id.pid)
                     })
                 });
                 if !has_child {
@@ -802,25 +989,74 @@ impl Supervisor<'_> {
     fn died(&mut self, index: usize, status: i32, domain: &mut Domain) {
         self.wake_needed = true;
         if !self.task(index).alive {
-            self.fail(domain, b"duplicate task death")
+            self.fail(domain, b"duplicate task death");
+        }
+        let id = self.task(index).id;
+        let group = self.task(index).group;
+        if let Pending::Fork {
+            child, parent_tid, ..
+        } = self.task(index).pending
+        {
+            if self.task(child).host == 0 {
+                self.release_group(child, domain);
+                let reserved = self.task(child).id;
+                let result = if parent_tid.is_some() {
+                    self.processes.cancel_thread(id, reserved)
+                } else {
+                    self.processes.cancel_fork(id, reserved)
+                };
+                if result.is_err() {
+                    self.fail(domain, b"unpublished task rollback failed");
+                }
+                self.tasks[child] = None;
+            }
+        }
+        if self.groups[group].as_ref().unwrap().creating == Some(index) {
+            self.groups[group].as_mut().unwrap().creating = None;
+        }
+        if let Pending::Wait { child, .. } = self.task(index).pending {
+            if let Some(child) = self.tasks[child].as_mut() {
+                child.waiter = None;
+            }
         }
         self.task_mut(index).alive = false;
-        self.task_mut(index).call.reset();
         self.task_mut(index).blocked = None;
-        if self.processes.exit(self.task(index).id, status).is_err() {
-            self.fail(domain, b"virtual task exit failed")
-        }
-        let result = self.tasks[index]
+        if let Err(reason) = self.tasks[index]
             .as_mut()
             .unwrap()
-            .descriptors
-            .release_exited(&mut self.objects);
-        if let Err(reason) = result {
-            self.fail(domain, reason)
+            .call
+            .reset(&mut self.objects)
+        {
+            self.fail(domain, reason);
+        }
+        if id == self.groups[group].as_ref().unwrap().leader {
+            self.groups[group].as_mut().unwrap().status = Some(status);
+        } else {
+            if self.processes.exit(id, status).is_err()
+                || self.processes.reap_exited_thread(id).is_err()
+            {
+                self.fail(domain, b"virtual thread exit failed");
+            }
+        }
+        if let Some((leader, status)) = self.release_group(index, domain) {
+            let Some(status) = status else {
+                self.fail(domain, b"process ended without leader status");
+            };
+            if self.processes.exit(leader, status).is_err() {
+                self.fail(domain, b"virtual process exit failed");
+            }
+            if leader.pid == 1 {
+                self.root_status = Some(status);
+            }
         }
         audit_write(b"ginux: task exited virtual-pid=");
-        audit_u64(self.task(index).id.pid as u64);
+        audit_u64(id.pid as u64);
         audit_write(b"\n");
+        if self.processes.view(id).is_err() {
+            self.retired[self.retired_next] = (self.task(index).host, id.pid);
+            self.retired_next = (self.retired_next + 1) % TASKS;
+            self.tasks[index] = None;
+        }
     }
     fn teardown(&mut self, domain: &mut Domain) {
         for t in self
@@ -866,8 +1102,13 @@ impl Supervisor<'_> {
             }
         }
         for task in self.tasks.iter_mut().flatten() {
-            if let Err(reason) = task.descriptors.release_exited(&mut self.objects) {
-                supervision_error(domain, reason)
+            if let Err(reason) = task.call.reset(&mut self.objects) {
+                supervision_error(domain, reason);
+            }
+        }
+        for group in self.groups.iter_mut().flatten() {
+            if let Err(reason) = group.table.release_exited(&mut self.objects) {
+                supervision_error(domain, reason);
             }
         }
         self.processes.shutdown(137);

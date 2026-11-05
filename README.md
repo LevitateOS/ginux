@@ -295,15 +295,24 @@ Nonblocking empty/full operations return `EAGAIN`. Blocking operations stay
 stopped at entry until a peer changes readiness or exits. No native pipe fd is
 passed through. Byte-flow checks alone do not prove ordinary child commands work.
 
-Configured launch supervises up to 16 processes through the existing process
-owner. Fork and vfork are supported, as are clone flags `SIGCHLD` and
-`CLONE_VM | CLONE_VFORK | SIGCHLD`. Other clone shapes and clone3 return `ENOSYS`;
-threads, shared descriptor tables and namespace creation are unsupported. Each
+Configured launch supervises up to 16 native tasks through the existing process
+owner. Fork and vfork are supported, as are clone flags `SIGCHLD`,
+`CLONE_VM | CLONE_VFORK | SIGCHLD`, and the x86-64 pthread shape `0x3d0f00`.
+Pthread tasks share their process's descriptor table, retain independent syscall
+transactions, and use distinct virtual TIDs with a common virtual process ID.
+Kernel parent-TID copyout is suppressed; the supervisor publishes the virtual TID
+at birth, and native clear-TID/futex wakeup supports joins. Other clone shapes,
+clone3, cross-process shared tables and namespace creation remain unsupported. Each
 child is registered at its ptrace birth stop before it can execute. Public
 process IDs start at 1. Fork returns the virtual child ID; getpid/gettid/getppid/
 getpgrp and SIGCHLD sender identities use domain IDs. Native descriptor tables
 inherit the kernel's shared file offsets; owned files/devices/pipes share backend
-references until the last process closes or exits.
+references until their last alias or pending IO reference is released. A blocked
+owned read/write pins its original object when another thread closes/reuses the
+public number. Native descriptor mutations settle before a fork snapshot; peers
+cannot change the table until the kernel confirms the child birth. Thread exit
+leaves peer handles intact, including after the process leader exits. Getcwd is
+mediated against the bootstrapped chroot workdir; runtime chdir is unsupported.
 
 Wait4 supports a positive virtual child ID or -1, with options 0 or WNOHANG and
 no rusage buffer. An invalid status pointer does not consume the child. Orphans
@@ -312,7 +321,10 @@ subreaper. Kill supports positive domain IDs with signals 0 or SIGKILL; other
 signal forms are rejected. SIGCHLD auto-reap dispositions are rejected; bootstrap
 resets an inherited ignored SIGCHLD to its default disposition. Job control,
 interruption/restart of parked calls and SIGCHLD notification for adopted
-children remain incomplete. Root exit or supervision failure kills and reaps all remaining
+children and robust-futex owner-death behavior remain incomplete. Supported
+futex operations are wait/wake/requeue and their ordinary variants; PI futexes
+are denied before the kernel can publish native owner TIDs. Final root-process
+exit or supervision failure kills and reaps all remaining
 descendants and releases owned descriptors before reporting completion.
 Image execve and execveat are supervised, including relative paths from the
 configured workdir, absolute execveat paths, and AT_EMPTY_PATH on image
@@ -323,12 +335,14 @@ bit: any surviving public alias keeps its native handle. The supervisor replays
 the original verified x86-64 syscall instruction; no executable bytes change.
 Only PTRACE_EVENT_EXEC retires public CLOEXEC descriptors and owned references.
 Failed exec preserves every public descriptor and its flags. Successful exec
-keeps task identity and advances the existing process owner's exec state.
+keeps task identity and advances the existing process owner's exec state. Exec
+currently requires the sole remaining task to be its process leader; other
+threaded exec transitions return EOPNOTSUPP.
 Signals interrupting descriptor synchronization fail the domain explicitly;
 restart/deferred delivery for that preparation remains incomplete. Path checking
 uses the current lexical view rather than a unified image/overlay resolver.
-Normal command helpers still require tracked threads and broader readiness
-support. This is not compiler support.
+Readiness beyond bootstrap consoles, compiler-sized writable storage and
+execution of generated files remain incomplete. This is not compiler support.
 
 When requested, the result file is reserved exclusively before launch, with
 mode 0600 and a maximum path length of 512 bytes. Existing files are never
@@ -362,4 +376,6 @@ make build-launch-task-fixture
 sudo make test-launch-tasks
 make build-launch-exec-fixture
 sudo make test-launch-exec
+make build-launch-thread-fixture
+sudo make test-launch-threads
 ```

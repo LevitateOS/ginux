@@ -104,19 +104,29 @@ pub struct DescriptorTable {
 pub struct DescriptorCall {
     pending: Option<Pending>,
     saved_args: Option<[u64; 7]>,
+    pinned: Option<Descriptor>,
 }
 impl DescriptorCall {
     pub const fn new() -> Self {
         Self {
             pending: None,
             saved_args: None,
+            pinned: None,
         }
     }
     pub fn native_mutation(&self) -> bool {
         self.pending.is_some()
     }
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self, backends: &mut Backends) -> Result<(), &'static [u8]> {
+        if let Some(Descriptor {
+            handle: Handle::Owned(handle),
+            ..
+        }) = self.pinned.take()
+        {
+            backends.release(handle)?;
+        }
         *self = Self::new();
+        Ok(())
     }
     fn save(&mut self, r: &UserRegs) {
         self.saved_args = Some([r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9, r.orig_rax]);
@@ -130,6 +140,7 @@ impl DescriptorCall {
         &mut self,
         table: &mut DescriptorTable,
         r: &mut UserRegs,
+        backends: &mut Backends,
     ) -> Result<bool, &'static [u8]> {
         let mut changed = false;
         if let Some(pending) = self.pending.take() {
@@ -168,6 +179,10 @@ impl DescriptorCall {
             r.r8 = args[4];
             r.r9 = args[5];
             r.orig_rax = args[6];
+            changed = true;
+        }
+        if self.pinned.is_some() {
+            self.reset(backends)?;
             changed = true;
         }
         Ok(changed)
@@ -358,14 +373,16 @@ impl DescriptorTable {
                             Ok(ready(0))
                         }
                         2 => Err(-22),
-                        _ => self.descriptor(pid, r, entry, backends),
+                        _ => self.descriptor(pid, r, entry, backends, call),
                     },
                 }
             }
             0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 74 | 75 | 77 | 78 | 91 | 217 => {
                 call.save(r);
-                self.get(r.rdi)
-                    .and_then(|d| self.descriptor(pid, r, d, backends))
+                call.pinned
+                    .map(Ok)
+                    .unwrap_or_else(|| self.get(r.rdi))
+                    .and_then(|d| self.descriptor(pid, r, d, backends, call))
             }
             9 if r.r10 & 0x20 == 0 => {
                 call.save(r);
@@ -515,6 +532,7 @@ impl DescriptorTable {
         r: &mut UserRegs,
         entry: Descriptor,
         backends: &mut Backends,
+        call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
         let public_fd = r.rdi as u32;
         match entry.handle {
@@ -543,7 +561,15 @@ impl DescriptorTable {
             Handle::Reserved => return Err(-9),
         }
         Ok(match backends.claim(pid, r) {
-            NativeDecision::Park { .. } => NativeDecision::Park { fd: public_fd },
+            NativeDecision::Park { .. } => {
+                if call.pinned.is_none() {
+                    if let Handle::Owned(handle) = entry.handle {
+                        backends.refs.retain(handle);
+                    }
+                    call.pinned = Some(entry);
+                }
+                NativeDecision::Park { fd: public_fd }
+            }
             decision => decision,
         })
     }

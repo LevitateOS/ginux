@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: rustup target add x86_64-unknown-linux-gnu
-      - run: make build build-launch-fixture build-launch-storage-fixture build-launch-device-fixture build-launch-pipe-fixture build-launch-fd-fixture build-launch-task-fixture build-launch-exec-fixture
+      - run: make build build-launch-fixture build-launch-storage-fixture build-launch-device-fixture build-launch-pipe-fixture build-launch-fd-fixture build-launch-task-fixture build-launch-exec-fixture build-launch-thread-fixture
       - run: sudo make test-launch
       - run: sudo make test-launch-storage
       - run: sudo make test-launch-devices
@@ -32,3 +32,4 @@ jobs:
       - run: sudo make test-launch-fds
       - run: sudo make test-launch-tasks
       - run: sudo make test-launch-exec
+      - run: sudo make test-launch-threads

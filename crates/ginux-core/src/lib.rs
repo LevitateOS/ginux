@@ -54,7 +54,7 @@ pub enum BalancedSurface {
 
 pub const fn balanced_surface(syscall: u64) -> BalancedSurface {
     match syscall {
-        0 | 2 | 3 | 4 | 5 | 8 | 17 | 21 | 72 | 89 | 217 | 257 | 262 | 332 | 439 => {
+        0 | 2 | 3 | 4 | 5 | 8 | 17 | 21 | 72 | 79 | 89 | 217 | 257 | 262 | 332 | 439 => {
             BalancedSurface::ImageRead
         }
         9 | 10 | 11 | 12 | 28 => BalancedSurface::Memory,

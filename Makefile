@@ -164,7 +164,7 @@ clean:
 	cargo clean
 	@./scripts/clean-build.sh
 
-.PHONY: build-launch-fixture test-launch build-launch-storage-fixture test-launch-storage build-launch-device-fixture test-launch-devices build-launch-pipe-fixture test-launch-pipes build-launch-fd-fixture test-launch-fds build-launch-task-fixture test-launch-tasks build-launch-exec-fixture test-launch-exec
+.PHONY: build-launch-fixture test-launch build-launch-storage-fixture test-launch-storage build-launch-device-fixture test-launch-devices build-launch-pipe-fixture test-launch-pipes build-launch-fd-fixture test-launch-fds build-launch-task-fixture test-launch-tasks build-launch-exec-fixture test-launch-exec build-launch-thread-fixture test-launch-threads
 build-launch-fixture:
 	mkdir -p .artifacts/launch
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fixture.c -o .artifacts/launch/launch-fixture
@@ -213,3 +213,10 @@ build-launch-exec-fixture:
 
 test-launch-exec:
 	python3 scripts/test-launch-exec.py $(GINUX) .artifacts/launch/launch-exec-fixture
+
+build-launch-thread-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-thread-fixture.c -o .artifacts/launch/launch-thread-fixture
+
+test-launch-threads:
+	python3 scripts/test-launch-threads.py $(GINUX) .artifacts/launch/launch-thread-fixture

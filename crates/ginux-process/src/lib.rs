@@ -300,7 +300,7 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
             return Err(ProcessError::InvalidParent);
         }
         self.allocate(
-            parent.id.pid,
+            parent.tgid,
             0,
             parent.process_group,
             parent.session,
@@ -311,10 +311,11 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
     /// Roll back a supervisor-reserved fork that never became a runnable task.
     /// The caller must use this only before publishing the child to execution.
     pub fn cancel_fork(&mut self, parent: TaskId, child: TaskId) -> Result<(), ProcessError> {
-        self.index(parent)?;
+        let parent = self.tasks[self.index(parent)?];
         let index = self.index(child)?;
         let task = self.tasks[index];
-        if task.parent != parent.pid
+        if task.id.pid != task.tgid
+            || task.parent != parent.tgid
             || task.state != TaskState::Running
             || task.exec_epoch != 0
             || self
@@ -340,6 +341,33 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
             leader.session,
             leader.credentials,
         )
+    }
+
+    /// Supervisor rollback before the native thread is published to execution.
+    pub fn cancel_thread(&mut self, parent: TaskId, thread: TaskId) -> Result<(), ProcessError> {
+        let parent = self.view(parent)?;
+        let index = self.index(thread)?;
+        let task = self.tasks[index];
+        if task.tgid != parent.tgid
+            || task.id.pid == task.tgid
+            || task.state != TaskState::Running
+            || task.exec_epoch != 0
+        {
+            return Err(ProcessError::InvalidState);
+        }
+        self.tasks[index] = Task::empty();
+        Ok(())
+    }
+
+    /// Native thread death has already been observed/reaped by the supervisor.
+    pub fn reap_exited_thread(&mut self, thread: TaskId) -> Result<(), ProcessError> {
+        let index = self.index(thread)?;
+        let task = self.tasks[index];
+        if task.id.pid == task.tgid || !matches!(task.state, TaskState::Exited(_)) {
+            return Err(ProcessError::InvalidState);
+        }
+        self.tasks[index] = Task::empty();
+        Ok(())
     }
 
     pub fn exec(&mut self, id: TaskId) -> Result<u32, ProcessError> {
@@ -404,10 +432,11 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
         if self.tasks[parent_index].state != TaskState::Running {
             return Err(ProcessError::InvalidState);
         }
-        let parent_pid = parent.pid;
+        let parent_pid = self.tasks[parent_index].tgid;
         let child = self.tasks.iter().position(|task| {
             task.occupied
                 && task.parent == parent_pid
+                && task.id.pid == task.tgid
                 && selected.is_none_or(|pid| task.id.pid == pid)
                 && matches!(task.state, TaskState::Exited(_))
         });
@@ -422,11 +451,12 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
             });
         }
         if let Some(pid) = selected {
-            if !self
-                .tasks
-                .iter()
-                .any(|task| task.occupied && task.parent == parent_pid && task.id.pid == pid)
-            {
+            if !self.tasks.iter().any(|task| {
+                task.occupied
+                    && task.parent == parent_pid
+                    && task.id.pid == task.tgid
+                    && task.id.pid == pid
+            }) {
                 return Err(ProcessError::NotChild);
             }
         }
@@ -1036,6 +1066,37 @@ mod tests {
         );
         table.exit(orphan, 9).unwrap();
         assert_eq!(table.wait(init, Some(orphan.pid)).unwrap().status, 9);
+        assert_eq!(table.active(), 1);
+    }
+
+    #[test]
+    fn threads_share_child_waits_and_reap_without_consuming_processes() {
+        let mut table: ProcessTable<6> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        let thread = table.clone_thread(init).unwrap();
+        let child = table.fork(thread).unwrap();
+        assert_eq!(table.view(child).unwrap().parent, init.pid);
+        let child_thread = table.clone_thread(child).unwrap();
+        table.exit(child_thread, 0).unwrap();
+        assert_eq!(
+            table.peek_wait(init, None),
+            Err(ProcessError::NoExitedChild)
+        );
+        table.reap_exited_thread(child_thread).unwrap();
+        table.exit(child, 17 << 8).unwrap();
+        assert_eq!(table.wait(thread, Some(child.pid)).unwrap().status, 17 << 8);
+        let reserved = table.clone_thread(thread).unwrap();
+        table.cancel_thread(init, reserved).unwrap();
+        assert_eq!(
+            table.reap_exited_thread(init),
+            Err(ProcessError::InvalidState)
+        );
+        table.exit(thread, 0).unwrap();
+        assert_eq!(
+            table.peek_wait(init, Some(thread.pid)),
+            Err(ProcessError::NotChild)
+        );
+        table.reap_exited_thread(thread).unwrap();
         assert_eq!(table.active(), 1);
     }
 
