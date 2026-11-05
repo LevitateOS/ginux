@@ -4,6 +4,7 @@ import json
 import fcntl
 import os
 from pathlib import Path
+import re
 import shutil
 import resource
 import signal
@@ -87,6 +88,12 @@ def main():
         invoke(["descriptor"], 0, "exited")
         invoke(["descriptor", "0"], 0, "exited", cloexec_stdin=True)
         invoke(["list"], 0, "exited", stdout=b"input\n")
+        # The thread identity matches the virtual pid: set_tid_address returns
+        # it instead of the host tid, and PI futexes, which would store the
+        # host tid in the futex word, are denied.
+        invoke(["virtual-tid"], 0, "exited",
+               stdout=b"set_tid_address=1\ngetpid=1\ngettid=1\nfutex_lock_pi=-95\n"
+               b"pi_word=0\nfutex_lock_pi_flags=-95\npi_flags_word=0\n")
         with (work / "secret").open("w+b") as secret:
             secret.write(b"host-only data")
             secret.flush()
@@ -95,6 +102,15 @@ def main():
         proc = invoke(["budget"], 0, "exited")
         if proc.stderr.count(b"audit truncated") != 1 or len(proc.stderr) > 68000:
             raise RuntimeError("audit output was not bounded")
+        # The budget drops whole records: the notice is a line of its own and
+        # every syscall record before it is complete.
+        lines = proc.stderr.splitlines()
+        record = re.compile(rb"ginux: audit sequence=\d+ phase=(exit result=-?\d+|"
+                            rb"entry syscall=\d+ virtual-pid=\d+ action=\S.* result=\S+)")
+        if (b"ginux: audit truncated budget=65536" not in lines
+                or any(line.startswith(b"ginux: audit sequence=") and not record.fullmatch(line)
+                       for line in lines)):
+            raise RuntimeError(f"audit budget split a record: {proc.stderr[-400:]!r}")
         invoke(["exit"], 2, "supervisor-error", changes={
             'profile = "balanced"': 'profile = "security"',
             'backend = "ptrace-native"': 'backend = "interpreter"'})

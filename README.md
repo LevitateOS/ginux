@@ -457,6 +457,8 @@ The focused Linux integration scenario consumes existing binaries:
 ```sh
 make build
 make build-launch-fixture
+make build-gate1-fixture
+sudo make test-gate1-setup
 sudo make test-launch
 make build-launch-storage-fixture
 sudo make test-launch-storage
@@ -480,6 +482,7 @@ make build-launch-owned-exec-fixture
 sudo make test-launch-owned-exec
 make build-launch-script-fixture
 sudo make test-launch-scripts
+sudo make test-native-supervision
 ```
 
 ## Native process scenarios

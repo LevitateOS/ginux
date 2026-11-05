@@ -49,6 +49,20 @@ void thread_body(void) {
 #elif defined(CASE_copied_files)
     show("child close=",call3(3,descriptors[1],0,0));
     __atomic_store_n(&done,1,__ATOMIC_RELEASE);
+#elif defined(CASE_thread_segv)
+    // The fault kills the whole group while the main thread is in syscalls.
+    static int *volatile null_pointer;
+    *null_pointer=1;
+#elif defined(CASE_thread_term)
+    __atomic_store_n(&done,1,__ATOMIC_RELEASE);
+    for(;;)call3(186,0,0,0);
+#elif defined(CASE_parked_kill)
+    // Release the grandchild and fault at once: its death races the group
+    // death of the parked waiter (this thread's main thread).
+    for(int i=0;i<(int)(call3(39,0,0,0)&3);i++)call3(186,0,0,0);
+    call3(1,descriptors[1],(word)"x",1);
+    static int *volatile null_pointer;
+    *null_pointer=1;
 #else
     long p=call3(22,(word)descriptors,0,0);
     show("child pipe result=",p);
@@ -145,6 +159,10 @@ long probe_main(word *stack) {
     show("dup inherited fd=",fd);
     show("read alias=",call3(0,fd,(word)buffer,20));
     call3(1,1,(word)buffer,20);
+    // close always runs on the host, so this reports whether the launcher's
+    // descriptor 9 reached the tracee at all; the reads above are also
+    // denied by the supervisor's gates and cannot tell.
+    show("inherited close=",call3(3,9,0,0));
 #elif defined(CASE_thread_exec)
     show("exec thread=",make_thread(0x10f00,child_stack+sizeof child_stack,0,0));
     for(;;)call3(186,0,0,0);
@@ -202,6 +220,78 @@ long probe_main(word *stack) {
     int status=0;
     show("segv wait=",call3(61,child,(word)&status,0));
     show("segv status=",status);
+#elif defined(CASE_thread_segv)
+    long child=call3(57,0,0,0);
+    if(!child) {
+        if(make_thread(0x10f00,child_stack+sizeof child_stack,0,0)<0)return 10;
+        for(;;)call3(39,0,0,0);
+    }
+    int status=0;
+    show("thread segv wait=",call3(61,child,(word)&status,0));
+    show("thread segv status=",status);
+#elif defined(CASE_thread_term)
+    if(call3(22,(word)descriptors,0,0))return 10;
+    long child=call3(57,0,0,0);
+    if(!child) {
+        if(make_thread(0x10f00,child_stack+sizeof child_stack,0,0)<0)return 11;
+        while(!__atomic_load_n(&done,__ATOMIC_ACQUIRE))call3(39,0,0,0);
+        call3(1,descriptors[1],(word)"x",1);
+        for(;;)call3(39,0,0,0);
+    }
+    // Signal the child only once both of its threads are making syscalls.
+    char byte=0;
+    if(call3(0,descriptors[0],(word)&byte,1)!=1)return 12;
+    show("thread term kill=",call3(62,child,15,0));
+    int status=0;
+    show("thread term wait=",call3(61,child,(word)&status,0));
+    show("thread term status=",status);
+#elif defined(CASE_parked_kill)
+    long middle=call3(57,0,0,0);
+    if(!middle) {
+        if(call3(22,(word)descriptors,0,0))return 20;
+        long grandchild=call3(57,0,0,0);
+        if(!grandchild) {
+            char byte;
+            call3(0,descriptors[0],(word)&byte,1);
+            return 0;
+        }
+        if(make_thread(0x10f00,child_stack+sizeof child_stack,0,0)<0)return 21;
+        // The main thread parks in wait4 while its thread faults.
+        int inner=0;
+        call3(61,grandchild,(word)&inner,0);
+        return 22;
+    }
+    int status=0;
+    show("parked kill wait=",call3(61,middle,(word)&status,0));
+    show("parked kill status=",status);
+#elif defined(CASE_parked_term)
+    static int ready[2];
+    if(call3(22,(word)ready,0,0))return 10;
+    long middle=call3(57,0,0,0);
+    if(!middle) {
+        if(call3(22,(word)descriptors,0,0))return 20;
+        long grandchild=call3(57,0,0,0);
+        if(!grandchild) {
+            // Reads EOF once the middle task dies with the last write end.
+            char byte;
+            call3(3,descriptors[1],0,0);
+            call3(0,descriptors[0],(word)&byte,1);
+            return 0;
+        }
+        call3(3,descriptors[0],0,0);
+        call3(1,ready[1],(word)"x",1);
+        // Parks in wait4 until the parent's SIGTERM ends it.
+        call3(61,grandchild,0,0);
+        return 21;
+    }
+    char byte=0;
+    if(call3(0,ready[0],(word)&byte,1)!=1)return 11;
+    // Give the middle task time to park after its ready byte.
+    for(int i=0;i<100;i++)call3(186,0,0,0);
+    show("parked term kill=",call3(62,middle,15,0));
+    int status=0;
+    show("parked term wait=",call3(61,middle,(word)&status,0));
+    show("parked term status=",status);
 #elif defined(CASE_kill_badsig)
     long pid=call3(39,0,0,0);
     show("kill signal 65=",call3(62,pid,65,0));
@@ -239,6 +329,35 @@ long probe_main(word *stack) {
     long result;
     __asm__ volatile("syscall" : "=a"(result) : "a"(311),"D"(0),"S"(0),"d"(0),"r"(r10),"r"(r8),"r"(r9) : "rcx","r11","memory");
     show("process_vm_writev(311)=",result);
+#elif defined(CASE_alias_writes)
+    // Every alias keeps the write rule of the stdio descriptor it names:
+    // stdin stays unwritable, stdout keeps the console bound.
+    static char large[4097];
+    show("plain stdin write=",call3(1,0,(word)"via-0\n",6));
+    show("plain stdout write 4097=",call3(1,1,(word)large,sizeof large));
+    long alias=call3(32,0,0,0);
+    show("dup stdin write=",call3(1,alias,(word)"via-dup\n",8));
+    long chained=call3(32,alias,0,0);
+    show("dup alias write=",call3(1,chained,(word)"via-dup-dup\n",12));
+    call3(33,0,7,0);
+    show("dup2 stdin write=",call3(1,7,(word)"via-dup2\n",9));
+    call3(292,0,8,0x80000);
+    show("dup3 stdin write=",call3(1,8,(word)"via-dup3\n",9));
+    long fcntl_alias=call3(72,0,0,10);
+    show("fcntl dupfd stdin write=",call3(1,fcntl_alias,(word)"via-dupfd\n",10));
+    long cloexec_alias=call3(72,0,1030,10);
+    show("fcntl dupfd-cloexec stdin write=",call3(1,cloexec_alias,(word)"via-dupfd-cloexec\n",18));
+    long saved=call3(32,1,0,0);
+    call3(33,0,1,0);
+    long over=call3(1,1,(word)"via-1\n",6);
+    call3(33,saved,1,0);
+    show("stdin over stdout write=",over);
+    show("stdout alias write=",call3(1,saved,(word)"stdout alias ok\n",16));
+    show("stdout alias write 4097=",call3(1,saved,(word)large,sizeof large));
+    show("restored stdout write 4097=",call3(1,1,(word)large,sizeof large));
+    long stderr_alias=call3(32,2,0,0);
+    show("stderr alias write=",call3(1,stderr_alias,(word)"stderr alias ok\n",16));
+    show("stderr alias write 4097=",call3(1,stderr_alias,(word)large,sizeof large));
 #endif
     return 0;
 }

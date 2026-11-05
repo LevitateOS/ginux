@@ -58,7 +58,7 @@ build:
 
 build-process-fixtures:
 	mkdir -p .artifacts/process
-	@for scenario in syscall_abi untraced_clone shared_pipe wait_status thread_reuse denied_host_memory inherited_fds thread_exec unused_parent_tid exec_failure copied_files shared_exec clone_tid child_signal nonblocking_wait vfork concurrent_wait remaining_wait sigpipe segv kill_badsig; do \
+	@for scenario in syscall_abi untraced_clone shared_pipe wait_status thread_reuse denied_host_memory inherited_fds thread_exec unused_parent_tid exec_failure copied_files shared_exec clone_tid child_signal nonblocking_wait vfork concurrent_wait remaining_wait sigpipe segv kill_badsig thread_segv thread_term parked_kill parked_term alias_writes; do \
 		$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -DCASE_$$scenario tests/fixtures/process-review-fixture.c -o .artifacts/process/$$scenario || exit; \
 	done
 	$(CC) -nostdlib -static tests/fixtures/process-exec-target.S -o .artifacts/process/process-exec-target
@@ -96,6 +96,15 @@ test-unit:
 
 test-intercept: build
 	@./scripts/with-rocky-host.sh ./scripts/test-intercept.sh
+
+.PHONY: build-gate1-fixture test-gate1-setup
+build-gate1-fixture:
+	mkdir -p .artifacts/gate1
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror -DDENY_PTRACE tests/fixtures/gate1-setup-fixture.c -o .artifacts/gate1/deny-ptrace
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/gate1-setup-fixture.c -o .artifacts/gate1/payload
+
+test-gate1-setup:
+	python3 scripts/test-gate1-setup.py $(GINUX) .artifacts/gate1/deny-ptrace .artifacts/gate1/payload
 
 test-runtime: build
 	@./scripts/with-rocky-host.sh ./scripts/test-runtime.sh
@@ -174,10 +183,11 @@ clean:
 	cargo clean
 	@./scripts/clean-build.sh
 
-.PHONY: build-launch-fixture test-launch build-launch-storage-fixture test-launch-storage build-launch-device-fixture test-launch-devices build-launch-pipe-fixture test-launch-pipes build-launch-fd-fixture test-launch-fds build-launch-task-fixture test-launch-tasks build-launch-exec-fixture test-launch-exec build-launch-thread-fixture test-launch-threads
+.PHONY: build-launch-fixture test-launch build-launch-storage-fixture test-launch-storage build-launch-device-fixture test-launch-devices build-launch-pipe-fixture test-launch-pipes build-launch-fd-fixture test-launch-fds build-launch-task-fixture test-launch-tasks build-launch-exec-fixture test-launch-exec build-launch-thread-fixture test-launch-threads test-native-supervision
 build-launch-fixture:
 	mkdir -p .artifacts/launch
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fixture.c -o .artifacts/launch/launch-fixture
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/native-fixture.c -o .artifacts/launch/native-fixture
 
 test-launch:
 	python3 scripts/test-launch.py $(GINUX) .artifacts/launch/launch-fixture
@@ -266,3 +276,5 @@ test-launch-scripts:
 .PHONY: test-launch-checkpoints
 test-launch-checkpoints:
 	python3 scripts/test-launch-checkpoints.py $(GINUX) .artifacts/launch/launch-storage-fixture
+test-native-supervision:
+	python3 scripts/test-native-supervision.py $(GINUX) .artifacts/launch/native-fixture

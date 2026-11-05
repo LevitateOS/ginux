@@ -198,11 +198,11 @@ pub fn config_rejected(error: ConfigError) -> ! {
     exit_process(2)
 }
 
-pub fn read_file(path: *const u8) -> usize {
+pub fn read_file(path: *const u8) -> Result<usize, &'static [u8]> {
     use crate::supervisor::{syscall1, syscall3, syscall4};
     let descriptor = unsafe { syscall4(SYS_OPENAT_HOST, AT_FDCWD, path as usize, O_RDONLY, 0) };
     if descriptor < 0 {
-        runtime_fail(b"fixture open failed");
+        return Err(b"fixture open failed");
     }
     let mut length = 0usize;
     while length < MAX_ELF_SIZE {
@@ -216,7 +216,7 @@ pub fn read_file(path: *const u8) -> usize {
         };
         if result < 0 {
             let _ = unsafe { syscall1(SYS_CLOSE_HOST, descriptor as usize) };
-            runtime_fail(b"fixture read failed");
+            return Err(b"fixture read failed");
         }
         if result == 0 {
             break;
@@ -225,9 +225,9 @@ pub fn read_file(path: *const u8) -> usize {
     }
     let _ = unsafe { syscall1(SYS_CLOSE_HOST, descriptor as usize) };
     if length == 0 || length == MAX_ELF_SIZE {
-        runtime_fail(b"fixture size invalid");
+        return Err(b"fixture size invalid");
     }
-    length
+    Ok(length)
 }
 
 pub fn read_config(path: *const u8) -> usize {
@@ -264,11 +264,11 @@ pub fn read_config(path: *const u8) -> usize {
     length
 }
 
-pub fn read_index(path: *const u8) -> usize {
+pub fn read_index(path: *const u8) -> Result<usize, &'static [u8]> {
     use crate::supervisor::{syscall1, syscall3, syscall4};
     let descriptor = unsafe { syscall4(SYS_OPENAT_HOST, AT_FDCWD, path as usize, O_RDONLY, 0) };
     if descriptor < 0 {
-        runtime_fail(b"VFS index open failed");
+        return Err(b"VFS index open failed");
     }
     let mut length = 0usize;
     while length < MAX_VFS_INDEX_SIZE {
@@ -284,7 +284,7 @@ pub fn read_index(path: *const u8) -> usize {
         };
         if result < 0 {
             let _ = unsafe { syscall1(SYS_CLOSE_HOST, descriptor as usize) };
-            runtime_fail(b"VFS index read failed");
+            return Err(b"VFS index read failed");
         }
         if result == 0 {
             break;
@@ -293,15 +293,9 @@ pub fn read_index(path: *const u8) -> usize {
     }
     let _ = unsafe { syscall1(SYS_CLOSE_HOST, descriptor as usize) };
     if length == 0 || length == MAX_VFS_INDEX_SIZE {
-        runtime_fail(b"VFS index size invalid");
+        return Err(b"VFS index size invalid");
     }
-    length
-}
-
-fn runtime_fail(reason: &[u8]) -> ! {
-    write_all(b"GATE3: FAIL: ");
-    line(reason);
-    exit_process(1)
+    Ok(length)
 }
 
 pub fn c_string_equals(value: *const u8, expected: &[u8]) -> bool {
@@ -536,6 +530,12 @@ static mut RESULT_FD: isize = -1;
 
 static mut AUDIT_BYTES: usize = 0;
 static mut AUDIT_CAPPED: bool = false;
+// One audit record is staged here and written whole once its newline
+// arrives, so the budget never splits a record and the truncation notice
+// always starts its own line.
+const AUDIT_RECORD_CAPACITY: usize = 256;
+static mut AUDIT_RECORD: [u8; AUDIT_RECORD_CAPACITY] = [0; AUDIT_RECORD_CAPACITY];
+static mut AUDIT_RECORD_LEN: usize = 0;
 
 const OUTCOME_EXITED: u8 = 0;
 const OUTCOME_SIGNALED: u8 = 1;
@@ -671,18 +671,43 @@ pub fn launch_usage() -> ! {
 }
 
 pub(crate) fn audit_write(bytes: &[u8]) {
-    unsafe {
+    let record = unsafe {
         if AUDIT_CAPPED {
             return;
         }
-        if AUDIT_BYTES + bytes.len() > AUDIT_BYTE_BUDGET {
-            AUDIT_CAPPED = true;
-            write_stderr(b"ginux: audit truncated budget=65536\n");
+        let start = AUDIT_RECORD_LEN;
+        if start + bytes.len() > AUDIT_RECORD_CAPACITY {
+            // No record is this long; stop auditing rather than split one.
+            audit_cap();
             return;
         }
-        AUDIT_BYTES += bytes.len();
+        let record = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(AUDIT_RECORD).cast::<u8>(),
+            AUDIT_RECORD_CAPACITY,
+        );
+        record[start..start + bytes.len()].copy_from_slice(bytes);
+        AUDIT_RECORD_LEN = start + bytes.len();
+        if bytes.last() != Some(&b'\n') {
+            return;
+        }
+        let length = AUDIT_RECORD_LEN;
+        AUDIT_RECORD_LEN = 0;
+        if AUDIT_BYTES + length > AUDIT_BYTE_BUDGET {
+            audit_cap();
+            return;
+        }
+        AUDIT_BYTES += length;
+        &record[..length]
+    };
+    write_stderr(record);
+}
+
+fn audit_cap() {
+    unsafe {
+        AUDIT_CAPPED = true;
+        AUDIT_RECORD_LEN = 0;
     }
-    write_stderr(bytes);
+    write_stderr(b"ginux: audit truncated budget=65536\n");
 }
 
 pub(crate) fn audit_u64(mut value: u64) {

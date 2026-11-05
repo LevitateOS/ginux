@@ -20,7 +20,7 @@ def main():
         "wait_status": [b"unaligned wait result=2", b"status byte 7=0", b"status byte 8=42"],
         "thread_reuse": [b"sequential thread=33"],
         "denied_host_memory": [b"process_vm_writev(311)=-38"],
-        "inherited_fds": [b"inherited read=-9", b"dup inherited fd=-9", b"read alias=-9"],
+        "inherited_fds": [b"inherited read=-9", b"dup inherited fd=-9", b"read alias=-9", b"inherited close=-9"],
         "thread_exec": [b"exec-success", b"exec-complete virtual-pid=1"],
         "unused_parent_tid": [b"no-parent-settid thread=2"],
         "exec_failure": [b"thread exec result=-2", b"parent resumed=1"],
@@ -35,6 +35,16 @@ def main():
         "sigpipe": [b"sigpipe wait=2", b"sigpipe status=13"],
         "segv": [b"segv wait=2", b"segv status=11"],
         "kill_badsig": [b"kill signal 65=-22", b"kill signal -1=-22", b"kill missing pid signal 65=-3"],
+        "thread_segv": [b"thread segv wait=2", b"thread segv status=11"],
+        "thread_term": [b"thread term kill=0", b"thread term wait=2", b"thread term status=15"],
+        "parked_kill": [b"parked kill wait=2", b"parked kill status=11"],
+        "parked_term": [b"parked term kill=0", b"parked term wait=2", b"parked term status=15"],
+        "alias_writes": [b"plain stdin write=-38", b"dup stdin write=-38", b"dup alias write=-38",
+                         b"dup2 stdin write=-38", b"dup3 stdin write=-38", b"fcntl dupfd stdin write=-38",
+                         b"fcntl dupfd-cloexec stdin write=-38", b"stdin over stdout write=-38",
+                         b"stdout alias write=16", b"plain stdout write 4097=-38",
+                         b"stdout alias write 4097=-38", b"restored stdout write 4097=-38",
+                         b"stderr alias write=16", b"stderr alias write 4097=-38"],
     }
     with tempfile.TemporaryDirectory(prefix="ginux-process-") as directory:
         sentinel = Path(directory) / "sentinel"
@@ -52,23 +62,36 @@ def main():
                 path = legacy if mode == "legacy" else f"{fixtures}/{mode}"
                 repetitions = 100 if mode == "legacy" else 20 if mode in (
                     "thread_exec", "exec_failure", "thread_reuse", "clone_tid", "vfork",
-                    "concurrent_wait", "remaining_wait", "sigpipe", "segv"
+                    "concurrent_wait", "remaining_wait", "sigpipe", "segv", "thread_segv",
+                    "thread_term", "parked_kill", "parked_term"
                 ) else 1
                 deferred_stops = 0
                 for run in range(repetitions):
                     # Exercise both child-first and parent-first ptrace event
                     # ordering under different amounts of CPU concurrency.
                     affinity = (allowed_cpus, allowed_cpus[:1], allowed_cpus[:2])[run % 3]
-                    proc = subprocess.Popen([binary, "process-native", str(config), path],
-                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                            pass_fds=(9,), start_new_session=True,
-                                            preexec_fn=lambda: os.sched_setaffinity(0, affinity))
+                    # A writable host file as stdin shows whether any write
+                    # through a stdin alias reaches the host.
+                    stdin_sink = Path(directory) / "stdin-sink"
+                    stdin = os.open(stdin_sink, os.O_RDWR | os.O_CREAT | os.O_TRUNC) \
+                        if mode == "alias_writes" else None
+                    try:
+                        proc = subprocess.Popen([binary, "process-native", str(config), path],
+                                                stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                pass_fds=(9,), start_new_session=True,
+                                                preexec_fn=lambda: os.sched_setaffinity(0, affinity))
+                    finally:
+                        if stdin is not None:
+                            os.close(stdin)
                     try:
                         out, err = proc.communicate(timeout=15)
                     except subprocess.TimeoutExpired:
                         os.killpg(proc.pid, signal.SIGKILL)
                         proc.communicate()
                         raise RuntimeError(f"process scenario {mode} hung")
+                    if stdin is not None and stdin_sink.read_bytes():
+                        raise RuntimeError(f"scenario {mode} wrote to the host stdin: "
+                                           f"{stdin_sink.read_bytes()!r}\n{out!r}")
                     required = expected.get(mode, [b"GINUX_NATIVE_PARENT: PASS"])
                     required = [*required, b"GATE7_NATIVE_PROCESS: PASS", b"descriptors live-pipes=0"]
                     if proc.returncode or any(item not in out for item in required):

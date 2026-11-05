@@ -4,8 +4,8 @@
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 use ginux_core::{
-    balanced_identity_result, balanced_surface, decide, Action, SYS_EXIT, SYS_EXIT_GROUP,
-    SYS_GETPID, SYS_UNAME, SYS_WRITE,
+    balanced_identity_result, balanced_mediated_result, balanced_surface, decide, Action, SYS_EXIT,
+    SYS_EXIT_GROUP, SYS_GETPID, SYS_UNAME, SYS_WRITE,
 };
 
 mod channel_hooks;
@@ -64,7 +64,7 @@ use ginux_kernel_views::{
     ViewError,
 };
 use ginux_process::{
-    ChildStatus, Credentials, EventFd, EventPoll, FutexTable, PipeSpace, ProcessError,
+    ChildStatus, Credentials, EventFd, EventPoll, FdKind, FutexTable, PipeSpace, ProcessError,
     ProcessTable, SignalAction, SignalDelivery, TaskState, TimerTable, VirtualClock, WaitTarget,
     EVENT_READ, EVENT_WRITE, WAIT_ALLOWED_OPTIONS, WNOHANG,
 };
@@ -536,6 +536,13 @@ struct NativeProcessTask {
     wait_options: u32,
     wait_status: usize,
     wait_rusage: usize,
+    /// A termination signal interrupted this task's `wait4` (parked or about
+    /// to park): the skipped call's exit stop rewinds it to its `syscall`
+    /// instruction, so the pending signal is delivered first and an ignored
+    /// one leaves the wait blocking, as on Linux. Always restarting is right
+    /// only because no handler can exist (`rt_sigaction` is `-ENOSYS` in this
+    /// lane); with a handler Linux returns `-EINTR` unless `SA_RESTART` is set.
+    wait_restart: bool,
     fork_result_pending: u32,
     fork_breakpoint_rip: usize,
     fork_breakpoint_word: usize,
@@ -558,6 +565,9 @@ struct NativeProcessTask {
     child_tid: usize,
     held_status: i32,
     created_virtual: u32,
+    /// The host killed this task while it sat in a reported, unresumed stop
+    /// (see [`tracee_killed`]); only its death report may follow.
+    killed: bool,
 }
 
 fn process_native_main(config_path: *const u8, fixture_path: *const u8) -> ! {
@@ -687,6 +697,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         wait_options: 0,
         wait_status: 0,
         wait_rusage: 0,
+        wait_restart: false,
+        killed: false,
     });
     let mut root_exited = false;
     let mut root_failed = false;
@@ -763,6 +775,16 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             process_native_fail(domain, root_host_pid, b"unknown host tracee");
         };
         let task = tasks[task_index].unwrap();
+        if task.killed && stopped(status) {
+            process_native_fail(domain, root_host_pid, b"killed process stopped again");
+        }
+        // A group exit (a fatal signal or exit_group in a sibling thread) or
+        // a sibling's exec SIGKILLs this task even while it sits in the stop
+        // handled below, and every later ptrace request on it then fails.
+        // Such a failure is no supervision loss: the killed task cannot run
+        // workload code or its pending syscall, and its death report follows.
+        // Mark it and wait for that report ([`killed_or_fail`] followed by
+        // `continue`); any other failure fails closed.
         if stopped(status)
             && (status as usize) >> 16 == 0
             && group_exec_pending(&tasks, &processes, task.virtual_id)
@@ -945,6 +967,8 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 wait_options: 0,
                 wait_status: 0,
                 wait_rusage: 0,
+                wait_restart: false,
+                killed: false,
             });
             tasks[child_slot].as_mut().unwrap().child_tid = task.clone_ctid;
             if let Some(slot) = newborn_stops
@@ -967,7 +991,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     parent_registers.as_mut_ptr() as usize,
                 ) < 0
                 {
-                    process_native_fail(domain, root_host_pid, b"fork breakpoint registers failed");
+                    killed_or_fail(
+                        &mut tasks,
+                        task_index,
+                        domain,
+                        root_host_pid,
+                        b"fork breakpoint registers failed",
+                    );
+                    continue;
                 }
                 let parent_registers = unsafe { parent_registers.assume_init() };
                 let breakpoint_rip = parent_registers.rip as usize;
@@ -979,7 +1010,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     &mut breakpoint_word as *mut _ as usize,
                 ) < 0
                 {
-                    process_native_fail(domain, root_host_pid, b"fork breakpoint read failed");
+                    killed_or_fail(
+                        &mut tasks,
+                        task_index,
+                        domain,
+                        root_host_pid,
+                        b"fork breakpoint read failed",
+                    );
+                    continue;
                 }
                 if ptrace(
                     PTRACE_POKETEXT,
@@ -988,7 +1026,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     (breakpoint_word & !0xff) | 0xcc,
                 ) < 0
                 {
-                    process_native_fail(domain, root_host_pid, b"fork breakpoint install failed");
+                    killed_or_fail(
+                        &mut tasks,
+                        task_index,
+                        domain,
+                        root_host_pid,
+                        b"fork breakpoint install failed",
+                    );
+                    continue;
                 }
                 let parent = tasks[task_index].as_mut().unwrap();
                 parent.awaiting_exit = false;
@@ -998,11 +1043,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 parent.fork_breakpoint_word = breakpoint_word;
                 parent.fork_variant_event = event as u32;
                 if ptrace(PTRACE_CONT, host_pid, 0, 0) < 0 {
-                    process_native_fail(
+                    killed_or_fail(
+                        &mut tasks,
+                        task_index,
                         domain,
                         root_host_pid,
                         b"fork parent breakpoint resume failed",
                     );
+                    continue;
                 }
                 continue;
             }
@@ -1015,7 +1063,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             parent.fork_variant_event = event as u32;
             parent.created_virtual = child_virtual.pid;
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
-                process_native_fail(domain, root_host_pid, b"fork parent resume failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"fork parent resume failed",
+                );
+                continue;
             }
             continue;
         }
@@ -1075,7 +1130,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             write_all(b"\n");
             tasks[task_index].as_mut().unwrap().exec_event_seen = true;
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
-                process_native_fail(domain, root_host_pid, b"exec event resume failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"exec event resume failed",
+                );
+                continue;
             }
             continue;
         }
@@ -1090,7 +1152,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 parent_registers.as_mut_ptr() as usize,
             ) < 0
             {
-                process_native_fail(domain, root_host_pid, b"fork result read failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"fork result read failed",
+                );
+                continue;
             }
             let mut parent_registers = unsafe { parent_registers.assume_init() };
             let pending = tasks[task_index].unwrap();
@@ -1102,7 +1171,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 pending.fork_breakpoint_word,
             ) < 0
             {
-                process_native_fail(domain, root_host_pid, b"fork breakpoint restore failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"fork breakpoint restore failed",
+                );
+                continue;
             }
             write_all(b"GINUX_NATIVE_PROCESS_AUDIT: fork variant=");
             if pending.fork_variant_event == PTRACE_EVENT_VFORK as u32 {
@@ -1122,7 +1198,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             if pending.clone_ptid != 0
                 && store_tracee_tid(host_pid, pending.clone_ptid, virtual_pid).is_err()
             {
-                process_native_fail(domain, root_host_pid, b"clone parent tid store failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"clone parent tid store failed",
+                );
+                continue;
             }
             if ptrace(
                 PTRACE_SETREGS,
@@ -1131,7 +1214,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 &parent_registers as *const _ as usize,
             ) < 0
             {
-                process_native_fail(domain, root_host_pid, b"fork result translation failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"fork result translation failed",
+                );
+                continue;
             }
             let parent = tasks[task_index].as_mut().unwrap();
             parent.fork_result_pending = 0;
@@ -1139,20 +1229,41 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             parent.fork_breakpoint_word = 0;
             parent.fork_variant_event = 0;
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
-                process_native_fail(domain, root_host_pid, b"fork parent resume failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"fork parent resume failed",
+                );
+                continue;
             }
             continue;
         }
         if signal == 19 {
             if task.child_tid != 0 {
                 if store_tracee_tid(host_pid, task.child_tid, task.virtual_id.pid).is_err() {
-                    process_native_fail(domain, root_host_pid, b"child tid store failed");
+                    killed_or_fail(
+                        &mut tasks,
+                        task_index,
+                        domain,
+                        root_host_pid,
+                        b"child tid store failed",
+                    );
+                    continue;
                 }
                 tasks[task_index].as_mut().unwrap().child_tid = 0;
             }
             let _ = ptrace(PTRACE_SETOPTIONS, host_pid, 0, options);
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
-                process_native_fail(domain, root_host_pid, b"fork child resume failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"fork child resume failed",
+                );
+                continue;
             }
             continue;
         }
@@ -1165,7 +1276,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             write_u64(task.virtual_id.pid as u64);
             write_all(b"\n");
             if ptrace(PTRACE_SYSCALL, host_pid, 0, SIGCHLD) < 0 {
-                process_native_fail(domain, root_host_pid, b"SIGCHLD mediation failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"SIGCHLD mediation failed",
+                );
+                continue;
             }
             continue;
         }
@@ -1182,7 +1300,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             write_u64(task.virtual_id.pid as u64);
             write_all(b"\n");
             if ptrace(PTRACE_SYSCALL, host_pid, 0, signal as usize) < 0 {
-                process_native_fail(domain, root_host_pid, b"terminating signal resume failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"terminating signal resume failed",
+                );
+                continue;
             }
             continue;
         }
@@ -1214,7 +1339,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         }
         let mut registers = core::mem::MaybeUninit::<UserRegs>::uninit();
         if ptrace(PTRACE_GETREGS, host_pid, 0, registers.as_mut_ptr() as usize) < 0 {
-            process_native_fail(domain, root_host_pid, b"process registers read failed");
+            killed_or_fail(
+                &mut tasks,
+                task_index,
+                domain,
+                root_host_pid,
+                b"process registers read failed",
+            );
+            continue;
         }
         let mut registers = unsafe { registers.assume_init() };
         let mut current = tasks[task_index].unwrap();
@@ -1263,11 +1395,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                                     write_all(b"\n");
                                 }
                                 Err(()) => {
-                                    process_native_fail(
+                                    killed_or_fail(
+                                        &mut tasks,
+                                        task_index,
                                         domain,
                                         root_host_pid,
                                         b"pipe result read failed",
                                     );
+                                    continue;
                                 }
                             }
                         }
@@ -1412,7 +1547,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     current.override_result = true;
                     if current.clone_ptid != 0 {
                         if store_tracee_tid(host_pid, current.clone_ptid, virtual_pid).is_err() {
-                            process_native_fail(domain, root_host_pid, b"thread tid store failed");
+                            killed_or_fail(
+                                &mut tasks,
+                                task_index,
+                                domain,
+                                root_host_pid,
+                                b"thread tid store failed",
+                            );
+                            continue;
                         }
                         write_all(b"GINUX_NATIVE_PROCESS_AUDIT: thread-tid virtual-tid=");
                         write_u64(virtual_pid as u64);
@@ -1458,19 +1600,47 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 }
                 current.exec_pending = false;
                 current.exec_event_seen = false;
+            } else if current.wait_restart {
+                // Interrupted wait: back over the two-byte `syscall` with
+                // the number restored; the arguments stayed untouched.
+                registers.rip -= 2;
+                registers.rax = current.syscall;
             } else if current.override_result {
                 registers.rax = current.result as u64;
             }
             if restore_translated_argument {
                 registers.rdi = current.translated_rdi;
             }
-            if (current.override_result || restore_translated_argument)
+            if (current.override_result || current.wait_restart || restore_translated_argument)
                 && ptrace(PTRACE_SETREGS, host_pid, 0, &registers as *const _ as usize) < 0
             {
-                process_native_fail(domain, root_host_pid, b"process result translation failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"process result translation failed",
+                );
+                continue;
+            }
+            // A SIGINT or SIGTERM the host accepted stays pending in a waiter
+            // of the target group parked at its entry stop; resume those.
+            if current.syscall == 62
+                && restore_translated_argument
+                && registers.rax == 0
+                && (registers.rsi == SIGINT as u64 || registers.rsi == SIGTERM as u64)
+            {
+                interrupt_parked_waiters(
+                    domain,
+                    root_host_pid,
+                    &processes,
+                    &mut tasks,
+                    current.translated_rdi as u32,
+                );
             }
             current.awaiting_exit = false;
             current.override_result = false;
+            current.wait_restart = false;
             current.translated_rdi = 0;
             current.fork_variant_event = 0;
             current.created_virtual = 0;
@@ -1482,7 +1652,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             current.desc_arg2 = 0;
             tasks[task_index] = Some(current);
             if ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0 {
-                process_native_fail(domain, root_host_pid, b"process exit resume failed");
+                killed_or_fail(
+                    &mut tasks,
+                    task_index,
+                    domain,
+                    root_host_pid,
+                    b"process exit resume failed",
+                );
+                continue;
             }
             continue;
         }
@@ -1498,11 +1675,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
             || syscall_info[0] as u8 != 1
             || (syscall_info[0] >> 32) as u32 != 0xc000003e
         {
-            process_native_fail(
+            killed_or_fail(
+                &mut tasks,
+                task_index,
                 domain,
                 root_host_pid,
                 b"process requires the x86-64 syscall ABI",
             );
+            continue;
         }
         current.syscall = registers.orig_rax;
         current.awaiting_exit = true;
@@ -1625,26 +1805,35 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                     {
                         match processes.wait(current.virtual_id, target, options) {
                             Ok(done) => {
+                                // The virtual child is reaped: drop its host
+                                // slot before the stores, which a killed
+                                // caller may skip.
+                                clear_host_slot(&mut tasks, done.child);
                                 if status_ptr != 0
                                     && store_tracee_status(host_pid, status_ptr, done.status.word())
                                         .is_err()
                                 {
-                                    process_native_fail(
+                                    killed_or_fail(
+                                        &mut tasks,
+                                        task_index,
                                         domain,
                                         root_host_pid,
                                         b"wait status store failed",
                                     );
+                                    continue;
                                 }
                                 if rusage_ptr != 0
                                     && zero_tracee_rusage(host_pid, rusage_ptr).is_err()
                                 {
-                                    process_native_fail(
+                                    killed_or_fail(
+                                        &mut tasks,
+                                        task_index,
                                         domain,
                                         root_host_pid,
                                         b"wait rusage store failed",
                                     );
+                                    continue;
                                 }
-                                clear_host_slot(&mut tasks, done.child);
                                 write_all(b"GINUX_NATIVE_PROCESS_AUDIT: wait selector=");
                                 write_i64(selector);
                                 write_all(b" virtual-result=");
@@ -1666,6 +1855,17 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                                     current.result = 0;
                                     current.override_result = true;
                                     registers.orig_rax = u64::MAX;
+                                } else if termination_pending(host_pid) {
+                                    // A termination signal is already queued:
+                                    // skip and restart the call instead of
+                                    // parking, so the signal is delivered.
+                                    current.wait_restart = true;
+                                    registers.orig_rax = u64::MAX;
+                                    write_all(
+                                        b"GINUX_NATIVE_PROCESS_AUDIT: wait interrupted caller=",
+                                    );
+                                    write_u64(current.virtual_id.pid as u64);
+                                    write_all(b"\n");
                                 } else {
                                     // Blocking wait with nothing reportable
                                     // yet: park the caller at this entry stop
@@ -1685,11 +1885,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                                         &registers as *const _ as usize,
                                     ) < 0
                                     {
-                                        process_native_fail(
+                                        killed_or_fail(
+                                            &mut tasks,
+                                            task_index,
                                             domain,
                                             root_host_pid,
                                             b"wait park failed",
                                         );
+                                        continue;
                                     }
                                     write_all(b"GINUX_NATIVE_PROCESS_AUDIT: wait parked caller=");
                                     write_u64(current.virtual_id.pid as u64);
@@ -1804,19 +2007,24 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
                 1 => {
                     // Managed write: the existing bounded console path
                     // is unchanged; tracked pipe ends execute regardless of
-                    // length so shell pipelines move arbitrary bytes. Beyond
-                    // that the old denial shape stays (ENOSYS for stdio with
-                    // an overlong write, EBADF past it).
-                    if !(matches!(registers.rdi, 1 | 2) && registers.rdx <= 4096
-                        || pipes
-                            .lookup(current.virtual_id.pid, registers.rdi as u32)
-                            .is_some())
-                    {
-                        current.result = if matches!(registers.rdi, 0..=2) {
-                            -ENOSYS
-                        } else {
-                            -EBADF
-                        };
+                    // length so shell pipelines move arbitrary bytes. A stdio
+                    // alias (dup, dup2, dup3, F_DUPFD) follows the rule of the
+                    // stdio it names, so it cannot widen it. Beyond that the
+                    // old denial shape stays (ENOSYS for stdio with an
+                    // overlong write, EBADF past it).
+                    let stdio = match pipes.lookup(current.virtual_id.pid, registers.rdi as u32) {
+                        Some(entry) if entry.kind == FdKind::External => Some(entry.origin as u64),
+                        Some(_) => None,
+                        None => Some(registers.rdi),
+                    };
+                    let denied = match stdio {
+                        Some(1 | 2) if registers.rdx <= 4096 => None,
+                        Some(0..=2) => Some(-ENOSYS),
+                        Some(_) => Some(-EBADF),
+                        None => None,
+                    };
+                    if let Some(result) = denied {
+                        current.result = result;
                         current.override_result = true;
                         registers.orig_rax = u64::MAX;
                     }
@@ -1868,7 +2076,14 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
         if ptrace(PTRACE_SETREGS, host_pid, 0, &registers as *const _ as usize) < 0
             || ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0
         {
-            process_native_fail(domain, root_host_pid, b"process syscall dispatch failed");
+            killed_or_fail(
+                &mut tasks,
+                task_index,
+                domain,
+                root_host_pid,
+                b"process syscall dispatch failed",
+            );
+            continue;
         }
     }
 }
@@ -1886,6 +2101,147 @@ fn supervise_process_native(root_host_pid: usize, domain: &mut Domain) -> ! {
 /// which must fail the domain instead of passing as a workload crash.
 fn fatal_default_signal(signal: u8) -> bool {
     matches!(signal, 1..=4 | 6..=8 | 10..=16 | 24..=27 | 29..=64)
+}
+
+/// Whether a tracee that was in a reported, not yet resumed ptrace stop has
+/// been killed out of it. Only SIGKILL ends such a stop without a resume
+/// request, and afterwards every ptrace request on the task fails with
+/// `ESRCH`: it is no longer stopped (or is already a zombie). A task still in
+/// its stop answers the probe, so a genuine request failure stays fatal.
+fn tracee_killed(host_pid: usize) -> bool {
+    let mut message = 0usize;
+    ptrace(
+        PTRACE_GETEVENTMSG,
+        host_pid,
+        0,
+        &mut message as *mut _ as usize,
+    ) == -ESRCH as isize
+}
+
+/// Record a [`tracee_killed`] task so the loop awaits its death report.
+fn mark_killed(tasks: &mut [Option<NativeProcessTask>; 8], index: usize) -> bool {
+    let Some(task) = tasks[index].as_mut() else {
+        return false;
+    };
+    task.killed = tracee_killed(task.host_pid);
+    if task.killed {
+        write_all(b"GINUX_NATIVE_PROCESS_AUDIT: killed-in-stop virtual-pid=");
+        write_u64(task.virtual_id.pid as u64);
+        write_all(b"\n");
+    }
+    task.killed
+}
+
+/// Fail the domain for a ptrace request on the handled stop of task `index`
+/// unless [`mark_killed`] finds the task killed out of that stop. Returns only
+/// for such a killed task; the caller then goes back to waiting for its death
+/// report.
+fn killed_or_fail(
+    tasks: &mut [Option<NativeProcessTask>; 8],
+    index: usize,
+    domain: &mut Domain,
+    root_host_pid: usize,
+    reason: &[u8],
+) {
+    if !mark_killed(tasks, index) {
+        process_native_fail(domain, root_host_pid, reason);
+    }
+}
+
+/// Whether a signal that is not blocked and whose default action terminates
+/// the task is queued for the stopped host task, privately or for its whole
+/// thread group. A blocked signal stays queued without interrupting the wait,
+/// so counting it would restart the call forever. An unreadable mask keeps
+/// the plain park.
+fn termination_pending(host_pid: usize) -> bool {
+    const PTRACE_PEEKSIGINFO: usize = 0x4209;
+    const PTRACE_GETSIGMASK: usize = 0x420a;
+    const PTRACE_PEEKSIGINFO_SHARED: u32 = 1;
+    #[repr(C)]
+    struct PeekSiginfoArgs {
+        offset: u64,
+        flags: u32,
+        count: i32,
+    }
+    let mut blocked = 0u64;
+    if ptrace(
+        PTRACE_GETSIGMASK,
+        host_pid,
+        core::mem::size_of_val(&blocked),
+        &mut blocked as *mut _ as usize,
+    ) < 0
+    {
+        return false;
+    }
+    let mut info = [0i32; 32];
+    for flags in [0, PTRACE_PEEKSIGINFO_SHARED] {
+        let mut offset = 0;
+        loop {
+            let arguments = PeekSiginfoArgs {
+                offset,
+                flags,
+                count: 1,
+            };
+            if ptrace(
+                PTRACE_PEEKSIGINFO,
+                host_pid,
+                &arguments as *const _ as usize,
+                info.as_mut_ptr() as usize,
+            ) != 1
+            {
+                break;
+            }
+            if (1..=64).contains(&info[0])
+                && blocked & (1u64 << (info[0] - 1)) == 0
+                && fatal_default_signal(info[0] as u8)
+            {
+                return true;
+            }
+            offset += 1;
+        }
+    }
+    false
+}
+
+/// Resume every `wait4` waiter of thread group `tgid` parked at its entry
+/// stop, after a SIGINT or SIGTERM was sent to that group. Only SIGKILL ends
+/// a ptrace stop by itself, so a parked waiter would hold any other signal
+/// pending forever. Each resumed waiter skips its call, and its exit stop
+/// restarts it (see `wait_restart`): the signal is delivered on the way back
+/// to user space and kills the task through the usual forwarding, or,
+/// ignored, lets the wait park again. Tasks of the group that are not parked
+/// are left alone; they take the signal on their own.
+fn interrupt_parked_waiters(
+    domain: &mut Domain,
+    root_host_pid: usize,
+    processes: &ProcessTable<8>,
+    tasks: &mut [Option<NativeProcessTask>; 8],
+    tgid: u32,
+) {
+    for index in 0..tasks.len() {
+        let Some(entry) = tasks[index] else {
+            continue;
+        };
+        if !entry.wait_pending
+            || !entry.tracing
+            || entry.killed
+            || !processes
+                .view(entry.virtual_id)
+                .is_ok_and(|view| view.tgid == tgid)
+        {
+            continue;
+        }
+        if let Some(slot) = tasks[index].as_mut() {
+            slot.wait_pending = false;
+            slot.wait_restart = true;
+        }
+        write_all(b"GINUX_NATIVE_PROCESS_AUDIT: wait interrupted caller=");
+        write_u64(entry.virtual_id.pid as u64);
+        write_all(b"\n");
+        if ptrace(PTRACE_SYSCALL, entry.host_pid, 0, 0) < 0 && !mark_killed(tasks, index) {
+            process_native_fail(domain, root_host_pid, b"wait interrupt resume failed");
+        }
+    }
 }
 
 fn group_exec_pending(
@@ -1980,7 +2336,7 @@ fn wake_waiters_for_child(
             index += 1;
             continue;
         };
-        if !entry.wait_pending || !entry.tracing {
+        if !entry.wait_pending || !entry.tracing || entry.killed {
             index += 1;
             continue;
         }
@@ -1998,18 +2354,28 @@ fn wake_waiters_for_child(
                 }
                 Err(_) => process_native_fail(domain, root_host_pid, b"wait wakeup failed"),
             };
+            clear_host_slot(tasks, done.child);
             if entry.wait_status != 0
                 && store_tracee_status(entry.host_pid, entry.wait_status, done.status.word())
                     .is_err()
             {
-                process_native_fail(domain, root_host_pid, b"wait status store failed");
+                // A parked waiter killed by its own group exit only awaits
+                // its death report now, like a killed task in the main loop.
+                if !mark_killed(tasks, index) {
+                    process_native_fail(domain, root_host_pid, b"wait status store failed");
+                }
+                index += 1;
+                continue;
             }
             if entry.wait_rusage != 0
                 && zero_tracee_rusage(entry.host_pid, entry.wait_rusage).is_err()
             {
-                process_native_fail(domain, root_host_pid, b"wait rusage store failed");
+                if !mark_killed(tasks, index) {
+                    process_native_fail(domain, root_host_pid, b"wait rusage store failed");
+                }
+                index += 1;
+                continue;
             }
-            clear_host_slot(tasks, done.child);
             write_all(b"GINUX_NATIVE_PROCESS_AUDIT: wait wakeup caller=");
             write_u64(entry.virtual_id.pid as u64);
             write_all(b" child=");
@@ -2031,7 +2397,7 @@ fn wake_waiters_for_child(
         write_all(b"GINUX_NATIVE_PROCESS_AUDIT: sigchld delivered parent=");
         write_u64(entry.virtual_id.pid as u64);
         write_all(b"\n");
-        if ptrace(PTRACE_SYSCALL, entry.host_pid, 0, SIGCHLD) < 0 {
+        if ptrace(PTRACE_SYSCALL, entry.host_pid, 0, SIGCHLD) < 0 && !mark_killed(tasks, index) {
             process_native_fail(domain, root_host_pid, b"wait wakeup resume failed");
         }
         index += 1;
@@ -2496,7 +2862,8 @@ fn vfs_main(config_path: *const u8, rootfs_path: *const u8, index_path: *const u
     if domain.start().is_err() {
         domain_fail(&mut domain, b"invalid start transition");
     }
-    let index_length = read_index(index_path);
+    let index_length =
+        read_index(index_path).unwrap_or_else(|reason| domain_fail(&mut domain, reason));
     let index_bytes = unsafe {
         core::slice::from_raw_parts(
             core::ptr::addr_of!(VFS_INDEX_BYTES).cast::<u8>(),
@@ -2738,8 +3105,11 @@ fn supervise_native(pid: usize, domain: &mut Domain) -> ! {
         if wait(pid, &mut status) < 0 || !stopped(status) {
             native_fail(domain, pid, b"native tracee escaped supervision");
         }
+        // With PTRACE_O_TRACESYSGOOD every syscall stop reports SIGTRAP | 0x80.
+        // Any other stop, such as a plain SIGTRAP from int3, would otherwise
+        // be taken as a syscall stop and swap entry and exit tracking.
         let signal = ((status >> 8) & 0xff) as u8;
-        if signal != (5 | 0x80) && signal != 5 {
+        if signal != (5 | 0x80) {
             native_fail(domain, pid, b"unexpected native trace stop");
         }
         let mut registers = core::mem::MaybeUninit::<UserRegs>::uninit();
@@ -2768,6 +3138,21 @@ fn supervise_native(pid: usize, domain: &mut Domain) -> ! {
             continue;
         }
 
+        // int 0x80 uses the i386 syscall table even from a 64-bit ELF (2 is
+        // fork there, open here). Never classify it with x86-64 numbers.
+        const PTRACE_GET_SYSCALL_INFO: usize = 0x420e;
+        let mut syscall_info = [0u64; 11];
+        if ptrace(
+            PTRACE_GET_SYSCALL_INFO,
+            pid,
+            core::mem::size_of_val(&syscall_info),
+            syscall_info.as_mut_ptr() as usize,
+        ) < 24
+            || syscall_info[0] as u8 != 1
+            || (syscall_info[0] >> 32) as u32 != 0xc000003e
+        {
+            native_fail(domain, pid, b"native requires the x86-64 syscall ABI");
+        }
         sequence += 1;
         let syscall = registers.orig_rax;
         let decision = match decide_native(syscall, registers.rdi, registers.rsi, registers.rdx) {
@@ -2836,6 +3221,12 @@ fn supervise_native(pid: usize, domain: &mut Domain) -> ! {
                 write_all(b"mediate surface=");
                 line(balanced_surface_name(balanced_surface(syscall)));
                 awaiting_exit = true;
+                // A host result that is the caller's host tid is replaced
+                // at the exit stop.
+                if let Some(result) = balanced_mediated_result(syscall) {
+                    override_exit = true;
+                    override_result = result;
+                }
                 if ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0 {
                     native_fail(domain, pid, b"native mediated syscall failed");
                 }
@@ -2895,7 +3286,7 @@ fn domain_main(config_path: *const u8, fixture_path: *const u8) -> ! {
     }
     lifecycle_state(&domain);
 
-    let length = read_file(fixture_path);
+    let length = read_file(fixture_path).unwrap_or_else(|reason| domain_fail(&mut domain, reason));
     let elf =
         unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BYTES).cast::<u8>(), length) };
     let mut memory = AddressSpace::new();
@@ -3063,7 +3454,7 @@ fn gate1_main() -> ! {
 
 fn runtime_main(path: *const u8) -> ! {
     line(b"GINUX_RUNTIME: backend=x86_64-interpreter");
-    let length = read_file(path);
+    let length = read_file(path).unwrap_or_else(|reason| runtime_fail(reason));
     let elf =
         unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(ELF_BYTES).cast::<u8>(), length) };
     let mut memory = AddressSpace::new();
@@ -3168,18 +3559,30 @@ fn tracee() -> ! {
     }
 }
 
+fn supervise_setup_fail(pid: usize, reason: &[u8]) -> ! {
+    // kill(2) instead of PTRACE_KILL: the same policy that failed the ptrace
+    // setup may also refuse PTRACE_KILL, and the reap below would then block.
+    let _ = unsafe { syscall2(SYS_KILL, pid, SIGKILL) };
+    let mut status = 0i32;
+    let _ = wait(pid, &mut status);
+    fail(reason)
+}
+
 fn supervise(pid: usize) -> ! {
     let mut status = 0i32;
     if wait(pid, &mut status) < 0 || !stopped(status) {
         fail(b"payload did not stop after exec");
     }
 
+    // Until PTRACE_O_EXITKILL is in place, exiting would detach the stopped
+    // payload and let it run untraced. Both setup failures kill and reap it
+    // before reporting, so it never runs past its stop after execve.
     let options = PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL;
     if ptrace(PTRACE_SETOPTIONS, pid, 0, options) < 0 {
-        fail(b"PTRACE_SETOPTIONS failed");
+        supervise_setup_fail(pid, b"PTRACE_SETOPTIONS failed");
     }
     if ptrace(PTRACE_SYSEMU, pid, 0, 0) < 0 {
-        fail(b"PTRACE_SYSEMU unavailable");
+        supervise_setup_fail(pid, b"PTRACE_SYSEMU unavailable");
     }
 
     let mut saw_getpid = false;

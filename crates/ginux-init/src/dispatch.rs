@@ -5,7 +5,9 @@
 //! and mediates supported process calls through its own event loop.
 //! Configured launch resolves its domain-owned descriptors in `decide_launch`.
 
-use ginux_core::{balanced_arguments_allowed, decide_balanced, BalancedSurface, Decision};
+use ginux_core::{
+    balanced_arguments_allowed, decide_balanced, Action, BalancedSurface, Decision, SYS_FORK,
+};
 
 use crate::supervisor::UserRegs;
 
@@ -46,8 +48,18 @@ pub enum NativeDecision {
 /// Dispatch one native supervision entry through lane hooks first, then the
 /// existing balanced-contract decision. `classify` is the single routing
 /// table: each lane arm gives its hook the first chance, and anything no
-/// hook claims falls through to `decide_balanced` byte-identically.
+/// hook claims falls through to `decide_balanced` byte-identically. The one
+/// exception is fork, which both callers (`launch` and `native`) deny
+/// although the balanced contract lists it in the task surface.
 pub fn decide_native(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> NativeDecision {
+    // Neither caller traces children, so a host fork would leave the child
+    // running unsupervised.
+    if syscall == SYS_FORK {
+        return NativeDecision::Contract(Decision {
+            syscall,
+            action: Action::Deny(38),
+        });
+    }
     match classify(syscall) {
         Lane::Process => match crate::process_hooks::claim(syscall, rdi, rsi, rdx) {
             Some(result) => NativeDecision::Hooked {

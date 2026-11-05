@@ -3,6 +3,8 @@
 pub const MAX_GROUPS: usize = 8;
 pub const MAX_SIGNAL: u8 = 64;
 pub const CAP_SYS_ADMIN: u64 = 1 << 21;
+/// SIGKILL and SIGSTOP: never blockable and never caught or ignored.
+const UNBLOCKABLE_SIGNALS: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessError {
@@ -373,13 +375,23 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
         if parent.state != TaskState::Running {
             return Err(ProcessError::InvalidParent);
         }
-        self.allocate(
+        let child = self.allocate(
             parent.tgid,
             0,
             parent.process_group,
             parent.session,
             parent.credentials,
-        )
+        )?;
+        // Linux fork copies the signal mask and dispositions (including an
+        // active handler frame on the copied stack); the child's pending set
+        // starts empty.
+        let index = self.index(child)?;
+        let task = &mut self.tasks[index];
+        task.signal_mask = parent.signal_mask;
+        task.signal_actions = parent.signal_actions;
+        task.signal_frame_active = parent.signal_frame_active;
+        task.saved_signal_mask = parent.saved_signal_mask;
+        Ok(child)
     }
 
     /// Roll back a supervisor-reserved fork that never became a runnable task.
@@ -439,8 +451,9 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
         if task.state != TaskState::Running {
             return Err(ProcessError::InvalidState);
         }
-        task.pending_signals = 0;
-        task.signal_mask = 0;
+        // Linux execve keeps the pending set and the signal mask, resets
+        // caught signals to their default action, and keeps ignored ones.
+        // The new image has no handler frame to return from.
         task.signal_frame_active = false;
         task.saved_signal_mask = 0;
         for action in &mut task.signal_actions {
@@ -647,7 +660,8 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
 
     pub fn set_signal_mask(&mut self, id: TaskId, mask: u64) -> Result<(), ProcessError> {
         let index = self.index(id)?;
-        self.tasks[index].signal_mask = mask;
+        // Linux silently drops SIGKILL and SIGSTOP from any requested mask.
+        self.tasks[index].signal_mask = mask & !UNBLOCKABLE_SIGNALS;
         Ok(())
     }
 
@@ -669,7 +683,7 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
         signal: u8,
         action: SignalAction,
     ) -> Result<(), ProcessError> {
-        if signal == 0 || signal > MAX_SIGNAL || matches!(signal, 9 | 19) {
+        if signal == 0 || signal > MAX_SIGNAL || UNBLOCKABLE_SIGNALS & (1u64 << (signal - 1)) != 0 {
             return Err(ProcessError::InvalidSignal);
         }
         let index = self.index(id)?;
@@ -1191,12 +1205,15 @@ pub enum FdKind {
 
 /// One tracked descriptor: the tracee-visible fd number, what it names, the
 /// pipe object id (`0` for [`FdKind::External` aliases of pre-supervision
-/// stdio), and whether exec closes it.
+/// stdio), the stdio number an [`FdKind::External`] alias names (`0` for
+/// pipe ends), and whether exec closes it. The origin survives chained
+/// duplication, so an alias keeps the access rule of the stdio it names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FdEntry {
     pub fd: u32,
     pub kind: FdKind,
     pub pipe: u32,
+    pub origin: u32,
     pub cloexec: bool,
 }
 
@@ -1322,7 +1339,8 @@ impl<const TASKS: usize, const FDS: usize, const PIPES: usize> PipeSpace<TASKS, 
     /// What a task's descriptor names, or `None` for untracked numbers
     /// (stdio the tracee held before supervision, or nothing at all). The
     /// supervision loop gates reads/writes on this: tracked ends and stdio
-    /// execute on the host, anything else fails closed.
+    /// execute on the host, writes through a stdio alias follow the rule of
+    /// its [`FdEntry::origin`], anything else fails closed.
     pub fn lookup(&self, task: u32, fd: u32) -> Option<FdEntry> {
         let index = self.task_index(task)?;
         self.tasks[index].entries.iter().find_map(|entry| {
@@ -1366,6 +1384,7 @@ impl<const TASKS: usize, const FDS: usize, const PIPES: usize> PipeSpace<TASKS, 
                         fd: read_fd,
                         kind: FdKind::PipeRead,
                         pipe: id,
+                        origin: 0,
                         cloexec,
                     }
                 } else {
@@ -1373,6 +1392,7 @@ impl<const TASKS: usize, const FDS: usize, const PIPES: usize> PipeSpace<TASKS, 
                         fd: write_fd,
                         kind: FdKind::PipeWrite,
                         pipe: id,
+                        origin: 0,
                         cloexec,
                     }
                 });
@@ -1406,12 +1426,14 @@ impl<const TASKS: usize, const FDS: usize, const PIPES: usize> PipeSpace<TASKS, 
                 fd: new_fd,
                 kind: entry.kind,
                 pipe: entry.pipe,
+                origin: entry.origin,
                 cloexec,
             },
             None if old_fd <= 2 => FdEntry {
                 fd: new_fd,
                 kind: FdKind::External,
                 pipe: 0,
+                origin: old_fd,
                 cloexec,
             },
             None => return Err(ProcessError::InvalidState),
@@ -1800,6 +1822,106 @@ mod tests {
     }
 
     #[test]
+    fn sigkill_and_sigstop_cannot_be_blocked() {
+        let mut table: ProcessTable<2> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        table.set_signal_mask(init, u64::MAX).unwrap();
+        table.signal(init, 15).unwrap();
+        table.signal(init, 19).unwrap();
+        table.signal(init, 9).unwrap();
+        assert_eq!(table.blocking_interrupted(init), Ok(true));
+        assert_eq!(table.next_signal(init), Ok(Some(9)));
+        assert_eq!(table.next_signal(init), Ok(Some(19)));
+        assert_eq!(table.next_signal(init), Ok(None));
+    }
+
+    #[test]
+    fn fork_inherits_signal_mask_and_dispositions_but_not_pending() {
+        let mut table: ProcessTable<4> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        table.set_signal_mask(init, 1 << (15 - 1)).unwrap();
+        table
+            .set_signal_action(init, 10, SignalAction::Handler(0x4000))
+            .unwrap();
+        table
+            .set_signal_action(init, 13, SignalAction::Ignore)
+            .unwrap();
+        table.signal(init, 2).unwrap();
+        let child = table.fork(init).unwrap();
+        assert_eq!(
+            table.signal_action(child, 10),
+            Ok(SignalAction::Handler(0x4000))
+        );
+        assert_eq!(table.signal_action(child, 13), Ok(SignalAction::Ignore));
+        assert_eq!(table.blocking_interrupted(child), Ok(false));
+        assert_eq!(table.next_signal(child), Ok(None));
+        table.signal(child, 15).unwrap();
+        assert_eq!(table.next_signal(child), Ok(None));
+
+        // A fork inside a handler leaves the child on the same handler
+        // frame, so its sigreturn restores the copied pre-handler mask.
+        table.signal(init, 10).unwrap();
+        assert_eq!(table.next_signal(init), Ok(Some(2)));
+        assert_eq!(
+            table.begin_signal(init),
+            Ok(Some(SignalDelivery::Handler {
+                signal: 10,
+                address: 0x4000,
+            }))
+        );
+        let handler_child = table.fork(init).unwrap();
+        table.signal(handler_child, 10).unwrap();
+        assert_eq!(table.next_signal(handler_child), Ok(None));
+        assert_eq!(table.signal_return(handler_child), Ok(()));
+        assert_eq!(table.next_signal(handler_child), Ok(Some(10)));
+    }
+
+    #[test]
+    fn exec_keeps_pending_signals_and_mask() {
+        let mut table: ProcessTable<2> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        table.set_signal_mask(init, 1 << (15 - 1)).unwrap();
+        table
+            .set_signal_action(init, 10, SignalAction::Handler(0x4000))
+            .unwrap();
+        table
+            .set_signal_action(init, 13, SignalAction::Ignore)
+            .unwrap();
+        table.signal(init, 15).unwrap();
+        table.signal(init, 10).unwrap();
+        assert_eq!(table.exec(init), Ok(1));
+        assert_eq!(table.signal_action(init, 10), Ok(SignalAction::Default));
+        assert_eq!(table.signal_action(init, 13), Ok(SignalAction::Ignore));
+        assert_eq!(table.next_signal(init), Ok(Some(10)));
+        assert_eq!(table.next_signal(init), Ok(None));
+        table.set_signal_mask(init, 0).unwrap();
+        assert_eq!(table.next_signal(init), Ok(Some(15)));
+    }
+
+    #[test]
+    fn exec_inside_handler_keeps_current_mask_and_drops_frame() {
+        let mut table: ProcessTable<2> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        table
+            .set_signal_action(init, 10, SignalAction::Handler(0x4000))
+            .unwrap();
+        table.signal(init, 10).unwrap();
+        assert_eq!(
+            table.begin_signal(init),
+            Ok(Some(SignalDelivery::Handler {
+                signal: 10,
+                address: 0x4000,
+            }))
+        );
+        assert_eq!(table.exec(init), Ok(1));
+        assert_eq!(table.signal_return(init), Err(ProcessError::InvalidState));
+        table.signal(init, 10).unwrap();
+        assert_eq!(table.next_signal(init), Ok(None));
+        table.set_signal_mask(init, 0).unwrap();
+        assert_eq!(table.next_signal(init), Ok(Some(10)));
+    }
+
+    #[test]
     fn eventfd_and_futex_have_bounded_linux_style_results() {
         let mut event = EventFd::new(0, false);
         assert_eq!(event.read(), Err(ProcessError::WouldBlock));
@@ -1853,5 +1975,30 @@ mod tests {
         assert_eq!(poll.ready(7, EVENT_READ), Ok(EVENT_READ));
         assert_eq!(poll.ready(8, EVENT_READ), Err(ProcessError::InvalidEvent));
         poll.remove(7).unwrap();
+    }
+
+    #[test]
+    fn stdio_aliases_keep_their_origin() {
+        let mut pipes: PipeSpace<2, 8, 2> = PipeSpace::new();
+        let origin = |pipes: &PipeSpace<2, 8, 2>, task, fd| {
+            pipes
+                .lookup(task, fd)
+                .map(|entry| (entry.kind, entry.origin))
+        };
+        pipes.duplicate(1, 0, 3, false).unwrap();
+        pipes.duplicate(1, 3, 4, true).unwrap();
+        pipes.duplicate(1, 1, 5, false).unwrap();
+        pipes.duplicate(1, 0, 1, false).unwrap();
+        assert_eq!(origin(&pipes, 1, 3), Some((FdKind::External, 0)));
+        assert_eq!(origin(&pipes, 1, 4), Some((FdKind::External, 0)));
+        assert_eq!(origin(&pipes, 1, 1), Some((FdKind::External, 0)));
+        pipes.duplicate(1, 5, 1, false).unwrap();
+        assert_eq!(origin(&pipes, 1, 1), Some((FdKind::External, 1)));
+        pipes.inherit(2, 1).unwrap();
+        assert_eq!(origin(&pipes, 2, 4), Some((FdKind::External, 0)));
+        assert_eq!(origin(&pipes, 2, 1), Some((FdKind::External, 1)));
+        pipes.create_pipe(1, 6, 7, false).unwrap();
+        pipes.duplicate(1, 7, 0, false).unwrap();
+        assert_eq!(origin(&pipes, 1, 0), Some((FdKind::PipeWrite, 0)));
     }
 }
