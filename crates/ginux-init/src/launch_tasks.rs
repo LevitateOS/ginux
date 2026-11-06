@@ -72,6 +72,7 @@ struct Task {
     id: TaskId,
     host: usize,
     alive: bool,
+    adopted_reaped: bool,
     wait_status: Option<i32>,
     group: usize,
     call: DescriptorCall,
@@ -254,6 +255,7 @@ pub fn supervise(
         id,
         host: root,
         alive: true,
+        adopted_reaped: false,
         wait_status: None,
         group: 0,
         call: DescriptorCall::new(),
@@ -950,6 +952,7 @@ impl Supervisor<'_> {
                     id: child,
                     host: 0,
                     alive: true,
+                    adopted_reaped: false,
                     wait_status: None,
                     group,
                     call: DescriptorCall::new(),
@@ -1778,7 +1781,26 @@ impl Supervisor<'_> {
     fn died(&mut self, index: usize, status: i32, domain: &mut Domain) {
         self.wake_needed = true;
         if !self.task(index).alive {
-            self.fail(domain, b"duplicate task death");
+            let task = self.task(index);
+            // ptrace reports a grandchild's death to us first. If its real
+            // parent exits without wait, subreaper adoption then reports the
+            // same zombie once more as our native child. This can precede the
+            // parent's own wait report; virtual adoption need not be visible yet.
+            if !task.adopted_reaped
+                && task.id.pid != 1
+                && task.wait_status == Some(status)
+                && self
+                    .processes
+                    .view(task.id)
+                    .is_ok_and(|v| v.id.pid == v.tgid)
+            {
+                self.task_mut(index).adopted_reaped = true;
+                audit_write(b"ginux: adopted zombie native-reap virtual-pid=");
+                audit_u64(self.task(index).id.pid as u64);
+                audit_write(b"\n");
+                return;
+            }
+            self.fail(domain, b"inconsistent repeated task death");
         }
         let id = self.task(index).id;
         let group = self.task(index).group;

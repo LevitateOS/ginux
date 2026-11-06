@@ -8,6 +8,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import select
+import time
 
 
 def main():
@@ -30,15 +32,33 @@ def main():
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
         config = config.replace('[devices]\nassignments = []', '[devices]\nassignments = ["null"]')
         for mode in ('z-time', 'directory', 'fork', 'vfork', 'clone', 'shared-vfork', 'libc-fork', 'junk-child-tid', 'protected-child-tid', 'handler-return',
-                     'inherit', 'kill', 'bound', 'orphan', 'rollback', 'inherit'):
+                     'inherit', 'kill', 'bound', 'orphan', 'adopted-zombie', 'rollback', 'inherit'):
             path, result = work / f'{mode}.toml', work / f'{mode}.json'
             path.write_text(config.replace('args = []', 'args = ' + json.dumps([mode])))
             result.unlink(missing_ok=True)
             def inherit_ignored_child_signal():
                 signal.signal(signal.SIGCHLD, signal.SIG_IGN)
-            proc = subprocess.run([binary, 'launch', str(path), str(root), '--result-file', str(result)],
-                                  capture_output=True, timeout=20,
-                                  preexec_fn=inherit_ignored_child_signal if mode == 'fork' else None)
+            command=[binary, 'launch', str(path), str(root), '--result-file', str(result)]
+            if mode == 'adopted-zombie':
+                audit=work/'adopted-zombie.audit'
+                with audit.open('wb') as errors:
+                    proc=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=errors)
+                    try:
+                        assert select.select([proc.stdout],[],[],5)[0], 'orphan handshake timed out'
+                        assert proc.stdout.readline()==b'zombie-ready\n'
+                        deadline=time.monotonic()+5
+                        while b'ginux: task exited virtual-pid=3' not in audit.read_bytes():
+                            assert proc.poll() is None and time.monotonic()<deadline, audit.read_text()
+                            time.sleep(.01)
+                        stdout,_=proc.communicate(b'G',timeout=5)
+                    finally:
+                        if proc.poll() is None:
+                            proc.kill();proc.communicate(timeout=5)
+                proc.stdout=stdout
+                proc.stderr=audit.read_bytes()
+            else:
+                proc = subprocess.run(command, capture_output=True, timeout=20,
+                                      preexec_fn=inherit_ignored_child_signal if mode == 'fork' else None)
             record = json.loads(result.read_text())
             assert proc.returncode == 0, (mode, proc.returncode, proc.stderr.decode(), record)
             assert proc.stdout == b'owned-tasks: PASS\n', (mode, proc.stdout)
@@ -56,7 +76,6 @@ def main():
                                         stdout=subprocess.PIPE, stderr=audit)
                 observed = []
                 try:
-                    import select
                     assert select.select([proc.stdout], [], [], 5)[0], 'descendants did not start'
                     assert proc.stdout.readline() == b'ready\n'
                     def children(pid):

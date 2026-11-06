@@ -32,7 +32,20 @@ long task_main(word *stack)
     CHECK(call(13,17,(word)action,0,8,0,0)==-95,81);
     action[0]=0; action[1]=2;
     CHECK(call(13,17,(word)action,0,8,0,0)==-95,82);
-    if (mode=='z') {
+    if (mode=='a') {
+        long child=DO(57,0,0,0); CHECK(child>=0,117);
+        if(child==0) {
+            long grandchild=DO(57,0,0,0); CHECK(grandchild>=0,118);
+            if(grandchild==0) {DO(60,37,0,0);__builtin_unreachable();}
+            CHECK(grandchild==3 && DO(1,1,"zombie-ready\n",13)==13 && DO(0,0,buffer,1)==1,119);
+            DO(60,19,0,0);__builtin_unreachable();
+        }
+        int status=-1;
+        CHECK(child==2 && DO(61,child,&status,0)==child && status==(19<<8),120);
+        CHECK(DO(61,3,&status,0)==3 && status==(37<<8),121);
+        CHECK(DO(61,-1,&status,0)==-10,122);
+    }
+    else if (mode=='z') {
         long before[2], after[2], delay[2]={0,20000000}, resolution[2];
         CHECK(DO(228,0,before,0)==0 && before[0]>0,103);
         CHECK(DO(229,1,resolution,0)==0 && (resolution[0] || resolution[1]),104);
@@ -55,7 +68,7 @@ long task_main(word *stack)
         long child=DO(57,0,0,0);
         CHECK(child>=0,91);
         if (child==0) {
-            CHECK(DO(80,"../work",0,0)==-95,92);
+            CHECK(DO(80,"../work",0,0)==0 && DO(80,"../source",0,0)==0,92);
             CHECK(DO(80,"sub",0,0)==0,93);
             long fd=DO(2,"value",0,0);
             CHECK(fd>=3 && DO(0,fd,buffer,1)==1 && buffer[0]=='c',94);
