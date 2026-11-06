@@ -396,7 +396,7 @@ impl DescriptorTable {
         call: &mut DescriptorCall,
     ) -> NativeDecision {
         // Resource changes cannot silently invalidate the public allocator.
-        if r.orig_rax == 302 && r.rsi == 7 && r.rdx != 0 {
+        if r.orig_rax == 302 && matches!(r.rsi, 7 | 9) && r.rdx != 0 {
             return ready(-1);
         }
         let result = match r.orig_rax {

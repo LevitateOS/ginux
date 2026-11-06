@@ -31,10 +31,12 @@ def main():
         config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
         config = config.replace('[devices]\nassignments = []', '[devices]\nassignments = ["null"]')
-        for mode in ('Locks', 'z-time', 'directory', 'fork', 'vfork', 'clone', 'shared-vfork', 'libc-fork', 'junk-child-tid', 'protected-child-tid', 'handler-return',
+        for mode in ('Resources', 'Locks', 'z-time', 'directory', 'fork', 'vfork', 'clone', 'shared-vfork', 'libc-fork', 'junk-child-tid', 'protected-child-tid', 'handler-return',
                      'inherit', 'kill', 'bound', 'orphan', 'adopted-zombie', 'rollback', 'inherit'):
             path, result = work / f'{mode}.toml', work / f'{mode}.json'
-            path.write_text(config.replace('args = []', 'args = ' + json.dumps([mode])))
+            current=config.replace('args = []', 'args = ' + json.dumps([mode]))
+            if mode == 'Resources': current=current.replace('memory_mib = 256','memory_mib = 32')
+            path.write_text(current)
             result.unlink(missing_ok=True)
             def inherit_ignored_child_signal():
                 signal.signal(signal.SIGCHLD, signal.SIG_IGN)

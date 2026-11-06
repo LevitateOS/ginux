@@ -371,7 +371,7 @@ pub fn launch_main(
         launch_domain_fail(&mut domain, b"launch tracee fork failed");
     }
     if child == 0 {
-        launch_tracee(root_path, descriptors.capacity());
+        launch_tracee(root_path, descriptors.capacity(), &config);
     }
     supervise_launch(
         child as usize,
@@ -853,8 +853,48 @@ pub(crate) fn finish_signaled(signal: u64) {
     exit_process(128 + signal as usize)
 }
 
-fn launch_tracee(root_path: *const u8, descriptor_limit: usize) -> ! {
+// Limits apply only to this child, before its exec. Kernel inheritance keeps
+// them on descendants; no cgroup mounts or host-global policy are modified.
+fn restrict_tracee_resources(config: &DomainConfig) -> bool {
+    let mut limits = [0usize; 2];
+    if unsafe { syscall4(302, 0, 9, 0, limits.as_mut_ptr() as usize) } != 0 {
+        return false;
+    }
+    let bound = (config.memory_mib as usize * 1024 * 1024)
+        .min(limits[0])
+        .min(limits[1]);
+    limits = [bound, bound];
+    if unsafe { syscall4(302, 0, 9, limits.as_ptr() as usize, 0) } != 0 {
+        return false;
+    }
+    let mut mask = [0u8; 1024];
+    let size = unsafe { syscall3(204, 0, mask.len(), mask.as_mut_ptr() as usize) };
+    if size <= 0 || size as usize > mask.len() {
+        return false;
+    }
+    let mut remaining = config.vcpus;
+    for byte in &mut mask[..size as usize] {
+        for bit in 0..8 {
+            if *byte & (1 << bit) != 0 {
+                if remaining == 0 {
+                    *byte &= !(1 << bit);
+                } else {
+                    remaining -= 1;
+                }
+            }
+        }
+    }
+    unsafe { syscall3(203, 0, size as usize, mask.as_ptr() as usize) == 0 }
+}
+
+fn launch_tracee(root_path: *const u8, descriptor_limit: usize, config: &DomainConfig) -> ! {
     static ROOT: &[u8] = b"/\0";
+    if !restrict_tracee_resources(config) {
+        tracee_setup_fail(
+            b"ginux: launch bootstrap failed: resource bounds unavailable\n",
+            132,
+        );
+    }
     // Host descriptors (including the result file) must not grant the
     // workload authority outside the supplied root. Only stdio is shared.
     const SYS_CLOSE_RANGE: usize = 436;

@@ -26,13 +26,37 @@ long task_main(word *stack)
     word argc=*stack;
     char **argv=(char **)(stack+1);
     char mode=argc>1 ? argv[1][0] : 'f';
-    CHECK(DO(39,0,0,0)==1 && DO(186,0,0,0)==1,10);
-    CHECK(DO(110,0,0,0)==0 && DO(111,0,0,0)==1,11);
+    long expected_pid=mode=='R' && argc>2 ? 2 : 1;
+    CHECK(DO(39,0,0,0)==expected_pid && DO(186,0,0,0)==expected_pid,10);
+    CHECK(DO(110,0,0,0)==(expected_pid==2 ? 1 : 0) && DO(111,0,0,0)==1,11);
     word action[4]={1,0,0,0};
     CHECK(call(13,17,(word)action,0,8,0,0)==-95,81);
     action[0]=0; action[1]=2;
     CHECK(call(13,17,(word)action,0,8,0,0)==-95,82);
-    if (mode=='L') {
+    if (mode=='R') {
+        word limits[2];CHECK(call(302,0,9,0,(word)limits,0,0)==0 && limits[0]==32*1024*1024 && limits[1]==limits[0],151);
+        word larger[2]={64*1024*1024,64*1024*1024};CHECK(call(302,0,9,(word)larger,0,0,0)==-1,152);
+        CHECK(call(9,0,64*1024*1024,3,0x22,-1,0)==-12,153);
+        long memory=call(9,0,1024*1024,3,0x22,-1,0);CHECK(memory>0,154);
+        ((volatile char *)memory)[0]=1;((volatile char *)memory)[1024*1024-1]=2;
+        CHECK(DO(11,memory,1024*1024,0)==0,155);
+        long previous=DO(12,0,0,0);CHECK(previous>0 && DO(12,previous+64*1024*1024,0,0)==previous,156);
+        unsigned char mask[1024];long size=DO(204,0,sizeof mask,mask);CHECK(size>0 && size<=1024,157);
+        word cpus=0;for(long i=0;i<size;i++) for(int bit=0;bit<8;bit++) if(mask[i]&(1<<bit)) cpus++;
+        CHECK(cpus==1 && DO(204,0,1,mask)==-22 && DO(204,999,sizeof mask,mask)==-3,158);
+        for(long i=0;i<1024;i++)mask[i]=255;
+        CHECK(DO(203,0,sizeof mask,mask)==-1,159);
+        if(argc>2) return 0;
+        long child=DO(57,0,0,0);CHECK(child>=0,160);
+        if(child==0) {
+            CHECK(call(302,0,9,0,(word)limits,0,0)==0 && limits[0]==32*1024*1024,161);
+            char *arguments[]={"/bin/fixture","Resources","exec",0};
+            char *environment[]={0};
+            DO(59,"/bin/fixture",arguments,environment);return 162;
+        }
+        int status=-1;CHECK(DO(61,child,&status,0)==child && status==0,163);
+    }
+    else if (mode=='L') {
         struct flock {short kind,whence;int padding;long start,len;int pid,padding2;};
         struct flock lock={1,0,0,10,20,0,0};
         long fd=DO(2,"/work/locked",0102,0600); CHECK(fd==3,123);

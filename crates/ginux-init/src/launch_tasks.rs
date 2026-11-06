@@ -716,6 +716,47 @@ impl Supervisor<'_> {
             }
         }
         match r.orig_rax {
+            203 => {
+                self.emulate(index, r, -1, domain);
+                return;
+            }
+            204 => {
+                let result = (|| {
+                    let target = r.rdi as u32;
+                    let tgid = self.processes.view(id).unwrap().tgid;
+                    if target != 0 && target != id.pid && target != tgid {
+                        return Err(-3);
+                    }
+                    if r.rsi > 1024 {
+                        return Err(-22);
+                    }
+                    let mut mask = [0u8; 1024];
+                    let size = unsafe {
+                        crate::supervisor::syscall3(
+                            204,
+                            self.task(index).host,
+                            r.rsi as usize,
+                            mask.as_mut_ptr() as usize,
+                        )
+                    };
+                    if size < 0 {
+                        return Err(size as i64);
+                    }
+                    if copy_memory(
+                        self.task(index).host,
+                        r.rdx,
+                        &mut mask[..size as usize],
+                        true,
+                    )? != size as i64
+                    {
+                        return Err(-14);
+                    }
+                    Ok(size as i64)
+                })()
+                .unwrap_or_else(|error| error);
+                self.emulate(index, r, result, domain);
+                return;
+            }
             89 | 267 => {
                 let host = self.task(index).host;
                 let (address, output, size, dirfd) = if r.orig_rax == 89 {

@@ -8,7 +8,9 @@ args = []
 environment = ["container=ginux"]
 
 [resources]
+# Maximum allowed logical CPUs, restricted within the operator's affinity mask.
 vcpus = 1
+# Per-process virtual address space; owned storage is separately bounded below.
 memory_mib = 256
 
 [execution]

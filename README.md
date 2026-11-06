@@ -216,8 +216,15 @@ the workload exit code, or `128 + signal` for signal termination. Startup
 failure returns 2; supervision or result-writing failure returns 1. Non-x86-64
 syscall ABIs and job-control
 group stops fail explicitly. Audit output is capped at 64 KiB plus a truncation
-notice. Process resource quotas remain unfinished; anonymous writable backing
-has the allocation bound described below.
+notice. `[resources].memory_mib` caps each tracee process's virtual address space
+with inherited hard/soft `RLIMIT_AS`; lower operator limits still apply. Anonymous,
+image and private owned-file mappings count toward that per-process bound; it is
+not an aggregate domain RSS limit. Supervisor-owned storage has its separate
+capacity accounting described below. Fork/exec retain the bounds and resource
+mutation is denied. `[resources].vcpus` restricts descendants to at most that many
+logical CPUs selected from the launcher's allowed CPU affinity mask; self affinity
+queries report that actual subset and mutation is denied. This bounds eligible
+CPUs, not cumulative CPU time. No host-global cgroup policy is changed.
 
 Configured `poll` resolves at most 16 public descriptors through their owning
 table. Pipes, assigned memory files/directories, null, and console aliases may
