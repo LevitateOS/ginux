@@ -79,6 +79,8 @@ def main():
                             assert tar.getmember('work/check-hardlink').islnk()
                             assert tar.getmember('work/check-hardlink').linkname == 'work/checkpoint'
                             assert tar.extractfile('work/check-hardlink').read() == expected
+                            assert tar.getmember('work/checkpoint').mtime == 123456789
+                            assert tar.getmember('work/check-hardlink').mtime == 123456789
                             assert tar.getmember('work/long-hardlink').islnk()
                             assert tar.getmember('work/long-hardlink').linkname == 'work/' + 'a'*120
                             assert tar.getmember('work/check-link').linkname == 'checkpoint'
@@ -155,7 +157,8 @@ def main():
                 ('traversing-hardlink', 'work/../checkpoint', None, None),
                 ('directory-hardlink', 'work/dir', tarfile.DIRTYPE, None),
                 ('symlink-hardlink', 'work/sym', tarfile.SYMTYPE, None),
-                ('hardlink-mode', 'work/source', tarfile.REGTYPE, 0o700)):
+                ('hardlink-mode', 'work/source', tarfile.REGTYPE, 0o700),
+                ('hardlink-mtime', 'work/source', tarfile.REGTYPE, None)):
             archive = work/(name+'.tar')
             with tarfile.open(archive, 'w', format=tarfile.USTAR_FORMAT) as tar:
                 if target_type is not None:
@@ -169,6 +172,7 @@ def main():
                 entry.type=tarfile.LNKTYPE
                 entry.linkname=target
                 entry.mode=extra or 0o600
+                if name == 'hardlink-mtime': entry.mtime=1
                 tar.addfile(entry)
             restore(archive, failure=True)
         # A size above the former 2 GiB ceiling is checked against the actual

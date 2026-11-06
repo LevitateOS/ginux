@@ -417,6 +417,11 @@ impl DescriptorTable {
                 call.save(r);
                 self.dup(pid, r, backends, call)
             }
+            280 if r.rsi == 0 => {
+                call.save(r);
+                self.get(r.rdi)
+                    .and_then(|d| self.descriptor(pid, r, d, backends, call))
+            }
             72 => {
                 call.save(r);
                 match call.pinned.map(Ok).unwrap_or_else(|| self.get(r.rdi)) {
@@ -469,7 +474,7 @@ impl DescriptorTable {
                     backends.claim(pid, r)
                 })
             }
-            258 | 262 | 263 | 267 | 268 | 269 | 332 | 439 => {
+            258 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 => {
                 call.save(r);
                 self.path_descriptor(pid, r, backends, call)
             }

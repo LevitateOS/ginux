@@ -38,6 +38,7 @@ pub struct RestoreEntry<'a> {
     pub mode: u32,
     pub length: usize,
     pub hardlink: bool,
+    pub modified: u64,
 }
 
 pub struct LaunchFs {
@@ -210,6 +211,7 @@ impl LaunchFs {
             mode,
             length,
             hardlink,
+            modified,
         } = entry;
         let directory = kind == NodeKind::Directory;
         let canonical = normalize(b"/", path).map_err(|_| b"invalid restore path".as_slice())?;
@@ -285,6 +287,7 @@ impl LaunchFs {
             if !seen[slot]
                 || metadata.kind != NodeKind::File
                 || metadata.mode != mode
+                || metadata.modified.seconds != modified as i64
                 || !self.owns_path(target)
             {
                 return Err(b"restore hardlink target or mode is invalid");
@@ -328,6 +331,17 @@ impl LaunchFs {
             result?;
             closed.map_err(|_| b"restore file close failed".as_slice())?;
         }
+        self.fs
+            .set_times(
+                path,
+                false,
+                None,
+                Some(ginux_vfs::Timestamp {
+                    seconds: modified as i64,
+                    nanoseconds: 0,
+                }),
+            )
+            .map_err(|_| b"restore timestamp failed".as_slice())?;
         // This launch view has a one-entry immutable root; live owned inode
         // numbers are stable slot+2 for the duration of startup import.
         let slot = self
@@ -840,6 +854,13 @@ impl LaunchFs {
             return Some(self.rename(pid, r).unwrap_or_else(|error| error));
         }
         let fd = r.rdi as i32;
+        if r.orig_rax == 280 && r.rsi == 0 {
+            return Some(if (FD_BASE as i32..FD_BASE as i32 + 64).contains(&fd) {
+                self.descriptor_call(pid, r, fd - FD_BASE as i32 + 3)
+            } else {
+                -9
+            });
+        }
         if matches!(
             r.orig_rax,
             0 | 1
@@ -879,7 +900,7 @@ impl LaunchFs {
             88 => (r.rsi, (-100i64) as u64),
             266 => (r.rdx, r.rsi),
             2 | 4 | 6 | 21 | 83 | 84 | 87 | 89 | 90 => (r.rdi, (-100i64) as u64),
-            257 | 258 | 262 | 263 | 267 | 268 | 269 | 332 | 439 => (r.rsi, r.rdi),
+            257 | 258 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 => (r.rsi, r.rdi),
             _ => return None,
         };
         let path = match self.path(pid, address, dirfd) {
@@ -889,7 +910,7 @@ impl LaunchFs {
         let original_path = path;
         let follow = match r.orig_rax {
             6 | 83 | 84 | 87 | 88 | 89 | 258 | 263 | 266 | 267 => false,
-            262 => r.r10 & 0x100 == 0,
+            262 | 280 => r.r10 & 0x100 == 0,
             332 => r.rdx & 0x100 == 0,
             439 => r.r10 & 0x100 == 0,
             // open handles O_EXCL and O_NOFOLLOW before following the final link.
@@ -938,6 +959,12 @@ impl LaunchFs {
             2 => self.open(path.as_bytes(), r.rsi, r.rdx),
             257 => self.open(path.as_bytes(), r.rdx, r.r10),
             4 | 6 => self.stat(pid, path.as_bytes(), r.rsi, false),
+            280 => self.timestamps(pid, r).and_then(|times| {
+                self.fs
+                    .set_times(path.as_bytes(), false, times[0], times[1])
+                    .map(|_| 0)
+                    .map_err(errno)
+            }),
             21 | 269 | 439 => self
                 .fs
                 .metadata_no_follow(path.as_bytes())
@@ -1264,6 +1291,13 @@ impl LaunchFs {
             77 if r.rsi as i64 >= 0 => self.fs.truncate(fd, r.rsi).map(|_| 0).map_err(errno),
             77 => Err(-22),
             217 => self.getdents(pid, fd, r.rsi, r.rdx),
+            280 if r.r10 == 0 => self.timestamps(pid, r).and_then(|times| {
+                self.fs
+                    .fset_times(fd, times[0], times[1])
+                    .map(|_| 0)
+                    .map_err(errno)
+            }),
+            280 => Err(-22),
             73 => self.flock(fd, r.rsi),
             72 if matches!(r.rsi, 5..=7) => self.file_lock(pid, fd, r.rsi, r.rdx),
             72 => self
@@ -1305,6 +1339,55 @@ impl LaunchFs {
             _ => Err(-95),
         };
         result.unwrap_or_else(|error| error)
+    }
+
+    fn timestamps(
+        &self,
+        pid: usize,
+        r: &UserRegs,
+    ) -> Result<[Option<ginux_vfs::Timestamp>; 2], i64> {
+        if r.r10 & !0x100 != 0 {
+            return Err(-22);
+        }
+        let mut bytes = [0u8; 32];
+        if r.rdx != 0 && copy_memory(pid, r.rdx, &mut bytes, false)? != 32 {
+            return Err(-14);
+        }
+        let mut times = [None; 2];
+        let mut now = None;
+        for (index, time) in times.iter_mut().enumerate() {
+            let seconds = i64::from_ne_bytes(bytes[index * 16..index * 16 + 8].try_into().unwrap());
+            let nanos = if r.rdx == 0 {
+                (1 << 30) - 1
+            } else {
+                i64::from_ne_bytes(bytes[index * 16 + 8..index * 16 + 16].try_into().unwrap())
+            };
+            *time = match nanos {
+                1_073_741_822 => None,
+                1_073_741_823 => {
+                    if now.is_none() {
+                        let mut clock = [0i64; 2];
+                        if unsafe {
+                            crate::supervisor::syscall2(228, 0, clock.as_mut_ptr() as usize)
+                        } != 0
+                        {
+                            return Err(-5);
+                        }
+                        now = Some(ginux_vfs::Timestamp {
+                            seconds: clock[0],
+                            nanoseconds: clock[1] as u32,
+                        });
+                    }
+                    now
+                }
+                0..=999_999_999 => Some(ginux_vfs::Timestamp {
+                    seconds,
+                    nanoseconds: nanos as u32,
+                }),
+                _ => return Err(-22),
+            };
+        }
+        Ok(times)
     }
 
     fn flock(&mut self, fd: i32, operation: u64) -> Result<i64, i64> {
@@ -1542,6 +1625,8 @@ fn copy_metadata(
         pid,
         address,
         crate::tracee_io::Stat {
+            accessed: metadata.accessed,
+            modified: metadata.modified,
             inode: metadata.inode,
             links: metadata.links,
             mode: metadata.mode

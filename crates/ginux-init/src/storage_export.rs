@@ -154,7 +154,7 @@ impl Archive {
         if name.len() > 100 {
             // GNU long names preserve any normalized VFS path, including a
             // single component longer than ustar's 100-byte name field.
-            self.header(b"././@LongLink", 0, (name.len() + 1) as u64, b'L', b"")?;
+            self.header(b"././@LongLink", 0, (name.len() + 1) as u64, b'L', b"", 0)?;
             self.bytes(name)?;
             self.bytes(&[0; 512][..512 - name.len()])?;
         }
@@ -183,7 +183,7 @@ impl Archive {
             &[]
         };
         if target.len() > 100 {
-            self.header(b"././@LongLink", 0, (target.len() + 1) as u64, b'K', b"")?;
+            self.header(b"././@LongLink", 0, (target.len() + 1) as u64, b'K', b"", 0)?;
             self.bytes(target)?;
             self.bytes(&[0; 512][..512 - target.len()])?;
         }
@@ -193,6 +193,8 @@ impl Archive {
             length,
             kind,
             &target[..target.len().min(100)],
+            u64::try_from(metadata.modified.seconds)
+                .map_err(|_| b"export timestamp is negative".as_slice())?,
         )?;
         let mut buffer = [0u8; 4096];
         let mut offset = 0usize;
@@ -212,6 +214,7 @@ impl Archive {
         length: u64,
         kind: u8,
         link: &[u8],
+        modified: u64,
     ) -> Result<(), Error> {
         let mut header = [0u8; 512];
         header[..name.len()].copy_from_slice(name);
@@ -219,7 +222,7 @@ impl Archive {
         octal(&mut header[108..116], 0)?;
         octal(&mut header[116..124], 0)?;
         octal(&mut header[124..136], length)?;
-        octal(&mut header[136..148], 0)?;
+        octal(&mut header[136..148], modified)?;
         header[148..156].fill(b' ');
         header[156] = kind;
         header[157..157 + link.len()].copy_from_slice(link);

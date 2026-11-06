@@ -469,6 +469,8 @@ impl LaunchChannels {
             pid,
             address,
             Stat {
+                accessed: ginux_vfs::Timestamp::ZERO,
+                modified: ginux_vfs::Timestamp::ZERO,
                 links: 1,
                 inode: 0x2_0000_0000 + pipe as u64,
                 mode: if socket { 0o140600 } else { 0o10600 },

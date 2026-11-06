@@ -202,6 +202,7 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
                 kind,
                 link: target,
                 mode: mode as u32,
+                modified: octal(&header[136..148])?,
                 length: size as usize,
                 hardlink,
             },

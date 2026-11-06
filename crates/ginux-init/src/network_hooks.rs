@@ -348,6 +348,8 @@ impl LaunchNetwork {
                 pid,
                 r.rsi,
                 Stat {
+                    accessed: ginux_vfs::Timestamp::ZERO,
+                    modified: ginux_vfs::Timestamp::ZERO,
                     inode: 0x60000000 + slot as u64,
                     links: 1,
                     mode: 0o140600,

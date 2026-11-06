@@ -138,6 +138,8 @@ pub fn image_link(pid: usize, member: &[u8]) -> Result<Path, i64> {
 
 /// Linux file type bits are part of mode; identities belong to the domain.
 pub struct Stat {
+    pub accessed: ginux_vfs::Timestamp,
+    pub modified: ginux_vfs::Timestamp,
     pub inode: u64,
     pub links: u64,
     pub mode: u32,
@@ -171,6 +173,20 @@ pub fn write_stat(pid: usize, address: u64, metadata: Stat, statx: bool) -> Resu
             | ((minor & !0xff) << 12)
             | ((major & !0xfff) << 32);
         bytes[40..48].copy_from_slice(&rdev.to_le_bytes());
+    }
+    for (index, time) in [metadata.accessed, metadata.modified].iter().enumerate() {
+        let offset = if statx {
+            64 + index * 48
+        } else {
+            72 + index * 16
+        };
+        bytes[offset..offset + 8].copy_from_slice(&time.seconds.to_le_bytes());
+        if statx {
+            bytes[offset + 8..offset + 12].copy_from_slice(&time.nanoseconds.to_le_bytes());
+        } else {
+            bytes[offset + 8..offset + 16]
+                .copy_from_slice(&(time.nanoseconds as u64).to_le_bytes());
+        }
     }
     bytes[ino..ino + 8].copy_from_slice(&metadata.inode.to_le_bytes());
     if let Some(mode_at) = mode_at {

@@ -234,6 +234,8 @@ impl LaunchDevices {
             pid,
             destination,
             Stat {
+                accessed: ginux_vfs::Timestamp::ZERO,
+                modified: ginux_vfs::Timestamp::ZERO,
                 links: 1,
                 inode: if dir { 0x1_0000_0000 } else { 0x1_0000_0001 },
                 mode: if dir { 0o40555 } else { 0o20666 },

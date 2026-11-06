@@ -20,6 +20,26 @@ long storage_main(word *stack)
 {
     word argc = *stack;
     char **argv = (char **)(stack + 1);
+    if (argc > 1 && argv[1][0] == 't') {
+        long fd=DO(2,"/work/time",0102,0600);CHECK(fd==3,219);
+        CHECK(DO(86,"/work/time","/work/time-alias",0)==0 && DO(88,"time","/work/time-link",0)==0,220);
+        long times[4]={11,123,123456789,987654321};
+        CHECK(call(280,fd,0,(word)times,0,0,0)==0 && DO(5,fd,meta,0)==0,221);
+        CHECK(*(long *)(meta+72)==11 && *(long *)(meta+80)==123 && *(long *)(meta+88)==123456789 && *(long *)(meta+96)==987654321,222);
+        CHECK(DO(4,"/work/time-alias",meta,0)==0 && *(long *)(meta+88)==123456789,223);
+        CHECK(call(332,-100,(word)"/work/time",0,0x7ff,(word)meta,0)==0 && *(long *)(meta+112)==123456789 && *(unsigned *)(meta+120)==987654321,224);
+        times[1]=1073741822;times[3]=1000000000;
+        CHECK(call(280,fd,0,(word)times,0,0,0)==-22 && call(280,fd,0,1,0,0,0)==-14,225);
+        times[3]=1073741823;CHECK(call(280,fd,0,(word)times,0,0,0)==0 && DO(5,fd,meta,0)==0,226);
+        CHECK(*(long *)(meta+72)==11 && *(long *)(meta+88)>1000000000,227);
+        times[0]=11;times[1]=123;times[2]=123456789;times[3]=987654321;
+        CHECK(call(280,-100,(word)"/work/time-alias",(word)times,0,0,0)==0,228);
+        times[2]=222;times[3]=333;
+        CHECK(call(280,-100,(word)"/work/time-link",(word)times,0x100,0,0)==0,229);
+        CHECK(DO(6,"/work/time-link",meta,0)==0 && *(long *)(meta+88)==222 && DO(5,fd,meta,0)==0 && *(long *)(meta+88)==123456789,230);
+        CHECK(DO(3,fd,0,0)==0,231);
+        return 0;
+    }
     if (argc > 1 && argv[1][0] == 's') {
         CHECK(DO(83,"/work/dir",0755,0)==0,166);
         CHECK(DO(88,"dir","/work/link",0)==0,167);
@@ -64,6 +84,7 @@ long storage_main(word *stack)
         CHECK(DO(0,fd,output,sizeof output)==(long)length,154);
         for (word i=0;i<length;++i) CHECK(output[i]==argv[2][i],155);
         CHECK(DO(5,fd,meta,0)==0 && (*(word *)(meta+24)&0777)==0600,156);
+        CHECK(*(long *)(meta+88)==123456789 && *(long *)(meta+96)==0,232);
         CHECK(DO(3,fd,0,0)==0,157);
         char path[128]="/work/";
         for (word i=6;i<126;++i) path[i]='a';
@@ -86,6 +107,8 @@ long storage_main(word *stack)
     if (argc > 1 && argv[1][0] == 'c') {
         long fd=DO(2,"/work/checkpoint",0102,0600);
         CHECK(fd==3 && DO(1,fd,"first",5)==5,148);
+        long times[4]={0,0,123456789,987654321};
+        CHECK(call(280,fd,0,(word)times,0,0,0)==0,233);
         CHECK(DO(83,"/work/empty",0700,0)==0,162);
         char path[128]="/work/";
         for (word i=6;i<126;++i) path[i]='a';

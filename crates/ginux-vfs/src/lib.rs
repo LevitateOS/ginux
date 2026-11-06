@@ -323,9 +323,24 @@ pub trait BaseReader {
     fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), VfsError>;
 }
 
+/// Explicit domain inode timestamps, independent of host file identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Timestamp {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+impl Timestamp {
+    pub const ZERO: Self = Self {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+}
+
 /// Metadata from the domain image/overlay, without host inode identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileMetadata {
+    pub accessed: Timestamp,
+    pub modified: Timestamp,
     pub inode: u64,
     pub kind: NodeKind,
     pub mode: u32,
@@ -374,6 +389,8 @@ fn child_name<'a>(directory: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
 
 #[derive(Clone, Copy)]
 pub struct OverlayFile {
+    accessed: Timestamp,
+    modified: Timestamp,
     state: u8,
     path: Path,
     mode: u32,
@@ -387,6 +404,8 @@ pub struct OverlayFile {
 impl OverlayFile {
     pub const fn empty() -> Self {
         Self {
+            accessed: Timestamp::ZERO,
+            modified: Timestamp::ZERO,
             state: 0,
             path: Path::new(),
             mode: 0,
@@ -1136,6 +1155,8 @@ impl<
         let object = self.object(slot);
         let entry = &self.overlay[object];
         FileMetadata {
+            accessed: entry.accessed,
+            modified: entry.modified,
             inode: (self.index.len() + object + 1) as u64,
             kind: match self.overlay[slot].state {
                 3 => NodeKind::Directory,
@@ -1281,6 +1302,8 @@ impl<
             return Err(error);
         }
         self.overlay[slot] = OverlayFile {
+            accessed: Timestamp::ZERO,
+            modified: Timestamp::ZERO,
             state: 4,
             path,
             mode: 0o777,
@@ -1373,6 +1396,8 @@ impl<
         }
         let entry = self.index.lookup_exact(path)?;
         Ok(FileMetadata {
+            accessed: Timestamp::ZERO,
+            modified: Timestamp::ZERO,
             inode: (self
                 .find_base_record(entry.path)
                 .ok_or(VfsError::InvalidIndex)?
@@ -1393,6 +1418,8 @@ impl<
         if descriptor.overlay {
             let file = &self.overlay[descriptor.object];
             Ok(FileMetadata {
+                accessed: file.accessed,
+                modified: file.modified,
                 inode: (self.index.len() + descriptor.object + 1) as u64,
                 kind: if descriptor.directory {
                     NodeKind::Directory
@@ -1406,6 +1433,8 @@ impl<
         } else {
             let entry = self.index.entry(descriptor.object)?;
             Ok(FileMetadata {
+                accessed: Timestamp::ZERO,
+                modified: Timestamp::ZERO,
                 inode: (descriptor.object + 1) as u64,
                 kind: entry.kind,
                 mode: entry.mode,
@@ -1593,6 +1622,56 @@ impl<
         }
         let object = self.object(slot);
         self.overlay[object].mode = mode;
+        Ok(())
+    }
+
+    pub fn set_times(
+        &mut self,
+        path: &[u8],
+        follow: bool,
+        accessed: Option<Timestamp>,
+        modified: Option<Timestamp>,
+    ) -> Result<(), VfsError> {
+        let path = self.resolved_path(path, follow, false)?;
+        let slot = self
+            .find_overlay(path.as_bytes())
+            .ok_or(VfsError::PermissionDenied)?;
+        if self.overlay[slot].state == 2 {
+            return Err(VfsError::NotFound);
+        }
+        self.set_object_times(self.object(slot), accessed, modified)
+    }
+    pub fn fset_times(
+        &mut self,
+        fd: i32,
+        accessed: Option<Timestamp>,
+        modified: Option<Timestamp>,
+    ) -> Result<(), VfsError> {
+        let descriptor = self.descriptors[self.descriptor(fd)?];
+        if !descriptor.overlay {
+            return Err(VfsError::PermissionDenied);
+        }
+        self.set_object_times(descriptor.object, accessed, modified)
+    }
+    fn set_object_times(
+        &mut self,
+        object: usize,
+        accessed: Option<Timestamp>,
+        modified: Option<Timestamp>,
+    ) -> Result<(), VfsError> {
+        if [accessed, modified]
+            .iter()
+            .flatten()
+            .any(|time| time.nanoseconds >= 1_000_000_000)
+        {
+            return Err(VfsError::InvalidPath);
+        }
+        if let Some(time) = accessed {
+            self.overlay[object].accessed = time;
+        }
+        if let Some(time) = modified {
+            self.overlay[object].modified = time;
+        }
         Ok(())
     }
 

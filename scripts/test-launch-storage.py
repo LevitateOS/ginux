@@ -88,6 +88,12 @@ def main():
                     with tarfile.open(archive) as tar:
                         names = tar.getnames()
                         assert len(names) == len(set(names)), names
+                        if args == ['timestamps']:
+                            assert tar.getmember('work/time').mtime == 123456789
+                            assert tar.getmember('work/time-alias').islnk()
+                            assert tar.getmember('work/time-alias').mtime == 123456789
+                            assert tar.getmember('work/time-link').mtime == 222
+                            return
                         assert 'out/deleted' not in names and 'image' not in names
                         assert tar.extractfile('out/product').read() == b'result\0data'
                         assert tar.getmember('out/product').mode == 0o700
@@ -107,6 +113,7 @@ def main():
             invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], [])
         invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['quota'])
         invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['bounds'], memory=32)
+        invoke(['memory:/work', 'memory:/out'], ['timestamps'], export=True)
         invoke(['memory:/work', 'memory:/out'], ['symlinks'])
         invoke(['memory:/work', 'memory:/out'], ['mapping'])
         invoke(['memory:/work', 'memory:/out'], ['export'], export=True)

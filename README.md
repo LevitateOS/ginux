@@ -279,6 +279,11 @@ subtree mutation remains unsupported.
 Owned regular-file link/linkat names share inode, bytes, permissions and link
 counts. Unlink removes a name; remaining links, open handles and executable
 pins keep its data alive. Capacity failure leaves existing names unchanged.
+Explicit inode access/modified timestamps support `utimensat` and descriptor
+`futimens`, including no-follow, nanoseconds and `UTIME_NOW`/`UTIME_OMIT`.
+Aliases share timestamps, and stat/statx project those values. Checkpoints keep
+whole-second nonnegative USTAR mtime; runtime nanoseconds and atime are not
+persisted. Unrepresentable mtimes fail export rather than silently changing.
 Owned execution and private file mappings are described below.
 This is not a complete unified image/overlay filesystem. IO is bounded to 4096 bytes per call. Metadata supports
 a configurable namespace and 64 independently opened file handles.
