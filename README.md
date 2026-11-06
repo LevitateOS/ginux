@@ -284,7 +284,11 @@ This is not a complete unified image/overlay filesystem. IO is bounded to 4096 b
 a configurable namespace and 64 independently opened file handles.
 `[storage].max_objects` defaults to 16384, accepts 1–1000000 and includes seeded
 directories and live or pinned namespace slots. Namespace and backing metadata
-use bounded supervisor allocations rather than stack arrays. Their page-rounded
+use bounded supervisor allocations rather than stack arrays. Before restore,
+the supervisor reserves a private descriptor budget of `max_objects + 128` by
+raising only its own soft limit within the existing hard limit; an insufficient
+hard limit rejects launch before starting the workload. Public workload file
+handles retain their separate limit. Their page-rounded
 size is charged before file bytes. Optional `[storage].max_bytes` sets a positive
 file-data budget; data plus metadata must fit `[resources].memory_mib`. If
 omitted, file bytes use the remaining memory budget. File bytes grow on demand in anonymous supervisor mappings rather than

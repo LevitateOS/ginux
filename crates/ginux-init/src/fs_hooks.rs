@@ -102,6 +102,31 @@ impl LaunchFs {
         )
         .map_err(|_| b"invalid storage root index".as_slice())?;
         let objects = config.storage_max_objects as usize;
+        if count != 0 {
+            // Each nonempty inode owns one private backing descriptor. Reserve
+            // that bounded budget before restore, without changing the hard limit
+            // or the workload's independently bounded public descriptor table.
+            let required = objects
+                .checked_add(128)
+                .ok_or(b"storage descriptor budget overflow".as_slice())?;
+            let mut limits = [0usize; 2];
+            if unsafe { crate::supervisor::syscall4(302, 0, 7, 0, limits.as_mut_ptr() as usize) }
+                != 0
+            {
+                return Err(b"cannot inspect storage descriptor budget");
+            }
+            if limits[0] < required {
+                if limits[1] < required {
+                    return Err(b"storage descriptor budget exceeds host hard limit");
+                }
+                limits[0] = required;
+                if unsafe { crate::supervisor::syscall4(302, 0, 7, limits.as_ptr() as usize, 0) }
+                    != 0
+                {
+                    return Err(b"cannot reserve storage descriptor budget");
+                }
+            }
+        }
         let metadata = MappedArray::<ginux_vfs::OverlayFile>::bytes_for(objects)
             .and_then(|n| {
                 MemoryStorage::metadata_bytes(objects)
@@ -1188,7 +1213,8 @@ impl LaunchFs {
         let result = match r.orig_rax {
             0 => self.read(pid, fd, r.rsi, r.rdx, None),
             17 => self.read(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
-            1 => self.write(pid, fd, r.rsi, r.rdx),
+            1 => self.write(pid, fd, r.rsi, r.rdx, None),
+            18 => self.write(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
             3 => self.fs.close(fd).map(|_| 0).map_err(errno),
             5 => self
                 .fs
@@ -1283,15 +1309,31 @@ impl LaunchFs {
         result
     }
 
-    fn write(&mut self, pid: usize, fd: i32, address: u64, length: u64) -> Result<i64, i64> {
+    fn write(
+        &mut self,
+        pid: usize,
+        fd: i32,
+        address: u64,
+        length: u64,
+        offset: Option<i64>,
+    ) -> Result<i64, i64> {
         self.fs.fstat(fd).map_err(errno)?;
         let mut buffer = [0u8; IO_SIZE];
         let count = length.min(IO_SIZE as u64) as usize;
         let copied = copy_memory(pid, address, &mut buffer[..count], false)? as usize;
-        self.fs
+        let previous = self.fs.seek(fd, 0, 1).map_err(errno)?;
+        if let Some(offset) = offset {
+            self.fs.seek(fd, offset, 0).map_err(errno)?;
+        }
+        let result = self
+            .fs
             .write(fd, &buffer[..copied])
             .map(|n| n as i64)
-            .map_err(errno)
+            .map_err(errno);
+        if offset.is_some() {
+            self.fs.seek(fd, previous as i64, 0).map_err(errno)?;
+        }
+        result
     }
 
     fn getdents(&mut self, pid: usize, fd: i32, address: u64, length: u64) -> Result<i64, i64> {

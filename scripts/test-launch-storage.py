@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import select
+import resource
 import subprocess
 import sys
 import tempfile
@@ -63,7 +64,11 @@ def main():
                 proc.stdout = stdout
                 proc.stderr = (work / 'mapping.audit').read_bytes()
             else:
-                proc = subprocess.run(command, capture_output=True, timeout=20)
+                def bounded_host_fds():
+                    _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (min(1024, hard), hard))
+                proc = subprocess.run(command, capture_output=True, timeout=90 if args == ['quota'] else 20,
+                                      preexec_fn=bounded_host_fds if args == ['quota'] else None)
             record = json.loads(result.read_text())
             if proc.returncode != expected:
                 sys.exit(f'launch failed: {proc.returncode}\n{proc.stderr.decode()}\n{record}')

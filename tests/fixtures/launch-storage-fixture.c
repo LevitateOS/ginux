@@ -186,6 +186,8 @@ long storage_main(word *stack)
             long fd = DO(2, path, 0101, 0644);
             if (fd == -28) return i == 8189 ? 0 : 61;
             CHECK(fd >= 3 && fd < 256, 62);
+            CHECK(DO(1,fd,"a",1)==1 && call(18,fd,(word)"b",1,0,0,0)==1,217);
+            CHECK(DO(8,fd,0,1)==1 && call(18,fd,(word)"x",1,-1,0,0)==-22 && DO(8,fd,0,1)==1,218);
             CHECK(DO(3, fd, 0, 0) == 0, 63);
         }
         return 64;
