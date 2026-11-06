@@ -468,7 +468,12 @@ impl LaunchFs {
                 if path == b"/dev/null" && self.null {
                     return Ok((NodeKind::File, 0));
                 }
-                if [b"/dev".as_slice(), b"/proc", b"/sys"]
+                // Hidden image device entries are absent from the assigned
+                // device namespace, just like direct device-owner lookups.
+                if within(path, b"/dev") {
+                    return Err(VfsError::NotFound);
+                }
+                if [b"/proc".as_slice(), b"/sys"]
                     .iter()
                     .any(|prefix| within(path, prefix))
                 {
