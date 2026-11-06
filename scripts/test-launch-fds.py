@@ -20,6 +20,7 @@ def main():
         root=work/'root'
         (root/'bin').mkdir(parents=True)
         (root/'work').mkdir()
+        (root/'large').write_bytes(b'r'*(2*1024*1024+2)+b'z')
         shutil.copyfile(fixture,root/'bin/fixture')
         (root/'bin/fixture').chmod(0o755)
         config=template.replace('init = "/bin/bash"','init = "/bin/fixture"')

@@ -12,6 +12,7 @@ static long call(long n, word a, word b, word c, word d, word e, word f)
 #define DO(n,a,b,c) call(n,(word)(a),(word)(b),(word)(c),0,0,0)
 #define CHECK(expr,code) if (!(expr)) return code
 static char bytes[256];
+static char large[2*1024*1024+3];
 static char meta[256] __attribute__((aligned(8)));
 long fd_main(word *stack)
 {
@@ -75,6 +76,12 @@ long fd_main(word *stack)
     CHECK(DO(5,memory,meta,0)==0 && *(word *)(meta+48)==3,40);
     for(word i=0;i<252;++i) CHECK(DO(3,aliases[i],0,0)==0,41);
     CHECK(DO(3,(1UL<<32)|(word)memory,0,0)==0,42); // Linux fd arguments use the low 32 bits.
+    long file=DO(2,"/large",0,0);CHECK(file==3,50);
+    CHECK(DO(0,file,large,sizeof large)==1024*1024 && large[0]=='r',51);
+    CHECK(DO(0,file,large,sizeof large)==1024*1024,52);
+    CHECK(DO(0,file,large,sizeof large)==3 && large[2]=='z' && DO(0,file,large,sizeof large)==0,53);
+    CHECK(DO(8,file,0,0)==0 && call(17,file,(word)large,sizeof large,1,0,0)==1024*1024 && DO(8,file,0,1)==0,54);
+    CHECK(DO(3,file,0,0)==0,55);
     DO(1,1,"shared-fds: PASS\n",17);
     return 0;
 }

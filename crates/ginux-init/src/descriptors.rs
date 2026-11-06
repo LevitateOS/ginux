@@ -736,6 +736,11 @@ impl DescriptorTable {
                 if !console && matches!(r.orig_rax, 1 | 20 | 18 | 77 | 91) {
                     return Err(-9);
                 }
+                if matches!(r.orig_rax, 0 | 17) {
+                    // Bound each native transfer without turning a legitimate
+                    // large read request into a false permission failure.
+                    r.rdx = r.rdx.min(1024 * 1024);
+                }
                 r.rdi = fd as u64;
             }
             Handle::Owned(handle) => r.rdi = handle as u64,
