@@ -289,6 +289,10 @@ subtree mutation remains unsupported.
 Owned regular-file link/linkat names share inode, bytes, permissions and link
 counts. Unlink removes a name; remaining links, open handles and executable
 pins keep its data alive. Capacity failure leaves existing names unchanged.
+Owned inode uid/gid are virtual root. `chown`, `fchown`, `lchown` and `fchownat`
+can preserve 0 or unchanged (-1) on existing assigned objects, including symlinks
+and empty-path descriptor operations. Other identities remain unsupported; these
+operations never change host ownership.
 Explicit inode access/modified timestamps support `utimensat` and descriptor
 `futimens`, including no-follow, nanoseconds and `UTIME_NOW`/`UTIME_OMIT`.
 Aliases share timestamps, and stat/statx project those values. Checkpoints keep

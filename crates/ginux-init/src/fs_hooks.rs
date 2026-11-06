@@ -885,13 +885,14 @@ impl LaunchFs {
                 | 75
                 | 77
                 | 91
+                | 93
                 | 217
                 | 292
         ) && fd >= FD_BASE as i32
         {
             return Some(self.descriptor_call(pid, r, fd - FD_BASE as i32 + 3));
         }
-        if matches!(r.orig_rax, 262 | 332 | 439) {
+        if matches!(r.orig_rax, 260 | 262 | 332 | 439) {
             match read_path(pid, r.rsi) {
                 Ok(p) if p.is_empty() && fd >= FD_BASE as i32 => {
                     return Some(self.descriptor_call(pid, r, fd - FD_BASE as i32 + 3))
@@ -904,8 +905,8 @@ impl LaunchFs {
         let (address, dirfd) = match r.orig_rax {
             88 => (r.rsi, (-100i64) as u64),
             266 => (r.rdx, r.rsi),
-            2 | 4 | 6 | 21 | 83 | 84 | 87 | 89 | 90 => (r.rdi, (-100i64) as u64),
-            257 | 258 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 => (r.rsi, r.rdi),
+            2 | 4 | 6 | 21 | 83 | 84 | 87 | 89 | 90 | 92 | 94 => (r.rdi, (-100i64) as u64),
+            257 | 258 | 260 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 => (r.rsi, r.rdi),
             _ => return None,
         };
         let path = match self.path(pid, address, dirfd) {
@@ -914,7 +915,8 @@ impl LaunchFs {
         };
         let original_path = path;
         let follow = match r.orig_rax {
-            6 | 83 | 84 | 87 | 88 | 89 | 258 | 263 | 266 | 267 => false,
+            6 | 83 | 84 | 87 | 88 | 89 | 94 | 258 | 263 | 266 | 267 => false,
+            260 => r.r8 & 0x100 == 0,
             262 | 280 => r.r10 & 0x100 == 0,
             332 => r.rdx & 0x100 == 0,
             439 => r.r10 & 0x100 == 0,
@@ -964,6 +966,17 @@ impl LaunchFs {
             2 => self.open(path.as_bytes(), r.rsi, r.rdx),
             257 => self.open(path.as_bytes(), r.rdx, r.r10),
             4 | 6 => self.stat(pid, path.as_bytes(), r.rsi, false),
+            92 | 94 => self
+                .fs
+                .metadata_no_follow(path.as_bytes())
+                .map_err(errno)
+                .and_then(|_| preserve_owner(r.rsi, r.rdx)),
+            260 if r.r8 & !0x1100 == 0 => self
+                .fs
+                .metadata_no_follow(path.as_bytes())
+                .map_err(errno)
+                .and_then(|_| preserve_owner(r.rdx, r.r10)),
+            260 => Err(-22),
             280 => self.timestamps(pid, r).and_then(|times| {
                 self.fs
                     .set_times(path.as_bytes(), false, times[0], times[1])
@@ -1284,6 +1297,18 @@ impl LaunchFs {
                 .map(|n| n as i64)
                 .map_err(errno),
             91 => self.fs.fchmod(fd, r.rsi as u32).map(|_| 0).map_err(errno),
+            93 => self
+                .fs
+                .fstat(fd)
+                .map_err(errno)
+                .and_then(|_| preserve_owner(r.rsi, r.rdx)),
+            260 if r.r8 & !0x1100 != 0 => Err(-22),
+            260 if r.r8 & 0x1000 == 0 => Err(-2),
+            260 => self
+                .fs
+                .fstat(fd)
+                .map_err(errno)
+                .and_then(|_| preserve_owner(r.rdx, r.r10)),
             74 | 75 => self.fs.fstat(fd).map_err(errno).and_then(|metadata| {
                 if metadata.kind == NodeKind::Directory {
                     return Ok(0);
@@ -1614,6 +1639,20 @@ impl LaunchFs {
         }
         self.fs.seek(fd, cookie as i64, 0).map_err(errno)?;
         Ok(used as i64)
+    }
+}
+
+// Owned inode uid/gid are always virtual root, as projected by copy_metadata.
+// Preserving that identity is a real no-op; changing it is unsupported. No host
+// chown syscall is issued for a domain path or private backing descriptor.
+fn preserve_owner(uid: u64, gid: u64) -> Result<i64, i64> {
+    if [uid, gid]
+        .iter()
+        .all(|id| matches!(*id as u32, 0 | u32::MAX))
+    {
+        Ok(0)
+    } else {
+        Err(-95)
     }
 }
 

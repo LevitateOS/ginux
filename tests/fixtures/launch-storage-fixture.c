@@ -36,6 +36,13 @@ long storage_main(word *stack)
         CHECK(DO(5,big,meta,0)==0 && *(word *)(meta+48)==4096 && DO(8,big,0,1)==4096,241);
         CHECK(DO(8,big,0,0)==0 && call(18,big,pages,8192,8192,0,0)==4096 && DO(8,big,0,1)==0,242);
         CHECK(DO(11,pages,8192,0)==0 && DO(3,big,0,0)==0,243);
+        CHECK(DO(93,fd,0,-1)==0 && DO(92,"/work/time-alias",-1,0)==0,247);
+        CHECK(DO(88,"missing","/work/dangling",0)==0 && DO(94,"/work/dangling",0,0)==0,248);
+        CHECK(DO(92,"/work/dangling",0,0)==-2 && call(260,-100,(word)"/work/dangling",0,0,0x100,0)==0,249);
+        CHECK(call(260,fd,(word)"",-1,0,0x1000,0)==0 && call(260,fd,(word)"",0,0,0,0)==-2,250);
+        CHECK(DO(93,fd,1,0)==-95 && DO(92,"/work/time",0,1)==-95 && DO(94,"/work/missing",0,0)==-2,251);
+        CHECK(DO(5,fd,meta,0)==0 && *(unsigned *)(meta+28)==0 && *(unsigned *)(meta+32)==0,252);
+        CHECK(DO(92,1,0,0)==-14 && call(260,-100,(word)"/work/time",0,0,2,0)==-22,253);
         long times[4]={11,123,123456789,987654321};
         CHECK(call(280,fd,0,(word)times,0,0,0)==0 && DO(5,fd,meta,0)==0,221);
         CHECK(*(long *)(meta+72)==11 && *(long *)(meta+80)==123 && *(long *)(meta+88)==123456789 && *(long *)(meta+96)==987654321,222);

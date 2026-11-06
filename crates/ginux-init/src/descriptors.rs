@@ -446,7 +446,7 @@ impl DescriptorTable {
                 }
             }
             0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55 | 74
-            | 73 | 75 | 77 | 78 | 91 | 217 => {
+            | 73 | 75 | 77 | 78 | 91 | 93 | 217 => {
                 call.save(r);
                 call.pinned
                     .map(Ok)
@@ -478,7 +478,7 @@ impl DescriptorTable {
                     backends.claim(pid, r)
                 })
             }
-            258 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 => {
+            258 | 260 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 => {
                 call.save(r);
                 self.path_descriptor(pid, r, backends, call)
             }
@@ -732,6 +732,9 @@ impl DescriptorTable {
                     if r.rsi == 4 && r.rdx & !STATUS_FLAGS != 0 {
                         return Err(-95);
                     }
+                }
+                if r.orig_rax == 93 {
+                    return Err(-1);
                 }
                 if !console && matches!(r.orig_rax, 1 | 20 | 18 | 77 | 91) {
                     return Err(-9);
