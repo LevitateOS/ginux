@@ -22,6 +22,10 @@ def main():
         shutil.copyfile(fixture,root/'bin/fixture')
         (root/'bin/fixture').chmod(0o755)
         (root/'image').write_bytes(b'immutable image')
+        (root/'image-work').symlink_to('/work')
+        (root/'image-cycle').symlink_to('/work/cycle')
+        (root/'work/hidden').write_bytes(b'hidden image bytes')
+        (root/'private').mkdir(mode=0)
         config=template.replace('init = "/bin/bash"','init = "/bin/fixture"')
         config=config.replace('[storage]\nassignments = []','[storage]\nassignments = ["memory:/work", "memory:/work/seed"]')
         config=config.replace('[devices]\nassignments = []','[devices]\nassignments = ["null"]')
@@ -34,7 +38,8 @@ def main():
             assert record['outcome']=='exited' and record['code']==0 and record['generation'] is None,record
             assert proc.stdout==b'owned-directories: PASS\n',proc.stdout
             assert b'ginux: teardown tasks=0 owned-handles=0' in proc.stderr,proc.stderr
-            assert list((root/'work').iterdir())==[]
+            assert sorted(p.name for p in (root/'work').iterdir())==['hidden']
+            assert (root/'work/hidden').read_bytes()==b'hidden image bytes'
             assert (root/'image').read_bytes()==b'immutable image'
         print('test-launch-directories: PASS (records, cursors, faults, aliases/fork, rename, removal, relative operations, isolation)')
 

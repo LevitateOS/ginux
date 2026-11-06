@@ -18,9 +18,11 @@ struct Segment {
     argument: Option<Path>,
 }
 
+#[derive(Clone, Copy)]
 struct Header {
     interpreter: Path,
     argument: Option<Path>,
+    payload: usize,
 }
 
 impl Header {
@@ -60,6 +62,7 @@ impl Header {
         Ok(Some(Self {
             interpreter,
             argument,
+            payload: newline.map_or(image.size, |n| n + 1),
         }))
     }
 }
@@ -73,6 +76,8 @@ pub struct Script {
     leaf: Path,
     pub kernel_script: bool,
     held: [Option<Executable>; SCRIPTS],
+    native_header: Option<Header>,
+    native_name: Option<Path>,
 }
 
 fn word(host: usize, address: u64) -> Result<u64, i64> {
@@ -149,6 +154,8 @@ impl Script {
             }; SCRIPTS],
             count: 0,
             leaf: Path::empty(),
+            native_header: None,
+            native_name: None,
             kernel_script: false,
             held: [None; SCRIPTS],
         })
@@ -195,6 +202,14 @@ impl Script {
                         }
                     }
                     None => {
+                        let resolved = fs.interpreter_path(host, header.interpreter.as_bytes())?;
+                        if resolved != header.interpreter {
+                            script.native_name = Some(header.interpreter);
+                            script.native_header = Some(Header {
+                                interpreter: resolved,
+                                ..header
+                            });
+                        }
                         script.kernel_script = true;
                         break;
                     }
@@ -218,6 +233,38 @@ impl Script {
                 Err(error)
             }
         }
+    }
+
+    /// Canonicalize only the sealed private copy passed to binfmt. Owned
+    /// script bytes and the interpreter name reported in argv remain intact.
+    pub fn private_header(&self, output: &mut [u8; 256]) -> Result<Option<(usize, usize)>, i64> {
+        let Some(header) = self.native_header else {
+            return Ok(None);
+        };
+        let interpreter = header.interpreter.as_bytes();
+        let argument = header.argument.as_ref().map_or(&[][..], |p| p.as_bytes());
+        let length = 2
+            + interpreter.len()
+            + if argument.is_empty() {
+                0
+            } else {
+                1 + argument.len()
+            }
+            + 1;
+        if length > 255 {
+            return Err(-7);
+        }
+        output[..2].copy_from_slice(b"#!");
+        output[2..2 + interpreter.len()].copy_from_slice(interpreter);
+        let mut end = 2 + interpreter.len();
+        if !argument.is_empty() {
+            output[end] = b' ';
+            end += 1;
+            output[end..end + argument.len()].copy_from_slice(argument);
+            end += argument.len();
+        }
+        output[end] = b'\n';
+        Ok(Some((end + 1, header.payload)))
     }
 
     pub fn release_held(self, fs: &mut LaunchFs) -> Result<(), i64> {
@@ -270,10 +317,26 @@ impl Script {
         let mut patched = [0usize; 2 * SCRIPTS + 1];
         let mut patches = 0;
         let mut used = 1;
-        // Keep any prefix the kernel produced through immutable interpreters.
+        // The kernel may have expanded further immutable script headers.
+        // Replace the requested leaf interpreter at its known prefix position,
+        // retaining the final interpreter and any intermediate argument pairs.
+        let replaced = self
+            .native_header
+            .and_then(|header| prefix.checked_sub(1 + usize::from(header.argument.is_some())));
         for n in 0..prefix {
-            words[used] = word(host, r.rsp + ((n + 1) * 8) as u64)?;
-            used += 1;
+            if Some(n) == replaced {
+                let name = self.native_name.ok_or(-5)?;
+                let bytes = name.as_bytes();
+                strings[..bytes.len()].copy_from_slice(bytes);
+                strings_len = bytes.len() + 1;
+                words[used] = 0;
+                patched[patches] = used;
+                patches += 1;
+                used += 1;
+            } else {
+                words[used] = word(host, r.rsp + ((n + 1) * 8) as u64)?;
+                used += 1;
+            }
         }
         let mut append = |path: Path| -> Result<(), i64> {
             let bytes = path.as_bytes();

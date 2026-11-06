@@ -116,6 +116,8 @@ pub struct DescriptorCall {
     poll_wait: bool,
     poll_tick: bool,
     poll_deadline: Option<u64>,
+    path: Option<crate::path_hooks::Rewrite>,
+    path_pid: usize,
 }
 impl DescriptorCall {
     pub const fn new() -> Self {
@@ -126,6 +128,8 @@ impl DescriptorCall {
             poll_wait: false,
             poll_tick: false,
             poll_deadline: None,
+            path: None,
+            path_pid: 0,
         }
     }
     pub fn native_mutation(&self) -> bool {
@@ -190,6 +194,9 @@ impl DescriptorCall {
                 }
             }
             changed = true;
+        }
+        if let Some(path) = self.path.take() {
+            path.finish(self.path_pid, r)?;
         }
         if let Some(args) = self.saved_args.take() {
             r.rdi = args[0];
@@ -463,7 +470,7 @@ impl DescriptorTable {
             }
             258 | 262 | 263 | 267 | 268 | 269 | 332 | 439 => {
                 call.save(r);
-                self.path_descriptor(pid, r, backends)
+                self.path_descriptor(pid, r, backends, call)
             }
             7 | 271 => self.poll(pid, r, backends, call),
             _ => Ok(backends.claim(pid, r)),
@@ -496,8 +503,13 @@ impl DescriptorTable {
         pid: usize,
         r: &mut UserRegs,
         backends: &mut Backends,
+        call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
         r.rdi = self.path_handle(pid, r.rdi, r.rsi)?;
+        if let Some(path) = crate::path_hooks::Rewrite::prepare(backends.filesystem, pid, r)? {
+            call.path = Some(path);
+            call.path_pid = pid;
+        }
         Ok(backends.claim(pid, r))
     }
 
@@ -515,7 +527,7 @@ impl DescriptorTable {
             }
             Handle::Native { fd, .. } if path.is_empty() => Ok(fd as u64),
             Handle::Owned(_) => Err(-20),
-            Handle::Native { .. } => Err(-95),
+            Handle::Native { fd, .. } => Ok(crate::fs_hooks::IMAGE_DIR_BASE + fd as u64),
             Handle::Reserved => Err(-9),
         }
     }
@@ -549,7 +561,7 @@ impl DescriptorTable {
         let decision = if let Some(decision) = self.open_descriptor_path(pid, r, backends) {
             decision
         } else if r.orig_rax == 257 {
-            self.path_descriptor(pid, r, backends)
+            self.path_descriptor(pid, r, backends, call)
         } else {
             Ok(backends.claim(pid, r))
         };

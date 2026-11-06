@@ -94,6 +94,9 @@ long exec_main(word *stack)
     if (mode=='d') {
         CHECK(DO(2,"/bin/second",02000000,0)==14,60);
         call(322,14,(word)"",(word)next,(word)next_env,0x1000,0);
+    } else if (mode=='i') {
+        CHECK(DO(2,"/bin",02200000,0)==14,62);
+        call(322,14,(word)"second",(word)next,(word)next_env,0,0);
     } else if (mode=='p') {
         call(322,-1,(word)"/bin/second",(word)next,(word)next_env,0,0);
     } else {

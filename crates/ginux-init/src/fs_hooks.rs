@@ -16,6 +16,7 @@ use ginux_vfs::{
 };
 
 pub const FD_BASE: usize = 1 << 20;
+pub const IMAGE_DIR_BASE: u64 = 0x0800_0000;
 const IO_SIZE: usize = 4096;
 type Path = Text<MAX_PATH>;
 type MemoryFs =
@@ -45,6 +46,7 @@ pub struct LaunchFs {
     count: usize,
     cwd: Option<i32>,
     byte_limit: usize,
+    null: bool,
 }
 
 impl LaunchFs {
@@ -144,6 +146,11 @@ impl LaunchFs {
             count,
             cwd: None,
             byte_limit: limit,
+            null: config
+                .devices
+                .as_slice()
+                .iter()
+                .any(|name| name.as_bytes() == b"null"),
         })
     }
 
@@ -370,46 +377,114 @@ impl LaunchFs {
             .any(|p| within(path, p.as_bytes()))
     }
 
-    // Stop lexical normalization as soon as traversal enters owned storage.
-    // Everything after that point must be interpreted by the VFS, including ..
-    // after a symlink. Never route a failed owned lookup into the image.
-    fn routed_path(&self, base: &[u8], name: &[u8]) -> Result<Path, i64> {
-        let mut raw = [0; MAX_PATH];
-        let mut length = 0;
+    fn joined_path(&self, base: &[u8], name: &[u8]) -> Result<Path, i64> {
+        let mut bytes = [0; MAX_PATH];
+        let mut n = 0;
         if name.first() != Some(&b'/') {
-            let n = base.len();
-            raw[..n].copy_from_slice(base);
-            length = n;
-            if length > 1 {
-                if length == MAX_PATH {
+            n = base.len();
+            bytes[..n].copy_from_slice(base);
+            if n > 1 {
+                if n == MAX_PATH {
                     return Err(-36);
                 }
-                raw[length] = b'/';
-                length += 1;
+                bytes[n] = b'/';
+                n += 1;
             }
         }
-        if length + name.len() > MAX_PATH {
-            return Err(-36);
-        }
-        raw[length..length + name.len()].copy_from_slice(name);
-        length += name.len();
-        for end in 1..=length {
-            if end == length || raw[end] == b'/' {
-                let prefix = normalize(b"/", &raw[..end])?;
-                if self.owns_path(prefix.as_bytes()) {
-                    let mut joined = [0; MAX_PATH];
-                    let n = prefix.as_bytes().len();
-                    let size = n + length - end;
-                    if size > MAX_PATH {
-                        return Err(-36);
+        let end = n
+            .checked_add(name.len())
+            .filter(|n| *n < MAX_PATH)
+            .ok_or(-36)?;
+        bytes[n..end].copy_from_slice(name);
+        Path::from_bytes(&bytes[..end]).map_err(|_| -36)
+    }
+
+    fn resolve(&self, pid: usize, path: &[u8], follow: bool, missing: bool) -> Result<Path, i64> {
+        let image = crate::path_hooks::ImageRoot::new(pid)?;
+        let mut output = [0; MAX_PATH];
+        let length =
+            ginux_vfs::resolve_namespace(path, follow, missing, &mut output, |path, target| {
+                if self.owns_path(path)
+                    || self.prefixes[..self.count]
+                        .iter()
+                        .any(|prefix| within(prefix.as_bytes(), path))
+                        && path != b"/"
+                {
+                    let metadata = self.fs.metadata_no_follow(path)?;
+                    if metadata.kind == NodeKind::Symlink {
+                        let n = self.fs.read_link(path, target)?;
+                        return Ok((metadata.kind, n));
                     }
-                    joined[..n].copy_from_slice(prefix.as_bytes());
-                    joined[n..size].copy_from_slice(&raw[end..length]);
-                    return Path::from_bytes(&joined[..size]).map_err(|_| -36);
+                    return Ok((metadata.kind, 0));
                 }
+                if path == b"/dev" {
+                    return Ok((NodeKind::Directory, 0));
+                }
+                if path == b"/dev/null" && self.null {
+                    return Ok((NodeKind::File, 0));
+                }
+                if [b"/dev".as_slice(), b"/proc", b"/sys"]
+                    .iter()
+                    .any(|prefix| within(path, prefix))
+                {
+                    return Err(VfsError::PermissionDenied);
+                }
+                image.lookup(path, target)
+            })
+            .map_err(errno)?;
+        Path::from_bytes(&output[..length]).map_err(|_| -36)
+    }
+
+    /// Native reads/exec/chdir use a canonical absolute domain name when a
+    /// virtual cwd or link traversal cannot be represented by the kernel cwd.
+    pub fn native_path(&self, pid: usize, r: &UserRegs) -> Result<Option<(u8, Path)>, i64> {
+        let (arg, address, dirfd, follow, missing) = match r.orig_rax {
+            2 | 257 => {
+                let (arg, address, dirfd, flags) = if r.orig_rax == 2 {
+                    (0, r.rdi, (-100i64) as u64, r.rsi)
+                } else {
+                    (1, r.rsi, r.rdi, r.rdx)
+                };
+                (
+                    arg,
+                    address,
+                    dirfd,
+                    flags & 0o400000 == 0 && flags & 0o300 != 0o300,
+                    flags & 0o100 != 0,
+                )
             }
+            4 | 21 | 80 | 90 | 59 => (0, r.rdi, (-100i64) as u64, true, false),
+            6 | 89 => (0, r.rdi, (-100i64) as u64, false, false),
+            262 => (1, r.rsi, r.rdi, r.r10 & 0x100 == 0, false),
+            267 => (1, r.rsi, r.rdi, false, false),
+            268 | 269 | 439 => (
+                1,
+                r.rsi,
+                r.rdi,
+                r.orig_rax != 439 || r.r10 & 0x100 == 0,
+                false,
+            ),
+            332 => (1, r.rsi, r.rdi, r.rdx & 0x100 == 0, false),
+            322 => (1, r.rsi, r.rdi, r.r8 & 0x100 == 0, false),
+            _ => return Ok(None),
+        };
+        let raw = read_path(pid, address)?;
+        if raw.as_bytes().first() != Some(&b'/') && dirfd as i32 != -100 && dirfd < FD_BASE as u64 {
+            return Ok(None);
         }
-        normalize(b"/", &raw[..length])
+        if raw.is_empty()
+            || raw.as_bytes() == b"/proc/self/exe"
+            || raw.as_bytes().starts_with(b"/proc/self/fd/")
+            || raw.as_bytes().starts_with(b"/dev/fd/")
+        {
+            return Ok(None);
+        }
+        let path = self.path(pid, address, dirfd)?;
+        let resolved = self.resolve(pid, path.as_bytes(), follow, missing)?;
+        if self.owns_path(resolved.as_bytes()) || resolved.as_bytes() == raw.as_bytes() {
+            return Ok(None);
+        }
+        Ok(Some((arg, resolved)))
     }
 
     fn mutation_path(&self, path: &[u8], missing: bool) -> Result<Path, i64> {
@@ -448,6 +523,14 @@ impl LaunchFs {
         } else if dirfd as i32 == -100 {
             cwd = self.cwd_path(pid)?;
             cwd.as_bytes()
+        } else if (IMAGE_DIR_BASE..IMAGE_DIR_BASE + 256).contains(&dirfd) {
+            cwd = crate::tracee_io::image_fd_path(pid, (dirfd - IMAGE_DIR_BASE) as u32)?;
+            let root = crate::path_hooks::ImageRoot::new(pid)?;
+            let mut link = [0; MAX_PATH];
+            if root.lookup(cwd.as_bytes(), &mut link).map_err(errno)?.0 != NodeKind::Directory {
+                return Err(-20);
+            }
+            cwd.as_bytes()
         } else {
             let fd = (dirfd as u32)
                 .checked_sub(FD_BASE as u32)
@@ -455,13 +538,7 @@ impl LaunchFs {
                 .ok_or(-9)?;
             self.fs.directory_path(fd as i32 + 3).map_err(errno)?
         };
-        let path = self.routed_path(base, text.as_bytes())?;
-        if !absolute && dirfd as i32 != -100 && !self.owns_path(path.as_bytes()) {
-            // The image does not share this directory descriptor. Never pass
-            // the private integer to a native open outside assigned storage.
-            return Err(-95);
-        }
-        Ok(path)
+        self.joined_path(base, text.as_bytes())
     }
 
     // Selected by the task owner before each entry. Threads share their
@@ -501,6 +578,7 @@ impl LaunchFs {
     /// An image change is committed only after its native syscall succeeds.
     pub fn chdir(&mut self, pid: usize, address: u64) -> Result<Option<i32>, i64> {
         let path = self.path(pid, address, (-100i64) as u64)?;
+        let path = self.resolve(pid, path.as_bytes(), true, false)?;
         if self.owns_path(path.as_bytes()) {
             let path = self.owned_path(path.as_bytes(), true, false)?;
             return self
@@ -547,10 +625,11 @@ impl LaunchFs {
         dirfd: u64,
     ) -> Result<Option<Executable>, i64> {
         let path = self.path(pid, address, dirfd)?;
+        let path = self.resolve(pid, path.as_bytes(), true, false)?;
         self.exec_resolved(path.as_bytes())
     }
 
-    pub fn exec_interpreter(&mut self, pid: usize, name: &[u8]) -> Result<Option<Executable>, i64> {
+    pub fn interpreter_path(&self, pid: usize, name: &[u8]) -> Result<Path, i64> {
         let cwd;
         let base = if name.first() == Some(&b'/') {
             b"/".as_slice()
@@ -558,7 +637,11 @@ impl LaunchFs {
             cwd = self.cwd_path(pid)?;
             cwd.as_bytes()
         };
-        let path = self.routed_path(base, name)?;
+        let path = self.joined_path(base, name)?;
+        self.resolve(pid, path.as_bytes(), true, false)
+    }
+    pub fn exec_interpreter(&mut self, pid: usize, name: &[u8]) -> Result<Option<Executable>, i64> {
+        let path = self.interpreter_path(pid, name)?;
         self.exec_resolved(path.as_bytes())
     }
 
@@ -601,7 +684,7 @@ impl LaunchFs {
         if !suffix.is_empty() {
             let directory = self.fs.directory_path(fd).map_err(errno)?;
             let relative = suffix.strip_prefix(b"/").unwrap_or(suffix);
-            let path = self.routed_path(directory, relative)?;
+            let path = self.joined_path(directory, relative)?;
             if !self.owns_path(path.as_bytes()) {
                 return Err(-95);
             }
@@ -757,17 +840,6 @@ impl LaunchFs {
             Ok(path) => path,
             Err(error) => return Some(error),
         };
-        if !self.owns_path(path.as_bytes()) {
-            // The kernel cwd remains in the immutable image while the task
-            // enters an owned directory. A relative fallback would enter the
-            // hidden image tree; crossing namespaces is resolved explicitly.
-            if self.cwd.is_some()
-                && read_path(pid, address).is_ok_and(|p| p.as_bytes().first() != Some(&b'/'))
-            {
-                return Some(-95);
-            }
-            return None;
-        }
         let original_path = path;
         let follow = match r.orig_rax {
             6 | 83 | 84 | 87 | 88 | 89 | 258 | 263 | 266 | 267 => false,
@@ -775,19 +847,47 @@ impl LaunchFs {
             332 => r.rdx & 0x100 == 0,
             439 => r.r10 & 0x100 == 0,
             // open handles O_EXCL and O_NOFOLLOW before following the final link.
-            2 | 257 => false,
+            2 | 257 => {
+                let flags = if r.orig_rax == 2 { r.rsi } else { r.rdx };
+                flags & 0o400000 == 0 && flags & 0o300 != 0o300
+            }
             _ => true,
         };
         let missing = matches!(r.orig_rax, 2 | 257 | 83 | 258 | 88 | 266);
-        let resolved = if matches!(r.orig_rax, 83 | 84 | 87 | 258 | 263) {
-            self.mutation_path(path.as_bytes(), missing)
-        } else {
-            self.owned_path(path.as_bytes(), follow, missing)
-        };
-        let path = match resolved {
+        let namespace = matches!(r.orig_rax, 83 | 84 | 87 | 258 | 263);
+        let mut raw = path.as_bytes();
+        if namespace {
+            while raw.len() > 1 && raw.ends_with(b"/") {
+                raw = &raw[..raw.len() - 1];
+            }
+        }
+        let path = match self.resolve(pid, raw, follow, missing) {
             Ok(path) => path,
             Err(error) => return Some(error),
         };
+        if !self.owns_path(path.as_bytes()) {
+            return None;
+        }
+        if namespace
+            && original_path.as_bytes().ends_with(b"/")
+            && self
+                .fs
+                .metadata_no_follow(path.as_bytes())
+                .is_ok_and(|m| m.kind != NodeKind::Directory)
+        {
+            return Some(-20);
+        }
+        if matches!(r.orig_rax, 84 | 263)
+            && matches!(
+                original_path
+                    .as_bytes()
+                    .rsplit(|b| *b == b'/')
+                    .find(|p| !p.is_empty()),
+                Some(b"." | b"..")
+            )
+        {
+            return Some(-22);
+        }
         let result = match r.orig_rax {
             2 => self.open(path.as_bytes(), r.rsi, r.rdx),
             257 => self.open(path.as_bytes(), r.rdx, r.r10),
@@ -848,10 +948,10 @@ impl LaunchFs {
                 .map(|_| 0)
                 .map_err(errno),
             87 => self.fs.unlink(path.as_bytes()).map(|_| 0).map_err(errno),
-            84 => self.remove_directory(original_path.as_bytes()),
+            84 => self.remove_directory(path.as_bytes()),
             263 => {
                 if r.rdx == 0x200 {
-                    self.remove_directory(original_path.as_bytes())
+                    self.remove_directory(path.as_bytes())
                 } else if r.rdx != 0 {
                     Err(-95)
                 } else {
@@ -973,6 +1073,8 @@ impl LaunchFs {
         if flags & !0x400 != 0 {
             return Err(-95);
         }
+        let source = self.resolve(pid, source.as_bytes(), flags & 0x400 != 0, false)?;
+        let destination = self.resolve(pid, destination.as_bytes(), false, true)?;
         if !self.owns_path(source.as_bytes()) || !self.owns_path(destination.as_bytes()) {
             return Err(-18);
         }
@@ -1001,14 +1103,51 @@ impl LaunchFs {
         if flags > 1 {
             return Err(-95);
         }
+        for path in [source.as_bytes(), destination.as_bytes()] {
+            if matches!(
+                path.rsplit(|b| *b == b'/').find(|p| !p.is_empty()),
+                Some(b"." | b"..")
+            ) {
+                return Err(-22);
+            }
+        }
+        let directory_destination = destination.as_bytes().ends_with(b"/");
+        let directory_source = source.as_bytes().ends_with(b"/");
+        let mut from = source.as_bytes();
+        while from.len() > 1 && from.ends_with(b"/") {
+            from = &from[..from.len() - 1];
+        }
+        let mut to = destination.as_bytes();
+        while to.len() > 1 && to.ends_with(b"/") {
+            to = &to[..to.len() - 1];
+        }
+        let source = self.resolve(pid, from, false, false)?;
+        let destination = self.resolve(pid, to, false, true)?;
         if !self.owns_path(source.as_bytes()) || !self.owns_path(destination.as_bytes()) {
             return Err(-18);
         }
         let original_source = source;
         let original_destination = destination;
-        let directory_destination = destination.as_bytes().ends_with(b"/");
         let source = self.mutation_path(source.as_bytes(), false)?;
         let destination = self.mutation_path(destination.as_bytes(), true)?;
+        if directory_source
+            && self
+                .fs
+                .metadata_no_follow(source.as_bytes())
+                .map_err(errno)?
+                .kind
+                != NodeKind::Directory
+        {
+            return Err(-20);
+        }
+        if directory_destination
+            && self
+                .fs
+                .metadata_no_follow(destination.as_bytes())
+                .is_ok_and(|m| m.kind != NodeKind::Directory)
+        {
+            return Err(-20);
+        }
         if directory_destination
             && self
                 .fs

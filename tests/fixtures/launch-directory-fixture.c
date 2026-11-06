@@ -70,7 +70,8 @@ long directory_main(word *stack)
     CHECK(call(262,dir,(word)"sub/leaf",(word)meta,0,0,0)==0 && *(word *)(meta+48)==4,35);
     CHECK(DO(258,alias,"next",0755)==0,36);
     CHECK(DO(257,file,"child",0)==-20 && DO(257,1048576,"file",0)==-9,37);
-    CHECK(DO(257,dir,"../../image",0)==-95,38);
+    long crossing=DO(257,dir,"../../image",0);
+    CHECK(crossing>=3 && DO(0,crossing,buffer,9)==9 && buffer[0]=='i' && DO(3,crossing,0,0)==0,38);
     long absolute=DO(257,123,"/image",0); CHECK(absolute>=3 && DO(3,absolute,0,0)==0,39);
     CHECK(DO(263,alias,"file",0)==0 && DO(4,"/work/dir/file",meta,0)==-2,40);
     CHECK(DO(8,file,0,0)==0 && DO(0,file,buffer,12)==12 && DO(3,file,0,0)==0,41);
@@ -163,6 +164,25 @@ long directory_main(word *stack)
     long bin=DO(2,"/bin",0200000,0); CHECK(bin>=3,104);
     CHECK(DO(80,"/work",0,0)==0 && DO(81,bin,0,0)==0 && DO(3,bin,0,0)==0,105);
     CHECK(DO(79,buffer,sizeof buffer,0)==5 && equal(buffer,"/bin"),106);
+    CHECK(DO(88,"/image","/work/image-link",0)==0,150);
+    long image_link=DO(2,"/work/image-link",0,0);
+    CHECK(image_link>=3 && DO(0,image_link,buffer,9)==9 && buffer[0]=='i' && DO(3,image_link,0,0)==0,151);
+    CHECK(DO(2,"/work/image-link",0400000,0)==-40 && DO(2,"/work/image-link",01001,0600)<0,152);
+    CHECK(create("/image-work/through-image","safe")==0 && DO(4,"/work/through-image",meta,0)==0,153);
+    CHECK(DO(2,"/image-work/hidden",0,0)==-2,154);
+    CHECK(DO(88,"/bin","/work/bin-link",0)==0,155);
+    long parent_link=DO(2,"/work/bin-link/../image",0,0);
+    CHECK(parent_link>=3 && DO(0,parent_link,buffer,9)==9 && DO(3,parent_link,0,0)==0,156);
+    CHECK(DO(80,"/image-work/cwd-moved",0,0)==0 && DO(79,buffer,sizeof buffer,0)==16 && equal(buffer,"/work/cwd-moved"),157);
+    CHECK(DO(80,"../../bin",0,0)==0 && DO(79,buffer,sizeof buffer,0)==5 && equal(buffer,"/bin"),158);
+    long native_dir=DO(2,"/bin",0200000,0); CHECK(native_dir>=3,159);
+    long image_to_owned=DO(257,native_dir,"../image-work/through-image",0);
+    CHECK(image_to_owned>=3 && DO(0,image_to_owned,buffer,4)==4 && buffer[0]=='s',160);
+    CHECK(DO(3,image_to_owned,0,0)==0 && DO(3,native_dir,0,0)==0,161);
+    CHECK(DO(82,"/image-work/through-image","/work/renamed-cross",0)==0,162);
+    CHECK(DO(2,"/private/../image",0,0)==-13 && DO(2,"/image/../image",0,0)==-20,163);
+    CHECK(DO(88,"/image-cycle","/work/cycle",0)==0 && DO(2,"/image-cycle",0,0)==-40,164);
+    CHECK(DO(88,"../../../../image","/work/escape",0)==0 && DO(2,"/work/escape",0,0)<0,165);
     DO(1,1,"owned-directories: PASS\n",24);
     return 0;
 }

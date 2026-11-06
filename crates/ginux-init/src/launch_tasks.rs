@@ -83,6 +83,7 @@ struct Task {
     mapping: Option<crate::file_mapping::MappingCall>,
     waiter: Option<usize>,
     image_chdir: Option<u64>,
+    path: Option<crate::path_hooks::Rewrite>,
 }
 
 struct DescriptorGroup {
@@ -264,6 +265,7 @@ pub fn supervise(
         mapping: None,
         waiter: None,
         image_chdir: None,
+        path: None,
     });
     if ptrace(PTRACE_SETOPTIONS, root, 0, OPTIONS) < 0 {
         s.fail(domain, b"launch ptrace setup failed");
@@ -626,6 +628,14 @@ impl Supervisor<'_> {
             audit_write(b"park surface=descriptor-snapshot\n");
             return;
         }
+        match crate::path_hooks::Rewrite::prepare(self.objects.filesystem, self.task(index).host, r)
+        {
+            Ok(path) => self.task_mut(index).path = path,
+            Err(error) => {
+                self.emulate(index, r, error, domain);
+                return;
+            }
+        }
         if r.orig_rax == 9 && r.r10 & 0x20 == 0 {
             match self.table(index).mapping_file(r.r8) {
                 Ok(Some(handle)) => {
@@ -951,6 +961,7 @@ impl Supervisor<'_> {
                     mapping: None,
                     waiter: None,
                     image_chdir: None,
+                    path: None,
                 });
                 self.task_mut(index).pending = Pending::Fork {
                     child: slot,
@@ -1061,7 +1072,7 @@ impl Supervisor<'_> {
             },
         }
     }
-    fn prepare_exec(&mut self, index: usize, r: &UserRegs) -> Result<(), i64> {
+    fn prepare_exec(&mut self, index: usize, r: &mut UserRegs) -> Result<(), i64> {
         let group = self.task(index).group;
         if self.groups[group].as_ref().unwrap().owners != 1
             || self.task(index).id != self.groups[group].as_ref().unwrap().leader
@@ -1069,6 +1080,22 @@ impl Supervisor<'_> {
             return Err(-95);
         }
         let host = self.task(index).host;
+        if r.orig_rax == 322 {
+            let path = crate::tracee_io::read_path(host, r.rsi)?;
+            if !path.is_empty() && path.as_bytes().first() != Some(&b'/') && r.rdi as i32 != -100 {
+                let mut translated = *r;
+                translated.rdi = self.table(index).exec_path_dirfd(host, r.rdi, r.rsi)?;
+                if let Some(mut path) = crate::path_hooks::Rewrite::prepare(
+                    self.objects.filesystem,
+                    host,
+                    &mut translated,
+                )? {
+                    path.original_args(r);
+                    self.task_mut(index).path = Some(path);
+                    *r = translated;
+                }
+            }
+        }
         let mut instruction = [0u8; 2];
         let address = r.rip.checked_sub(2).ok_or(-95)?;
         if copy_memory(host, address, &mut instruction, false) != Ok(2)
@@ -1274,6 +1301,7 @@ impl Supervisor<'_> {
     }
 
     fn exec_completed(&mut self, index: usize, domain: &mut Domain) {
+        self.task_mut(index).path = None;
         if !self
             .task(index)
             .exec
@@ -1485,6 +1513,7 @@ impl Supervisor<'_> {
                             fd,
                             self.objects.filesystem,
                             owned.image,
+                            owned.script.as_ref(),
                         ) {
                             self.task_mut(index)
                                 .exec
@@ -1635,6 +1664,11 @@ impl Supervisor<'_> {
         ) {
             Ok(changed) => self.wake_needed |= changed,
             Err(reason) => self.fail(domain, reason),
+        }
+        if let Some(path) = self.task_mut(index).path.take() {
+            if let Err(reason) = path.finish(self.task(index).host, r) {
+                self.fail(domain, reason);
+            }
         }
         audit_write(b"ginux: audit sequence=");
         audit_u64(self.task(index).sequence);

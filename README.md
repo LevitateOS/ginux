@@ -270,8 +270,12 @@ Owned symlink/symlinkat, readlink/readlinkat and nofollow metadata are supported
 Resolution expands links before processing parent components, bounds link chains,
 and rechecks storage assignment boundaries. Unlink and rename act on the final
 link itself; exclusive create and O_NOFOLLOW retain their distinct semantics.
-Cross-image/owned traversal, native-image relative directory-fd access, image
-subtree mutation remain unsupported.
+The bounded component resolver traverses both image and assigned storage links,
+including relative directory descriptors. Owned prefixes hide image entries
+through every alias; crossing into the image grants only its existing readonly
+operations. Image directory search permissions, link-loop bounds, final-entry
+nofollow behavior and namespace mutation checks remain enforced. Native image
+subtree mutation remains unsupported.
 Owned regular-file link/linkat names share inode, bytes, permissions and link
 counts. Unlink removes a name; remaining links, open handles and executable
 pins keep its data alive. Capacity failure leaves existing names unchanged.
@@ -384,8 +388,7 @@ exit or supervision failure kills and reaps all remaining
 descendants and releases owned descriptors before reporting completion.
 Image execve and execveat are supervised, including relative paths from the
 configured workdir, absolute execveat paths, and AT_EMPTY_PATH on image
-file descriptors. Relative native-image directory-fd execution remains
-unsupported. Virtual devices cannot execute; assigned file paths use the owned
+file descriptors, including relative native-image directory-fd execution. Virtual devices cannot execute; assigned file paths use the owned
 loader described below.
 Before exec, controlled fcntl syscalls synchronize each native handle's CLOEXEC
 bit: any surviving public alias keeps its native handle. The supervisor replays

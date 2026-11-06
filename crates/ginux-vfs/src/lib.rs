@@ -227,6 +227,20 @@ impl Path {
 
 // Expand each link before interpreting a following `..`. Normalizing the
 // entire pathname first would give the wrong object for /link/../name.
+/// Resolve a bounded namespace supplied by an adapter. The adapter's lookup
+/// returns one exact component, so link targets are expanded before `..`.
+pub fn resolve_namespace(
+    path: &[u8],
+    follow_final: bool,
+    missing: bool,
+    output: &mut [u8; MAX_PATH],
+    lookup: impl FnMut(&[u8], &mut [u8; MAX_PATH]) -> Result<(NodeKind, usize), VfsError>,
+) -> Result<usize, VfsError> {
+    let path = resolve_components(path, follow_final, missing, lookup)?;
+    output[..path.len].copy_from_slice(path.as_bytes());
+    Ok(path.len)
+}
+
 fn resolve_components(
     input: &[u8],
     follow_final: bool,

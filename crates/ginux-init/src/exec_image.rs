@@ -8,7 +8,13 @@ use crate::fs_hooks::LaunchFs;
 use crate::supervisor::{syscall1, syscall2, syscall3, syscall4};
 use ginux_vfs::Executable;
 
-pub fn populate(host: usize, descriptor: u32, fs: &LaunchFs, image: Executable) -> Result<(), i64> {
+pub fn populate(
+    host: usize,
+    descriptor: u32,
+    fs: &LaunchFs,
+    image: Executable,
+    script: Option<&crate::exec_script::Script>,
+) -> Result<(), i64> {
     let mut path = [0u8; 64];
     path[..6].copy_from_slice(b"/proc/");
     let mut end = 6;
@@ -32,24 +38,19 @@ pub fn populate(host: usize, descriptor: u32, fs: &LaunchFs, image: Executable) 
     let result = (|| {
         let mut buffer = [0u8; 4096];
         let mut offset = 0;
+        if let Some(script) = script {
+            let mut header = [0; 256];
+            if let Some((length, skip)) = script.private_header(&mut header)? {
+                write_bytes(fd, &header[..length])?;
+                offset = skip;
+            }
+        }
         while offset < image.size {
             let count = fs.read_executable(image, offset, &mut buffer)?;
             if count == 0 {
                 return Err(-5);
             }
-            let mut written = 0;
-            while written < count {
-                let result = unsafe {
-                    syscall3(1, fd, buffer[written..].as_ptr() as usize, count - written)
-                };
-                if result == -4 {
-                    continue;
-                }
-                if result <= 0 {
-                    return Err(if result == 0 { -5 } else { result as i64 });
-                }
-                written += result as usize;
-            }
+            write_bytes(fd, &buffer[..count])?;
             offset += count;
         }
         let mode = unsafe { syscall2(91, fd, 0o500) };
@@ -79,6 +80,28 @@ pub fn populate(host: usize, descriptor: u32, fs: &LaunchFs, image: Executable) 
         return Err(closed as i64);
     }
     result
+}
+
+fn write_bytes(fd: usize, bytes: &[u8]) -> Result<(), i64> {
+    let mut written = 0;
+    while written < bytes.len() {
+        let count = unsafe {
+            syscall3(
+                1,
+                fd,
+                bytes[written..].as_ptr() as usize,
+                bytes.len() - written,
+            )
+        };
+        if count == -4 {
+            continue;
+        }
+        if count <= 0 {
+            return Err(if count == 0 { -5 } else { count as i64 });
+        }
+        written += count as usize;
+    }
+    Ok(())
 }
 
 fn number(output: &mut [u8], end: &mut usize, mut value: usize) {

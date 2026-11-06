@@ -34,7 +34,7 @@ def main():
         config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
         config = config.replace('[devices]\nassignments = []', '[devices]\nassignments = ["null"]')
-        for mode in ('success', 'bad', 'child', 'descriptor', 'path', 'relative', 'link'):
+        for mode in ('success', 'bad', 'child', 'descriptor', 'image-directory', 'path', 'relative', 'link'):
             path, result, audit_path = work / f'{mode}.toml', work / f'{mode}.json', work / f'{mode}.audit'
             path.write_text(config.replace('args = []', 'args = ' + json.dumps([mode])))
             with audit_path.open('wb') as audit:

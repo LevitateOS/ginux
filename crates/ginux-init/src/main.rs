@@ -20,6 +20,7 @@ mod fs_hooks;
 mod launch;
 mod launch_tasks;
 mod network_hooks;
+mod path_hooks;
 mod process_hooks;
 mod storage_export;
 mod storage_memory;

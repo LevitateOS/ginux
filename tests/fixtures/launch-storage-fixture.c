@@ -37,9 +37,10 @@ long storage_main(word *stack)
         CHECK(DO(88,"../link","/work/dir/chain",0)==0,174);
         CHECK(DO(2,"/work/dir/chain/../fresh",0101,0600)==3 && DO(3,3,0,0)==0,175);
         CHECK(DO(4,"/work/fresh",meta,0)==0 && DO(4,"/work/dir/fresh",meta,0)==-2,176);
-        CHECK(DO(88,"/image","/work/image",0)==0 && DO(2,"/work/image",0,0)<0,177);
+        CHECK(DO(88,"/image","/work/image",0)==0 && DO(2,"/work/image",0,0)==3,177);
+        CHECK(DO(0,3,output,9)==9 && output[0]=='i' && DO(3,3,0,0)==0,216);
         CHECK(DO(88,"/","/work/root",0)==0 && DO(2,"/work/root/escape",0101,0600)<0,178);
-        CHECK(DO(2,"/work/root/../image",0,0)<0 && DO(2,"/work/link/../../image",0,0)<0,179);
+        CHECK(DO(2,"/work/root/../image",0,0)<0 && DO(2,"/work/link/../../image",0,0)==3 && DO(3,3,0,0)==0,179);
         CHECK(DO(2,"/work/dir",0200000,0)==3,180);
         CHECK(DO(266,"file",3,"relative")==0,181);
         CHECK(call(267,3,(word)"relative",(word)output,64,0,0)==4 && output[0]=='f',182);

@@ -26,19 +26,20 @@ long script_main(word *stack)
 {
     word argc=*stack;
     char **argv=(char **)(stack+1), **env=argv+argc+1;
-    if (equal(argv[0],"/bin/interpreter")) {
+    if (equal(argv[0],"/bin/interpreter") || equal(argv[0],"/work/interpreter-link")) {
         CHECK(env[0] && equal(env[0],"SCRIPT_ENV=present") && env[1] && equal(env[1],"SECOND=two words") && !env[2],10);
         const char *mode=argv[argc-1];
+        if(equal(mode,"cross")) CHECK(equal(argv[0],"/work/interpreter-link"),62);
         int large=equal(mode,"many");
         const char *name=argv[large?2:argc-2];
         int plain=equal(mode,"plain");
-        int nested=equal(mode,"nested");
+        int nested=equal(mode,"nested") || equal(mode,"cross-nested");
         int descriptor=equal(mode,"descriptor") || equal(mode,"unlinked") || equal(mode,"fd-fork") || equal(mode,"fd-vfork");
         int directory=equal(mode,"dir-relative") || equal(mode,"dir-renamed");
         CHECK(argc==(word)(large?4098:(plain?3:(nested?6:4))),11);
         if(large) for(word n=3;n<argc-1;++n) CHECK(equal(argv[n],"padding"),23);
         if (!plain) CHECK(equal(argv[nested?3:1],"option with spaces"),12);
-        if (nested) CHECK(equal(argv[1],"nested option") && equal(argv[2],"/bin/wrapper"),13);
+        if (nested) CHECK(equal(argv[1],"nested option") && equal(argv[2],equal(mode,"cross-nested")?"/work/interpreter-link":"/bin/wrapper"),13);
         CHECK(equal(name,descriptor?"/dev/fd/6":(directory?"/dev/fd/6/program":(equal(mode,"relative")?"work/program":"/work/program"))),14);
         word *aux=(word *)(env+3); int found=0;
         while(aux[0]) { if(aux[0]==31) { CHECK(equal((char *)aux[1],name),15); found=1; } aux+=2; }
@@ -59,6 +60,10 @@ long script_main(word *stack)
     const char *mode=argv[1];
     CHECK(publish("/work/program",equal(mode,"plain")?"#!/bin/interpreter\nbody\n":
         (equal(mode,"nested")?"#!/bin/wrapper option with spaces\nbody\n":"#! \t/bin/interpreter\toption with spaces \t\nbody\n"))==0,31);
+    if(equal(mode,"cross") || equal(mode,"cross-nested")) {
+        CHECK(DO(88,equal(mode,"cross-nested")?"/bin/wrapper":"/bin/interpreter","/work/interpreter-link",0)==0,63);
+        CHECK(publish("/work/program","#!/work/interpreter-link option with spaces\nbody\n")==0,64);
+    }
     CHECK(DO(2,"/work/drop",02000102,0600)==3 && DO(2,"/work/keep",0102,0600)==4 && DO(1,4,"K",1)==1,32);
     CHECK(DO(2,"/input",02000000,0)==5,33);
     char *next[]={"ignored-argv-zero",(char *)mode,0};

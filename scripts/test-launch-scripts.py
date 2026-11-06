@@ -33,7 +33,7 @@ def main():
         config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"\nworkdir = "/"')
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
         fork_modes = ('fork', 'vfork', 'clone', 'fd-fork', 'fd-vfork')
-        for mode in ('plain', 'optional', 'nested', 'relative', 'at', 'fork', 'vfork', 'clone', 'many',
+        for mode in ('plain', 'cross', 'cross-nested', 'optional', 'nested', 'relative', 'at', 'fork', 'vfork', 'clone', 'many',
                      'descriptor', 'unlinked', 'dir-relative', 'dir-renamed', 'fd-fork', 'fd-vfork'):
             path, result, audit_path = [work / (mode + suffix) for suffix in ('.toml', '.json', '.audit')]
             path.write_text(config.replace('args = []', 'args = ' + json.dumps([mode])))

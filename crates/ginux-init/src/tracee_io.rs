@@ -65,6 +65,26 @@ pub fn image_cwd(pid: usize) -> Result<Path, i64> {
     image_link(pid, b"/cwd")
 }
 
+pub fn image_fd_path(pid: usize, fd: u32) -> Result<Path, i64> {
+    let mut member = [0u8; 24];
+    member[..4].copy_from_slice(b"/fd/");
+    let mut digits = [0; 10];
+    let mut n = fd;
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (n % 10) as u8;
+        count += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for i in 0..count {
+        member[4 + i] = digits[count - 1 - i];
+    }
+    image_link(pid, &member[..4 + count])
+}
+
 /// Only callers in the supervisor choose the proc member; no host prefix is
 /// returned unless it resolves beneath the tracee's immutable root.
 pub fn image_link(pid: usize, member: &[u8]) -> Result<Path, i64> {
