@@ -27,6 +27,7 @@ jobs:
       - run: make build build-process-fixtures build-launch-fixture build-launch-storage-fixture build-launch-device-fixture build-launch-pipe-fixture build-launch-fd-fixture build-launch-task-fixture build-launch-exec-fixture build-launch-thread-fixture build-launch-poll-fixture build-launch-directory-fixture build-launch-owned-exec-fixture build-launch-script-fixture build-gate1-fixture build-launch-network-fixture
       - run: sudo make test-launch
       - run: sudo make test-launch-storage
+      - run: sudo make test-launch-checkpoints
       - run: sudo make test-launch-devices
       - run: sudo make test-launch-pipes
       - run: sudo make test-launch-fds
