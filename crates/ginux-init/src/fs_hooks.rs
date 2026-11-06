@@ -47,6 +47,9 @@ pub struct LaunchFs {
     cwd: Option<i32>,
     byte_limit: usize,
     null: bool,
+    process: u32,
+    locks: crate::file_locks::Locks,
+    flocks: crate::file_locks::Locks,
 }
 
 impl LaunchFs {
@@ -166,6 +169,9 @@ impl LaunchFs {
             }
         }
         Ok(Self {
+            process: 1,
+            locks: crate::file_locks::Locks::new(),
+            flocks: crate::file_locks::Locks::new(),
             fs,
             prefixes,
             count,
@@ -568,6 +574,20 @@ impl LaunchFs {
 
     // Selected by the task owner before each entry. Threads share their
     // process cwd, while fork owns a separate reference to the same directory.
+    pub fn select_process(&mut self, process: u32) {
+        self.process = process;
+    }
+    pub fn release_process_locks(&mut self, process: u32) {
+        self.locks.release(process, None);
+    }
+    pub fn close_locks(&mut self, handle: u32) {
+        if (FD_BASE as u32..FD_BASE as u32 + 64).contains(&handle) {
+            if let Ok(metadata) = self.fs.fstat((handle - FD_BASE as u32) as i32 + 3) {
+                self.locks.release(self.process, Some(metadata.inode));
+            }
+        }
+    }
+
     pub fn select_cwd(&mut self, descriptor: Option<i32>) {
         self.cwd = descriptor;
     }
@@ -834,6 +854,7 @@ impl LaunchFs {
                 | 32
                 | 33
                 | 72
+                | 73
                 | 74
                 | 75
                 | 77
@@ -1215,7 +1236,10 @@ impl LaunchFs {
             17 => self.read(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
             1 => self.write(pid, fd, r.rsi, r.rdx, None),
             18 => self.write(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
-            3 => self.fs.close(fd).map(|_| 0).map_err(errno),
+            3 => {
+                self.flocks.release((fd - 3) as u32, None);
+                self.fs.close(fd).map(|_| 0).map_err(errno)
+            }
             5 => self
                 .fs
                 .fstat(fd)
@@ -1240,6 +1264,8 @@ impl LaunchFs {
             77 if r.rsi as i64 >= 0 => self.fs.truncate(fd, r.rsi).map(|_| 0).map_err(errno),
             77 => Err(-22),
             217 => self.getdents(pid, fd, r.rsi, r.rdx),
+            73 => self.flock(fd, r.rsi),
+            72 if matches!(r.rsi, 5..=7) => self.file_lock(pid, fd, r.rsi, r.rdx),
             72 => self
                 .fs
                 .descriptor_flags(fd)
@@ -1279,6 +1305,87 @@ impl LaunchFs {
             _ => Err(-95),
         };
         result.unwrap_or_else(|error| error)
+    }
+
+    fn flock(&mut self, fd: i32, operation: u64) -> Result<i64, i64> {
+        let kind = operation & !4;
+        if !matches!(kind, 1 | 2 | 8) {
+            return Err(-22);
+        }
+        let metadata = self.fs.fstat(fd).map_err(errno)?;
+        if !matches!(metadata.kind, NodeKind::File | NodeKind::Directory) {
+            return Err(-9);
+        }
+        let lock = crate::file_locks::Lock {
+            inode: metadata.inode,
+            owner: (fd - 3) as u32,
+            range: crate::file_locks::Range::new(0, 0, 0)?,
+            write: kind == 2,
+        };
+        // flock belongs to the open description, including aliases across fork.
+        // Converting a shared lock may release it before waiting for exclusive.
+        self.flocks.release(lock.owner, None);
+        if kind != 8 {
+            self.flocks.set(lock, false)?;
+        }
+        Ok(0)
+    }
+
+    fn file_lock(&mut self, pid: usize, fd: i32, command: u64, address: u64) -> Result<i64, i64> {
+        let metadata = self.fs.fstat(fd).map_err(errno)?;
+        if metadata.kind != NodeKind::File {
+            return Err(-9);
+        }
+        let mut bytes = [0u8; 32];
+        if copy_memory(pid, address, &mut bytes, false)? != 32 {
+            return Err(-14);
+        }
+        let kind = i16::from_ne_bytes(bytes[..2].try_into().unwrap());
+        let whence = i16::from_ne_bytes(bytes[2..4].try_into().unwrap());
+        let start = i64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+        let length = i64::from_ne_bytes(bytes[16..24].try_into().unwrap());
+        if !(0..=2).contains(&kind) || (command == 5 && kind == 2) {
+            return Err(-22);
+        }
+        let base = match whence {
+            0 => 0,
+            1 => self.fs.seek(fd, 0, 1).map_err(errno)?,
+            2 => metadata.size,
+            _ => return Err(-22),
+        };
+        let (flags, _) = self.fs.descriptor_flags(fd).map_err(errno)?;
+        if command != 5 && ((kind == 0 && flags & 3 == 1) || (kind == 1 && flags & 3 == 0)) {
+            return Err(-9);
+        }
+        let lock = crate::file_locks::Lock {
+            inode: metadata.inode,
+            owner: self.process,
+            range: crate::file_locks::Range::new(base, start, length)?,
+            write: kind == 1,
+        };
+        if command != 5 {
+            self.locks.set(lock, kind == 2)?;
+        } else {
+            if let Some(conflict) = self.locks.conflict(lock) {
+                bytes[..2]
+                    .copy_from_slice(&(if conflict.write { 1i16 } else { 0i16 }).to_ne_bytes());
+                bytes[2..4].copy_from_slice(&0i16.to_ne_bytes());
+                bytes[8..16].copy_from_slice(&(conflict.range.start as i64).to_ne_bytes());
+                let length = if conflict.range.end == i64::MAX as u64 + 1 {
+                    0
+                } else {
+                    conflict.range.end - conflict.range.start
+                };
+                bytes[16..24].copy_from_slice(&(length as i64).to_ne_bytes());
+                bytes[24..28].copy_from_slice(&(conflict.owner as i32).to_ne_bytes());
+            } else {
+                bytes[..2].copy_from_slice(&2i16.to_ne_bytes());
+            }
+            if copy_memory(pid, address, &mut bytes, true)? != 32 {
+                return Err(-14);
+            }
+        }
+        Ok(0)
     }
 
     fn read(

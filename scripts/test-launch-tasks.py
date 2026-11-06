@@ -31,7 +31,7 @@ def main():
         config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
         config = config.replace('[devices]\nassignments = []', '[devices]\nassignments = ["null"]')
-        for mode in ('z-time', 'directory', 'fork', 'vfork', 'clone', 'shared-vfork', 'libc-fork', 'junk-child-tid', 'protected-child-tid', 'handler-return',
+        for mode in ('Locks', 'z-time', 'directory', 'fork', 'vfork', 'clone', 'shared-vfork', 'libc-fork', 'junk-child-tid', 'protected-child-tid', 'handler-return',
                      'inherit', 'kill', 'bound', 'orphan', 'adopted-zombie', 'rollback', 'inherit'):
             path, result = work / f'{mode}.toml', work / f'{mode}.json'
             path.write_text(config.replace('args = []', 'args = ' + json.dumps([mode])))

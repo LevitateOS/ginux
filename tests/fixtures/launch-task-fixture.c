@@ -32,7 +32,46 @@ long task_main(word *stack)
     CHECK(call(13,17,(word)action,0,8,0,0)==-95,81);
     action[0]=0; action[1]=2;
     CHECK(call(13,17,(word)action,0,8,0,0)==-95,82);
-    if (mode=='a') {
+    if (mode=='L') {
+        struct flock {short kind,whence;int padding;long start,len;int pid,padding2;};
+        struct flock lock={1,0,0,10,20,0,0};
+        long fd=DO(2,"/work/locked",0102,0600); CHECK(fd==3,123);
+        CHECK(DO(86,"/work/locked","/work/alias",0)==0,124);
+        long alias=DO(2,"/work/alias",0,0); CHECK(alias==4,125);
+        CHECK(DO(72,fd,6,&lock)==0,126);
+        lock.kind=2;lock.start=15;lock.len=5;CHECK(DO(72,fd,6,&lock)==0,127);
+        int pipes[2];CHECK(DO(22,pipes,0,0)==0,128);
+        long child=DO(57,0,0,0);CHECK(child>=0,129);
+        if(child==0) {
+            lock.kind=1;lock.start=10;lock.len=20;
+            CHECK(DO(72,fd,5,&lock)==0 && lock.kind==1 && lock.pid==1 && lock.start==10 && lock.len==5,130);
+            lock.kind=0;lock.start=30;lock.len=-20;CHECK(DO(72,fd,6,&lock)==-11,131);
+            lock.kind=1;lock.start=15;lock.len=5;CHECK(DO(72,fd,5,&lock)==0 && lock.kind==2,132);
+            lock.kind=1;CHECK(DO(72,fd,6,&lock)==0,133);
+            CHECK(DO(1,pipes[1],"R",1)==1,134);
+            lock.start=10;lock.len=20;CHECK(DO(72,fd,7,&lock)==0,135);
+            CHECK(DO(72,fd,5,&lock)==0 && lock.kind==2,136);
+            DO(60,37,0,0);__builtin_unreachable();
+        }
+        CHECK(DO(0,pipes[0],buffer,1)==1 && buffer[0]=='R',137);
+        CHECK(DO(3,alias,0,0)==0,138); // Any alias close releases this process's inode locks.
+        int status=-1;CHECK(DO(61,child,&status,0)==child && status==(37<<8),139);
+        lock.kind=1;lock.start=0;lock.len=0;CHECK(DO(72,fd,6,&lock)==0,140);
+        lock.kind=0;CHECK(DO(72,fd,5,&lock)==0 && lock.kind==2,141);
+        CHECK(DO(72,fd,6,1)==-14 && DO(73,fd,6,0)==0,142);
+        child=DO(57,0,0,0);CHECK(child>=0,143);
+        if(child==0) {
+            CHECK(DO(73,fd,6,0)==0,144); // fork shares this open-description lock.
+            long separate=DO(2,"/work/alias",0,0);CHECK(separate>=3,145);
+            CHECK(DO(73,separate,6,0)==-11 && DO(1,pipes[1],"F",1)==1,146);
+            CHECK(DO(73,separate,2,0)==0,147);
+            DO(60,29,0,0);__builtin_unreachable();
+        }
+        CHECK(DO(0,pipes[0],buffer,1)==1 && buffer[0]=='F',148);
+        CHECK(DO(73,fd,8,0)==0 && DO(61,child,&status,0)==child && status==(29<<8),149);
+        CHECK(DO(73,fd,6,0)==0 && DO(73,fd,16,0)==-22 && DO(3,fd,0,0)==0,150);
+    }
+    else if (mode=='a') {
         long child=DO(57,0,0,0); CHECK(child>=0,117);
         if(child==0) {
             long grandchild=DO(57,0,0,0); CHECK(grandchild>=0,118);

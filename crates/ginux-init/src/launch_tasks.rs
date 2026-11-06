@@ -449,6 +449,7 @@ impl Supervisor<'_> {
         if self.groups[group].as_ref().unwrap().owners == 0 {
             let owner = self.groups[group].as_ref().unwrap();
             let result = (owner.leader, owner.status);
+            self.objects.filesystem.release_process_locks(result.0.pid);
             if let Err(reason) = self.groups[group]
                 .as_mut()
                 .unwrap()
@@ -616,6 +617,9 @@ impl Supervisor<'_> {
         let original = *r;
         let id = self.task(index).id;
         let parent_group = self.task(index).group;
+        self.objects
+            .filesystem
+            .select_process(self.processes.view(id).unwrap().tgid);
         self.objects
             .filesystem
             .select_cwd(self.groups[parent_group].as_ref().unwrap().cwd);
@@ -1304,6 +1308,8 @@ impl Supervisor<'_> {
     }
 
     fn exec_completed(&mut self, index: usize, domain: &mut Domain) {
+        let owner = self.processes.view(self.task(index).id).unwrap().tgid;
+        self.objects.filesystem.select_process(owner);
         self.task_mut(index).path = None;
         if !self
             .task(index)

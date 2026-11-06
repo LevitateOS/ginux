@@ -309,7 +309,14 @@ handles stay private, including when the kernel reuses an underlying fd number.
 Dup/dup2/dup3 and fcntl duplication share an open description across owners;
 close-on-exec flags belong to each public descriptor. Owned backends close only
 after their last alias across all processes. Syscall arguments are translated for native IO/metadata/
-mmap and restored at exit. Native locks, leases and signal ownership are denied.
+mmap and restored at exit. Owned regular files support POSIX byte-range locks
+(`F_GETLK`, `F_SETLK`, `F_SETLKW`) with virtual process ownership: threads share
+locks, fork does not inherit them, and closing any descriptor for the inode
+releases that process's locks. Owned file/directory `flock` locks instead follow
+the open description across dup/fork and release on its final close. Each lock
+table is bounded to 64 ranges; exhaustion returns `ENOLCK` without a partial
+update. Conflicting blocking locks wait in the supervisor; native image locks,
+leases and signal ownership remain denied.
 
 Bootstrap constrains the real descriptor soft/hard limits to 256 while keeping
 lower operator limits. Allocation respects that lower soft limit; runtime

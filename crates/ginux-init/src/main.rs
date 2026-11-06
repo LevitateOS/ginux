@@ -15,6 +15,7 @@ mod device_hooks;
 mod dispatch;
 mod exec_image;
 mod exec_script;
+mod file_locks;
 mod file_mapping;
 mod fs_hooks;
 mod launch;

@@ -328,6 +328,7 @@ impl DescriptorTable {
         for entry in &mut self.entries {
             if entry.is_some_and(|d| d.cloexec) {
                 if let Handle::Owned(handle) = entry.take().unwrap().handle {
+                    backends.filesystem.close_locks(handle);
                     backends.release(handle)?;
                 }
                 // Kernel closed native handles with no surviving aliases.
@@ -418,7 +419,7 @@ impl DescriptorTable {
             }
             72 => {
                 call.save(r);
-                match self.get(r.rdi) {
+                match call.pinned.map(Ok).unwrap_or_else(|| self.get(r.rdi)) {
                     Err(e) => Err(e),
                     Ok(entry) => match r.rsi {
                         0 | 1030 => self.dup(pid, r, backends, call),
@@ -436,7 +437,7 @@ impl DescriptorTable {
                 }
             }
             0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55 | 74
-            | 75 | 77 | 78 | 91 | 217 => {
+            | 73 | 75 | 77 | 78 | 91 | 217 => {
                 call.save(r);
                 call.pinned
                     .map(Ok)
@@ -740,7 +741,15 @@ impl DescriptorTable {
                 return Ok(ready(-11));
             }
         }
-        Ok(match backends.claim(pid, r) {
+        let decision = match backends.claim(pid, r) {
+            NativeDecision::Hooked { result: -11, .. }
+                if (r.orig_rax == 72 && r.rsi == 7) || (r.orig_rax == 73 && r.rsi & 4 == 0) =>
+            {
+                NativeDecision::Park { fd: public_fd }
+            }
+            decision => decision,
+        };
+        Ok(match decision {
             NativeDecision::Park { .. } => {
                 if let Handle::Owned(handle) = entry.handle {
                     if crate::network_hooks::LaunchNetwork::owns(handle) {
@@ -781,6 +790,7 @@ impl DescriptorTable {
         };
         let entry = self.entries[slot].take().ok_or(-9)?;
         if let Handle::Owned(handle) = entry.handle {
+            backends.filesystem.close_locks(handle);
             if !backends.refs.release(handle) {
                 return Ok(ready(result.unwrap_or(0)));
             }
