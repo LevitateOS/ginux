@@ -716,6 +716,24 @@ impl Supervisor<'_> {
             }
         }
         match r.orig_rax {
+            63 => {
+                let result = (|| {
+                    let identity = ginux_kernel_views::IdentityView {
+                        hostname: domain.config().id.as_bytes(),
+                        machine_id: b"",
+                        boot_id: b"",
+                    };
+                    let mut bytes = [0u8; 390];
+                    identity.uname(b"x86_64", &mut bytes).map_err(|_| -5)?;
+                    if copy_memory(self.task(index).host, r.rdi, &mut bytes, true)? != 390 {
+                        return Err(-14);
+                    }
+                    Ok(0)
+                })()
+                .unwrap_or_else(|error| error);
+                self.emulate(index, r, result, domain);
+                return;
+            }
             203 => {
                 self.emulate(index, r, -1, domain);
                 return;

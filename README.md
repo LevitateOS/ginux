@@ -225,6 +225,9 @@ mutation is denied. `[resources].vcpus` restricts descendants to at most that ma
 logical CPUs selected from the launcher's allowed CPU affinity mask; self affinity
 queries report that actual subset and mutation is denied. This bounds eligible
 CPUs, not cumulative CPU time. No host-global cgroup policy is changed.
+Configured `uname` returns `Linux`, the domain id as hostname, the Ginux package
+version with `-ginux` as its virtual release, version `ginux`, and `x86_64`.
+It does not report host kernel/hostname data or promise that host kernel's ABI.
 
 Configured `poll` resolves at most 16 public descriptors through their owning
 table. Pipes, assigned memory files/directories, null, and console aliases may

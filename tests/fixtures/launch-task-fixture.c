@@ -34,6 +34,10 @@ long task_main(word *stack)
     action[0]=0; action[1]=2;
     CHECK(call(13,17,(word)action,0,8,0,0)==-95,82);
     if (mode=='R') {
+        unsigned char identity[390];
+        CHECK(DO(63,identity,0,0)==0 && identity[0]=='L' && identity[4]=='x' && identity[5]==0,164);
+        CHECK(identity[65]=='g' && identity[130]=='0' && identity[195]=='g' && identity[260]=='x' && identity[265]=='4' && identity[266]==0,165);
+        CHECK(DO(63,1,0,0)==-14,166);
         word limits[2];CHECK(call(302,0,9,0,(word)limits,0,0)==0 && limits[0]==32*1024*1024 && limits[1]==limits[0],151);
         word larger[2]={64*1024*1024,64*1024*1024};CHECK(call(302,0,9,(word)larger,0,0,0)==-1,152);
         CHECK(call(9,0,64*1024*1024,3,0x22,-1,0)==-12,153);
