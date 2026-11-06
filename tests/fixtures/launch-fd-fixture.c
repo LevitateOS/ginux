@@ -50,7 +50,9 @@ long fd_main(word *stack)
     long mapped=call(9,0,4096,1,2,reopened,0);
     CHECK(mapped>0 && *(unsigned char *)mapped==127,22);
     CHECK(DO(11,mapped,4096,0)==0,23);
-    CHECK(call(9,0,4096,1,2,memory,0)==-95,24); // Owned files never become native mmap handles.
+    mapped=call(9,0,4096,1,2,memory,0);
+    CHECK(mapped>0 && *(unsigned char *)mapped=='A' && DO(11,mapped,4096,0)==0,24); // Owned mappings use the private transfer transaction.
+    CHECK(call(9,0,4096,3,1,memory,0)==-95,49); // Writable shared backing is never exposed.
     CHECK(call(9,0,4096,1,2,0,0)==-95 && DO(217,0,bytes,sizeof bytes)==-20,48);
     CHECK(DO(33,null,reopened,0)==reopened,25);
     CHECK(DO(0,reopened,bytes,1)==0,26);

@@ -242,6 +242,10 @@ impl DescriptorTable {
         Ok(table)
     }
 
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub fn fork_copy(&self, refs: &mut ObjectReferences) -> Result<Self, &'static [u8]> {
         if self
             .entries

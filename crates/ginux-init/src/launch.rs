@@ -349,13 +349,14 @@ pub fn launch_main(
     launch_validate(&config);
     let mut devices = crate::device_hooks::LaunchDevices::prepare(&config)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
+    // Capture the operator's public limit before reserving private storage FDs.
+    let descriptors = crate::descriptors::DescriptorTable::new()
+        .unwrap_or_else(|reason| launch_startup_fail(reason));
     let mut filesystem = crate::fs_hooks::LaunchFs::prepare(&config)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     crate::storage_restore::restore(restore_path, &mut filesystem)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     let mut channels = crate::channel_hooks::LaunchChannels::new();
-    let descriptors = crate::descriptors::DescriptorTable::new()
-        .unwrap_or_else(|reason| launch_startup_fail(reason));
     print_launch_config(&config);
     let mut domain = Domain::create(config);
     if domain.start().is_err() {
@@ -370,7 +371,7 @@ pub fn launch_main(
         launch_domain_fail(&mut domain, b"launch tracee fork failed");
     }
     if child == 0 {
-        launch_tracee(root_path);
+        launch_tracee(root_path, descriptors.capacity());
     }
     supervise_launch(
         child as usize,
@@ -852,12 +853,12 @@ pub(crate) fn finish_signaled(signal: u64) {
     exit_process(128 + signal as usize)
 }
 
-fn launch_tracee(root_path: *const u8) -> ! {
+fn launch_tracee(root_path: *const u8, descriptor_limit: usize) -> ! {
     static ROOT: &[u8] = b"/\0";
     // Host descriptors (including the result file) must not grant the
     // workload authority outside the supplied root. Only stdio is shared.
     const SYS_CLOSE_RANGE: usize = 436;
-    if !crate::tracee_io::reserve_native_descriptors(crate::descriptors::LIMIT) {
+    if !crate::tracee_io::reserve_native_descriptors(descriptor_limit) {
         tracee_setup_fail(
             b"ginux: launch bootstrap failed: descriptor namespace unavailable\n",
             130,

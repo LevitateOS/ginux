@@ -34,15 +34,23 @@ def main():
             assert record['outcome']=='exited' and record['code']==0 and record['generation'] is None,record
             assert proc.stdout==b'shared-fds: PASS\n',proc.stdout
             assert not (root/'work/data').exists()
-        # A lower operator limit remains effective for both native and public FDs.
+        # A lower public soft limit remains effective despite private backing FDs.
         (work/'low.toml').write_text(config.replace('args = []','args = ["low"]'))
         def lower_limit():
-            resource.setrlimit(resource.RLIMIT_NOFILE,(8,8))
+            _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE,(8,hard))
         result=work/'low.json'
         proc=subprocess.run([binary,'launch',str(work/'low.toml'),str(root),'--result-file',str(result)],capture_output=True,timeout=20,preexec_fn=lower_limit)
         assert proc.returncode==0,(proc.returncode,proc.stderr)
         assert proc.stdout==b'lower-limit: PASS\n',proc.stdout
         assert json.loads(result.read_text())['code']==0
+        # A hard limit too low for the declared backing budget fails before exec.
+        def insufficient_hard_limit():
+            resource.setrlimit(resource.RLIMIT_NOFILE,(8,8))
+        result=work/'hard.json'
+        proc=subprocess.run([binary,'launch',str(work/'low.toml'),str(root),'--result-file',str(result)],capture_output=True,timeout=20,preexec_fn=insufficient_hard_limit)
+        assert proc.returncode==2 and b'storage descriptor budget exceeds host hard limit' in proc.stderr,(proc.returncode,proc.stderr)
+        assert json.loads(result.read_text())['outcome']=='supervisor-error'
         print('test-launch-fds: PASS (small numbers, cross-owner aliases, native reuse/mmap, limits, registers)')
 
 
