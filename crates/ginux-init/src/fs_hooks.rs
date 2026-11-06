@@ -1534,18 +1534,41 @@ impl LaunchFs {
         offset: Option<i64>,
     ) -> Result<i64, i64> {
         self.fs.fstat(fd).map_err(errno)?;
-        let mut buffer = [0u8; IO_SIZE];
-        let count = length.min(IO_SIZE as u64) as usize;
-        let copied = copy_memory(pid, address, &mut buffer[..count], false)? as usize;
         let previous = self.fs.seek(fd, 0, 1).map_err(errno)?;
         if let Some(offset) = offset {
             self.fs.seek(fd, offset, 0).map_err(errno)?;
         }
-        let result = self
-            .fs
-            .write(fd, &buffer[..copied])
-            .map(|n| n as i64)
-            .map_err(errno);
+        let result = (|| {
+            let mut buffer = [0u8; IO_SIZE];
+            let limit = length.min(1024 * 1024) as usize;
+            if limit == 0 {
+                return self.fs.write(fd, &[]).map(|n| n as i64).map_err(errno);
+            }
+            let mut written = 0usize;
+            while written < limit {
+                let count = (limit - written).min(IO_SIZE);
+                let copy = address
+                    .checked_add(written as u64)
+                    .ok_or(-14)
+                    .and_then(|address| copy_memory(pid, address, &mut buffer[..count], false));
+                let copied = match copy {
+                    Ok(n) => n as usize,
+                    Err(_) if written != 0 => break,
+                    Err(error) => return Err(error),
+                };
+                match self.fs.write(fd, &buffer[..copied]).map_err(errno) {
+                    Ok(n) => {
+                        written += n;
+                        if n != copied || copied != count {
+                            break;
+                        }
+                    }
+                    Err(_) if written != 0 => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(written as i64)
+        })();
         if offset.is_some() {
             self.fs.seek(fd, previous as i64, 0).map_err(errno)?;
         }

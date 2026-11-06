@@ -27,6 +27,15 @@ long storage_main(word *stack)
         CHECK(DO(20,fd,vectors,2)==4 && DO(8,fd,0,0)==0,234);
         vectors[0]=(word)output;vectors[1]=1;vectors[2]=(word)(output+1);vectors[3]=3;
         CHECK(DO(19,fd,vectors,2)==4 && output[0]=='a' && output[3]=='d',235);
+        long big=DO(2,"/work/big-write",0102,0600);CHECK(big>=3,236);
+        data[0]='A';data[sizeof data-1]='Z';
+        CHECK(DO(1,big,data,sizeof data)==sizeof data && DO(5,big,meta,0)==0 && *(word *)(meta+48)==sizeof data,237);
+        CHECK(call(17,big,(word)output,1,sizeof data-1,0,0)==1 && output[0]=='Z',238);
+        long pages=call(9,0,8192,3,0x22,-1,0);CHECK(pages>0 && DO(10,pages+4096,4096,0)==0,239);
+        CHECK(DO(77,big,0,0)==0 && DO(8,big,0,0)==0 && DO(1,big,pages,8192)==4096,240);
+        CHECK(DO(5,big,meta,0)==0 && *(word *)(meta+48)==4096 && DO(8,big,0,1)==4096,241);
+        CHECK(DO(8,big,0,0)==0 && call(18,big,pages,8192,8192,0,0)==4096 && DO(8,big,0,1)==0,242);
+        CHECK(DO(11,pages,8192,0)==0 && DO(3,big,0,0)==0,243);
         long times[4]={11,123,123456789,987654321};
         CHECK(call(280,fd,0,(word)times,0,0,0)==0 && DO(5,fd,meta,0)==0,221);
         CHECK(*(long *)(meta+72)==11 && *(long *)(meta+80)==123 && *(long *)(meta+88)==123456789 && *(long *)(meta+96)==987654321,222);
@@ -223,6 +232,9 @@ long storage_main(word *stack)
         const word mib=1024*1024;
         long a=DO(2,"/out/a",0102,0600), b=DO(2,"/out/b",0102,0600), c=DO(2,"/out/c",0102,0600);
         CHECK(a>=3 && b>=3 && c>=3,75);
+        CHECK(DO(77,a,16*mib-4096,0)==0 && DO(8,a,16*mib-4096,0)==16*mib-4096,244);
+        CHECK(DO(1,a,data,8192)==4096 && DO(1,a,data,1)==-28 && DO(5,a,meta,0)==0 && *(word *)(meta+48)==16*mib,245);
+        CHECK(DO(77,a,0,0)==0 && DO(8,a,0,0)==0,246);
         CHECK(DO(77,a,12*mib,0)==0 && DO(77,b,8*mib,0)==-28,76);
         CHECK(DO(5,b,meta,0)==0 && *(word *)(meta+48)==0,77);
         CHECK(DO(77,a,4*mib,0)==0 && DO(77,b,8*mib,0)==0,78);

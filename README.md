@@ -295,7 +295,9 @@ Aliases share timestamps, and stat/statx project those values. Checkpoints keep
 whole-second nonnegative USTAR mtime; runtime nanoseconds and atime are not
 persisted. Unrepresentable mtimes fail export rather than silently changing.
 Owned execution and private file mappings are described below.
-This is not a complete unified image/overlay filesystem. IO is bounded to 4096 bytes per call. Metadata supports
+This is not a complete unified image/overlay filesystem. Regular writes/pwrites process at most 1 MiB per call using 4 KiB scratch chunks;
+errors and copy faults return only the bytes actually committed. Regular reads,
+vectored IO, pipes and network IO retain their 4 KiB per-call bounds. Metadata supports
 a configurable namespace and 64 independently opened file handles.
 `[storage].max_objects` defaults to 16384, accepts 1–1000000 and includes seeded
 directories and live or pinned namespace slots. Namespace and backing metadata
