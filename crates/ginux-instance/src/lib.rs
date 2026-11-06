@@ -152,9 +152,14 @@ pub struct InstanceConfig {
     pub contract_deny: TextList<POLICY_ITEMS, POLICY_BYTES>,
     pub contract_digest: Text<REFERENCE_BYTES>,
     pub storage: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
+    pub storage_max_objects: u64,
+    pub storage_max_bytes: u64,
     pub volumes: TextList<ASSIGNMENT_ITEMS, POLICY_BYTES>,
     pub devices: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     pub network_backend: NetworkBackend,
+    pub network_endpoints: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
+    pub network_max_connections: u64,
+    pub network_max_bytes: u64,
     pub network_interface: Text<IDENTIFIER_BYTES>,
     pub network_source: Text<IDENTIFIER_BYTES>,
     pub ingress_allow: TextList<POLICY_ITEMS, POLICY_BYTES>,
@@ -170,6 +175,22 @@ pub struct InstanceConfig {
     pub stop_timeout_seconds: u64,
     pub audit_mode: AuditMode,
     pub failure_policy: FailurePolicy,
+}
+
+/// Numeric destination parsing does not consult host DNS or interface state.
+pub fn parse_network_endpoint(text: &[u8]) -> Result<core::net::SocketAddr, ConfigError> {
+    let text = core::str::from_utf8(text).map_err(|_| ConfigError::InvalidValue)?;
+    let endpoint = text
+        .parse::<core::net::SocketAddr>()
+        .map_err(|_| ConfigError::InvalidValue)?;
+    if endpoint.port() == 0
+        || endpoint.ip().is_unspecified()
+        || endpoint.ip().is_multicast()
+        || matches!(endpoint, core::net::SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.flowinfo() != 0)
+    {
+        return Err(ConfigError::InvalidValue);
+    }
+    Ok(endpoint)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -260,9 +281,14 @@ struct ConfigBuilder {
     contract_deny: TextList<POLICY_ITEMS, POLICY_BYTES>,
     contract_digest: Text<REFERENCE_BYTES>,
     storage: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
+    storage_max_objects: u64,
+    storage_max_bytes: u64,
     volumes: TextList<ASSIGNMENT_ITEMS, POLICY_BYTES>,
     devices: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     network_backend: NetworkBackend,
+    network_endpoints: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
+    network_max_connections: u64,
+    network_max_bytes: u64,
     network_interface: Text<IDENTIFIER_BYTES>,
     network_source: Text<IDENTIFIER_BYTES>,
     ingress_allow: TextList<POLICY_ITEMS, POLICY_BYTES>,
@@ -302,9 +328,14 @@ impl ConfigBuilder {
             contract_deny: TextList::empty(),
             contract_digest: Text::empty(),
             storage: TextList::empty(),
+            storage_max_objects: 32,
+            storage_max_bytes: 0,
             volumes: TextList::empty(),
             devices: TextList::empty(),
             network_backend: NetworkBackend::Shared,
+            network_endpoints: TextList::empty(),
+            network_max_connections: 0,
+            network_max_bytes: 0,
             network_interface: Text::empty(),
             network_source: Text::empty(),
             ingress_allow: TextList::empty(),
@@ -370,9 +401,14 @@ impl ConfigBuilder {
             contract_deny: self.contract_deny,
             contract_digest: Text::empty(),
             storage: self.storage,
+            storage_max_objects: self.storage_max_objects,
+            storage_max_bytes: self.storage_max_bytes,
             volumes: self.volumes,
             devices: self.devices,
             network_backend: self.network_backend,
+            network_endpoints: self.network_endpoints,
+            network_max_connections: self.network_max_connections,
+            network_max_bytes: self.network_max_bytes,
             network_interface: self.network_interface,
             network_source: self.network_source,
             ingress_allow: self.ingress_allow,
@@ -472,6 +508,11 @@ impl InstanceConfig {
             b"contract.deny" => self.contract_deny = parse_list(value)?,
             b"contract.digest" => return Err(ConfigError::DerivedField),
             b"storage.assignments" => self.storage = parse_list(value)?,
+            b"storage.max_objects" => self.storage_max_objects = parse_u64(value)?,
+            b"storage.max_bytes" => {
+                self.storage_max_bytes = parse_u64(value)?;
+                if self.storage_max_bytes == 0 { return Err(ConfigError::InvalidValue); }
+            }
             b"volumes.assignments" => self.volumes = parse_list(value)?,
             b"devices.assignments" => self.devices = parse_list(value)?,
             b"network.backend" => {
@@ -482,6 +523,9 @@ impl InstanceConfig {
                     _ => return Err(ConfigError::InvalidValue),
                 }
             }
+            b"network.endpoints" => self.network_endpoints = parse_list(value)?,
+            b"network.max_connections" => self.network_max_connections = parse_u64(value)?,
+            b"network.max_bytes" => self.network_max_bytes = parse_u64(value)?,
             b"network.interface" => self.network_interface = parse_string(value)?,
             b"network.source" => self.network_source = parse_string(value)?,
             b"network.ingress_allow" => self.ingress_allow = parse_list(value)?,
@@ -534,6 +578,40 @@ impl InstanceConfig {
         validate_identifier(self.hostname.as_bytes())?;
         if !self.contract_digest.is_empty() {
             validate_reference(self.contract_digest.as_bytes())?;
+        }
+        if !(1..=1_000_000).contains(&self.storage_max_objects)
+            || self
+                .memory_mib
+                .checked_mul(1024 * 1024)
+                .is_none_or(|limit| self.storage_max_bytes > limit)
+        {
+            return Err(ConfigError::InvalidValue);
+        }
+        let endpoints = self.network_endpoints.as_slice();
+        if self.network_backend == NetworkBackend::None
+            && (!endpoints.is_empty()
+                || self.network_max_connections != 0
+                || self.network_max_bytes != 0)
+        {
+            return Err(ConfigError::InvalidValue);
+        }
+        if !endpoints.is_empty() || self.network_max_connections != 0 || self.network_max_bytes != 0
+        {
+            if endpoints.is_empty()
+                || !(1..=16).contains(&self.network_max_connections)
+                || self.network_max_bytes == 0
+            {
+                return Err(ConfigError::InvalidValue);
+            }
+            for (index, text) in endpoints.iter().enumerate() {
+                let endpoint = parse_network_endpoint(text.as_bytes())?;
+                if endpoints[..index]
+                    .iter()
+                    .any(|prior| parse_network_endpoint(prior.as_bytes()) == Ok(endpoint))
+                {
+                    return Err(ConfigError::InvalidValue);
+                }
+            }
         }
         if !(1..=64).contains(&self.vcpus) || !(16..=1_048_576).contains(&self.memory_mib) {
             return Err(ConfigError::InvalidValue);
@@ -714,6 +792,12 @@ impl InstanceConfig {
         output.quoted(self.contract_digest.as_bytes())?;
         output.raw(b"\n\n[storage]\nassignments = ")?;
         output.list(self.storage.as_slice())?;
+        output.raw(b"\nmax_objects = ")?;
+        output.number(self.storage_max_objects)?;
+        if self.storage_max_bytes != 0 {
+            output.raw(b"\nmax_bytes = ")?;
+            output.number(self.storage_max_bytes)?;
+        }
         output.raw(b"\n\n[volumes]\nassignments = ")?;
         output.list(self.volumes.as_slice())?;
         output.raw(b"\n\n[devices]\nassignments = ")?;
@@ -724,6 +808,14 @@ impl InstanceConfig {
             NetworkBackend::Mediated => b"mediated",
             NetworkBackend::Shared => b"shared",
         })?;
+        if !self.network_endpoints.as_slice().is_empty() {
+            output.raw(b"\nendpoints = ")?;
+            output.list(self.network_endpoints.as_slice())?;
+            output.raw(b"\nmax_connections = ")?;
+            output.number(self.network_max_connections)?;
+            output.raw(b"\nmax_bytes = ")?;
+            output.number(self.network_max_bytes)?;
+        }
         output.raw(b"\ninterface = ")?;
         output.quoted(self.network_interface.as_bytes())?;
         output.raw(b"\nsource = ")?;
@@ -849,7 +941,7 @@ const CONFIG_TEXT_BYTES: usize = IDENTIFIER_BYTES
     + ASSIGNMENT_ITEMS * ASSIGNMENT_BYTES
     + 2 * POLICY_ITEMS * POLICY_BYTES
     + REFERENCE_BYTES
-    + 2 * ASSIGNMENT_ITEMS * ASSIGNMENT_BYTES
+    + 3 * ASSIGNMENT_ITEMS * ASSIGNMENT_BYTES
     + ASSIGNMENT_ITEMS * POLICY_BYTES
     + 2 * IDENTIFIER_BYTES
     + 4 * POLICY_ITEMS * POLICY_BYTES
@@ -1048,6 +1140,15 @@ fn parse_field(
             builder.mark(1 << 11)?;
             builder.storage = parse_list(value)?;
         }
+        (Section::Storage, b"max_objects") => {
+            builder.mark(1u64 << 36)?;
+            builder.storage_max_objects = parse_u64(value)?;
+        }
+        (Section::Storage, b"max_bytes") => {
+            builder.mark(1u64 << 37)?;
+            builder.storage_max_bytes = parse_u64(value)?;
+            if builder.storage_max_bytes == 0 { return Err(ConfigError::InvalidValue); }
+        }
         (Section::Volumes, b"assignments") => {
             builder.mark(1 << 22)?;
             builder.volumes = parse_list(value)?;
@@ -1064,6 +1165,18 @@ fn parse_field(
                 b"shared" => NetworkBackend::Shared,
                 _ => return Err(ConfigError::InvalidValue),
             };
+        }
+        (Section::Network, b"endpoints") => {
+            builder.mark(1u64 << 38)?;
+            builder.network_endpoints = parse_list(value)?;
+        }
+        (Section::Network, b"max_connections") => {
+            builder.mark(1u64 << 39)?;
+            builder.network_max_connections = parse_u64(value)?;
+        }
+        (Section::Network, b"max_bytes") => {
+            builder.mark(1u64 << 40)?;
+            builder.network_max_bytes = parse_u64(value)?;
         }
         (Section::Network, b"interface") => {
             builder.mark(1 << 23)?;
@@ -1601,6 +1714,65 @@ mode = "stderr"
 [failure]
 policy = "stop"
 "#;
+
+    #[test]
+    fn storage_bounds_are_explicit_and_round_trip() {
+        use std::format;
+        let text = VALID.replace(
+            "[storage]",
+            "[storage]\nmax_objects = 8192\nmax_bytes = 8388608",
+        );
+        let config = InstanceConfig::parse(text.as_bytes()).unwrap();
+        assert_eq!(config.storage_max_objects, 8192);
+        assert_eq!(config.storage_max_bytes, 8388608);
+        let normalized = config.normalized().unwrap();
+        assert_eq!(InstanceConfig::parse(normalized.as_bytes()).unwrap(), config);
+        for field in [
+            "max_objects = 0",
+            "max_objects = 1000001",
+            "max_bytes = 0",
+            "max_bytes = 18446744073709551615",
+            "max_objects = 1\nmax_objects = 2",
+        ] {
+            assert!(InstanceConfig::parse(
+                VALID
+                    .replace("[storage]", &format!("[storage]\n{field}"))
+                    .as_bytes()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn tcp_grants_are_numeric_bounded_and_complete() {
+        let fields = "backend = \"mediated\"\nendpoints = [\"127.0.0.1:443\", \"[::1]:8443\"]\nmax_connections = 2\nmax_bytes = 4096";
+        let text = VALID.replace("backend = \"none\"", fields);
+        let config = InstanceConfig::parse(text.as_bytes()).unwrap();
+        assert_eq!(
+            InstanceConfig::parse(config.normalized().unwrap().as_bytes()).unwrap(),
+            config
+        );
+        for field in [
+            "endpoints = [\"example.com:443\"]",
+            "endpoints = [\"127.0.0.1:0\"]",
+            "endpoints = [\"127.0.0.1:443\",\"127.0.0.1:443\"]",
+            "max_connections = 17",
+            "max_bytes = 0",
+        ] {
+            let original = if field.starts_with("endpoints") {
+                "endpoints = [\"127.0.0.1:443\", \"[::1]:8443\"]"
+            } else if field.starts_with("max_connections") {
+                "max_connections = 2"
+            } else {
+                "max_bytes = 4096"
+            };
+            let text = VALID.replace("backend = \"none\"", &fields.replace(original, field));
+            assert!(InstanceConfig::parse(text.as_bytes()).is_err());
+        }
+        assert!(parse_network_endpoint(b"example.com:443").is_err());
+        assert!(parse_network_endpoint(b"[fe80::1%1]:443").is_err());
+        assert!(parse_network_endpoint(b"0.0.0.0:443").is_err());
+    }
 
     #[test]
     fn parses_and_normalizes_versioned_config() {

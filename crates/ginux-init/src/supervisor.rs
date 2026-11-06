@@ -78,6 +78,7 @@ pub const INSTANCE_UID: usize = 1000;
 pub const INSTANCE_GID: usize = 1000;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct UserRegs {
     pub r15: u64,
     pub r14: u64,
@@ -147,19 +148,7 @@ const VM_WRITE_DENIED: u8 = 2;
 pub fn write_tracee_bytes(pid: usize, address: usize, bytes: &[u8]) -> Result<(), i64> {
     let state = VM_WRITE.load(Ordering::Relaxed);
     if state != VM_WRITE_DENIED {
-        let local = [bytes.as_ptr() as usize, bytes.len()];
-        let remote = [address, bytes.len()];
-        let written = unsafe {
-            syscall6(
-                SYS_PROCESS_VM_WRITEV,
-                pid,
-                local.as_ptr() as usize,
-                1,
-                remote.as_ptr() as usize,
-                1,
-                0,
-            )
-        } as i64;
+        let written = process_vm_write_bytes(pid, address, bytes);
         let unavailable = matches!(-written, ENOSYS | EPERM | EACCES);
         if !unavailable || state == VM_WRITE_AVAILABLE {
             if written >= 0 {
@@ -179,6 +168,35 @@ pub fn write_tracee_bytes(pid: usize, address: usize, bytes: &[u8]) -> Result<()
         write_all(b"\n");
     }
     poke_tracee_bytes(pid, address, bytes).map_err(fault_errno)
+}
+
+/// Copy without ptrace fallback: guest page protections remain authoritative.
+pub fn write_tracee_bytes_strict(pid: usize, address: usize, bytes: &[u8]) -> Result<(), i64> {
+    address.checked_add(bytes.len()).ok_or(-EFAULT)?;
+    let written = process_vm_write_bytes(pid, address, bytes);
+    if written == bytes.len() as i64 {
+        Ok(())
+    } else if written < 0 {
+        Err(written)
+    } else {
+        Err(-EFAULT)
+    }
+}
+
+fn process_vm_write_bytes(pid: usize, address: usize, bytes: &[u8]) -> i64 {
+    let local = [bytes.as_ptr() as usize, bytes.len()];
+    let remote = [address, bytes.len()];
+    (unsafe {
+        syscall6(
+            SYS_PROCESS_VM_WRITEV,
+            pid,
+            local.as_ptr() as usize,
+            1,
+            remote.as_ptr() as usize,
+            1,
+            0,
+        )
+    }) as i64
 }
 
 /// Map a failed ptrace access to the errno a user copy would report: an

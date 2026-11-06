@@ -255,7 +255,7 @@ clean:
 	cargo clean
 	@./scripts/clean-build.sh
 
-.PHONY: build-launch-fixture test-launch test-native-supervision
+.PHONY: build-launch-fixture test-launch test-native-supervision build-launch-storage-fixture test-launch-storage
 build-launch-fixture:
 	mkdir -p .artifacts/launch
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fixture.c -o .artifacts/launch/launch-fixture
@@ -266,3 +266,100 @@ test-launch:
 
 test-native-supervision:
 	python3 scripts/test-native-supervision.py $(GINUX) .artifacts/launch/native-fixture
+
+build-launch-storage-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-storage-fixture.c -o .artifacts/launch/launch-storage-fixture
+
+test-launch-storage:
+	python3 scripts/test-launch-storage.py $(GINUX) .artifacts/launch/launch-storage-fixture
+
+.PHONY: build-launch-device-fixture test-launch-devices
+build-launch-device-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-device-fixture.c -o .artifacts/launch/launch-device-fixture
+
+test-launch-devices:
+	python3 scripts/test-launch-devices.py $(GINUX) .artifacts/launch/launch-device-fixture
+
+.PHONY: build-launch-pipe-fixture test-launch-pipes
+build-launch-pipe-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-pipe-fixture.c -o .artifacts/launch/launch-pipe-fixture
+
+test-launch-pipes:
+	python3 scripts/test-launch-pipes.py $(GINUX) .artifacts/launch/launch-pipe-fixture
+
+.PHONY: build-launch-fd-fixture test-launch-fds
+build-launch-fd-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fd-fixture.c -o .artifacts/launch/launch-fd-fixture
+
+test-launch-fds:
+	python3 scripts/test-launch-fds.py $(GINUX) .artifacts/launch/launch-fd-fixture
+
+.PHONY: build-launch-task-fixture test-launch-tasks
+build-launch-task-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-task-fixture.c -o .artifacts/launch/launch-task-fixture
+
+test-launch-tasks:
+	python3 scripts/test-launch-tasks.py $(GINUX) .artifacts/launch/launch-task-fixture
+
+.PHONY: build-launch-exec-fixture test-launch-exec
+build-launch-exec-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-exec-fixture.c -o .artifacts/launch/launch-exec-fixture
+	$(CC) -nostdlib -pie -Wl,--dynamic-linker=/work/hidden tests/fixtures/launch-interpreter-fixture.S -o .artifacts/launch/launch-interpreter-fixture
+	$(CC) -nostdlib -pie -Wl,--dynamic-linker=/bin/second tests/fixtures/launch-interpreter-fixture.S -o .artifacts/launch/launch-interpreter-allowed-fixture
+
+test-launch-exec:
+	python3 scripts/test-launch-exec.py $(GINUX) .artifacts/launch/launch-exec-fixture .artifacts/launch/launch-interpreter-fixture .artifacts/launch/launch-interpreter-allowed-fixture
+
+.PHONY: build-launch-poll-fixture test-launch-poll
+build-launch-poll-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-poll-fixture.c -o .artifacts/launch/launch-poll-fixture
+
+test-launch-poll:
+	python3 scripts/test-launch-poll.py $(GINUX) .artifacts/launch/launch-poll-fixture
+
+.PHONY: build-launch-directory-fixture test-launch-directories
+build-launch-directory-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-directory-fixture.c -o .artifacts/launch/launch-directory-fixture
+
+test-launch-directories:
+	python3 scripts/test-launch-directories.py $(GINUX) .artifacts/launch/launch-directory-fixture
+
+.PHONY: build-launch-owned-exec-fixture test-launch-owned-exec
+build-launch-owned-exec-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-owned-exec-fixture.c -o .artifacts/launch/launch-owned-exec-fixture
+
+test-launch-owned-exec:
+	python3 scripts/test-launch-owned-exec.py $(GINUX) .artifacts/launch/launch-owned-exec-fixture
+
+.PHONY: build-launch-script-fixture test-launch-scripts
+build-launch-script-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-script-fixture.c -o .artifacts/launch/launch-script-fixture
+
+test-launch-scripts:
+	python3 scripts/test-launch-scripts.py $(GINUX) .artifacts/launch/launch-script-fixture
+
+.PHONY: test-launch-checkpoints
+test-launch-checkpoints:
+	python3 scripts/test-launch-checkpoints.py $(GINUX) .artifacts/launch/launch-storage-fixture
+
+.PHONY: test-launch-restore
+test-launch-restore:
+	python3 scripts/test-launch-restore.py $(GINUX) .artifacts/launch/launch-storage-fixture
+
+.PHONY: build-launch-network-fixture test-launch-network
+build-launch-network-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-network-fixture.c -o .artifacts/launch/launch-network-fixture
+
+test-launch-network:
+	python3 scripts/test-launch-network.py $(GINUX) .artifacts/launch/launch-network-fixture

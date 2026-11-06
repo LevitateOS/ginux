@@ -1,0 +1,979 @@
+//! Configured-launch public descriptors. Backend handles never cross this ABI.
+//! Aliases share an open object; descriptor flags belong to each public slot.
+
+use crate::channel_hooks::LaunchChannels;
+use crate::device_hooks::LaunchDevices;
+use crate::dispatch::{decide_objects, Lane, NativeDecision};
+use crate::fs_hooks::LaunchFs;
+use crate::supervisor::{syscall2, syscall3, syscall4, UserRegs};
+use crate::tracee_io::{copy_memory, read_path};
+use ginux_core::decide_balanced;
+
+pub const LIMIT: usize = 256;
+pub enum ExecDescriptor {
+    Native(u32),
+    Owned(u32),
+}
+const CLOEXEC: u64 = 0o2000000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Handle {
+    Reserved,
+    Native { fd: u32, console: bool },
+    Owned(u32),
+}
+
+#[derive(Clone, Copy)]
+struct Descriptor {
+    handle: Handle,
+    cloexec: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Pending {
+    Open { slot: usize },
+    Close { result: Option<i64> },
+}
+
+/// Owned backend handles are domain-wide; native kernel numbers are per task.
+pub struct ObjectReferences {
+    counts: [u16; 128 + crate::channel_hooks::FDS + crate::network_hooks::FDS],
+}
+impl ObjectReferences {
+    pub const fn new() -> Self {
+        Self {
+            counts: [0; 128 + crate::channel_hooks::FDS + crate::network_hooks::FDS],
+        }
+    }
+    pub fn active(&self) -> usize {
+        self.counts.iter().filter(|n| **n != 0).count()
+    }
+    fn index(handle: u32) -> usize {
+        if crate::network_hooks::LaunchNetwork::owns(handle) {
+            128 + crate::channel_hooks::FDS + (handle - crate::network_hooks::FD_BASE) as usize
+        } else if (0x4000_0000..0x4000_0040).contains(&handle) {
+            64 + crate::channel_hooks::FDS + (handle - 0x4000_0000) as usize
+        } else if (0x2000_0000..0x2000_0000 + crate::channel_hooks::FDS as u32).contains(&handle) {
+            64 + (handle - 0x2000_0000) as usize
+        } else {
+            assert!((1048576..1048640).contains(&handle));
+            (handle - 1048576) as usize
+        }
+    }
+    fn retain(&mut self, handle: u32) {
+        let i = Self::index(handle);
+        self.counts[i] = self.counts[i]
+            .checked_add(1)
+            .expect("owned descriptor reference overflow");
+    }
+    fn release(&mut self, handle: u32) -> bool {
+        let i = Self::index(handle);
+        assert!(self.counts[i] > 0);
+        self.counts[i] -= 1;
+        self.counts[i] == 0
+    }
+}
+
+pub struct Backends<'a> {
+    pub filesystem: &'a mut LaunchFs,
+    pub devices: &'a mut LaunchDevices,
+    pub channels: &'a mut LaunchChannels,
+    pub refs: &'a mut ObjectReferences,
+}
+impl Backends<'_> {
+    fn claim(&mut self, pid: usize, r: &UserRegs) -> NativeDecision {
+        decide_objects(pid, r, self.filesystem, self.devices, self.channels)
+    }
+    fn release(&mut self, handle: u32) -> Result<(), &'static [u8]> {
+        if !self.refs.release(handle) {
+            return Ok(());
+        }
+        // Owned close does not use task memory or a native descriptor.
+        let mut r = empty_regs();
+        r.orig_rax = 3;
+        r.rdi = handle as u64;
+        match self.claim(0, &r) {
+            NativeDecision::Hooked { result: 0, .. } => Ok(()),
+            _ => Err(b"owned backend release failed"),
+        }
+    }
+}
+
+fn empty_regs() -> UserRegs {
+    unsafe { core::mem::zeroed() }
+}
+
+pub struct DescriptorTable {
+    entries: [Option<Descriptor>; LIMIT],
+    capacity: usize,
+    pending: Option<Pending>,
+    saved_args: Option<[u64; 7]>,
+    poll_wait: bool,
+    poll_tick: bool,
+    poll_deadline: Option<u64>,
+    poll_input: [u8; 128],
+}
+
+impl DescriptorTable {
+    pub fn new() -> Result<Self, &'static [u8]> {
+        let mut limits = [0u64; 2];
+        if unsafe { syscall4(302, 0, 7, 0, limits.as_mut_ptr() as usize) } < 0 {
+            return Err(b"descriptor limit query failed");
+        }
+        let mut table = Self {
+            entries: [None; LIMIT],
+            capacity: limits[0].min(LIMIT as u64) as usize,
+            pending: None,
+            saved_args: None,
+            poll_wait: false,
+            poll_tick: false,
+            poll_deadline: None,
+            poll_input: [0; 128],
+        };
+        for fd in 0..3 {
+            // Bootstrap exec closes CLOEXEC stdio just like an already closed
+            // descriptor. Neither may invent a live public console handle.
+            if unsafe { syscall3(72, fd, 1, 0) } == 0 {
+                table.entries[fd] = Some(Descriptor {
+                    handle: Handle::Native {
+                        fd: fd as u32,
+                        console: true,
+                    },
+                    cloexec: false,
+                });
+            }
+        }
+        Ok(table)
+    }
+
+    pub fn needs_poll_tick(&self) -> bool {
+        self.poll_tick
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn fork_copy(&self, refs: &mut ObjectReferences) -> Result<Self, &'static [u8]> {
+        if self.pending.is_some() || self.saved_args.is_some() {
+            return Err(b"cannot inherit unfinished descriptor syscall");
+        }
+        for entry in self.entries.iter().flatten() {
+            if let Handle::Owned(handle) = entry.handle {
+                refs.retain(handle);
+            }
+        }
+        Ok(Self {
+            entries: self.entries,
+            capacity: self.capacity,
+            pending: None,
+            saved_args: None,
+            poll_wait: false,
+            poll_tick: false,
+            poll_deadline: None,
+            poll_input: [0; 128],
+        })
+    }
+
+    /// One native handle can back public aliases with different FD_CLOEXEC.
+    /// Synchronize the kernel bit only when all aliases will be retired.
+    pub fn next_exec_native(&self, first: usize) -> Option<(usize, bool)> {
+        for fd in first..LIMIT {
+            let mut aliases = self
+                .entries
+                .iter()
+                .flatten()
+                .filter(
+                    |d| matches!(d.handle, Handle::Native { fd: raw, .. } if raw as usize == fd),
+                )
+                .peekable();
+            if aliases.peek().is_some() {
+                return Some((fd, aliases.all(|d| d.cloexec)));
+            }
+        }
+        None
+    }
+
+    pub fn native_descriptor_set(&self) -> [bool; LIMIT] {
+        let mut used = [false; LIMIT];
+        for descriptor in self.entries.iter().flatten() {
+            if let Handle::Native { fd, .. } = descriptor.handle {
+                used[fd as usize] = true;
+            }
+        }
+        used
+    }
+
+    pub fn mapping_file(&self, fd: u64) -> Result<Option<u32>, i64> {
+        match self.get(fd)?.handle {
+            Handle::Native { .. } => Ok(None),
+            Handle::Owned(handle) if (1048576..1048640).contains(&handle) => Ok(Some(handle)),
+            _ => Err(-95),
+        }
+    }
+
+    pub fn exec_descriptor(&self, fd: u64) -> Result<ExecDescriptor, i64> {
+        match self.get(fd)?.handle {
+            Handle::Native { fd, console: false } => Ok(ExecDescriptor::Native(fd)),
+            Handle::Owned(handle) if (1048576..1048640).contains(&handle) => {
+                Ok(ExecDescriptor::Owned(handle))
+            }
+            _ => Err(-95),
+        }
+    }
+    pub fn exec_path_dirfd(&self, pid: usize, fd: u64, address: u64) -> Result<u64, i64> {
+        self.path_handle(pid, fd, address)
+    }
+    pub fn exec_cloexec(&self, fd: u64) -> Result<bool, i64> {
+        Ok(self.get(fd)?.cloexec)
+    }
+
+    /// PTRACE_EVENT_EXEC is the commit point. Failed exec never calls this.
+    pub fn exec_completed(&mut self, backends: &mut Backends) -> Result<(), &'static [u8]> {
+        if self.pending.is_some() || self.saved_args.is_some() {
+            return Err(b"exec overlapped unfinished descriptor syscall");
+        }
+        for entry in &mut self.entries {
+            if entry.is_some_and(|d| d.cloexec) {
+                if let Handle::Owned(handle) = entry.take().unwrap().handle {
+                    backends.filesystem.close_locks(handle);
+                    backends.release(handle)?;
+                }
+                // Kernel closed native handles with no surviving aliases.
+            }
+        }
+        Ok(())
+    }
+
+    pub fn release_exited(&mut self, backends: &mut Backends) -> Result<(), &'static [u8]> {
+        for entry in &mut self.entries {
+            if let Some(Descriptor {
+                handle: Handle::Owned(handle),
+                ..
+            }) = entry.take()
+            {
+                backends.release(handle)?;
+            }
+        }
+        self.pending = None;
+        self.saved_args = None;
+        self.poll_wait = false;
+        self.poll_tick = false;
+        self.poll_deadline = None;
+        Ok(())
+    }
+
+    fn get(&self, fd: u64) -> Result<Descriptor, i64> {
+        let fd = fd as i32;
+        if fd < 0 {
+            return Err(-9);
+        }
+        self.entries
+            .get(fd as usize)
+            .copied()
+            .flatten()
+            .filter(|d| d.handle != Handle::Reserved)
+            .ok_or(-9)
+    }
+
+    fn free(&self, minimum: u64) -> Result<usize, i64> {
+        if minimum > i32::MAX as u64 || minimum as usize >= self.capacity {
+            return Err(-22);
+        }
+        self.entries[..self.capacity]
+            .iter()
+            .enumerate()
+            .skip(minimum as usize)
+            .find_map(|(i, d)| d.is_none().then_some(i))
+            .ok_or(-24)
+    }
+
+    fn reserve(&mut self, cloexec: bool) -> Result<usize, i64> {
+        let slot = self.free(0)?;
+        self.entries[slot] = Some(Descriptor {
+            handle: Handle::Reserved,
+            cloexec,
+        });
+        Ok(slot)
+    }
+
+    fn save(&mut self, r: &UserRegs) {
+        self.saved_args = Some([r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9, r.orig_rax]);
+    }
+
+    /// Called at the matching syscall exit, including emulated exits. Never
+    /// restore memory/TLS or signal state: only the arguments we translated.
+    pub fn finish(&mut self, r: &mut UserRegs) -> Result<bool, &'static [u8]> {
+        self.poll_wait = false;
+        self.poll_tick = false;
+        self.poll_deadline = None;
+        let mut changed = false;
+        if let Some(pending) = self.pending.take() {
+            match pending {
+                Pending::Open { slot } => {
+                    if r.rax as i64 >= 0 {
+                        if r.rax >= LIMIT as u64 {
+                            return Err(b"native descriptor outside bounded table");
+                        }
+                        self.entries[slot].as_mut().unwrap().handle = Handle::Native {
+                            fd: r.rax as u32,
+                            console: false,
+                        };
+                        r.rax = slot as u64;
+                    } else {
+                        self.entries[slot] = None;
+                    }
+                }
+                Pending::Close { result } => {
+                    // Native handles are known live; EBADF means ownership drift.
+                    if r.rax as i64 == -9 {
+                        return Err(b"native descriptor close lost ownership");
+                    }
+                    if let Some(result) = result {
+                        r.rax = result as u64;
+                    }
+                }
+            }
+            changed = true;
+        }
+        if let Some(args) = self.saved_args.take() {
+            r.rdi = args[0];
+            r.rsi = args[1];
+            r.rdx = args[2];
+            r.r10 = args[3];
+            r.r8 = args[4];
+            r.r9 = args[5];
+            r.orig_rax = args[6];
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    pub fn enter(
+        &mut self,
+        pid: usize,
+        r: &mut UserRegs,
+        backends: &mut Backends,
+    ) -> NativeDecision {
+        // Resource changes cannot invalidate the public allocator or address-space bound.
+        if r.orig_rax == 302 && matches!(r.rsi, 7 | 9) && r.rdx != 0 {
+            return ready(-1);
+        }
+        let result = match r.orig_rax {
+            2 | 257 => {
+                self.save(r);
+                self.open(pid, r, backends)
+            }
+            41 => {
+                self.save(r);
+                self.socket(pid, r, backends)
+            }
+            22 | 53 | 293 => {
+                self.save(r);
+                self.pipe(pid, r, backends)
+            }
+            3 => {
+                self.save(r);
+                self.get(r.rdi)
+                    .and_then(|_| self.close(r.rdi as u32 as usize, r, pid, backends))
+            }
+            32 | 33 | 292 => {
+                self.save(r);
+                self.dup(pid, r, backends)
+            }
+            280 if r.rsi == 0 => {
+                self.save(r);
+                self.get(r.rdi)
+                    .and_then(|d| self.descriptor(pid, r, d, backends))
+            }
+            72 => {
+                self.save(r);
+                match self.get(r.rdi) {
+                    Err(e) => Err(e),
+                    Ok(entry) => match r.rsi {
+                        0 | 1030 => self.dup(pid, r, backends),
+                        1 => Ok(ready(entry.cloexec as i64)),
+                        2 if r.rdx & !1 == 0 => {
+                            self.entries[r.rdi as u32 as usize]
+                                .as_mut()
+                                .unwrap()
+                                .cloexec = r.rdx != 0;
+                            Ok(ready(0))
+                        }
+                        2 => Err(-22),
+                        _ => self.descriptor(pid, r, entry, backends),
+                    },
+                }
+            }
+            0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55 | 74
+            | 73 | 75 | 77 | 78 | 91 | 93 | 217 => {
+                self.save(r);
+                self.get(r.rdi)
+                    .and_then(|d| self.descriptor(pid, r, d, backends))
+            }
+            9 if r.r10 & 0x20 == 0 => {
+                self.save(r);
+                match self.get(r.r8) {
+                    Ok(Descriptor {
+                        handle: Handle::Native { fd, console: false },
+                        ..
+                    }) => {
+                        r.r8 = fd as u64;
+                        Ok(backends.claim(pid, r))
+                    }
+                    Ok(_) => Err(-95),
+                    Err(e) => Err(e),
+                }
+            }
+            264 | 265 | 316 => {
+                self.save(r);
+                self.rename_paths(pid, r, backends)
+            }
+            266 => {
+                self.save(r);
+                self.path_handle(pid, r.rsi, r.rdx).map(|handle| {
+                    r.rsi = handle;
+                    backends.claim(pid, r)
+                })
+            }
+            258 | 260 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 => {
+                self.save(r);
+                self.path_descriptor(pid, r, backends)
+            }
+            7 | 271 => self.poll(pid, r, backends),
+            _ => Ok(backends.claim(pid, r)),
+        };
+        result.unwrap_or_else(ready)
+    }
+
+    fn socket(
+        &mut self,
+        pid: usize,
+        r: &UserRegs,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        let slot = self.reserve(r.rsi & CLOEXEC != 0)?;
+        match backends.claim(pid, r) {
+            NativeDecision::Hooked { result, .. } if result >= 0 => {
+                backends.refs.retain(result as u32);
+                self.entries[slot].as_mut().unwrap().handle = Handle::Owned(result as u32);
+                Ok(ready(slot as i64))
+            }
+            decision => {
+                self.entries[slot] = None;
+                Ok(decision)
+            }
+        }
+    }
+
+    fn path_descriptor(
+        &mut self,
+        pid: usize,
+        r: &mut UserRegs,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        r.rdi = self.path_handle(pid, r.rdi, r.rsi)?;
+        Ok(backends.claim(pid, r))
+    }
+
+    fn path_handle(&self, pid: usize, dirfd: u64, address: u64) -> Result<u64, i64> {
+        let path = read_path(pid, address)?;
+        if path.as_bytes().first() == Some(&b'/') {
+            return Ok((-100i64) as u64);
+        }
+        if dirfd as i32 == -100 {
+            return Ok(dirfd);
+        }
+        match self.get(dirfd)?.handle {
+            Handle::Owned(handle) if path.is_empty() || (1048576..1048640).contains(&handle) => {
+                Ok(handle as u64)
+            }
+            Handle::Native { fd, .. } if path.is_empty() => Ok(fd as u64),
+            Handle::Owned(_) => Err(-20),
+            Handle::Native { fd, .. } => Ok(crate::fs_hooks::IMAGE_DIR_BASE + fd as u64),
+            Handle::Reserved => Err(-9),
+        }
+    }
+
+    fn rename_paths(
+        &self,
+        pid: usize,
+        r: &mut UserRegs,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        r.rdi = self.path_handle(pid, r.rdi, r.rsi)?;
+        r.rdx = self.path_handle(pid, r.rdx, r.r10)?;
+        Ok(backends.claim(pid, r))
+    }
+
+    fn open(
+        &mut self,
+        pid: usize,
+        r: &mut UserRegs,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        let flags = if r.orig_rax == 2 { r.rsi } else { r.rdx };
+        // Reserve before any create/truncate or native open can occur.
+        let slot = self.reserve(flags & CLOEXEC != 0)?;
+        if r.orig_rax == 2 {
+            r.rsi &= !CLOEXEC;
+        } else {
+            r.rdx &= !CLOEXEC;
+        }
+        let decision = if let Some(decision) = self.open_descriptor_path(pid, r, backends) {
+            decision
+        } else if r.orig_rax == 257 {
+            self.path_descriptor(pid, r, backends)
+        } else {
+            Ok(backends.claim(pid, r))
+        };
+        match decision {
+            Ok(NativeDecision::Hooked { lane, result }) => {
+                if result >= 0 {
+                    backends.refs.retain(result as u32);
+                    self.entries[slot].as_mut().unwrap().handle = Handle::Owned(result as u32);
+                } else {
+                    self.entries[slot] = None;
+                }
+                Ok(NativeDecision::Hooked {
+                    lane,
+                    result: if result >= 0 { slot as i64 } else { result },
+                })
+            }
+            Ok(NativeDecision::Contract(decision)) => {
+                self.pending = Some(Pending::Open { slot });
+                Ok(NativeDecision::Contract(decision))
+            }
+            other => {
+                self.entries[slot] = None;
+                other
+            }
+        }
+    }
+
+    fn open_descriptor_path(
+        &self,
+        pid: usize,
+        r: &UserRegs,
+        backends: &mut Backends,
+    ) -> Option<Result<NativeDecision, i64>> {
+        let address = if r.orig_rax == 2 { r.rdi } else { r.rsi };
+        let path = match read_path(pid, address) {
+            Ok(path) => path,
+            Err(error) => return Some(Err(error)),
+        };
+        let suffix = path.as_bytes().strip_prefix(b"/dev/fd/")?;
+        Some((|| {
+            let end = suffix
+                .iter()
+                .position(|b| *b == b'/')
+                .unwrap_or(suffix.len());
+            if end == 0 {
+                return Err(-2);
+            }
+            let mut fd = 0u64;
+            for digit in &suffix[..end] {
+                if !digit.is_ascii_digit() {
+                    return Err(-2);
+                }
+                fd = fd
+                    .checked_mul(10)
+                    .and_then(|n| n.checked_add((digit - b'0') as u64))
+                    .ok_or(-2)?;
+            }
+            // Path digits are names, not an i32 syscall argument. Never let a
+            // larger number wrap onto a different public descriptor.
+            if fd >= LIMIT as u64 {
+                return Err(-2);
+            }
+            let handle = match self.get(fd).map_err(|_| -2)?.handle {
+                Handle::Owned(handle) if (1048576..1048640).contains(&handle) => handle,
+                _ => return Err(-95),
+            };
+            let flags = if r.orig_rax == 2 { r.rsi } else { r.rdx };
+            let tail = &suffix[end..];
+            let handle = backends
+                .filesystem
+                .open_descriptor(pid, handle, tail, flags)?;
+            Ok(ready(handle))
+        })())
+    }
+
+    fn pipe(
+        &mut self,
+        pid: usize,
+        r: &UserRegs,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        let packet = r.orig_rax == 53;
+        if packet && (r.rdi != 1 || r.rsi & !(CLOEXEC | 0o4000) != 5 || r.rdx != 0) {
+            return Err(-95);
+        }
+        let flags = if packet {
+            r.rsi & !5
+        } else if r.orig_rax == 293 {
+            r.rsi
+        } else {
+            0
+        };
+        if flags & !(CLOEXEC | 0o4000) != 0 {
+            return Err(-22);
+        }
+        let first = self.reserve(flags & CLOEXEC != 0)?;
+        let second = match self.reserve(flags & CLOEXEC != 0) {
+            Ok(s) => s,
+            Err(e) => {
+                self.entries[first] = None;
+                return Err(e);
+            }
+        };
+        let allocated = if packet {
+            backends.channels.allocate_packet_pair(flags & !CLOEXEC)
+        } else {
+            backends.channels.allocate(flags & !CLOEXEC)
+        };
+        let handles = match allocated {
+            Ok(handles) => handles,
+            Err(e) => {
+                self.entries[first] = None;
+                self.entries[second] = None;
+                return Err(e);
+            }
+        };
+        let mut bytes = [0u8; 8];
+        bytes[..4].copy_from_slice(&(first as u32).to_le_bytes());
+        bytes[4..].copy_from_slice(&(second as u32).to_le_bytes());
+        let copied = copy_memory(pid, if packet { r.r10 } else { r.rdi }, &mut bytes, true);
+        if copied != Ok(8) {
+            backends.channels.release(handles[0]);
+            backends.channels.release(handles[1]);
+            self.entries[first] = None;
+            self.entries[second] = None;
+            return Err(-14);
+        }
+        backends.refs.retain(handles[0]);
+        backends.refs.retain(handles[1]);
+        self.entries[first].as_mut().unwrap().handle = Handle::Owned(handles[0]);
+        self.entries[second].as_mut().unwrap().handle = Handle::Owned(handles[1]);
+        Ok(ready(0))
+    }
+
+    fn descriptor(
+        &mut self,
+        pid: usize,
+        r: &mut UserRegs,
+        entry: Descriptor,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        let public_fd = r.rdi as u32;
+        let network = matches!(entry.handle, Handle::Owned(h) if crate::network_hooks::LaunchNetwork::owns(h));
+        let packet = matches!(entry.handle, Handle::Owned(h) if backends.channels.is_socket(h));
+        if matches!(r.orig_rax, 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55)
+            && !network
+            && !(packet && matches!(r.orig_rax, 44 | 45))
+        {
+            return Err(-88);
+        }
+        if network
+            && self
+                .poll_deadline
+                .is_some_and(|end| monotonic_nanoseconds().is_ok_and(|now| now >= end))
+        {
+            return Ok(ready(-11));
+        }
+        match entry.handle {
+            Handle::Native { fd, console } => {
+                if r.orig_rax == 93 {
+                    return Err(-1);
+                }
+                if console && matches!(r.orig_rax, 78 | 217) {
+                    return Err(-20);
+                }
+                if r.orig_rax == 72 {
+                    // Duplication and descriptor flags are handled above.
+                    // Never broker native locks, leases or signal ownership.
+                    if !matches!(r.rsi, 3 | 4) {
+                        return Err(-95);
+                    }
+                    const STATUS_FLAGS: u64 =
+                        3 | 0o2000 | 0o4000 | 0o100000 | 0o200000 | 0o400000 | 0o10000000;
+                    if r.rsi == 4 && r.rdx & !STATUS_FLAGS != 0 {
+                        return Err(-95);
+                    }
+                }
+                if !console && matches!(r.orig_rax, 1 | 20 | 18 | 77 | 91) {
+                    return Err(-9);
+                }
+                r.rdi = fd as u64;
+            }
+            Handle::Owned(handle) => r.rdi = handle as u64,
+            Handle::Reserved => return Err(-9),
+        }
+        let decision = match backends.claim(pid, r) {
+            NativeDecision::Hooked { result: -11, .. }
+                if (r.orig_rax == 72 && r.rsi == 7) || (r.orig_rax == 73 && r.rsi & 4 == 0) =>
+            {
+                NativeDecision::Park { fd: public_fd }
+            }
+            decision => decision,
+        };
+        Ok(match decision {
+            NativeDecision::Park { .. } => {
+                if network {
+                    if !self.poll_tick {
+                        let timeout = backends.devices.network.timeout(r.rdi as u32, r.orig_rax);
+                        if timeout != 0 {
+                            self.poll_deadline =
+                                Some(monotonic_nanoseconds()?.checked_add(timeout).ok_or(-22)?);
+                        }
+                    }
+                    self.poll_tick = true;
+                }
+                NativeDecision::Park { fd: public_fd }
+            }
+            decision => decision,
+        })
+    }
+
+    fn close(
+        &mut self,
+        slot: usize,
+        r: &mut UserRegs,
+        pid: usize,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        let result = if r.orig_rax == 3 {
+            None
+        } else {
+            Some(slot as i64)
+        };
+        let entry = self.entries[slot].take().ok_or(-9)?;
+        if let Handle::Owned(handle) = entry.handle {
+            backends.filesystem.close_locks(handle);
+            if !backends.refs.release(handle) {
+                return Ok(ready(result.unwrap_or(0)));
+            }
+        } else if self
+            .entries
+            .iter()
+            .flatten()
+            .any(|d| d.handle == entry.handle)
+        {
+            return Ok(ready(result.unwrap_or(0)));
+        }
+        match entry.handle {
+            Handle::Native { fd, .. } => {
+                r.orig_rax = 3;
+                r.rdi = fd as u64;
+                self.pending = Some(Pending::Close { result });
+                Ok(NativeDecision::Contract(decide_balanced(3)))
+            }
+            Handle::Owned(handle) => {
+                let mut close = *r;
+                close.orig_rax = 3;
+                close.rdi = handle as u64;
+                match backends.claim(pid, &close) {
+                    NativeDecision::Hooked { result: 0, .. } => Ok(ready(result.unwrap_or(0))),
+                    _ => Err(-5),
+                }
+            }
+            Handle::Reserved => Err(-9),
+        }
+    }
+
+    fn dup(
+        &mut self,
+        pid: usize,
+        r: &mut UserRegs,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        let source = r.rdi as i32;
+        let mut entry = self.get(r.rdi)?;
+        let (target, cloexec) = match r.orig_rax {
+            32 => (self.free(0)?, false),
+            72 => (self.free(r.rdx)?, r.rsi == 1030),
+            33 | 292 => {
+                let target = r.rsi as i32;
+                if target < 0 || target as usize >= self.capacity {
+                    return Err(-9);
+                }
+                if r.orig_rax == 292 && (target == source || r.rdx & !CLOEXEC != 0) {
+                    return Err(-22);
+                }
+                if target == source {
+                    return Ok(ready(target as i64));
+                }
+                (target as usize, r.orig_rax == 292 && r.rdx != 0)
+            }
+            _ => return Err(-22),
+        };
+        entry.cloexec = cloexec;
+        // Preserve the source in its own slot until target retirement completes.
+        let decision = if self.entries[target].is_some() {
+            self.close(target, r, pid, backends)?
+        } else {
+            ready(target as i64)
+        };
+        if let Handle::Owned(handle) = entry.handle {
+            backends.refs.retain(handle);
+        }
+        self.entries[target] = Some(entry);
+        Ok(decision)
+    }
+    fn poll(
+        &mut self,
+        pid: usize,
+        r: &UserRegs,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        // Snapshot ppoll's relative timeout once, like the pollfd layout. A
+        // parked task must retain its original deadline across scheduler ticks.
+        let timeout = if self.poll_wait {
+            -1
+        } else if r.orig_rax == 271 {
+            if r.r10 != 0 {
+                return Err(-95);
+            }
+            if r.rdx == 0 {
+                -1
+            } else {
+                let mut time = [0u8; 16];
+                if copy_memory(pid, r.rdx, &mut time, false)? != 16 {
+                    return Err(-14);
+                }
+                let sec = i64::from_ne_bytes(time[..8].try_into().unwrap());
+                let ns = i64::from_ne_bytes(time[8..].try_into().unwrap());
+                if sec < 0 || !(0..1_000_000_000).contains(&ns) || sec > 300 {
+                    return Err(-22);
+                }
+                (sec * 1000 + (ns + 999999) / 1000000) as i32
+            }
+        } else {
+            r.rdx as i32
+        };
+        if r.rsi > 16 || timeout > 300000 {
+            return Err(-1);
+        }
+        let count = r.rsi as usize;
+        let mut bytes = [0u8; 128];
+        let length = count * 8;
+        if self.poll_wait {
+            bytes = self.poll_input;
+        } else {
+            if copy_memory(pid, r.rdi, &mut bytes[..length], false)? != length as i64 {
+                return Err(-14);
+            }
+            self.poll_input = bytes;
+        }
+        // Console OFDs are inherited unchanged from this supervisor. Only
+        // explicitly tracked console handles can query those host descriptors.
+        // Image descriptors are not supervisor handles and remain unsupported.
+        let mut consoles = [PollFd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        }; 16];
+        let mut ready_count = 0;
+        let mut network_wait = false;
+        for i in 0..count {
+            let entry = &mut bytes[i * 8..i * 8 + 8];
+            let fd = i32::from_ne_bytes(entry[..4].try_into().unwrap());
+            let events = u16::from_ne_bytes(entry[4..6].try_into().unwrap());
+            entry[6..8].fill(0);
+            if fd < 0 {
+                continue;
+            }
+            let revents = match self.get(fd as u64) {
+                Ok(Descriptor {
+                    handle: Handle::Native { fd, console: true },
+                    ..
+                }) => {
+                    assert!(fd < 3);
+                    consoles[i] = PollFd {
+                        fd: fd as i32,
+                        events,
+                        revents: 0,
+                    };
+                    0
+                }
+                Ok(Descriptor {
+                    handle: Handle::Native { .. },
+                    ..
+                }) => return Err(-95),
+                Ok(Descriptor {
+                    handle: Handle::Owned(handle),
+                    ..
+                }) => {
+                    // Assigned regular memory files/directories and null are
+                    // immediately ready. Pipes supply their own live state.
+                    network_wait |= crate::network_hooks::LaunchNetwork::owns(handle);
+                    let available = backends
+                        .channels
+                        .readiness(handle)
+                        .or_else(|| backends.filesystem.readiness(handle))
+                        .or_else(|| backends.devices.readiness(handle))
+                        .ok_or(-95)?;
+                    available & (events | 8 | 16)
+                }
+                _ => 32, // POLLNVAL, even when events is zero.
+            };
+            entry[6..8].copy_from_slice(&revents.to_ne_bytes());
+        }
+        let result = unsafe { syscall3(7, consoles.as_mut_ptr() as usize, count, 0) };
+        if result < 0 {
+            return Err(result as i64);
+        }
+        for i in 0..count {
+            let output = &mut bytes[i * 8 + 6..i * 8 + 8];
+            let revents = u16::from_ne_bytes(output.try_into().unwrap()) | consoles[i].revents;
+            output.copy_from_slice(&revents.to_ne_bytes());
+            ready_count += i64::from(revents != 0);
+        }
+        let now = monotonic_nanoseconds()?;
+        if !self.poll_wait && timeout > 0 {
+            self.poll_deadline = Some(now.checked_add(timeout as u64 * 1_000_000).ok_or(-22)?);
+        }
+        if ready_count != 0 || timeout == 0 || self.poll_deadline.is_some_and(|end| now >= end) {
+            for i in 0..count {
+                let address = r.rdi.checked_add((i * 8 + 6) as u64).ok_or(-14)?;
+                if copy_memory(pid, address, &mut bytes[i * 8 + 6..i * 8 + 8], true)? != 2 {
+                    return Err(-14);
+                }
+            }
+            return Ok(ready(ready_count));
+        }
+        self.poll_wait = true;
+        // Infinite owned-object waits need no timer: object progress/death
+        // already wakes them. External console IO needs periodic observation.
+        self.poll_tick = network_wait
+            || self.poll_deadline.is_some()
+            || consoles[..count].iter().any(|fd| fd.fd >= 0);
+        Ok(NativeDecision::ParkPoll)
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: u16,
+    revents: u16,
+}
+
+pub fn monotonic_nanoseconds() -> Result<u64, i64> {
+    let mut time = [0u64; 2];
+    if unsafe { syscall2(228, 1, time.as_mut_ptr() as usize) } < 0 {
+        return Err(-5);
+    }
+    time[0]
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(time[1]))
+        .ok_or(-5)
+}
+
+fn ready(result: i64) -> NativeDecision {
+    NativeDecision::Hooked {
+        lane: Lane::Filesystem,
+        result,
+    }
+}

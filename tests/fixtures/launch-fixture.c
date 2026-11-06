@@ -20,6 +20,17 @@ static long call4(long number, word a, word b, word c, word d)
     return result;
 }
 
+static long call6(long n, word a, word b, word c, word d, word e, word f)
+{
+    register word r10 __asm__("r10") = d;
+    register word r8 __asm__("r8") = e;
+    register word r9 __asm__("r9") = f;
+    long result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(n), "D"(a), "S"(b), "d"(c),
+                     "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
+    return result;
+}
+
 /* Signal return trampoline (SA_RESTORER), as libc provides it. */
 void launch_fixture_restore(void);
 __asm__(".global launch_fixture_restore\n"
@@ -78,6 +89,30 @@ long launch_fixture_main(word *stack)
     char **env = argv + argc + 1;
     if (argc < 2) return 90;
     switch (argv[1][0]) {
+    case 'r': {
+        word limits[2];
+        word expected=(argc>2 ? number(argv[2]) : 32)*1024*1024;
+        if(call4(302,0,9,0,(word)limits)!=0 || limits[0]!=expected || limits[1]!=expected) return 160;
+        /* Reserve virtual space only; no host memory pressure is generated. */
+        if(call6(9,0,64*1024*1024,3,0x22,-1,0)!=-12) return 161;
+        long memory=call6(9,0,1024*1024,3,0x22,-1,0);
+        if(memory<=0) return 162;
+        ((volatile char *)memory)[0]=1;
+        ((volatile char *)memory)[1024*1024-1]=2;
+        if(call3(11,memory,1024*1024,0)!=0) return 163;
+        long previous=call3(12,0,0,0);
+        if(previous<=0 || call3(12,previous+64*1024*1024,0,0)!=previous) return 164;
+        print("process-address-space: PASS");
+        return 0;
+    }
+    case 'u': {
+        unsigned char bytes[400];
+        for(word i=0;i<sizeof bytes;++i) bytes[i]=0xa5;
+        if(call3(63,(word)(bytes+5),0,0)!=0) return 170;
+        for(word i=0;i<5;++i) if(bytes[i]!=0xa5 || bytes[395+i]!=0xa5) return 171;
+        if(call3(1,1,(word)(bytes+5),390)!=390) return 172;
+        return 0;
+    }
     case 'e': return argc > 2 ? number(argv[2]) : 0;
     case 'a':
         for (word i = 2; i < argc; ++i) print(argv[i]);
@@ -94,7 +129,18 @@ long launch_fixture_main(word *stack)
     }
     case 't': __asm__ volatile("int3"); return 93;
     case 's': __asm__ volatile("xor %%rax, %%rax; mov (%%rax), %%rax" ::: "rax", "memory"); return 94;
-    case 'f': return call3(57, 0, 0, 0) == -38 ? 0 : 95;
+    case 'f': {
+        long child = call3(57, 0, 0, 0);
+        if (child == 0) return 31;
+        if (child != 2) return 95;
+        int status = 0;
+        register word r10 __asm__("r10") = 0;
+        long reaped;
+        __asm__ volatile("syscall" : "=a"(reaped)
+            : "a"(61), "D"(child), "S"(&status), "d"(0), "r"(r10)
+            : "rcx", "r11", "memory");
+        return reaped == child && status == (31 << 8) ? 0 : 113;
+    }
     case 'i':
         __asm__ volatile("int $0x80" :: "a"(20), "b"(1), "c"(0), "d"(0) : "memory");
         return 96;

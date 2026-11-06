@@ -8,7 +8,9 @@ args = []
 environment = ["container=ginux"]
 
 [resources]
+# Maximum eligible logical CPUs within the operator affinity mask.
 vcpus = 1
+# Per-process virtual address-space bound, not aggregate RSS.
 memory_mib = 256
 
 [execution]

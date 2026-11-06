@@ -32,6 +32,36 @@ pub struct IdentityView<'a> {
     pub boot_id: &'a [u8],
 }
 
+impl IdentityView<'_> {
+    /// Linux utsname layout with domain-owned identity and a virtual release.
+    /// This release names the contract implementation, not the host kernel.
+    pub fn uname(&self, machine: &[u8], output: &mut [u8]) -> Result<usize, ViewError> {
+        const LENGTH: usize = 6 * 65;
+        if output.len() < LENGTH {
+            return Err(ViewError::BufferTooSmall);
+        }
+        let fields = [
+            b"Linux".as_slice(),
+            self.hostname,
+            concat!(env!("CARGO_PKG_VERSION"), "-ginux").as_bytes(),
+            b"ginux",
+            machine,
+            b"",
+        ];
+        if fields
+            .iter()
+            .any(|field| field.len() >= 65 || field.contains(&0))
+        {
+            return Err(ViewError::InvalidPath);
+        }
+        output[..LENGTH].fill(0);
+        for (index, field) in fields.iter().enumerate() {
+            output[index * 65..index * 65 + field.len()].copy_from_slice(field);
+        }
+        Ok(LENGTH)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct NamespaceView {
     pub mount: u64,

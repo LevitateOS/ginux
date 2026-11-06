@@ -273,8 +273,8 @@ executes `[instance].init` with the configured arguments and environment inside
 the supplied host root directory. The bootstrap requires chroot and credential
 change privileges, and a kernel with `close_range` (Linux 5.9 or later).
 It drops to UID/GID 1000 before executing the workload. The configuration must
-select `profile = "balanced"` and `backend = "ptrace-native"`; storage and device
-assignments are not implemented by this command and are rejected.
+select `profile = "balanced"` and `backend = "ptrace-native"`. Only the `null`
+device assignment and memory-storage backend described below are supported.
 
 `[instance].workdir` is optional and defaults to `/work`; `/` is also supported.
 The bootstrap creates the working directory if its parent exists, then enters
@@ -287,10 +287,236 @@ Workload stdout stays separate from supervisor diagnostics on stderr. Only
 stdin, stdout, and stderr are inherited by the workload. The launcher returns
 the workload exit code, or `128 + signal` for signal termination. Startup
 failure returns 2; supervision or result-writing failure returns 1. Native
-fork, clone, and subsequent exec are unsupported; fork returns `ENOSYS` until
-child supervision is implemented. Non-x86-64 syscall ABIs and job-control
+fork/vfork, bounded process-only clone, image exec and child wait are supervised
+by a configured-launch task loop. Non-x86-64 syscall ABIs and job-control
 group stops fail explicitly. Audit output is capped at 64 KiB plus a truncation
-notice. This path does not implement resource quotas from the instance metadata.
+notice. `[resources].memory_mib` caps each tracee process's virtual address space
+with hard/soft `RLIMIT_AS`, preserving lower operator limits. This includes
+anonymous and image mappings; it is not an aggregate domain RSS limit.
+`[resources].vcpus` restricts the child to at most that many logical CPUs selected
+from the launcher's allowed affinity mask. This bounds eligible CPUs, not CPU
+time. Limits are installed only in the child before exec; no host-global cgroup
+policy is changed. Kernel inheritance preserves them for supported descendants.
+Self affinity queries (zero, current virtual PID or thread-group ID) report the
+actual eligible CPU subset through a buffer of at most 1024 bytes. Affinity mutation and address-space limit mutation
+are denied; unrelated virtual PIDs are not native scheduler targets.
+
+Configured `uname` returns `Linux`, the domain id as nodename, the kernel-views
+package version with `-ginux` as its virtual release, version `ginux`, machine
+`x86_64`, and an empty domainname. This identifies the virtual implementation;
+it does not report host kernel/hostname data or promise the host kernel's ABI.
+The shared native syscall contract and `sysinfo` behavior are unchanged.
+
+Optional `[storage].assignments` entries of the form `"memory:/absolute/path"`
+declare empty, ephemeral writable namespaces. For example:
+
+```toml
+[storage]
+assignments = ["memory:/work", "memory:/work/build", "memory:/out"]
+```
+
+Each assignment creates its directory and parents in supervisor-owned memory.
+Overlapping assignments can precreate nested directories. Image files beneath
+an assigned path are hidden; missing files there never fall through to native
+storage. Paths must be canonical, unique, and cannot cover init, `/`, `/proc`,
+`/sys`, or `/dev`. Up to eight assignments fit the existing 64-byte entry bound.
+Without assignments, native image access remains read-only.
+
+This backend supports regular-file open/create/exclusive-create/truncate/append,
+read/write/pread/pwrite, ftruncate, seek, close, descriptor flags, mkdir/unlink/rmdir,
+owned directory descriptions/getdents64, rename/renameat/renameat2 with NOREPLACE,
+chmod and stat/fstat/fstatat/statx metadata. Positioned writes preserve the
+shared open-description offset; append descriptions retain Linux append semantics. Access and readlink probes stay in
+the owned namespace; regular files accept O_NOCTTY. Directory cookies and inode
+identity follow open descriptions across aliases, fork, rename and removal.
+Namespace changes validate types, capacity and replacement before mutation.
+Relative AT_FDCWD paths follow the calling process's cwd; owned directory
+FDs resolve relative operations through their current VFS identity. Image chdir,
+getcwd and relative image exec retain native per-process cwd semantics.
+Relative image-directory FD paths join the same namespace. Owned chdir/fchdir/
+getcwd keep a private VFS directory reference per process. Fork copies that
+reference; exec keeps it; successful image chdir/fchdir
+releases it. Rename updates the reported path, and a removed cwd reports ENOENT
+for getcwd and relative operations until an absolute directory change. Private
+cwd references consume the existing 64-entry VFS open-description capacity.
+Relative owned scripts/interpreters and explicit image paths use that cwd.
+Native kernel-selected relative interpreters from owned cwd remain unsupported.
+Configured-launch threads and shared cwd groups remain unsupported.
+Owned regular-file link/linkat names share inode, bytes, permissions and link
+counts. Removing one name preserves data through other names, file descriptions
+and executable references. Descriptions and executable pins retain the name
+through which they were obtained, including rename and deletion state. Hardlinks
+consume namespace entries without duplicating file capacity. Only owned regular
+files are linkable; linkat supports flags zero or AT_SYMLINK_FOLLOW. Symlink inode
+links, image-file imports, descriptor-only AT_EMPTY_PATH linking and directory
+hardlinks remain unsupported. Failed creation preserves names and link counts.
+Owned symlink/symlinkat and readlink/readlinkat support bounded targets and
+nofollow metadata. Link expansion precedes later parent components; mutations
+name the final link itself, including directory requirements on trailing slashes.
+Exclusive create and O_NOFOLLOW keep their separate failure behavior. Owned links
+may lead to readonly image paths or assigned virtual devices; image links may lead
+into owned storage. Directory descriptors and cwd use the same assignment
+precedence. Image mutations remain unsupported; hidden device paths retain absent
+semantics. Owned script
+interpreter aliases are canonicalized only in the sealed execution copy; original
+script bytes and interpreter names in argv remain unchanged. Kernel-selected
+nested native interpreters must still match the image namespace. Canonical script
+interpreter targets containing shebang separators are unsupported.
+Link target bytes consume the same owned storage capacity as regular data.
+Component-wise image-link traversal preserves assignment
+precedence, missing components and non-directory errors. Native image operations
+use a temporary canonical path below the stopped workload's stack; an unavailable
+scratch area or overlapping output buffer returns EFAULT. This is a bounded
+storage adapter, not a complete unified image/overlay filesystem. Regular writes
+and pwrites process at most 1 MiB per call in 4 KiB scratch chunks, returning
+only committed bytes after a short transfer or error. Reads and readv/writev
+remain bounded to 4096 bytes per call; callers must handle short transfers.
+Owned files and pipes accept at most 16 iovecs, including empty entries, with a
+combined length no greater than the signed transfer-result range. Pipe writes
+use the combined vector length for atomicity and retain their existing bounds.
+Native image/console transfer policy is unchanged. Metadata defaults to 32 objects (including seeded directories) and 64 independently
+opened files. `[storage].max_objects` permits 1–1000000 namespace slots. Bounded
+supervisor allocations hold namespace and backing metadata. Before workload
+startup, assigned storage reserves `max_objects + 128` private descriptors by raising
+only the supervisor soft limit within its existing hard limit; insufficient hard
+capacity rejects launch. The public descriptor capacity is captured beforehand
+and applied to the tracee. Page-rounded metadata bytes are charged before file data. Optional positive `[storage].max_bytes` caps
+file-data capacity. Data plus metadata must fit `[resources].memory_mib`; without
+max_bytes, data uses the remainder. Removed names with live descriptions retain
+their slots until final close. Bytes grow on demand in supervisor-owned memfd mappings. Total mapped capacity, including page rounding and growth
+reserve, is bounded by `[resources].memory_mib`, shared across files instead of
+a 64 KiB per-file ceiling. This accounts for writable backing, not total process
+RAM. Exhaustion returns `ENOSPC` without changing file bytes, size or offset.
+Truncation returns unused pages; sparse gaps and regrowth read as zero. Unlinked
+bytes survive until the last open reference closes; teardown releases mappings.
+Aliases use the common public descriptor table. Handle exhaustion returns `EMFILE`.
+
+Configured launch uses one table of up to 256 public descriptors for bootstrap
+stdio, immutable-image files, writable files, devices and pipes. Allocation uses
+the lowest free number; native opens reserve a slot before running. Backend
+handles stay private, including when the kernel reuses an underlying fd number.
+Dup/dup2/dup3 and fcntl duplication share an open description across owners;
+close-on-exec flags belong to each public descriptor. The backend closes only
+after its last alias. Syscall arguments are translated for native IO/metadata/
+mmap and restored at exit. Owned regular files support POSIX byte-range locks
+(`F_GETLK`, `F_SETLK`, `F_SETLKW`) with virtual process ownership. Fork does not
+inherit record locks; closing any descriptor for the inode releases that
+process's record locks. Owned file/directory `flock` locks follow the open
+description across dup/fork and release on its final close. Each table holds at
+most 64 ranges; exhaustion returns `ENOLCK` without a partial update. Conflicting
+blocking calls wait in the supervisor; deadlock detection and thread sharing
+remain unsupported. Native image locks, leases and signal ownership stay denied.
+
+Bootstrap constrains the real descriptor soft/hard limits to 256 while keeping
+lower operator limits. Allocation respects that lower soft limit; runtime
+NOFILE-limit changes are currently denied. Reported limits are not inflated to
+accommodate backend handle ranges. Fork copies public descriptor tables while
+sharing open descriptions and owned-object lifetimes. Successful exec closes
+CLOEXEC entries; failed exec preserves the table. Owned directory-fd operations
+are supported; configured readiness is described below.
+Guest-memory copies respect page protections, including partial read copyout.
+No writable host descriptor is exposed. Data disappears at domain teardown;
+explicit export and restore are described below. There is no retained storage generation.
+
+Owned executable files with an execute bit and no open writers may be replaced
+through execve or execveat, including an owned directory FD or an unlinked read
+FD with AT_EMPTY_PATH. The VFS pins the bytes; a private sealed memfd supplies
+them to the native kernel ELF loader. Paths and ELF interpreter metadata use the
+same assignment checks as image execution.
+No writable host pathname is used for generated program bytes. Writable opens
+and truncation report ETXTBSY while the program is pinned; unlink/rename retain
+identity until the last process releases it. Fork retains the executable pin;
+exit or successful replacement releases it. Failed exec closes its temporary
+backing, releases its proposed pin and preserves public descriptors. CLOEXEC
+retirement still commits only after successful exec. Threads remain unsupported.
+Readlink of /proc/self/exe and /proc/thread-self/exe returns the current domain
+executable name, with a deleted suffix for an unlinked owned executable; native
+memfd names and supervisor prefixes are not part of that interface.
+
+Owned shebang programs support up to four consecutive owned scripts followed
+by an owned ELF or an image interpreter chain. Each shebang has one optional
+argument, including spaces. Owned script bytes stay pinned until exec commits;
+the final owned ELF retains the running executable pin. The new exec stack
+restores the virtual script name in argv and AT_EXECFN; existing arguments and
+environment are preserved, with argv[0] replaced as for kernel shebang execution.
+Image interpreters use a transient non-CLOEXEC script backing, retired before
+the interpreter's first syscall. Stack reconstruction is bounded to 4096 caller
+arguments, 4096 environment entries and 64 auxiliary pairs. Unsupported stack
+layouts fail the domain after exec rather than resuming a replaced address space.
+Descriptor-based scripts require a non-CLOEXEC public file or directory descriptor;
+otherwise execveat fails with ENOENT. The interpreter can reopen /dev/fd/<public>
+(or an owned directory suffix) read-only through the virtual descriptor owner,
+with a fresh offset, including after unlink/rename. This never imports native
+or private descriptors. Other /dev/fd operations remain unsupported. Threads,
+owned ELF dynamic loaders remain unsupported.
+
+Owned regular files support private mappings and read-only shared mappings.
+Mediated writes/truncation use the same anonymous file backing; private writes
+remain copy-on-write, and unlink/recreation preserves existing mapping identity.
+Writable shared mappings are unsupported. A temporary read-only descriptor
+transfer requires host pidfd_open/pidfd_getfd and ptrace access. Temporary native
+descriptors and stack scratch retire before the original mmap returns. Fixed
+maps cannot replace the replay instruction or scratch region. Transfer failure,
+signal interruption or death stops the domain if cleanup cannot complete safely.
+Threads remain unsupported in configured launch; nonleader mapping integration
+is not provided here. File capacity charging remains unchanged, but guest mappings,
+private COW pages and mappings retained after unlink are not aggregate RAM-accounted.
+No retention, mapping budget or wider Linux compatibility is promised.
+
+The configured `/dev` view is an immutable virtual directory, empty by default;
+image entries beneath it are hidden. The script descriptor reopen operation
+described above is separate from directory enumeration. `[devices].assignments = ["null"]` exposes
+`/dev/null` through the existing device registry: reads return EOF and writes
+discard up to 4096 bytes per call. Stat/fstat/fstatat/statx report a character
+device with domain-owned identity and major/minor 1:3. Open access modes,
+close-on-exec descriptor flags, seek, close and basic access queries are
+supported; device metadata cannot be changed. There are 64 open-device slots.
+Unknown and duplicate assignments fail before launch. Device aliases share the
+common descriptor table and handle lifetime. No host device node or descriptor
+is used. Assigned null descriptors are always ready for configured polling. Additional
+device types are not implemented by configured launch yet.
+
+Anonymous `pipe`/`pipe2` are emulated with supervisor-owned memory and virtual
+handles. Up to sixteen channel buffers hold 65536 bytes each; aliases use the common table.
+`pipe2` accepts only `O_CLOEXEC|O_NONBLOCK`. IO is bounded to 4096 bytes per call;
+writes of up to 4096 bytes are atomic. Reads consume only bytes successfully
+copied out, so invalid/partially inaccessible destinations do not lose data.
+Read/write direction, EOF, SIGPIPE, metadata, seek rejection, descriptor/status
+flags, pipe-size queries and aliases across owners are supported.
+Alias status flags and endpoint lifetimes are shared; close-on-exec flags are
+per descriptor. No native pipe or host descriptor is given to the workload.
+
+Nonblocking empty/full operations return `EAGAIN`. Blocking operations stay
+stopped at entry until another task changes pipe state. Forked peers can exchange
+data and wake blocked reads/writes; a self-pipe without a runnable peer still
+waits indefinitely. SIGKILL termination and reaping are supported. Signal-driven restart of emulated blocking operations remains unsupported;
+configured descriptor readiness is described below.
+
+Configured launch owns at most 16 task slots, including unreaped children.
+Process creation accepts fork, vfork, and clone with `SIGCHLD`,
+`CLONE_VM|CLONE_VFORK|SIGCHLD`, or the libc-fork
+`CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD` flags. Threads and other clone
+forms are unsupported. New children remain stopped until their virtual identity
+and descriptor snapshot are installed. Init is PID 1; PID/TID/parent queries,
+child-TID writes and forwarded signal senders use virtual identities. Actual
+credentials remain UID/GID 1000. `wait4` supports a positive child PID or -1,
+optional `WNOHANG`, and a null rusage pointer. A faulty status destination still
+reaps the child and leaves the status word unchanged. Kill supports only signal
+0 and SIGKILL directed at a positive virtual PID. Ignoring SIGCHLD and
+`SA_NOCLDWAIT` are unsupported. Init termination kills and reaps all descendants
+before the launcher reports completion.
+
+Subsequent exec supports image paths and native image descriptors with
+`execveat(AT_EMPTY_PATH)`. Descriptor synchronization precedes native exec;
+CLOEXEC retirement commits at the observed successful exec event. Failed exec
+restores public arguments and descriptor state. Owned ELF/script execution uses
+the separate pinned-byte transaction described above. Native script and ELF
+interpreter paths must resolve to the same permitted image object in both the
+configured and native namespaces; hidden assignments
+cannot be bypassed through a kernel-selected interpreter. Interpreter metadata
+is bounded to x86-64 ELF headers, 256-byte paths and 16 script-chain inspections;
+unsupported or ambiguous chains fail explicitly. The initial executable has the
+same interpreter ownership check before its first instruction runs.
 
 When requested, the result file is reserved exclusively before launch, with
 mode 0600 and a maximum path length of 512 bytes. Existing files are never
@@ -315,6 +541,14 @@ make build-gate1-fixture
 sudo make test-gate1-setup
 sudo make test-launch
 sudo make test-native-supervision
+make build-launch-storage-fixture
+sudo make test-launch-storage
+make build-launch-device-fixture
+sudo make test-launch-devices
+make build-launch-pipe-fixture build-launch-fd-fixture
+sudo make test-launch-pipes test-launch-fds
+make build-launch-task-fixture build-launch-exec-fixture
+sudo make test-launch-tasks test-launch-exec
 ```
 
 ## Native process scenarios
@@ -323,7 +557,8 @@ The separate `process-native <config> <executable>` command exercises native
 fork, clone, vfork, exec, threads, waits, termination signals, and pipes. It
 executes a trusted host fixture as the caller, without chroot; it does not
 require root on a host that permits tracing child processes. Configured
-`launch` remains a separate entry point and does not yet use this process loop.
+`launch` uses its own bounded task loop that joins configured storage, device
+and descriptor ownership; it does not use this native-only fixture loop.
 
 Process creation returns virtual identities, including clone TID cells.
 Untraced, reparenting, namespace, and unsupported clone flags are denied.
@@ -347,3 +582,127 @@ checks for syscall ABI dispatch, clone restrictions, descriptor inheritance,
 thread reuse, successful and failed worker exec, signals, wait-status writes,
 nonblocking waits, and vfork. The existing native fork fixture also runs. These
 checks do not claim complete libc, job-control, or systemd compatibility.
+
+Configured `poll` resolves at most 16 public descriptors through their existing
+owners: pipes, local packets, TCP, assigned memory files/null and inherited console aliases. Negative
+descriptors are ignored; closed descriptors report POLLNVAL. Image files remain
+unsupported for this operation. Error/hangup bits are reported independently of
+the requested mask. Zero through 300000 ms and negative infinite waits are
+supported. Queries park and wake on object progress; finite/console waits also
+use a 1 ms supervisor tick. Internal monotonic time does not enable guest clocks.
+General nonfatal signal interruption/restart remains unfinished. The shared
+native syscall contract is unchanged; this is configured-launch readiness.
+
+Configured local `AF_UNIX` / `SOCK_SEQPACKET` pairs consume two channel buffers
+and support duplex messages up to4096 bytes, aliases, nonblocking IO and poll.
+Messages preserve boundaries; a short receive discards the remaining message.
+Local socket names, descriptor transfer and socket shutdown are unsupported.
+FIONBIO changes the shared open status of owned pipe and packet endpoints,
+preserving other status flags and each public descriptor's CLOEXEC flag.
+
+Configured launch accepts `--export-file <fresh tar path>` to retrieve owned
+regular files and directories after a successful workload exit. Remaining tasks
+are terminated and reaped before capture. Deleted names and immutable image files
+are excluded; file modes and long paths are preserved. Guest names are archive
+data and never select host destinations. The supervisor stages mode0600 output
+beside the destination, then publishes without overwrite only after complete
+write, sync and close. Failed workloads cancel staging. Export failures fail the
+launch; an existing destination is preserved. Abrupt supervisor death can leave a
+private staging file, which is never a published archive. Consumers must require
+both successful completion and a valid archive. This is final export, without
+retained storage.
+Owned regular files support fsync/fdatasync against their supervisor backing;
+these calls do not imply persistence after the in-memory domain ends.
+
+A host coordinator may pass `--control-fd <inherited Unix stream socket>` for
+mid-run filesystem snapshots. The supervisor keeps the socket private. Requests
+are GXS1, a little-endian u64 strictly increasing sequence, a little-endian u16
+pathname length1–512, and non-NUL pathname bytes. Destinations must be fresh.
+Only after complete archive write/sync/close and no-overwrite publication does
+it reply GXA1, the matching little-endian u64 sequence and u64 zero status.
+Valid partial frames are buffered within the fixed bound. Invalid requests,
+peer loss and capture failure stop the domain. The host owns request deadlines,
+directory durability, paired state and workload acknowledgment. Capture serializes
+with mediated owned filesystem mutation; it does not save process memory or live
+handles. Private signal/control readiness wakes the supervisor without a periodic
+control tick; wait4 remains the sole task-status owner. Finite guest readiness waits
+also use a bounded timer tick; shared-thread capture remains a separate capability.
+
+`--restore-file <snapshot tar>` reconstructs the owned filesystem before workload
+startup. Regular files, directories, symlinks, modes and GNU long names/targets
+are supported. Regular hardlinks export one payload followed by zero-size aliases
+to an earlier name; restore preserves shared bytes and inode identity. Symbolic
+link targets are stored as data and are never followed during import. Their
+permission mode is fixed at 0777; imports with another symlink mode are rejected.
+
+Import uses the configured namespace and data budgets, including prepared
+assignment parents. Archive bytes are bounded by the data budget plus 3072 bytes
+per namespace slot and a 1024-byte terminator. There is no fixed 2 GiB payload
+ceiling; ustar octal size fields limit each file to below 8 GiB. Hardlink aliases
+consume namespace capacity and share the original data charge. Invalid paths,
+forward hardlinks, conflicting alias modes, symlink parents, duplicate entries,
+metadata, checksums, truncation or trailing data fail launch. The source must be
+a bounded regular file opened without following a symlink; it remains unchanged.
+Failure discards the new memory view. The host must verify the chosen snapshot
+and matching runtime state: process memory and live handles are not restored,
+and no checkpoint control socket is required.
+
+Owned inode access and modification timestamps can be set explicitly through
+`utimensat` and descriptor `futimens`, including no-follow, nanoseconds and
+`UTIME_OMIT`/`UTIME_NOW`. Aliases share times; stat/statx return them. New owned objects
+and VFS index metadata start at zero; reads/writes do not update times automatically.
+`UTIME_NOW` uses the supervisor's native realtime clock, without allowing new
+workload clock syscalls. These operations require existing owned objects.
+Archives retain only whole-second nonnegative USTAR mtime. Access time and runtime
+nanoseconds are not persisted; unrepresentable mtimes fail export explicitly.
+
+### Supervisor-owned TCP backend
+
+`ginux-devices` exposes `BoundedTcp` with a fixed numeric IPv4/IPv6 endpoint set,
+a concurrent socket-slot limit and a cumulative sent-plus-received byte budget.
+Connections use a supervisor-supplied `TcpBackend`; the Linux x86-64 adapter uses
+private nonblocking, close-on-exec TCP sockets. Each transfer is at most 4096
+bytes and only transferred bytes consume budget. Empty transfers consume none.
+Endpoint metadata, TCP_NODELAY, readiness, connect error and half-close are
+available through the same owner. Connect may remain in progress; callers check
+readiness and socket error before treating it as complete. Readiness reports the
+transport state; read/write also enforce the byte budget. Final close, drop and
+revocation release private handles. Callers own public descriptor alias counts.
+
+This library capability performs no DNS, accepts no connections and does not
+change configured-launch networking or the default-denied guest socket contract.
+Callers must grant endpoints explicitly before use. It is not a general network
+namespace or firewall implementation. Linux device tests exercise real local
+peers; the portable static/unit job remains unchanged.
+
+## Configured TCP grants
+
+Networking is disabled with `[network].backend = "none"`. A configured launch
+may select `backend = "mediated"` with up to eight numeric `endpoints`, such as
+`["192.0.2.10:443", "[2001:db8::1]:443"]`, `max_connections` between 1 and 16,
+and a positive `max_bytes` aggregate sent/received budget. Hostname resolution
+and TLS verification belong to the caller and workload respectively; Ginux
+never expands the endpoint grant. IP/port grants do not isolate HTTP paths or
+hostnames sharing an address. Connect outside the set fails before a host
+connection is created. Datagram, listening and arbitrary socket operations
+remain denied.
+
+TCP descriptors share the existing public descriptor, alias and fork owners.
+Their private nonblocking host sockets remain in the supervisor. Blocking and
+nonblocking connect/read/write, vectored IO, poll/ppoll, SO_ERROR, socket names,
+TCP_NODELAY, receive/send timeouts and shutdown use the bounded backend and task
+scheduler. Transfer accounting counts successful bytes once across all aliases;
+exhaustion is EDQUOT, socket capacity exhaustion is EMFILE, and teardown closes
+connecting and connected sockets. Receive bytes that cannot be copied out remain
+with the shared socket until delivered or closed. SO_ERROR consumption does not
+turn a failed connection into a successful one. Socket names require a started
+connection; ppoll accepts a null signal mask and rounds positive timeouts up to
+milliseconds without modifying the supplied timespec. General signal interruption
+and restart behavior is not implemented. Live sockets are never exported or restored.
+The focused scenario is `make build-launch-network-fixture` followed by
+`sudo make test-launch-network`.
+
+Owned storage inode uid/gid are virtual root. `chown`, `fchown`, `lchown` and
+`fchownat` can preserve 0 or unchanged (-1) on existing assigned storage objects,
+including symlinks and empty-path descriptor operations. Other identities remain
+unsupported; these operations never change host ownership.

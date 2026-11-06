@@ -13,11 +13,25 @@ use ginux_core::{
 use ginux_instance::{AuditMode, HookFailurePolicy};
 
 mod channel_hooks;
+mod checkpoint_control;
+mod descriptors;
+mod device_hooks;
 mod dispatch;
+mod exec_image;
+mod exec_script;
+mod file_locks;
+mod file_mapping;
 mod fs_hooks;
 mod launch;
+mod launch_tasks;
+mod network_hooks;
+mod path_hooks;
 mod process_hooks;
+mod storage_export;
+mod storage_memory;
+mod storage_restore;
 mod supervisor;
+mod tracee_io;
 
 use crate::dispatch::{balanced_surface_name, decide_native, process_entry, Lane, NativeDecision};
 use crate::launch::{
@@ -250,9 +264,21 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
             device_bench_main(config_path, block_path, kind)
         }
         Some(Command::KernelViews(config_path)) => kernel_views_main(config_path),
-        Some(Command::Launch(config_path, root_path, result_path)) => {
-            launch_main(config_path, root_path, result_path)
-        }
+        Some(Command::Launch(
+            config_path,
+            root_path,
+            result_path,
+            export_path,
+            control_fd,
+            restore_path,
+        )) => launch_main(
+            config_path,
+            root_path,
+            result_path,
+            export_path,
+            control_fd,
+            restore_path,
+        ),
         Some(Command::LaunchUsage) => launch_usage(),
         Some(Command::Usage) => usage(),
         None => gate1_main(),

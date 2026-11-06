@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run real launch workloads against an existing binary and fixture (Linux/root)."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import re
@@ -13,9 +14,9 @@ import tempfile
 
 
 def main():
-    if len(sys.argv) != 3 or os.geteuid() != 0:
+    if len(sys.argv) < 3 or os.geteuid() != 0:
         sys.exit("usage (as root): test-launch.py <ginux binary> <launch fixture>")
-    binary, fixture = (str(Path(arg).resolve()) for arg in sys.argv[1:])
+    binary, fixture = (str(Path(arg).resolve()) for arg in sys.argv[1:3])
     template = (Path(__file__).resolve().parent.parent / "config/instance-gate5.toml").read_text()
     with tempfile.TemporaryDirectory(prefix="ginux-launch-") as directory:
         work = Path(directory)
@@ -34,7 +35,7 @@ def main():
         (root / "work/a..b").mkdir()
         counter = 0
 
-        def invoke(args, expected, outcome, *, stdout=b"", changes=None, env=None, pass_fds=()):
+        def invoke(args, expected, outcome, *, stdout=b"", changes=None, env=None, pass_fds=(), cloexec_stdin=False, preexec=None):
             nonlocal counter
             counter += 1
             config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
@@ -45,9 +46,15 @@ def main():
             config_path = work / f"{counter}.toml"
             config_path.write_text(config)
             result_path = work / f"{counter}.json"
+            def child_setup():
+                if preexec:
+                    preexec()
+                if cloexec_stdin:
+                    fcntl.fcntl(0, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
             proc = subprocess.run([binary, "launch", str(config_path), str(root),
                                    "--result-file", str(result_path)], capture_output=True,
-                                  timeout=20, pass_fds=pass_fds)
+                                  timeout=20, pass_fds=pass_fds,
+                                  preexec_fn=child_setup if (preexec or cloexec_stdin) else None)
             record = json.loads(result_path.read_text())
             wanted = {"version": 1, "outcome": outcome, "code": None,
                       "signal": None, "generation": None}
@@ -63,6 +70,36 @@ def main():
             print(f"PASS launch {args}: {outcome} ({expected})")
             return proc
 
+        def resource_cases():
+            invoke(["resources", "32"], 0, "exited", stdout=b"process-address-space: PASS\n",
+                   changes={"memory_mib = 256": "memory_mib = 32"})
+            original = resource.getrlimit(resource.RLIMIT_AS)
+            def lower_operator_limit():
+                resource.setrlimit(resource.RLIMIT_AS, (24*1024*1024, original[1]))
+            invoke(["resources", "24"], 0, "exited", stdout=b"process-address-space: PASS\n",
+                   changes={"memory_mib = 256": "memory_mib = 32"},
+                   preexec=lower_operator_limit)
+            assert resource.getrlimit(resource.RLIMIT_AS) == original
+        def identity_cases():
+            manifest = (Path(__file__).resolve().parent.parent /
+                        'crates/ginux-kernel-views/Cargo.toml').read_text()
+            release = re.search(r'^version = "([^"]+)"', manifest, re.MULTILINE).group(1) + '-ginux'
+            for name in ['gate5-demo', 'identity-other', 'u'*64, 'gate5-demo']:
+                fields = ['Linux', name, release, 'ginux', 'x86_64', '']
+                expected = b''.join(field.encode() + b'\0'*(65-len(field)) for field in fields)
+                invoke(['uname'], 0, 'exited', stdout=expected,
+                       changes={'id = "gate5-demo"': 'id = "' + name + '"'})
+            invoke(['exit', '3'], 3, 'exited')
+            invoke(['args', 'identity-control'], 0, 'exited', stdout=b'identity-control\n')
+        if sys.argv[3:]:
+            selected={'ordinary-resources':resource_cases, 'ordinary-uname':identity_cases}
+            if any(mode not in selected for mode in sys.argv[3:]):
+                sys.exit('unknown selected launch scenario')
+            for mode in sys.argv[3:]:
+                selected[mode]()
+            return
+        resource_cases()
+        identity_cases()
         for code in (0, 3, 120, 127, 128, 255):
             invoke(["exit", str(code)], code, "exited")
         invoke(["args", "one two", ""], 0, "exited", env=["GREETING=hello world", "EMPTY="],
@@ -77,6 +114,9 @@ def main():
         invoke(["cwd"], 0, "exited", stdout=b"root working directory\n",
                changes={"args = [": 'workdir = "/"\nargs = ['})
         invoke(["exit"], 0, "exited", changes={"args = [": 'workdir = "/work/a..b"\nargs = ['})
+        invoke(["exit"], 0, "exited", changes={"args = [": 'workdir = "/created-workdir"\nargs = ['})
+        if not (root / "created-workdir").is_dir():
+            raise RuntimeError("missing workload directory was not created as a directory")
         invoke(["trap"], 133, "signaled")
         invoke(["handler"], 0, "exited", stdout=b"handled\n")
         invoke(["segv"], 139, "signaled")
@@ -88,8 +128,9 @@ def main():
         # it instead of the host tid, and PI futexes, which would store the
         # host tid in the futex word, are denied.
         invoke(["virtual-tid"], 0, "exited",
-               stdout=b"set_tid_address=4242\ngetpid=4242\ngettid=-38\nfutex_lock_pi=-1\n"
+               stdout=b"set_tid_address=1\ngetpid=1\ngettid=1\nfutex_lock_pi=-1\n"
                b"pi_word=0\nfutex_lock_pi_flags=-1\npi_flags_word=0\n")
+        invoke(["descriptor", "0"], 0, "exited", cloexec_stdin=True)
         with (work / "secret").open("w+b") as secret:
             secret.write(b"host-only data")
             secret.flush()
@@ -102,7 +143,7 @@ def main():
         # every syscall record before it is complete.
         lines = proc.stderr.splitlines()
         record = re.compile(rb"ginux: audit sequence=\d+ phase=(exit result=-?\d+|"
-                            rb"entry syscall=\d+ action=\S.* result=\S+)")
+                            rb"entry syscall=\d+(?: virtual-pid=\d+)? action=\S.* result=\S+)")
         if (b"ginux: audit truncated budget=65536" not in lines
                 or any(line.startswith(b"ginux: audit sequence=") and not record.fullmatch(line)
                        for line in lines)):

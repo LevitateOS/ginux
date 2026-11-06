@@ -14,6 +14,7 @@ use crate::supervisor::UserRegs;
 pub enum Lane {
     Process,
     Filesystem,
+    Device,
     Channel,
     Contract,
 }
@@ -33,6 +34,10 @@ pub fn classify(syscall: u64) -> Lane {
 
 /// Outcome of dispatching one native entry.
 pub enum NativeDecision {
+    /// An owned channel cannot progress yet; retain its syscall-entry stop.
+    Park { fd: u32 },
+    /// A public-descriptor query waits for object readiness or a deadline.
+    ParkPoll,
     /// A lane hook claimed the entry; emulate it with this result.
     Hooked { lane: Lane, result: i64 },
     /// No hook claimed the entry; apply the shared contract decision.
@@ -76,8 +81,64 @@ pub fn decide_native(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> NativeDecisi
             },
             None => NativeDecision::Contract(decide_balanced(syscall)),
         },
-        Lane::Contract => NativeDecision::Contract(decide_balanced(syscall)),
+        Lane::Device | Lane::Contract => NativeDecision::Contract(decide_balanced(syscall)),
     }
+}
+
+/// Resolve registered backend objects before the immutable native contract.
+pub fn decide_objects(
+    pid: usize,
+    registers: &UserRegs,
+    filesystem: &mut crate::fs_hooks::LaunchFs,
+    devices: &mut crate::device_hooks::LaunchDevices,
+    channels: &mut crate::channel_hooks::LaunchChannels,
+) -> NativeDecision {
+    if let Some(result) = channels.claim(pid, registers) {
+        match result {
+            crate::channel_hooks::ChannelResult::Ready(result) => NativeDecision::Hooked {
+                lane: Lane::Channel,
+                result,
+            },
+            crate::channel_hooks::ChannelResult::Blocked { fd } => NativeDecision::Park { fd },
+        }
+    } else if let Some(result) = devices.network.claim(pid, registers) {
+        match result {
+            crate::network_hooks::Result::Ready(result) => NativeDecision::Hooked {
+                lane: Lane::Device,
+                result,
+            },
+            crate::network_hooks::Result::Blocked => NativeDecision::Park {
+                fd: registers.rdi as u32,
+            },
+        }
+    } else if let Some(result) = devices.claim(pid, registers, filesystem) {
+        NativeDecision::Hooked {
+            lane: Lane::Device,
+            result,
+        }
+    } else if let Some(result) = filesystem.claim(pid, registers) {
+        NativeDecision::Hooked {
+            lane: Lane::Filesystem,
+            result,
+        }
+    } else {
+        decide_native(
+            registers.orig_rax,
+            registers.rdi,
+            registers.rsi,
+            registers.rdx,
+        )
+    }
+}
+
+/// Configured launch resolves the public descriptor ABI before backend handles.
+pub fn decide_launch(
+    pid: usize,
+    registers: &mut UserRegs,
+    descriptors: &mut crate::descriptors::DescriptorTable,
+    backends: &mut crate::descriptors::Backends,
+) -> NativeDecision {
+    descriptors.enter(pid, registers, backends)
 }
 
 /// Dispatch one process-supervision entry through the process-lane hook.
