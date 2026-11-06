@@ -21,6 +21,29 @@ long pipe_main(word *stack)
     word argc = *stack;
     char **argv = (char **)(stack + 1);
     int pair[2];
+    if (argc > 1 && argv[1][0] == 'v') {
+        CHECK(DO(293,pair,04000,0)==0,122);
+        word vectors[4]={(word)"ab",2,(word)"cd",2};
+        CHECK(DO(20,pair[1],vectors,2)==4,123);
+        vectors[0]=(word)buffer;vectors[1]=1;vectors[2]=(word)(buffer+1);vectors[3]=3;
+        CHECK(DO(19,pair[0],vectors,2)==4 && buffer[0]=='a' && buffer[3]=='d',124);
+        vectors[0]=(word)"ab";vectors[1]=2;vectors[2]=1;vectors[3]=2;
+        CHECK(DO(20,pair[1],vectors,2)==-14 && DO(0,pair[0],buffer,4)==-11,125);
+        CHECK(DO(1,pair[1],"abcd",4)==4,126);
+        vectors[0]=(word)buffer;vectors[1]=2;
+        CHECK(DO(19,pair[0],vectors,2)==2 && buffer[1]=='b',127);
+        CHECK(DO(0,pair[0],buffer,4)==2 && buffer[0]=='c' && buffer[1]=='d',128);
+        CHECK(DO(19,pair[0],1,0)==0 && DO(20,pair[1],1,0)==0 && DO(20,pair[1],vectors,17)==-22,129);
+        CHECK(DO(3,pair[0],0,0)==0 && DO(3,pair[1],0,0)==0,130);
+        CHECK(call(53,1,5,0,(word)pair,0,0)==0,131);
+        vectors[0]=(word)"ab";vectors[1]=2;vectors[2]=(word)"cd";vectors[3]=2;
+        CHECK(DO(20,pair[0],vectors,2)==4,132);
+        vectors[0]=(word)buffer;vectors[1]=1;vectors[2]=(word)(buffer+1);vectors[3]=3;
+        CHECK(DO(19,pair[1],vectors,2)==4 && buffer[3]=='d',133);
+        CHECK(DO(3,pair[0],0,0)==0 && DO(3,pair[1],0,0)==0,134);
+        DO(1,1,"owned-pipes: PASS\n",18);
+        return 0;
+    }
     if (argc > 1 && argv[1][0] == 'p') {
         CHECK(call(53,2,5,0,(word)pair,0,0)==-95,100);
         CHECK(call(53,1,1,0,(word)pair,0,0)==-95,101);

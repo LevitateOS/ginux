@@ -23,6 +23,10 @@ long storage_main(word *stack)
     if (argc > 1 && argv[1][0] == 't') {
         long fd=DO(2,"/work/time",0102,0600);CHECK(fd==3,219);
         CHECK(DO(86,"/work/time","/work/time-alias",0)==0 && DO(88,"time","/work/time-link",0)==0,220);
+        word vectors[4]={(word)"ab",2,(word)"cd",2};
+        CHECK(DO(20,fd,vectors,2)==4 && DO(8,fd,0,0)==0,234);
+        vectors[0]=(word)output;vectors[1]=1;vectors[2]=(word)(output+1);vectors[3]=3;
+        CHECK(DO(19,fd,vectors,2)==4 && output[0]=='a' && output[3]=='d',235);
         long times[4]={11,123,123456789,987654321};
         CHECK(call(280,fd,0,(word)times,0,0,0)==0 && DO(5,fd,meta,0)==0,221);
         CHECK(*(long *)(meta+72)==11 && *(long *)(meta+80)==123 && *(long *)(meta+88)==123456789 && *(long *)(meta+96)==987654321,222);

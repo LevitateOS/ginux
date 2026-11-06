@@ -1262,6 +1262,7 @@ impl LaunchFs {
             0 => self.read(pid, fd, r.rsi, r.rdx, None),
             17 => self.read(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
             1 => self.write(pid, fd, r.rsi, r.rdx, None),
+            19 | 20 => self.vector_io(pid, fd, r),
             18 => self.write(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
             3 => {
                 self.flocks.release((fd - 3) as u32, None);
@@ -1497,6 +1498,31 @@ impl LaunchFs {
         };
         self.fs.seek(fd, next as i64, 0).map_err(errno)?;
         result
+    }
+
+    fn vector_io(&mut self, pid: usize, fd: i32, r: &UserRegs) -> Result<i64, i64> {
+        let vectors = crate::tracee_io::IoVectors::read(pid, r.rsi, r.rdx)?;
+        let mut bytes = [0u8; IO_SIZE];
+        let count = vectors.length.min(IO_SIZE);
+        if r.orig_rax == 20 {
+            let copied = vectors.copy(pid, &mut bytes[..count], false)?;
+            self.fs
+                .write(fd, &bytes[..copied])
+                .map(|n| n as i64)
+                .map_err(errno)
+        } else {
+            let offset = self.fs.seek(fd, 0, 1).map_err(errno)?;
+            let read = self.fs.read(fd, &mut bytes[..count]).map_err(errno)?;
+            let result = vectors.copy(pid, &mut bytes[..read], true);
+            self.fs
+                .seek(
+                    fd,
+                    (offset + result.as_ref().copied().unwrap_or(0) as u64) as i64,
+                    0,
+                )
+                .map_err(errno)?;
+            result.map(|n| n as i64)
+        }
     }
 
     fn write(

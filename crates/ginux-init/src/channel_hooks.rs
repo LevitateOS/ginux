@@ -159,7 +159,7 @@ impl LaunchChannels {
             Ok(entry) => entry,
             Err(error) => return Some(ChannelResult::Ready(error)),
         };
-        if matches!(r.orig_rax, 0 | 1 | 44 | 45) {
+        if matches!(r.orig_rax, 0 | 1 | 19 | 20 | 44 | 45) {
             if matches!(r.orig_rax, 44 | 45)
                 && (entry.peer.is_none() || r.r10 & !(0x40 | 0x4000) != 0 || r.r8 != 0 || r.r9 != 0)
             {
@@ -375,11 +375,17 @@ impl LaunchChannels {
         entry: PipeFd,
         r: &UserRegs,
     ) -> Result<ChannelResult, i64> {
-        let writing = matches!(r.orig_rax, 1 | 44);
+        let writing = matches!(r.orig_rax, 1 | 20 | 44);
+        let vectors = if matches!(r.orig_rax, 19 | 20) {
+            crate::tracee_io::IoVectors::read(pid, r.rsi, r.rdx)?
+        } else {
+            crate::tracee_io::IoVectors::single(r.rsi, r.rdx)
+        };
+        let requested = vectors.length;
         if entry.peer.is_none() && writing != entry.write {
             return Err(-9);
         }
-        if r.rdx == 0 && entry.peer.is_none() {
+        if requested == 0 && entry.peer.is_none() {
             return Ok(ChannelResult::Ready(0));
         }
         let nonblock =
@@ -401,15 +407,15 @@ impl LaunchChannels {
                 }
                 return Err(-32);
             }
-            if p.packet && r.rdx > IO_SIZE as u64 {
+            if p.packet && requested > IO_SIZE {
                 return Err(-90);
             }
             let overhead = if p.packet { 2 } else { 0 };
             let available = (CAPACITY - p.len).saturating_sub(overhead);
-            let atomic = r.rdx <= IO_SIZE as u64;
+            let atomic = requested <= IO_SIZE;
             if CAPACITY - p.len < overhead
-                || (available == 0 && r.rdx != 0)
-                || (atomic && available < r.rdx as usize)
+                || (available == 0 && requested != 0)
+                || (atomic && available < requested)
             {
                 return Ok(if nonblock {
                     ChannelResult::Ready(-11)
@@ -417,8 +423,8 @@ impl LaunchChannels {
                     ChannelResult::Blocked { fd }
                 });
             }
-            let count = r.rdx.min(IO_SIZE as u64).min(available as u64) as usize;
-            let copied = copy_memory(pid, r.rsi, &mut buffer[..count], false)? as usize;
+            let count = requested.min(IO_SIZE).min(available);
+            let copied = vectors.copy(pid, &mut buffer[..count], false)?;
             if atomic && copied != count {
                 return Err(-14);
             }
@@ -449,11 +455,11 @@ impl LaunchChannels {
             } else {
                 p.len
             };
-            let count = r.rdx.min(IO_SIZE as u64).min(length as u64) as usize;
+            let count = requested.min(IO_SIZE).min(length);
             for (i, byte) in buffer[..count].iter_mut().enumerate() {
                 *byte = p.data[(p.head + overhead + i) % CAPACITY];
             }
-            let copied = copy_memory(pid, r.rsi, &mut buffer[..count], true)? as usize;
+            let copied = vectors.copy(pid, &mut buffer[..count], true)?;
             if p.packet && copied != count {
                 return Err(-14);
             }

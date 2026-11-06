@@ -81,6 +81,7 @@ def main():
         invoke(['blocked-read'], sig=signal.SIGKILL, park=True)
         invoke(['write-full'], sig=signal.SIGKILL, park=True)
         invoke()  # Fresh launch: no live pipe state or buffered bytes.
+        invoke(['vectors'])
         print('test-launch-pipes: PASS (data, atomicity, copyout, aliases, EOF, bounds, blocking, SIGPIPE)')
 
 

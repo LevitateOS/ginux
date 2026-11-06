@@ -211,3 +211,62 @@ pub fn reserve_native_descriptors(limit: usize) -> bool {
     limits[1] = limits[1].min(limit as u64);
     unsafe { syscall4(302, 0, 7, limits.as_ptr() as usize, 0) == 0 }
 }
+
+/// Bounded scatter/gather layout shared by owned byte-stream backends.
+pub struct IoVectors {
+    entries: [(u64, usize); 16],
+    pub length: usize,
+}
+impl IoVectors {
+    pub fn single(address: u64, length: u64) -> Self {
+        let mut entries = [(0, 0); 16];
+        entries[0] = (address, length as usize);
+        Self {
+            entries,
+            length: length as usize,
+        }
+    }
+    pub fn read(pid: usize, address: u64, count: u64) -> Result<Self, i64> {
+        if count > 16 {
+            return Err(-22);
+        }
+        let mut output = Self::single(0, 0);
+        let mut bytes = [0u8; 16 * 16];
+        let size = count as usize * 16;
+        if size != 0 && copy_memory(pid, address, &mut bytes[..size], false)? != size as i64 {
+            return Err(-14);
+        }
+        for (index, entry) in output.entries[..count as usize].iter_mut().enumerate() {
+            let address = u64::from_ne_bytes(bytes[index * 16..index * 16 + 8].try_into().unwrap());
+            let length =
+                u64::from_ne_bytes(bytes[index * 16 + 8..index * 16 + 16].try_into().unwrap())
+                    as usize;
+            output.length = output.length.checked_add(length).ok_or(-22)?;
+            *entry = (address, length);
+        }
+        Ok(output)
+    }
+    pub fn copy(&self, pid: usize, buffer: &mut [u8], to_tracee: bool) -> Result<usize, i64> {
+        let mut copied = 0;
+        for (address, length) in self.entries {
+            let count = length.min(buffer.len() - copied);
+            if count == 0 {
+                continue;
+            }
+            match copy_memory(pid, address, &mut buffer[copied..copied + count], to_tracee) {
+                Ok(n) => {
+                    copied += n as usize;
+                    if n as usize != count {
+                        break;
+                    }
+                }
+                Err(error) if copied == 0 => return Err(error),
+                Err(_) => break,
+            }
+            if copied == buffer.len() {
+                break;
+            }
+        }
+        Ok(copied)
+    }
+}
