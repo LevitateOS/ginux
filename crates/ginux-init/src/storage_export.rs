@@ -224,10 +224,13 @@ pub fn cancel() -> Result<(), Error> {
         return Ok(());
     };
     let closed = close(state.fd);
-    close(state.inode_fd);
-    close(state.parent_fd);
+    let inode_closed = close(state.inode_fd);
+    let parent_closed = close(state.parent_fd);
     if closed != 0 {
         return Err(b"export-file close failed");
+    }
+    if inode_closed != 0 || parent_closed != 0 {
+        return Err(b"export-file reference close failed");
     }
     Ok(())
 }
