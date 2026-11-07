@@ -1078,6 +1078,24 @@ fn launch_tracee(
             131,
         );
     }
+    // The caller's blocked signals are process state, not workload policy.
+    // Start the tracee with an empty mask before its first exec.
+    let empty_mask = 0u64;
+    if unsafe {
+        syscall4(
+            crate::supervisor::SYS_RT_SIGPROCMASK,
+            2,
+            &empty_mask as *const _ as usize,
+            0,
+            8,
+        )
+    } < 0
+    {
+        tracee_setup_fail(
+            b"ginux: launch bootstrap failed: child signal setup failed\n",
+            131,
+        );
+    }
     if unsafe { syscall1(SYS_CHROOT, root_path as usize) } < 0 {
         tracee_setup_fail(
             b"ginux: launch bootstrap unavailable: chroot failed (host privilege required)\n",

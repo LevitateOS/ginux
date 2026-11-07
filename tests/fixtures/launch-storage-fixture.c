@@ -176,6 +176,12 @@ static long task_events_data(void) {
     for(word n=0;n<10000;++n) CHECK(DO(39,0,0,0)>0,218);
     CHECK(DO(1,1,"events: PASS\n",13)==13,219); return 0;
 }
+static long signal_mask_data(void) {
+    word mask=~(word)0;
+    CHECK(call(14,0,0,(word)&mask,8,0,0)==0,226);
+    CHECK(mask==0,227);
+    CHECK(DO(1,1,"signal-mask: PASS\n",18)==18,228); return 0;
+}
 static long restore_data(int large) {
     if(large) {
         long fd=DO(2,"/out/nested/data",0,0); CHECK(fd==3,220);
@@ -377,6 +383,7 @@ long storage_main(word *stack)
     if(argc>1 && equal(argv[1],"positioned")) return positioned();
     if(argc>1 && equal(argv[1],"checkpoint")) return checkpoint_data();
     if(argc>1 && equal(argv[1],"events")) return task_events_data();
+    if(argc>1 && equal(argv[1],"signal-mask")) return signal_mask_data();
     if(argc>1 && equal(argv[1],"restore")) return restore_data(0);
     if(argc>1 && equal(argv[1],"restore-large")) return restore_data(1);
     if(argc>1 && (equal(argv[1],"flush") || equal(argv[1],"export") || equal(argv[1],"export-wait") || equal(argv[1],"failed-export") || equal(argv[1],"child-export"))) return export_data(argv[1]);

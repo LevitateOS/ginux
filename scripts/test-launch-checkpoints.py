@@ -132,6 +132,16 @@ def main():
                 print(f'10000 syscalls, control={controlled}: {time.monotonic()-start:.3f}s')
             finally:
                 client.close(); server.close()
+        # A blocked caller mask must not become the configured workload's mask.
+        config_path.write_text(config.replace('args = ["checkpoint"]','args = ["signal-mask"]'))
+        for inherited in (False, True):
+            def set_child_mask():
+                signal.pthread_sigmask(signal.SIG_BLOCK if inherited else signal.SIG_UNBLOCK,
+                                       {signal.SIGCHLD, signal.SIGUSR1})
+            proc = subprocess.run([binary, 'launch', str(config_path), str(root)],
+                                  preexec_fn=set_child_mask, capture_output=True, timeout=10)
+            assert proc.returncode == 0, proc.stderr.decode()
+            assert proc.stdout == b'signal-mask: PASS\n', proc.stdout
         print('test-launch-checkpoints: PASS (' + ('ordinary snapshots, fragmented valid frames, final export, cancellation and task events' if ordinary else 'snapshots, private fds, partial frames, replay, freshness, cancellation and task events') + ')')
 
 
