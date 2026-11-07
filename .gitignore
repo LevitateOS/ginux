@@ -5,3 +5,4 @@
 /docs/paper/*.log
 /docs/paper/*.pdf
 /.artifacts/
+/scripts/__pycache__/
