@@ -1,6 +1,6 @@
 //! Exact component lookup beneath the tracee root and temporary native path
 //! translation. Supervisor prefixes never enter a workload pathname.
-use crate::supervisor::{syscall1, syscall4, UserRegs, INSTANCE_GID, INSTANCE_UID};
+use crate::supervisor::{managed_host_identity, syscall1, syscall4, UserRegs};
 use crate::tracee_io::copy_memory;
 use ginux_vfs::{NodeKind, VfsError, MAX_PATH};
 pub struct ImageRoot(usize);
@@ -145,9 +145,11 @@ impl ImageRoot {
             0o40000 => {
                 let uid = (stat[3] >> 32) as u32;
                 let gid = stat[4] as u32;
-                let shift = if uid == INSTANCE_UID as u32 {
+                // Search permission as the identity the workload runs as.
+                let identity = managed_host_identity();
+                let shift = if uid == identity.uid as u32 {
                     6
-                } else if gid == INSTANCE_GID as u32 {
+                } else if gid == identity.gid as u32 {
                     3
                 } else {
                     0

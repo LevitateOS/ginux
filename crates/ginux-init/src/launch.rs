@@ -7,8 +7,8 @@
 use ginux_instance::{ConfigError, ExecutionBackend, ExecutionProfile, Instance, InstanceConfig};
 
 use crate::supervisor::{
-    exit_process, line, ptrace, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5,
-    write_all, AT_FDCWD, INSTANCE_GID, INSTANCE_UID, O_RDONLY, PR_SET_NO_NEW_PRIVS, PTRACE_SEIZE,
+    exit_process, line, managed_host_identity, ptrace, syscall0, syscall1, syscall2, syscall3,
+    syscall4, syscall5, write_all, AT_FDCWD, O_RDONLY, PR_SET_NO_NEW_PRIVS, PTRACE_SEIZE,
     SYS_CHDIR, SYS_CHROOT, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC,
     SYS_KILL, SYS_OPENAT_HOST, SYS_PRCTL, SYS_READ_HOST, SYS_SETGID, SYS_SETGROUPS, SYS_SETUID,
     SYS_WRITE_HOST,
@@ -27,7 +27,11 @@ pub enum Command {
     Runtime(*const u8),
     Config(*const u8),
     ConfigMerge(*const u8, usize, *const usize),
-    ContractPlan(*const u8),
+    InstancePlan(*const u8),
+    InstanceValidate(*const u8),
+    InstanceExplain(*const u8, *const u8),
+    InstanceDiff(*const u8, *const u8),
+    InstanceInspect(*const u8),
     HookPlan(*const u8),
     Lifecycle(*const u8),
     Vfs(*const u8, *const u8, *const u8),
@@ -76,9 +80,23 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
         Some(Command::ConfigMerge(config_path, argc - 3, unsafe {
             argv.add(3)
         }))
-    } else if c_string_equals(command, b"contract-plan") {
+    } else if c_string_equals(command, b"instance-plan") {
         let config_path = unsafe { *argv.add(2) as *const u8 };
-        Some(Command::ContractPlan(config_path))
+        Some(Command::InstancePlan(config_path))
+    } else if c_string_equals(command, b"instance-validate") {
+        let config_path = unsafe { *argv.add(2) as *const u8 };
+        Some(Command::InstanceValidate(config_path))
+    } else if argc >= 4 && c_string_equals(command, b"instance-explain") {
+        let config_path = unsafe { *argv.add(2) as *const u8 };
+        let operation = unsafe { *argv.add(3) as *const u8 };
+        Some(Command::InstanceExplain(config_path, operation))
+    } else if argc >= 4 && c_string_equals(command, b"instance-diff") {
+        let left = unsafe { *argv.add(2) as *const u8 };
+        let right = unsafe { *argv.add(3) as *const u8 };
+        Some(Command::InstanceDiff(left, right))
+    } else if c_string_equals(command, b"instance-inspect") {
+        let config_path = unsafe { *argv.add(2) as *const u8 };
+        Some(Command::InstanceInspect(config_path))
     } else if c_string_equals(command, b"hook-plan") {
         let config_path = unsafe { *argv.add(2) as *const u8 };
         Some(Command::HookPlan(config_path))
@@ -757,8 +775,10 @@ fn print_launch_config(config: &InstanceConfig) {
 pub fn usage() -> ! {
     line_stderr(b"ginux: usage: ginux (no arguments: interception demonstration)");
     line_stderr(
-        b"ginux: usage: ginux config|contract-plan|lifecycle|process|kernel-views <config>",
+        b"ginux: usage: ginux config|instance-plan|instance-validate|instance-inspect|lifecycle|process|kernel-views <config>",
     );
+    line_stderr(b"ginux: usage: ginux instance-explain <config> <operation>");
+    line_stderr(b"ginux: usage: ginux instance-diff <left-config> <right-config>");
     line_stderr(b"ginux: usage: ginux runtime <elf>");
     line_stderr(b"ginux: usage: ginux instance|process-native <config> <fixture>");
     line_stderr(b"ginux: usage: ginux native <config> <root> [hold|probe]");
@@ -1069,23 +1089,26 @@ fn launch_tracee(
     }
     let workdir = core::ptr::addr_of!(LAUNCH_WORKDIR).cast::<u8>();
     let _ = unsafe { syscall3(SYS_MKDIRAT, AT_FDCWD, workdir as usize, 0o755) };
-    if unsafe { syscall2(SYS_SETGROUPS, 0, 0) } < 0 {
-        tracee_setup_fail(
-            b"ginux: launch bootstrap failed: supplementary groups drop failed\n",
-            123,
-        );
-    }
-    if unsafe { syscall1(SYS_SETGID, INSTANCE_GID) } < 0 {
-        tracee_setup_fail(
-            b"ginux: launch bootstrap failed: group privilege drop failed\n",
-            124,
-        );
-    }
-    if unsafe { syscall1(SYS_SETUID, INSTANCE_UID) } < 0 {
-        tracee_setup_fail(
-            b"ginux: launch bootstrap failed: user privilege drop failed\n",
-            125,
-        );
+    let host_identity = managed_host_identity();
+    if host_identity.drop_root {
+        if unsafe { syscall2(SYS_SETGROUPS, 0, 0) } < 0 {
+            tracee_setup_fail(
+                b"ginux: launch bootstrap failed: supplementary groups drop failed\n",
+                123,
+            );
+        }
+        if unsafe { syscall1(SYS_SETGID, host_identity.gid) } < 0 {
+            tracee_setup_fail(
+                b"ginux: launch bootstrap failed: group privilege drop failed\n",
+                124,
+            );
+        }
+        if unsafe { syscall1(SYS_SETUID, host_identity.uid) } < 0 {
+            tracee_setup_fail(
+                b"ginux: launch bootstrap failed: user privilege drop failed\n",
+                125,
+            );
+        }
     }
     if unsafe { syscall5(SYS_PRCTL, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
         tracee_setup_fail(
