@@ -35,7 +35,8 @@ def main():
         (root / "work/a..b").mkdir()
         counter = 0
 
-        def invoke(args, expected, outcome, *, stdout=b"", changes=None, env=None, pass_fds=(), cloexec_stdin=False, preexec=None):
+        def invoke(args, expected, outcome, *, stdout=b"", changes=None, env=None, pass_fds=(), cloexec_stdin=False, preexec=None,
+                   stdin=None):
             nonlocal counter
             counter += 1
             config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
@@ -53,7 +54,7 @@ def main():
                     fcntl.fcntl(0, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
             proc = subprocess.run([binary, "launch", str(config_path), str(root),
                                    "--result-file", str(result_path)], capture_output=True,
-                                  timeout=20, pass_fds=pass_fds,
+                                  timeout=20, pass_fds=pass_fds, stdin=stdin,
                                   preexec_fn=child_setup if (preexec or cloexec_stdin) else None)
             record = json.loads(result_path.read_text())
             wanted = {"version": 1, "outcome": outcome, "code": None,
@@ -126,6 +127,39 @@ def main():
         invoke(["int80"], 1, "supervisor-error")
         invoke(["descriptor"], 0, "exited")
         invoke(["list"], 0, "exited", stdout=b"input\n")
+        # A directory as a standard stream would anchor *at calls outside the
+        # root, so launch refuses it; a regular file stays a valid stdin.
+        outside = work / "outside"
+        outside.mkdir()
+
+        def refused(stream, flags):
+            stream_config = work / f"stream-{stream}-{flags}.toml"
+            stream_config.write_text(template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
+                                    .replace("args = []", 'args = ["exit"]'))
+            result_path = work / f"stream-{stream}-{flags}.json"
+            directory = os.open(outside, flags)
+            try:
+                streams = {"stdin": None, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+                streams[stream] = directory
+                proc = subprocess.run([binary, "launch", str(stream_config), str(root),
+                                       "--result-file", str(result_path)], timeout=20, **streams)
+            finally:
+                os.close(directory)
+            record = json.loads(result_path.read_text())
+            reason = b"standard " + {"stdin": b"input", "stdout": b"output", "stderr": b"error"}[stream]
+            # With stderr a directory the refusal has nowhere to print.
+            if (proc.returncode != 2 or record["outcome"] != "supervisor-error"
+                    or (stream != "stdout" and proc.stdout)
+                    or (stream != "stderr" and reason + b" is a directory" not in proc.stderr)):
+                raise RuntimeError(f"directory {stream} was not refused as expected: "
+                                   f"exit={proc.returncode} record={record!r} stderr={proc.stderr!r}")
+            print(f"PASS launch directory {stream} refused")
+
+        for stream in ("stdin", "stdout", "stderr"):
+            refused(stream, os.O_RDONLY | os.O_DIRECTORY)
+        refused("stdin", os.O_PATH | os.O_DIRECTORY)
+        with open(root / "input", "rb") as regular:
+            invoke(["exit"], 0, "exited", stdin=regular)
         # The thread identity matches the virtual pid: set_tid_address returns
         # it instead of the host tid, and PI futexes, which would store the
         # host tid in the futex word, are denied.

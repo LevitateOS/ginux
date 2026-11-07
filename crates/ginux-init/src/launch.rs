@@ -7,11 +7,11 @@
 use ginux_instance::{ConfigError, ExecutionBackend, ExecutionProfile, Instance, InstanceConfig};
 
 use crate::supervisor::{
-    exit_process, line, managed_host_identity, ptrace, syscall0, syscall1, syscall2, syscall3,
-    syscall4, syscall5, write_all, AT_FDCWD, O_RDONLY, PR_SET_NO_NEW_PRIVS, PTRACE_SEIZE,
-    SYS_CHDIR, SYS_CHROOT, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC,
-    SYS_KILL, SYS_OPENAT_HOST, SYS_PRCTL, SYS_READ_HOST, SYS_SETGID, SYS_SETGROUPS, SYS_SETUID,
-    SYS_WRITE_HOST,
+    exit_process, line, managed_host_identity, ptrace, standard_stream_refusal, syscall0, syscall1,
+    syscall2, syscall3, syscall4, syscall5, write_all, AT_FDCWD, O_RDONLY, PR_SET_NO_NEW_PRIVS,
+    PTRACE_SEIZE, SYS_CHDIR, SYS_CHROOT, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK,
+    SYS_FSYNC, SYS_KILL, SYS_OPENAT_HOST, SYS_PRCTL, SYS_READ_HOST, SYS_SETGID, SYS_SETGROUPS,
+    SYS_SETUID, SYS_WRITE_HOST,
 };
 
 pub const MAX_ELF_SIZE: usize = 64 * 1024;
@@ -411,6 +411,9 @@ pub fn launch_main(
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     let config = launch_load_config(config_path);
     launch_validate(&config);
+    if let Some(reason) = standard_stream_refusal() {
+        launch_startup_fail(reason);
+    }
     let mut devices = crate::device_hooks::LaunchDevices::prepare(&config)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     // Capture the public operator limit before reserving private backing FDs.
