@@ -431,7 +431,7 @@ long storage_main(word *stack)
     }
     if (argc > 1 && equal(argv[1],"ordinary-mapping")) return ordinary_mapping(0);
     if (argc > 1 && equal(argv[1],"ordinary-unlinked-mapping")) return ordinary_mapping(1);
-    if (argc > 1 && argv[1][0] == 'm') {
+    if (argc > 1 && equal(argv[1],"mapping")) {
         long fd=DO(2,"/work/mapped",0102,0600);
         CHECK(fd==3 && DO(77,fd,8192,0)==0,110);
         CHECK(DO(1,fd,"old",3)==3 && DO(8,fd,4096,0)==4096 && DO(1,fd,"second",6)==6,111);
