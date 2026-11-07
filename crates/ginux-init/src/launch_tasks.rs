@@ -546,7 +546,7 @@ pub fn supervise(
             }
             2 => {
                 s.syscall_exit(index, &mut r, instance);
-                if s.path_guard == Some(index) {
+                if s.path_guard == Some(index) && s.task(index).exec.is_none() {
                     s.release_path_guard(instance);
                 }
             }
