@@ -36,6 +36,16 @@ static long sigchld_writer(void) {
     }
     return 0;
 }
+static volatile word *race_tid_page;
+static volatile int race_ready, race_done;
+static long tid_protect_writer(void) {
+    race_ready=1;
+    while(!race_done) {
+        if(DO(10,race_tid_page,4096,1)!=0 || DO(10,race_tid_page,4096,3)!=0) { error=160; break; }
+    }
+    DO(10,race_tid_page,4096,3);
+    return 0;
+}
 static volatile int private_done, private_checks;
 static long private_fd_probe(void) {
     char byte;
@@ -169,7 +179,30 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-1 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='Z' || mode=='z' || mode=='V') {
+    if (mode=='T' || mode=='U') {
+        long page=call(9,0,4096,3,0x22,(word)-1,0);
+        CHECK(page>0,161);
+        race_tid_page=(volatile word *)page;
+        if(mode=='T') {
+            CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],tid_protect_writer)==2,162);
+            while(!race_ready) __asm__ volatile("pause");
+        }
+        word successes=0, faults=0, capacity=0;
+        for(word i=1;i<=16;++i) {
+            long child=spawn_thread((word)(stacks[i]+sizeof stacks[i]),(volatile int *)race_tid_page,quick);
+            if(child>1) ++successes;
+            else if(child==-14) ++faults;
+            else if(child==-11) ++capacity;
+            else { error=163; break; }
+            for(word j=0;j<32;++j) DO(39,0,0,0);
+        }
+        race_done=1;
+        if(mode=='T') join(0);
+        CHECK(DO(10,race_tid_page,4096,3)==0,164);
+        CHECK(successes+faults+capacity==16,165);
+        CHECK(!error && spawn_thread((word)(stacks[17]+sizeof stacks[17]),
+                                    (volatile int *)race_tid_page,quick)>1,166);
+    } else if (mode=='Z' || mode=='z' || mode=='V') {
         word successful=0, rejected=0, exposed=0;
         if(mode=='z' || mode=='V') {
             action_flags_mode=(mode=='V');

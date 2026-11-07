@@ -570,8 +570,10 @@ impl Supervisor<'_> {
         &self.group(index).table
     }
     fn needs_argument_guard(&self, index: usize, r: &UserRegs) -> bool {
+        // Thread clone publishes parent_tid only after the native birth event.
         path_call(r.orig_rax)
             || (r.orig_rax == 13 && r.rdi == 17 && r.rsi != 0 && r.r10 == 8)
+            || (r.orig_rax == 56 && matches!(r.rdi, 0x3d0f00 | 0x7d0f00))
             || (r.orig_rax == 9
                 && r.r10 & 0x20 == 0
                 && self
