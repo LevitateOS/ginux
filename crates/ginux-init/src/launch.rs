@@ -7,10 +7,11 @@
 use ginux_instance::{ConfigError, ExecutionBackend, ExecutionProfile, Instance, InstanceConfig};
 
 use crate::supervisor::{
-    exit_process, line, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5, write_all,
-    AT_FDCWD, INSTANCE_GID, INSTANCE_UID, O_RDONLY, PR_SET_NO_NEW_PRIVS, PTRACE_TRACEME, SYS_CHDIR,
-    SYS_CHROOT, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC, SYS_OPENAT_HOST,
-    SYS_PRCTL, SYS_PTRACE, SYS_READ_HOST, SYS_SETGID, SYS_SETGROUPS, SYS_SETUID, SYS_WRITE_HOST,
+    exit_process, line, ptrace, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5,
+    write_all, AT_FDCWD, INSTANCE_GID, INSTANCE_UID, O_RDONLY, PR_SET_NO_NEW_PRIVS, PTRACE_SEIZE,
+    SYS_CHDIR, SYS_CHROOT, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC,
+    SYS_KILL, SYS_OPENAT_HOST, SYS_PRCTL, SYS_READ_HOST, SYS_SETGID, SYS_SETGROUPS, SYS_SETUID,
+    SYS_WRITE_HOST,
 };
 
 pub const MAX_ELF_SIZE: usize = 64 * 1024;
@@ -413,12 +414,60 @@ pub fn launch_main(
     if unsafe { syscall5(SYS_PRCTL, 36, 1, 0, 0, 0) } < 0 {
         launch_instance_fail(&mut instance, b"instance subreaper setup failed");
     }
+    // The child waits for this private token before any guest code can run.
+    // Seize it first so every descendant can be interrupted without signals.
+    let mut gate = [0i32; 2];
+    if unsafe { syscall2(293, gate.as_mut_ptr() as usize, 0x80000) } < 0 {
+        launch_instance_fail(&mut instance, b"launch tracee gate unavailable");
+    }
     let child = unsafe { syscall0(SYS_FORK) };
     if child < 0 {
+        unsafe {
+            syscall1(SYS_CLOSE_HOST, gate[0] as usize);
+            syscall1(SYS_CLOSE_HOST, gate[1] as usize);
+        }
         launch_instance_fail(&mut instance, b"launch tracee fork failed");
     }
     if child == 0 {
-        launch_tracee(root_path, &config, descriptors.capacity());
+        unsafe {
+            syscall1(SYS_CLOSE_HOST, gate[1] as usize);
+        }
+        launch_tracee(root_path, &config, descriptors.capacity(), gate[0] as usize);
+    }
+    unsafe {
+        syscall1(SYS_CLOSE_HOST, gate[0] as usize);
+    }
+    if ptrace(
+        PTRACE_SEIZE,
+        child as usize,
+        0,
+        crate::launch_tasks::OPTIONS,
+    ) < 0
+    {
+        unsafe {
+            syscall1(SYS_CLOSE_HOST, gate[1] as usize);
+            syscall2(SYS_KILL, child as usize, 9);
+        }
+        launch_instance_fail(&mut instance, b"launch ptrace seize failed");
+    }
+    let token = b'G';
+    if unsafe {
+        syscall3(
+            SYS_WRITE_HOST,
+            gate[1] as usize,
+            &token as *const _ as usize,
+            1,
+        )
+    } != 1
+    {
+        unsafe {
+            syscall1(SYS_CLOSE_HOST, gate[1] as usize);
+            syscall2(SYS_KILL, child as usize, 9);
+        }
+        launch_instance_fail(&mut instance, b"launch tracee gate release failed");
+    }
+    unsafe {
+        syscall1(SYS_CLOSE_HOST, gate[1] as usize);
     }
     supervise_launch(
         child as usize,
@@ -952,8 +1001,30 @@ fn restrict_tracee_resources(config: &InstanceConfig) -> bool {
     unsafe { syscall3(203, 0, size as usize, mask.as_ptr() as usize) == 0 }
 }
 
-fn launch_tracee(root_path: *const u8, config: &InstanceConfig, descriptor_limit: usize) -> ! {
+fn launch_tracee(
+    root_path: *const u8,
+    config: &InstanceConfig,
+    descriptor_limit: usize,
+    gate: usize,
+) -> ! {
     static ROOT: &[u8] = b"/\0";
+    let mut token = 0u8;
+    loop {
+        let n = unsafe { syscall3(SYS_READ_HOST, gate, &mut token as *mut _ as usize, 1) };
+        if n == -4 {
+            continue;
+        }
+        if n != 1 || token != b'G' {
+            tracee_setup_fail(
+                b"ginux: launch bootstrap failed: ptrace startup gate failed\n",
+                122,
+            );
+        }
+        break;
+    }
+    unsafe {
+        syscall1(SYS_CLOSE_HOST, gate);
+    }
     if !restrict_tracee_resources(config) {
         tracee_setup_fail(
             b"ginux: launch bootstrap failed: resource bounds unavailable\n",
@@ -998,12 +1069,6 @@ fn launch_tracee(root_path: *const u8, config: &InstanceConfig, descriptor_limit
     }
     let workdir = core::ptr::addr_of!(LAUNCH_WORKDIR).cast::<u8>();
     let _ = unsafe { syscall3(SYS_MKDIRAT, AT_FDCWD, workdir as usize, 0o755) };
-    if unsafe { syscall4(SYS_PTRACE, PTRACE_TRACEME, 0, 0, 0) } < 0 {
-        tracee_setup_fail(
-            b"ginux: launch bootstrap unavailable: ptrace traceme failed\n",
-            122,
-        );
-    }
     if unsafe { syscall2(SYS_SETGROUPS, 0, 0) } < 0 {
         tracee_setup_fail(
             b"ginux: launch bootstrap failed: supplementary groups drop failed\n",
@@ -1079,7 +1144,7 @@ pub(crate) fn launch_exit_reason(code: i32) -> &'static [u8] {
     match code {
         120 => b"bootstrap unavailable: chroot failed (host privilege required)",
         121 => b"bootstrap failed: root directory unavailable",
-        122 => b"bootstrap unavailable: ptrace traceme failed",
+        122 => b"bootstrap failed: ptrace startup gate failed",
         123 => b"bootstrap failed: supplementary groups drop failed",
         124 => b"bootstrap failed: group privilege drop failed",
         125 => b"bootstrap failed: user privilege drop failed",

@@ -19,7 +19,7 @@ use ginux_vfs::Executable;
 const TASKS: usize = 32;
 const WALL: usize = 0x4000_0000;
 // Linux x86-64: sys/ptrace and asm/unistd_64.h.
-const OPTIONS: usize = PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL | 2 | 4 | 8 | 16;
+pub(crate) const OPTIONS: usize = PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL | 2 | 4 | 8 | 16;
 
 #[derive(Clone, Copy)]
 enum Pending {
@@ -113,6 +113,10 @@ struct Supervisor<'a> {
     signal_fd: Option<usize>,
     root_status: Option<i32>,
     creation_failure_reported: bool,
+}
+
+fn birth_stop(status: i32) -> bool {
+    stopped(status) && (status as u32 >> 16) == 128 && ((status >> 8) & 255) == 5
 }
 
 // Created only after the tracee's initial exec stop, so neither the blocked
@@ -344,7 +348,7 @@ pub fn supervise(
         let Some(index) = index else {
             // Auto-attached children can report their birth stop before the
             // parent's event. Hold them; GETEVENTMSG must confirm ownership.
-            if stopped(status) && ((status >> 8) & 255) == 19 {
+            if birth_stop(status) {
                 let slot = s
                     .unknown_stops
                     .iter()
@@ -380,6 +384,11 @@ pub fn supervise(
         if event == 4 {
             s.exec_completed(index, instance);
             continue;
+        }
+        if event == 128 {
+            // A seized tracee reports a real group stop as EVENT_STOP.
+            // It cannot be forwarded as a normal signal-delivery stop.
+            s.fail(instance, b"launch group stops are unsupported")
         }
         if event != 0 {
             s.fail(instance, b"unsupported task transition")
@@ -442,6 +451,13 @@ pub fn supervise(
         }
         if info_length < 24 || (info[0] >> 32) as u32 != 0xc000003e {
             s.fail(instance, b"launch requires the x86-64 syscall ABI")
+        }
+        // SEIZE reports the initial exec event before its syscall-exit stop.
+        // No guest syscall entry has occurred yet, so do not audit a phantom
+        // sequence-zero exit or run per-syscall completion logic.
+        if index == 0 && s.task(index).sequence == 0 && info[0] as u8 == 2 {
+            s.resume(index, 0, instance);
+            continue;
         }
         match info[0] as u8 {
             1 => s.entry(index, &mut r, instance),
@@ -1557,7 +1573,7 @@ impl Supervisor<'_> {
             let mut status = 0;
             if unsafe { syscall4(SYS_WAIT4, host, &mut status as *mut _ as usize, WALL, 0) } < 0
                 || !stopped(status)
-                || ((status >> 8) & 255) != 19
+                || !birth_stop(status)
             {
                 self.fail(instance, b"child birth stop missing")
             }
