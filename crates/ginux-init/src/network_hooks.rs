@@ -1,7 +1,7 @@
 //! Configured TCP ownership. Only pre-granted numeric destinations can acquire
 //! a supervisor socket; the workload never receives its private descriptor.
-use crate::supervisor::{SYS_KILL, UserRegs, syscall2};
-use crate::tracee_io::{IoVectors, Stat, copy_memory, write_stat};
+use crate::supervisor::{syscall2, UserRegs, SYS_KILL};
+use crate::tracee_io::{copy_memory, write_stat, IoVectors, Stat};
 use ginux_devices::{BoundedTcp, LinuxTcpBackend, NetworkError, TcpEndpoint, TcpFamily};
 use ginux_instance::{InstanceConfig, NetworkBackend};
 
