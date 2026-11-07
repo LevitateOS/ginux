@@ -78,6 +78,11 @@ __asm__(".global spawn_thread\nspawn_thread:\n"
         "mov %rdx,-16(%rdi)\nmov %rsi,%rdx\nmov %rsi,%r10\nmov %rdi,%rsi\nsub $16,%rsi\n"
         "xor %r8d,%r8d\nmov thread_flags(%rip),%edi\nmov $56,%eax\nsyscall\ntest %rax,%rax\njnz 1f\n"
         "xor %ebp,%ebp\ncall *(%rsp)\nmov %rax,%rdi\nmov $60,%eax\nsyscall\nud2\n1:ret\n");
+long spawn_thread_split(word top, volatile int *parent_tid, volatile int *child_tid, long (*fn)(void));
+__asm__(".global spawn_thread_split\nspawn_thread_split:\n"
+        "mov %rcx,-16(%rdi)\nmov %rdx,%r10\nmov %rsi,%rdx\nmov %rdi,%rsi\nsub $16,%rsi\n"
+        "xor %r8d,%r8d\nmov thread_flags(%rip),%edi\nmov $56,%eax\nsyscall\ntest %rax,%rax\njnz 1f\n"
+        "xor %ebp,%ebp\ncall *(%rsp)\nmov %rax,%rdi\nmov $60,%eax\nsyscall\nud2\n1:ret\n");
 static void join(word i)
 {
     for (;;) {
@@ -105,6 +110,31 @@ static long nested_birth(void) {
     nested_good=spawn_thread((word)(stacks[1]+sizeof stacks[1]),&tid[1],nested_quick);
     if(nested_good>1) join(1);
     if(DO(11,page,4096,0)!=0) error=182;
+    return 0;
+}
+static volatile long child_pointer_result, child_pointer_tid;
+static volatile int child_pointer_done;
+static long child_pointer_quick(void) {
+    child_pointer_tid=DO(186,0,0,0);
+    child_pointer_done=1;
+    DO(202,&child_pointer_done,1,1);
+    return 0;
+}
+static long nested_child_pointer(void) {
+    long page=call(9,0,4096,3,0x22,(word)-1,0);
+    if(page<=0) { error=186; return 0; }
+    *(volatile int *)page=0x44332211;
+    if(DO(10,page,4096,1)!=0) { error=187; return 0; }
+    child_pointer_result=spawn_thread_split((word)(stacks[1]+sizeof stacks[1]),&tid[1],
+                                            (volatile int *)page,child_pointer_quick);
+    if(child_pointer_result<0) { error=188; return 0; }
+    while(!child_pointer_done) {
+        long result=DO(202,&child_pointer_done,0,0);
+        if(result!=0 && result!=-11 && result!=-4) { error=189; return 0; }
+    }
+    if(child_pointer_result!=3 || child_pointer_tid!=3 || tid[1]!=3 ||
+       *(volatile int *)page!=0x44332211) error=190;
+    if(DO(11,page,4096,0)!=0) error=191;
     return 0;
 }
 static long shared_umask(void) {
@@ -198,7 +228,12 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-1 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='N') {
+    if (mode=='C') {
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],nested_child_pointer)==2,192);
+        join(0);
+        CHECK(!error && child_pointer_result==3 && child_pointer_tid==3 &&
+              tid[0]==0 && tid[1]==3,193);
+    } else if (mode=='N') {
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],nested_birth)==2,183);
         join(0);
         CHECK(!error && nested_bad==-14 && nested_good==3 &&

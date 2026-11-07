@@ -17,7 +17,7 @@ def main():
     if len(sys.argv) < 3 or os.geteuid() != 0:
         sys.exit('usage (as root): test-launch-threads.py <ginux> <thread-fixture> [scenario ...]')
     binary, fixture = [str(Path(p).resolve()) for p in sys.argv[1:3]]
-    scenarios = ('basic', 'musl', 'umask', 'pin', 'limit', 'stress', 'Z-safe', 'z-race', 'V-flags', 'U-clone-tid', 'T-clone-tid-race', 'B-cross-tid', 'N-nonleader-tid', 'x-path', 'y-mapping', 'k-scratch', 'v-private', 'n-mapping', 'j-leader-map', 'q-fixed', 'w-rollback', 'a-pair-fail', 'fork', 'early', 'rollback', 'tiny', 'teardown')
+    scenarios = ('basic', 'musl', 'umask', 'pin', 'limit', 'stress', 'Z-safe', 'z-race', 'V-flags', 'U-clone-tid', 'T-clone-tid-race', 'B-cross-tid', 'N-nonleader-tid', 'C-child-tid', 'x-path', 'y-mapping', 'k-scratch', 'v-private', 'n-mapping', 'j-leader-map', 'q-fixed', 'w-rollback', 'a-pair-fail', 'fork', 'early', 'rollback', 'tiny', 'teardown')
     selected = sys.argv[3:] or scenarios
     if any(mode not in scenarios for mode in selected):
         sys.exit('unknown thread scenario')
