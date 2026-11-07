@@ -6837,7 +6837,8 @@ fn supervise_native(
                 if mode == 3
                     && syscall == 16
                     && registers.rdi as i64 == task.console_fd
-                    && registers.rsi == 21_505 =>
+                    // TCGETS, and TCGETS2, which glibc 2.42 tcgetattr uses.
+                    && matches!(registers.rsi, 21_505 | 0x802c_542a) =>
             {
                 line(b"mediate surface=virtual-console-termios result=pending");
                 task.awaiting_exit = true;
