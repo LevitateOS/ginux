@@ -849,7 +849,12 @@ impl LaunchFs {
         if !suffix.is_empty() {
             let directory = self.fs.directory_path(fd).map_err(errno)?;
             let joined = join_path(directory, &suffix[1..])?;
-            let path = self.resolve(pid, joined.as_bytes(), true, false)?;
+            // A descriptor reopen cannot leave its assigned namespace. The
+            // namespace walker reports an above-root traversal as InvalidPath;
+            // expose the same unsupported-authority result as a resolved exit.
+            let path = self
+                .resolve(pid, joined.as_bytes(), true, false)
+                .map_err(|error| if error == -22 { -95 } else { error })?;
             if !self.owns_path(path.as_bytes()) {
                 return Err(-95);
             }
