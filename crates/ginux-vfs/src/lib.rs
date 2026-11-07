@@ -83,6 +83,8 @@ impl<'a> Index<'a> {
             let entry = index.entry(offset)?;
             if entry.path.is_empty()
                 || entry.path[0] != b'/'
+                || entry.path.contains(&0)
+                || entry.link.contains(&0)
                 || previous.is_some_and(|value| value >= entry.path)
                 || (entry.kind == NodeKind::File
                     && entry.data_offset.checked_add(entry.size).is_none())
@@ -178,6 +180,8 @@ pub fn encode_record(entry: Entry<'_>, output: &mut [u8; RECORD_SIZE]) -> Result
         || entry.path.len() > MAX_PATH
         || entry.link.len() > MAX_LINK
         || entry.path[0] != b'/'
+        || entry.path.contains(&0)
+        || entry.link.contains(&0)
     {
         return Err(VfsError::InvalidPath);
     }
@@ -2157,6 +2161,43 @@ mod tests {
         vfs.unlink(b"/bin").unwrap();
         assert_eq!(vfs.open(b"/bin/sh", O_READ), Err(VfsError::NotFound));
         assert!(vfs.open(b"/usr/bin/tool", O_READ).is_ok());
+    }
+
+    #[test]
+    fn rejects_embedded_nul_in_image_names_and_links() {
+        let mut path = index_bytes();
+        let last_path = HEADER_SIZE + 7 * RECORD_SIZE + 40;
+        path[last_path + b"/usr/bin/tool".len() - 1] = 0;
+        assert!(matches!(Index::new(&path), Err(VfsError::InvalidIndex)));
+
+        let mut link = index_bytes();
+        let first_link = HEADER_SIZE + 2 * RECORD_SIZE + 40 + MAX_PATH;
+        link[first_link + 3] = 0;
+        assert!(matches!(Index::new(&link), Err(VfsError::InvalidIndex)));
+
+        let mut record = [0u8; RECORD_SIZE];
+        let valid = index_bytes();
+        let entry = Index::new(&valid).unwrap().entry(0).unwrap();
+        assert_eq!(
+            encode_record(
+                Entry {
+                    path: b"/bad\0name",
+                    ..entry
+                },
+                &mut record
+            ),
+            Err(VfsError::InvalidPath)
+        );
+        assert_eq!(
+            encode_record(
+                Entry {
+                    link: b"bad\0target",
+                    ..entry
+                },
+                &mut record
+            ),
+            Err(VfsError::InvalidPath)
+        );
     }
 
     #[test]
