@@ -115,7 +115,7 @@ struct Supervisor<'a> {
     signal_fd: Option<usize>,
     root_status: Option<i32>,
     creation_failure_reported: bool,
-    path_guard: Option<usize>,
+    argument_guard: Option<usize>,
 }
 
 fn birth_stop(status: i32) -> bool {
@@ -299,7 +299,7 @@ pub fn supervise(
         signal_fd: None,
         root_status: None,
         creation_failure_reported: false,
-        path_guard: None,
+        argument_guard: None,
     };
     s.groups[0] = Some(DescriptorGroup {
         table: descriptors,
@@ -362,7 +362,7 @@ pub fn supervise(
             s.fail(instance, reason);
         }
         status = 0;
-        let held = if s.path_guard.is_none() {
+        let held = if s.argument_guard.is_none() {
             s.tasks
                 .iter_mut()
                 .flatten()
@@ -416,7 +416,7 @@ pub fn supervise(
             s.fail(instance, b"event from unregistered task");
         };
         s.task_mut(index).running = false;
-        if s.path_guard.is_some_and(|owner| owner != index) {
+        if s.argument_guard.is_some_and(|owner| owner != index) {
             if s.task(index).held_status.is_some() {
                 s.fail(instance, b"multiple held stops for one task");
             }
@@ -424,8 +424,8 @@ pub fn supervise(
             continue;
         }
         if exited(status) || signaled(status) {
-            if s.path_guard == Some(index) {
-                s.release_path_guard(instance);
+            if s.argument_guard == Some(index) {
+                s.release_argument_guard(instance);
             }
             s.died(index, status, instance);
             if let Some(status) = s.root_status {
@@ -449,8 +449,8 @@ pub fn supervise(
             continue;
         }
         if event == 4 {
-            if s.path_guard == Some(index) {
-                s.release_path_guard(instance);
+            if s.argument_guard == Some(index) {
+                s.release_argument_guard(instance);
             }
             s.exec_completed(index, instance);
             continue;
@@ -536,18 +536,21 @@ pub fn supervise(
         }
         match info[0] as u8 {
             1 => {
-                if path_call(r.orig_rax) {
-                    s.begin_path_guard(index, instance);
+                if s.needs_argument_guard(index, &r) {
+                    s.begin_argument_guard(index, instance);
                 }
                 s.entry(index, &mut r, instance);
-                if s.path_guard == Some(index) && s.task(index).blocked.is_some() {
-                    s.release_path_guard(instance);
+                if s.argument_guard == Some(index) && s.task(index).blocked.is_some() {
+                    s.release_argument_guard(instance);
                 }
             }
             2 => {
                 s.syscall_exit(index, &mut r, instance);
-                if s.path_guard == Some(index) && s.task(index).exec.is_none() {
-                    s.release_path_guard(instance);
+                if s.argument_guard == Some(index)
+                    && s.task(index).exec.is_none()
+                    && s.task(index).mapping.is_none()
+                {
+                    s.release_argument_guard(instance);
                 }
             }
             _ => s.fail(instance, b"unknown syscall stop"),
@@ -565,6 +568,15 @@ impl Supervisor<'_> {
     }
     fn table(&self, index: usize) -> &DescriptorTable {
         &self.group(index).table
+    }
+    fn needs_argument_guard(&self, index: usize, r: &UserRegs) -> bool {
+        path_call(r.orig_rax)
+            || (r.orig_rax == 9
+                && r.r10 & 0x20 == 0
+                && self
+                    .table(index)
+                    .mapping_file(r.r8)
+                    .is_ok_and(|file| file.is_some()))
     }
     fn release_group(
         &mut self,
@@ -658,12 +670,12 @@ impl Supervisor<'_> {
             self.task_mut(index).running = true;
         }
     }
-    fn begin_path_guard(&mut self, owner: usize, instance: &mut Instance) {
-        if self.path_guard.is_some() {
+    fn begin_argument_guard(&mut self, owner: usize, instance: &mut Instance) {
+        if self.argument_guard.is_some() {
             return;
         }
         let deadline = crate::descriptors::monotonic_nanoseconds()
-            .unwrap_or_else(|_| self.fail(instance, b"path peer-stop clock failed"))
+            .unwrap_or_else(|_| self.fail(instance, b"argument peer-stop clock failed"))
             .saturating_add(5_000_000_000);
         let mut requested = [false; TASKS];
         for (index, wanted) in requested.iter_mut().enumerate() {
@@ -683,7 +695,7 @@ impl Supervisor<'_> {
             *wanted = true;
             let result = ptrace(PTRACE_INTERRUPT, task.host, 0, 0);
             if result < 0 && result != -3 && result != -5 {
-                self.fail(instance, b"path peer interrupt failed");
+                self.fail(instance, b"argument peer interrupt failed");
             }
         }
         for (index, wanted) in requested.iter().enumerate() {
@@ -700,7 +712,7 @@ impl Supervisor<'_> {
                     if crate::descriptors::monotonic_nanoseconds()
                         .map_or(true, |now| now >= deadline)
                     {
-                        self.fail(instance, b"path peer interrupt timed out");
+                        self.fail(instance, b"argument peer interrupt timed out");
                     }
                     unsafe {
                         syscall0(24);
@@ -711,7 +723,7 @@ impl Supervisor<'_> {
                     continue;
                 }
                 if waited != host as isize {
-                    self.fail(instance, b"path peer stop missing");
+                    self.fail(instance, b"argument peer stop missing");
                 }
                 let peer = self.task_mut(index);
                 peer.running = false;
@@ -719,11 +731,11 @@ impl Supervisor<'_> {
                 break;
             }
         }
-        self.path_guard = Some(owner);
+        self.argument_guard = Some(owner);
     }
 
-    fn release_path_guard(&mut self, instance: &mut Instance) {
-        let owner = self.path_guard.take().unwrap();
+    fn release_argument_guard(&mut self, instance: &mut Instance) {
+        let owner = self.argument_guard.take().unwrap();
         for index in 0..TASKS {
             if index == owner || self.tasks[index].is_none() {
                 continue;
@@ -2133,23 +2145,23 @@ impl Supervisor<'_> {
         }
     }
     fn wake(&mut self, instance: &mut Instance) {
-        // Do not resume a peer while a kernel pathname is in flight.
-        if self.path_guard.is_some() || !core::mem::replace(&mut self.wake_needed, false) {
+        // Do not resume a peer while kernel-consumed guest arguments are in flight.
+        if self.argument_guard.is_some() || !core::mem::replace(&mut self.wake_needed, false) {
             return;
         }
         for index in 0..TASKS {
-            if self.path_guard.is_some() {
+            if self.argument_guard.is_some() {
                 break;
             }
             let Some(mut r) = self.tasks[index].as_mut().and_then(|t| t.blocked.take()) else {
                 continue;
             };
-            if path_call(r.orig_rax) {
-                self.begin_path_guard(index, instance);
+            if self.needs_argument_guard(index, &r) {
+                self.begin_argument_guard(index, instance);
             }
             self.entry(index, &mut r, instance);
-            if self.path_guard == Some(index) && self.task(index).blocked.is_some() {
-                self.release_path_guard(instance);
+            if self.argument_guard == Some(index) && self.task(index).blocked.is_some() {
+                self.release_argument_guard(instance);
             }
         }
     }

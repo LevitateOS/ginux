@@ -124,6 +124,13 @@ long thread_main(word *stack)
         join(0);
         CHECK(!error,100);
         CHECK(!exposed,99);
+    } else if (mode=='y') {
+        CHECK(DO(77,3,4096,0)==0 && DO(1,3,"M",1)==1,101);
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],path_writer)==2,102);
+        long mapped=call(9,0,4096,1,2,3,0);
+        path_done=1;
+        join(0);
+        CHECK(mapped>0 && *(volatile char *)mapped=='M' && DO(11,mapped,4096,0)==0 && !error,103);
     } else if (mode=='u') {
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],shared_umask)==2,92);
         join(0);CHECK(!error && DO(95,0022,0,0)==0077,93);
