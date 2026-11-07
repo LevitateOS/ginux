@@ -84,11 +84,37 @@ static long ordinary_resources(word argc, char **argv) {
     DO(1,1,"owned-tasks: PASS\n",18);
     return 0;
 }
+static long ordinary_umask(int after_exec) {
+    static char metadata[144] __attribute__((aligned(8)));
+    if(after_exec) { CHECK(DO(95,0,0,0)==0077,229);return 0; }
+    CHECK(DO(95,0,0,0)==0022,220);
+    long fd=DO(2,"/work/unmasked",0102,0666);CHECK(fd==3,221);
+    CHECK(DO(5,fd,metadata,0)==0 && (*(unsigned int *)(metadata+24)&0777)==0666 && DO(3,fd,0,0)==0,222);
+    CHECK(DO(83,"/work/unmasked-dir",0777,0)==0,223);
+    CHECK(call(262,-100,(word)"/work/unmasked-dir",(word)metadata,0,0,0)==0 && (*(unsigned int *)(metadata+24)&0777)==0777,224);
+    CHECK(DO(95,0027,0,0)==0,225);
+    fd=call(257,-100,(word)"/work/masked",0102,0666,0,0);CHECK(fd==3,226);
+    CHECK(DO(5,fd,metadata,0)==0 && (*(unsigned int *)(metadata+24)&0777)==0640 && DO(3,fd,0,0)==0,227);
+    long child=DO(57,0,0,0);CHECK(child>=0,228);
+    if(child==0) {
+        CHECK(DO(95,0077,0,0)==0027,230);
+        char *arguments[]={"/bin/fixture","UmaskExec",0}, *environment[]={0};
+        DO(59,arguments[0],arguments,environment);return 231;
+    }
+    int status=-1;CHECK(DO(61,child,&status,0)==child && status==0,232);
+    CHECK(DO(95,0022,0,0)==0027,233);
+    return 0;
+}
 long task_main(word *stack)
 {
     word argc=*stack;
     char **argv=(char **)(stack+1);
     char mode=argc>1 ? argv[1][0] : 'f';
+    if(mode=='U') {
+        long result=ordinary_umask(argc>1 && argv[1][5]=='E');if(result)return result;
+        if(argv[1][5]!='E') { DO(1,1,"owned-tasks: PASS\n",18); }
+        return 0;
+    }
     if(mode=='C') {
         CHECK(DO(39,0,0,0)==2 && DO(72,3,1,0)==0 && DO(72,4,1,0)==-9,168);
         CHECK(DO(1,6,"E",1)==1 && DO(0,7,buffer,1)==1,169); return 0;

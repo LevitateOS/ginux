@@ -32,6 +32,10 @@ static void join(word i)
     }
 }
 static long quick(void) { return 0; }
+static long shared_umask(void) {
+    if(DO(95,0077,0,0)!=0022)error=91;
+    return 0;
+}
 static long basic(void)
 {
     if (DO(39,0,0,0)!=1 || DO(186,0,0,0)!=tid[0] || tid[0]!=2 || DO(110,0,0,0)!=0) { error=11; return 0; }
@@ -96,7 +100,10 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-1 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='t') {
+    if (mode=='u') {
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],shared_umask)==2,92);
+        join(0);CHECK(!error && DO(95,0022,0,0)==0077,93);
+    } else if (mode=='t') {
         for (word attempt=0;attempt<256;++attempt) {
             long child=-11;
             for (word retry=0;retry<64 && child==-11;++retry) {

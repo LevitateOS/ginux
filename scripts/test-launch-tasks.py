@@ -54,7 +54,7 @@ def main():
                 print(f'PASS launch resources: vcpus={vcpus}, operator={allowed}, actual={expected_cpus}; fork/exec')
         if not sys.argv[3:] or 'ordinary-resources' in sys.argv[3:]:
             resource_cases()
-        modes = ('Locks', 'OrdinaryLocks', 'ExecLocks', 'BoundedTasks', 'qfault', 'fork', 'vfork', 'clone', 'shared-vfork', 'libc-fork', 'junk-child-tid', 'protected-child-tid', 'x-child-tid', 'handler-return', 'inherit', 'kill', 'bound', 'orphan', 'adopted-zombie', 'rollback', 'inherit')
+        modes = ('Umask', 'Locks', 'OrdinaryLocks', 'ExecLocks', 'BoundedTasks', 'qfault', 'fork', 'vfork', 'clone', 'shared-vfork', 'libc-fork', 'junk-child-tid', 'protected-child-tid', 'x-child-tid', 'handler-return', 'inherit', 'kill', 'bound', 'orphan', 'adopted-zombie', 'rollback', 'inherit')
         if sys.argv[3:]:
             allowed=set(modes) | {'OrdinaryLocks', 'ordinary-resources'}
             if any(mode not in allowed for mode in sys.argv[3:]): sys.exit('unknown task selection')

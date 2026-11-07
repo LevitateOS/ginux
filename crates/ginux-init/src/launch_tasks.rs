@@ -96,6 +96,7 @@ struct DescriptorGroup {
     creating: Option<usize>,
     image: Option<Executable>,
     cwd: Option<i32>,
+    creation_mask: u32,
 }
 
 struct Supervisor<'a> {
@@ -263,6 +264,7 @@ pub fn supervise(
         creating: None,
         image: None,
         cwd: None,
+        creation_mask: 0o022,
     });
     s.tasks[0] = Some(Task {
         id,
@@ -580,6 +582,9 @@ impl Supervisor<'_> {
             .filesystem
             .select_process(self.processes.view(self.task(index).id).unwrap().tgid);
         self.objects.filesystem.select_cwd(self.group(index).cwd);
+        self.objects
+            .filesystem
+            .select_creation_mask(self.group(index).creation_mask);
         if let Some(mapping) = &self.task(index).mapping {
             match mapping.entry(r) {
                 Ok(next) => self.run(index, &next, instance),
@@ -744,6 +749,12 @@ impl Supervisor<'_> {
             }
         }
         match r.orig_rax {
+            95 => {
+                let previous = self.group(index).creation_mask;
+                self.group_mut(index).creation_mask = r.rdi as u32 & 0o777;
+                self.emulate(index, r, previous as i64, instance);
+                return;
+            }
             89 | 267 => {
                 let host = self.task(index).host;
                 let (address, output, size, dirfd) = if r.orig_rax == 89 {
@@ -1051,6 +1062,7 @@ impl Supervisor<'_> {
                         creating: None,
                         image,
                         cwd,
+                        creation_mask: self.group(index).creation_mask,
                     });
                     self.group_mut(index).creating = Some(index);
                     group

@@ -48,6 +48,7 @@ pub struct LaunchFs {
     prefixes: [Path; 8],
     count: usize,
     cwd: Option<i32>,
+    creation_mask: u32,
     init: Path,
     null: bool,
     process: u32,
@@ -185,6 +186,7 @@ impl LaunchFs {
             prefixes,
             count,
             cwd: None,
+            creation_mask: 0o022,
             null: config
                 .devices
                 .as_slice()
@@ -637,6 +639,11 @@ impl LaunchFs {
     // Borrow the caller's cwd for this syscall; the task owns its reference.
     pub fn select_cwd(&mut self, descriptor: Option<i32>) {
         self.cwd = descriptor;
+    }
+
+    // Borrow the current process group's creation mask with its cwd.
+    pub fn select_creation_mask(&mut self, mask: u32) {
+        self.creation_mask = mask;
     }
 
     pub fn cwd_path(&self, pid: usize) -> Result<Path, i64> {
@@ -1098,12 +1105,12 @@ impl LaunchFs {
             }
             83 => self
                 .fs
-                .mkdir(path.as_bytes(), r.rsi as u32 & 0o755)
+                .mkdir(path.as_bytes(), r.rsi as u32 & 0o777 & !self.creation_mask)
                 .map(|_| 0)
                 .map_err(errno),
             258 => self
                 .fs
-                .mkdir(path.as_bytes(), r.rdx as u32 & 0o755)
+                .mkdir(path.as_bytes(), r.rdx as u32 & 0o777 & !self.creation_mask)
                 .map(|_| 0)
                 .map_err(errno),
             87 => self.fs.unlink(path.as_bytes()).map(|_| 0).map_err(errno),
@@ -1191,7 +1198,9 @@ impl LaunchFs {
         let existed = self.fs.metadata(path).is_ok();
         let fd = self.fs.open(path, translated).map_err(errno)?;
         if !existed && flags & 0o100 != 0 {
-            self.fs.fchmod(fd, mode as u32 & 0o755).map_err(errno)?;
+            self.fs
+                .fchmod(fd, mode as u32 & 0o777 & !self.creation_mask)
+                .map_err(errno)?;
         }
         Ok(FD_BASE as i64 + fd as i64 - 3)
     }

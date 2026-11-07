@@ -496,6 +496,10 @@ data and wake blocked reads/writes; a self-pipe without a runnable peer still
 waits indefinitely. SIGKILL termination and reaping are supported. Signal-driven restart of emulated blocking operations remains unsupported;
 configured descriptor readiness is described below.
 
+Configured processes start with a creation mask of `022`. `umask` updates the
+process group's mask used by owned file and directory creation; fork copies it,
+exec preserves it, and threads share it. This does not change the native lane.
+
 Configured launch owns at most 32 task slots, including unreaped children.
 Process creation accepts fork, vfork, and clone with `SIGCHLD`,
 `CLONE_VM|CLONE_VFORK|SIGCHLD`, or the libc-fork
