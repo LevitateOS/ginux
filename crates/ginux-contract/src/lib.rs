@@ -1320,6 +1320,54 @@ pub static CATALOG: &[Operation] = &[
         "test-systemd"
     ),
     syscall!(
+        "lstat",
+        6,
+        Partial,
+        Action::Mediate,
+        "instance filesystem",
+        "test-process"
+    ),
+    syscall!(
+        "getgroups",
+        115,
+        Partial,
+        Action::Emulate,
+        "virtual identity",
+        "test-process"
+    ),
+    syscall!(
+        "pipe",
+        22,
+        Partial,
+        Action::Mediate,
+        "validated flags",
+        "test-process"
+    ),
+    syscall!(
+        "nanosleep",
+        35,
+        Partial,
+        Action::Mediate,
+        "bounded wait",
+        "test-process"
+    ),
+    syscall!(
+        "getsid",
+        124,
+        Partial,
+        Action::Emulate,
+        "virtual identity",
+        "test-process"
+    ),
+    syscall!(
+        "faccessat",
+        269,
+        Partial,
+        Action::Mediate,
+        "instance filesystem",
+        "test-process"
+    ),
+    syscall!(
         "pipe2",
         293,
         Partial,

@@ -87,7 +87,9 @@ pub const fn decide_systemd(syscall: u64, shared_network: bool) -> Decision {
     let action = match syscall {
         63 | 92 | 93 | 94 | 109 | 112 | 153 | 165 | 166 | 260 | SYS_GETPRIORITY
         | SYS_SETPRIORITY | SYS_GETTID | SYS_SETUID | SYS_SETGID | SYS_SETREUID | SYS_SETREGID
-        | SYS_SETGROUPS | SYS_SETRESUID | SYS_SETRESGID | SYS_REBOOT => Action::Emulate,
+        | SYS_SETGROUPS | SYS_SETRESUID | SYS_SETRESGID | SYS_REBOOT | 115 | 124 => Action::Emulate,
+        // musl variants: pipe, nanosleep, faccessat (glibc: pipe2, clock_nanosleep, faccessat2).
+        6 | 22 | 35 | 269 => Action::Mediate,
         7
         | 15
         | 16
@@ -178,7 +180,11 @@ pub const fn systemd_surface(syscall: u64, shared_network: bool) -> BalancedSurf
         BalancedSurface::Network
     } else if syscall == SYS_REBOOT {
         BalancedSurface::Lifecycle
-    } else if matches!(syscall, SYS_GETPRIORITY | SYS_SETPRIORITY) {
+    } else if matches!(syscall, 22 | 35) {
+        BalancedSurface::Task
+    } else if matches!(syscall, 6 | 269) {
+        BalancedSurface::ImageRead
+    } else if matches!(syscall, SYS_GETPRIORITY | SYS_SETPRIORITY | 115 | 124) {
         BalancedSurface::VirtualIdentity
     } else if matches!(
         syscall,
