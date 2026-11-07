@@ -8,12 +8,21 @@ type Error = &'static [u8];
 struct Input(usize);
 impl Drop for Input {
     fn drop(&mut self) {
-        unsafe {
-            syscall1(3, self.0);
+        if self.0 != usize::MAX {
+            unsafe {
+                syscall1(3, self.0);
+            }
         }
     }
 }
 impl Input {
+    fn close(&mut self, failure: Error) -> Result<(), Error> {
+        let fd = core::mem::replace(&mut self.0, usize::MAX);
+        if unsafe { syscall1(3, fd) } != 0 {
+            return Err(failure);
+        }
+        Ok(())
+    }
     fn read(&mut self, bytes: &mut [u8]) -> Result<usize, Error> {
         loop {
             let count = unsafe { syscall3(0, self.0, bytes.as_mut_ptr() as usize, bytes.len()) };
@@ -154,7 +163,7 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
         return Err(b"restore archive is not a bounded regular file");
     }
     let mut input = source.snapshot(stat[6], &stat)?;
-    core::mem::drop(source);
+    source.close(b"restore source close failed")?;
     let mut seen = MappedArray::new(files.capacity(), false)
         .map_err(|_| b"restore metadata allocation failed".as_slice())?;
     let mut long_name = [0u8; 256];
@@ -173,6 +182,7 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
             if header.iter().any(|b| *b != 0) || input.read(&mut header[..1])? != 0 {
                 return Err(b"invalid restore archive terminator");
             }
+            input.close(b"restore snapshot close failed")?;
             return Ok(());
         }
         let checksum = octal(&header[148..156])?;
