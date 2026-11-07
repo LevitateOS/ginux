@@ -941,7 +941,7 @@ impl Supervisor<'_> {
             56..=58 => {
                 let flags = r.rdi;
                 let libc_fork = r.orig_rax == 56 && flags == 0x1200011;
-                let thread = r.orig_rax == 56 && flags == 0x3d0f00;
+                let thread = r.orig_rax == 56 && matches!(flags, 0x3d0f00 | 0x7d0f00);
                 if r.orig_rax == 56 && !thread && !matches!(flags, 17 | 0x4111 | 0x1200011) {
                     self.emulate(index, r, -38, instance);
                     return;

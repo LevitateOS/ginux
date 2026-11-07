@@ -14,12 +14,13 @@ static long call(long n, word a, word b, word c, word d, word e, word f)
 #define CHECK(expr,code) if (!(expr)) return code
 static char stacks[32][16384] __attribute__((aligned(16)));
 static volatile int tid[32], gate, count, error;
+static volatile word thread_flags __attribute__((used))=0x3d0f00;
 static int pair[2];
 static char byte;
 long spawn_thread(word top, volatile int *tid, long (*fn)(void));
 __asm__(".global spawn_thread\nspawn_thread:\n"
         "mov %rdx,-16(%rdi)\nmov %rsi,%rdx\nmov %rsi,%r10\nmov %rdi,%rsi\nsub $16,%rsi\n"
-        "xor %r8d,%r8d\nmov $0x3d0f00,%edi\nmov $56,%eax\nsyscall\ntest %rax,%rax\njnz 1f\n"
+        "xor %r8d,%r8d\nmov thread_flags(%rip),%edi\nmov $56,%eax\nsyscall\ntest %rax,%rax\njnz 1f\n"
         "xor %ebp,%ebp\ncall *(%rsp)\nmov %rax,%rdi\nmov $60,%eax\nsyscall\nud2\n1:ret\n");
 static void join(word i)
 {
@@ -91,6 +92,7 @@ long thread_main(word *stack)
     word argc=*stack;
     char **argv=(char **)(stack+1);
     char mode=argc>1?argv[1][0]:'b';
+    if (mode=='m') { thread_flags=0x7d0f00; mode='b'; }
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-1 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);

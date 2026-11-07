@@ -497,8 +497,9 @@ Configured launch owns at most 32 task slots, including unreaped children.
 Process creation accepts fork, vfork, and clone with `SIGCHLD`,
 `CLONE_VM|CLONE_VFORK|SIGCHLD`, or the libc-fork
 `CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD` flags. Native threads accept
-the libc `0x3d0f00` flag set (VM, FS, FILES, SIGHAND, THREAD, SYSVSEM, SETTLS,
-PARENT_SETTID and CHILD_CLEARTID); other clone forms remain unsupported. Threads
+the glibc `0x3d0f00` and musl `0x7d0f00` flag sets (VM, FS, FILES,
+SIGHAND, THREAD, SYSVSEM, SETTLS, PARENT_SETTID and CHILD_CLEARTID; musl also
+sets the ignored DETACHED bit); other clone forms remain unsupported. Threads
 share the process descriptor table, cwd and executable pin. Pending syscall
 results and readiness snapshots remain per task. A blocked owned IO call keeps
 its original handle until completion, even if another thread replaces its fd. New children remain stopped until their virtual identity
