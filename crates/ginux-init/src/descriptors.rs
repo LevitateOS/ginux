@@ -415,6 +415,12 @@ impl DescriptorTable {
         if r.orig_rax == 302 && matches!(r.rsi, 7 | 9) && r.rdx != 0 {
             return ready(-1);
         }
+        // Signal-driven I/O would let the host kernel signal a process the
+        // workload names. Refuse it as the balanced policy does, before any
+        // backend answers the request.
+        if ginux_core::signal_driven_io(r.orig_rax, r.rsi, r.rdx) {
+            return ready(-1);
+        }
         let result = match r.orig_rax {
             2 | 257 => {
                 call.save(r);

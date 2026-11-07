@@ -54,7 +54,7 @@ long fd_main(word *stack)
     word limits[2];
     CHECK(call(302,0,7,0,(word)limits,0,0)==0 && limits[0]==256 && limits[1]==256,12);
     CHECK(DO(72,image,1,0)==1 && DO(72,null,1,0)==1 && DO(72,memory,1,0)==1,13);
-    CHECK(DO(72,image,3,0)>=0 && DO(72,image,8,1234)==-95,47);
+    CHECK(DO(72,image,3,0)>=0 && DO(72,image,8,1234)==-1,47);
     CHECK(DO(1,memory,"ABC",3)==3 && DO(8,memory,0,0)==0,14);
     long alias=DO(32,memory,0,0);
     CHECK(alias==8 && DO(72,alias,1,0)==0,15);
