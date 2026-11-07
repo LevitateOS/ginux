@@ -341,7 +341,7 @@ for getcwd and relative operations until an absolute directory change. Private
 cwd references consume the existing 64-entry VFS open-description capacity.
 Relative owned scripts/interpreters and explicit image paths use that cwd.
 Native kernel-selected relative interpreters from owned cwd remain unsupported.
-Configured-launch threads and shared cwd groups remain unsupported.
+Supported configured-launch threads share the process cwd reference.
 Owned regular-file link/linkat names share inode, bytes, permissions and link
 counts. Removing one name preserves data through other names, file descriptions
 and executable references. Descriptions and executable pins retain the name
@@ -404,8 +404,8 @@ inherit record locks; closing any descriptor for the inode releases that
 process's record locks. Owned file/directory `flock` locks follow the open
 description across dup/fork and release on its final close. Each table holds at
 most 64 ranges; exhaustion returns `ENOLCK` without a partial update. Conflicting
-blocking calls wait in the supervisor; deadlock detection and thread sharing
-remain unsupported. Native image locks, leases and signal ownership stay denied.
+blocking calls wait in the supervisor; threads share their process lock owner.
+Deadlock detection, native image locks, leases and signal ownership stay denied.
 
 Bootstrap constrains the real descriptor soft/hard limits to 256 while keeping
 lower operator limits. Allocation respects that lower soft limit; runtime
@@ -428,7 +428,8 @@ and truncation report ETXTBSY while the program is pinned; unlink/rename retain
 identity until the last process releases it. Fork retains the executable pin;
 exit or successful replacement releases it. Failed exec closes its temporary
 backing, releases its proposed pin and preserves public descriptors. CLOEXEC
-retirement still commits only after successful exec. Threads remain unsupported.
+retirement still commits only after successful exec. Threads retain their
+process executable pin until the last thread exits.
 Readlink of /proc/self/exe and /proc/thread-self/exe returns the current domain
 executable name, with a deleted suffix for an unlinked owned executable; native
 memfd names and supervisor prefixes are not part of that interface.
@@ -495,16 +496,23 @@ configured descriptor readiness is described below.
 Configured launch owns at most 16 task slots, including unreaped children.
 Process creation accepts fork, vfork, and clone with `SIGCHLD`,
 `CLONE_VM|CLONE_VFORK|SIGCHLD`, or the libc-fork
-`CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD` flags. Threads and other clone
-forms are unsupported. New children remain stopped until their virtual identity
+`CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD` flags. Native threads accept
+the libc `0x3d0f00` flag set (VM, FS, FILES, SIGHAND, THREAD, SYSVSEM, SETTLS,
+PARENT_SETTID and CHILD_CLEARTID); other clone forms remain unsupported. Threads
+share the process descriptor table, cwd and executable pin. Pending syscall
+results and readiness snapshots remain per task. A blocked owned IO call keeps
+its original handle until completion, even if another thread replaces its fd. New children remain stopped until their virtual identity
 and descriptor snapshot are installed. Init is PID 1; PID/TID/parent queries,
 child-TID writes and forwarded signal senders use virtual identities. Actual
 credentials remain UID/GID 1000. `wait4` supports a positive child PID or -1,
 optional `WNOHANG`, and a null rusage pointer. A faulty status destination still
 reaps the child and leaves the status word unchanged. Kill supports only signal
 0 and SIGKILL directed at a positive virtual PID. Ignoring SIGCHLD and
-`SA_NOCLDWAIT` are unsupported. Init termination kills and reaps all descendants
-before the launcher reports completion.
+`SA_NOCLDWAIT` are unsupported. A leader exiting alone keeps its remaining threads and resources alive. The
+last thread publishes the leader's status. Process completion kills and reaps all
+remaining descendants before the launcher reports completion. Exec requires the
+single remaining task to be the process leader; other thread exec returns
+EOPNOTSUPP.
 
 Subsequent exec supports image paths and native image descriptors with
 `execveat(AT_EMPTY_PATH)`. Descriptor synchronization precedes native exec;
@@ -549,6 +557,8 @@ make build-launch-pipe-fixture build-launch-fd-fixture
 sudo make test-launch-pipes test-launch-fds
 make build-launch-task-fixture build-launch-exec-fixture
 sudo make test-launch-tasks test-launch-exec
+make build-launch-thread-fixture
+sudo make test-launch-threads
 ```
 
 ## Native process scenarios

@@ -28,6 +28,7 @@ enum Pending {
         child: usize,
         flags: u64,
         child_tid: Option<u64>,
+        parent_tid: Option<u64>,
     },
     Wait {
         child: usize,
@@ -74,10 +75,8 @@ struct Task {
     alive: bool,
     adopted_reaped: bool,
     wait_status: Option<i32>,
-    descriptors: DescriptorTable,
+    group: usize,
     call: DescriptorCall,
-    image: Option<Executable>,
-    cwd: Option<i32>,
     image_chdir: Option<u64>,
     pending: Pending,
     override_result: Option<i64>,
@@ -86,10 +85,22 @@ struct Task {
     exec: Option<Exec>,
     mapping: Option<crate::file_mapping::MappingCall>,
     path_rewrite: Option<crate::path_hooks::Rewrite>,
+    waiter: Option<usize>,
+}
+
+struct DescriptorGroup {
+    table: DescriptorTable,
+    owners: usize,
+    leader: TaskId,
+    status: Option<i32>,
+    creating: Option<usize>,
+    image: Option<Executable>,
+    cwd: Option<i32>,
 }
 
 struct Supervisor<'a> {
     tasks: [Option<Task>; TASKS],
+    groups: [Option<DescriptorGroup>; TASKS],
     processes: ProcessTable<TASKS>,
     objects: Backends<'a>,
     unknown_stops: [usize; TASKS],
@@ -99,6 +110,7 @@ struct Supervisor<'a> {
     wake_needed: bool,
     tearing_down: bool,
     signal_fd: Option<usize>,
+    root_status: Option<i32>,
 }
 
 // Created only after the tracee's initial exec stop, so neither the blocked
@@ -229,6 +241,7 @@ pub fn supervise(
         .unwrap();
     let mut s = Supervisor {
         tasks: core::array::from_fn(|_| None),
+        groups: core::array::from_fn(|_| None),
         processes,
         objects,
         unknown_stops: [0; TASKS],
@@ -238,17 +251,25 @@ pub fn supervise(
         wake_needed: false,
         tearing_down: false,
         signal_fd: None,
+        root_status: None,
     };
+    s.groups[0] = Some(DescriptorGroup {
+        table: descriptors,
+        owners: 1,
+        leader: id,
+        status: None,
+        creating: None,
+        image: None,
+        cwd: None,
+    });
     s.tasks[0] = Some(Task {
         id,
         host: root,
         alive: true,
         adopted_reaped: false,
         wait_status: None,
-        descriptors,
+        group: 0,
         call: DescriptorCall::new(),
-        image: None,
-        cwd: None,
         image_chdir: None,
         pending: Pending::None,
         override_result: None,
@@ -257,6 +278,7 @@ pub fn supervise(
         exec: None,
         mapping: None,
         path_rewrite: None,
+        waiter: None,
     });
     if ptrace(PTRACE_SETOPTIONS, root, 0, OPTIONS) < 0 {
         s.fail(domain, b"launch ptrace setup failed");
@@ -331,7 +353,7 @@ pub fn supervise(
         };
         if exited(status) || signaled(status) {
             s.died(index, status, domain);
-            if index == 0 {
+            if let Some(status) = s.root_status {
                 s.teardown(domain, status == 0);
                 let normal = exited(status);
                 let _ = domain.task_exited(normal);
@@ -426,6 +448,47 @@ pub fn supervise(
 }
 
 impl Supervisor<'_> {
+    fn group(&self, index: usize) -> &DescriptorGroup {
+        self.groups[self.task(index).group].as_ref().unwrap()
+    }
+    fn group_mut(&mut self, index: usize) -> &mut DescriptorGroup {
+        let group = self.task(index).group;
+        self.groups[group].as_mut().unwrap()
+    }
+    fn table(&self, index: usize) -> &DescriptorTable {
+        &self.group(index).table
+    }
+    fn release_group(
+        &mut self,
+        index: usize,
+        domain: &mut Domain,
+    ) -> Option<(TaskId, Option<i32>)> {
+        let group = self.task(index).group;
+        let state = self.groups[group].as_mut().unwrap();
+        state.owners -= 1;
+        if state.owners != 0 {
+            return None;
+        }
+        let mut state = self.groups[group].take().unwrap();
+        if let Some(cwd) = state.cwd.take() {
+            if self.objects.filesystem.close_cwd(cwd).is_err() {
+                self.fail(domain, b"process cwd release failed");
+            }
+        }
+        if let Some(image) = state.image.take() {
+            if self.objects.filesystem.release_executable(image).is_err() {
+                self.fail(domain, b"process executable release failed");
+            }
+        }
+        self.objects
+            .filesystem
+            .release_process_locks(state.leader.pid);
+        if let Err(reason) = state.table.release_exited(&mut self.objects) {
+            self.fail(domain, reason);
+        }
+        Some((state.leader, state.status))
+    }
+
     fn task(&self, index: usize) -> &Task {
         self.tasks[index].as_ref().unwrap()
     }
@@ -504,8 +567,8 @@ impl Supervisor<'_> {
     fn entry(&mut self, index: usize, r: &mut UserRegs, domain: &mut Domain) {
         self.objects
             .filesystem
-            .select_process(self.task(index).id.pid);
-        self.objects.filesystem.select_cwd(self.task(index).cwd);
+            .select_process(self.processes.view(self.task(index).id).unwrap().tgid);
+        self.objects.filesystem.select_cwd(self.group(index).cwd);
         if let Some(mapping) = &self.task(index).mapping {
             match mapping.entry(r) {
                 Ok(next) => self.run(index, &next, domain),
@@ -574,6 +637,17 @@ impl Supervisor<'_> {
         audit_write(b" action=");
         let original = *r;
         let id = self.task(index).id;
+        let parent_group = self.task(index).group;
+        if self
+            .group(index)
+            .creating
+            .is_some_and(|owner| owner != index)
+            && !matches!(r.orig_rax, 60 | 231 | 62)
+        {
+            self.task_mut(index).blocked = Some(original);
+            audit_write(b"park surface=descriptor-snapshot\n");
+            return;
+        }
         if r.orig_rax == ginux_core::SYS_UNAME {
             let identity = ginux_kernel_views::IdentityView {
                 hostname: domain.config().id.as_bytes(),
@@ -597,7 +671,7 @@ impl Supervisor<'_> {
             return;
         }
         if r.orig_rax == 9 && r.r10 & 0x20 == 0 {
-            match self.task(index).descriptors.mapping_file(r.r8) {
+            match self.table(index).mapping_file(r.r8) {
                 Ok(Some(handle)) => {
                     if r.r10 & 3 == 0 || r.r10 & 3 != 2 && r.rdx & 2 != 0 {
                         self.emulate(index, r, -95, domain);
@@ -637,7 +711,7 @@ impl Supervisor<'_> {
                         self.task(index).host,
                         original,
                         backing,
-                        self.task(index).descriptors.native_descriptor_set(),
+                        self.table(index).native_descriptor_set(),
                     ) {
                         Ok(mapping) => mapping,
                         Err(reason) => self.fail(domain, reason),
@@ -677,7 +751,7 @@ impl Supervisor<'_> {
                         if size == 0 {
                             return Err(-22);
                         }
-                        let name = if let Some(image) = self.task(index).image {
+                        let name = if let Some(image) = self.group(index).image {
                             self.objects.filesystem.executable_name(image)?
                         } else {
                             let image = crate::tracee_io::image_link(host, b"/exe")?;
@@ -734,7 +808,7 @@ impl Supervisor<'_> {
                 return;
             }
             81 => {
-                match self.task(index).descriptors.exec_descriptor(r.rdi) {
+                match self.table(index).exec_descriptor(r.rdi) {
                     Ok(ExecDescriptor::Owned(handle)) => {
                         match self.objects.filesystem.descriptor_cwd(handle) {
                             Ok(fd) => {
@@ -796,6 +870,11 @@ impl Supervisor<'_> {
                 return;
             }
             59 | 322 => {
+                // Replacing a live shared address space requires group exec ownership.
+                if self.group(index).owners != 1 || self.group(index).leader != id {
+                    self.emulate(index, r, -95, domain);
+                    return;
+                }
                 let result = self.prepare_exec(index, r);
                 if result == Err(-5) {
                     self.fail(domain, b"exec path scratch restoration failed");
@@ -824,7 +903,12 @@ impl Supervisor<'_> {
                 }
             }
             39 | 186 => {
-                self.emulate(index, r, id.pid as i64, domain);
+                let value = if r.orig_rax == 39 {
+                    self.processes.view(id).unwrap().tgid
+                } else {
+                    id.pid
+                };
+                self.emulate(index, r, value as i64, domain);
                 return;
             }
             110 | 111 => {
@@ -844,61 +928,111 @@ impl Supervisor<'_> {
             56..=58 => {
                 let flags = r.rdi;
                 let libc_fork = r.orig_rax == 56 && flags == 0x1200011;
-                if r.orig_rax == 56 && !matches!(flags, 17 | 0x4111 | 0x1200011) {
+                let thread = r.orig_rax == 56 && flags == 0x3d0f00;
+                if r.orig_rax == 56 && !thread && !matches!(flags, 17 | 0x4111 | 0x1200011) {
                     self.emulate(index, r, -38, domain);
                     return;
+                }
+                if !thread
+                    && self
+                        .tasks
+                        .iter()
+                        .flatten()
+                        .any(|t| t.group == parent_group && t.call.native_mutation())
+                {
+                    self.task_mut(index).blocked = Some(original);
+                    audit_write(b"park surface=descriptor-snapshot\n");
+                    return;
+                }
+                if thread {
+                    let mut before = [0u8; 4];
+                    if copy_memory(self.task(index).host, r.rdx, &mut before, false) != Ok(4) {
+                        self.emulate(index, r, -14, domain);
+                        return;
+                    }
+                    match crate::tracee_io::store_u32(
+                        self.task(index).host,
+                        r.rdx,
+                        u32::from_ne_bytes(before),
+                    ) {
+                        Ok(()) => {}
+                        Err(-5) => self.fail(domain, b"parent tid rollback failed"),
+                        Err(error) => {
+                            self.emulate(index, r, error, domain);
+                            return;
+                        }
+                    }
                 }
                 let Some(slot) = self.tasks.iter().position(|t| t.is_none()) else {
                     self.emulate(index, r, -11, domain);
                     return;
                 };
-                let child = match self.processes.fork(id) {
-                    Ok(id) => id,
+                let child = match if thread {
+                    self.processes.clone_thread(id)
+                } else {
+                    self.processes.fork(id)
+                } {
+                    Ok(child) => child,
                     Err(_) => {
                         self.emulate(index, r, -11, domain);
                         return;
                     }
                 };
-                let table = match self.tasks[index]
-                    .as_ref()
-                    .unwrap()
-                    .descriptors
-                    .fork_copy(self.objects.refs)
-                {
-                    Ok(table) => table,
-                    Err(reason) => self.fail(domain, reason),
-                };
-                let image = self.task(index).image;
-                if let Some(image) = image {
-                    if self.objects.filesystem.retain_executable(image).is_err() {
-                        let mut table = table;
-                        if let Err(reason) = table.release_exited(&mut self.objects) {
-                            self.fail(domain, reason);
-                        }
-                        self.fail(domain, b"fork executable retain failed");
-                    }
-                }
-                let cwd = match self.task(index).cwd {
-                    Some(fd) => match self.objects.filesystem.copy_cwd(fd) {
-                        Ok(fd) => Some(fd),
-                        Err(error) => {
-                            if let Some(image) = image {
-                                if self.objects.filesystem.release_executable(image).is_err() {
-                                    self.fail(domain, b"cwd-limited fork image rollback failed");
-                                }
-                            }
-                            let mut table = table;
+                let group = if thread {
+                    self.group_mut(index).owners += 1;
+                    parent_group
+                } else {
+                    let group = self.groups.iter().position(|g| g.is_none()).unwrap();
+                    let mut table = self.groups[parent_group]
+                        .as_ref()
+                        .unwrap()
+                        .table
+                        .fork_copy(self.objects.refs)
+                        .unwrap_or_else(|reason| self.fail(domain, reason));
+                    let image = self.group(index).image;
+                    if let Some(image) = image {
+                        if self.objects.filesystem.retain_executable(image).is_err() {
                             if let Err(reason) = table.release_exited(&mut self.objects) {
                                 self.fail(domain, reason);
                             }
-                            if self.processes.cancel_fork(id, child).is_err() {
-                                self.fail(domain, b"cwd-limited fork rollback failed");
-                            }
-                            self.emulate(index, r, error, domain);
-                            return;
+                            self.fail(domain, b"fork executable retain failed");
                         }
-                    },
-                    None => None,
+                    }
+                    let cwd = match self.group(index).cwd {
+                        Some(fd) => match self.objects.filesystem.copy_cwd(fd) {
+                            Ok(fd) => Some(fd),
+                            Err(error) => {
+                                if let Some(image) = image {
+                                    if self.objects.filesystem.release_executable(image).is_err() {
+                                        self.fail(
+                                            domain,
+                                            b"cwd-limited fork image rollback failed",
+                                        );
+                                    }
+                                }
+                                if let Err(reason) = table.release_exited(&mut self.objects) {
+                                    self.fail(domain, reason);
+                                }
+                                if self.processes.cancel_fork(id, child).is_err() {
+                                    self.fail(domain, b"cwd-limited fork rollback failed");
+                                }
+                                self.emulate(index, r, error, domain);
+                                return;
+                            }
+                        },
+                        None => None,
+                    };
+                    self.groups[group] = Some(DescriptorGroup {
+                        table,
+                        owners: 1,
+                        leader: child,
+                        status: None,
+                        creating: None,
+                        image,
+                        cwd,
+                    });
+                    self.group_mut(index).creating = Some(index);
+                    group
                 };
                 self.tasks[slot] = Some(Task {
                     id: child,
@@ -906,10 +1040,8 @@ impl Supervisor<'_> {
                     alive: true,
                     adopted_reaped: false,
                     wait_status: None,
-                    descriptors: table,
+                    group,
                     call: DescriptorCall::new(),
-                    image,
-                    cwd,
                     image_chdir: None,
                     pending: Pending::None,
                     override_result: None,
@@ -918,14 +1050,19 @@ impl Supervisor<'_> {
                     exec: None,
                     mapping: None,
                     path_rewrite: None,
+                    waiter: None,
                 });
                 self.task_mut(index).pending = Pending::Fork {
                     child: slot,
                     flags,
                     child_tid: libc_fork.then_some(r.r10),
+                    parent_tid: thread.then_some(r.rdx),
                 };
                 if libc_fork {
                     r.rdi &= !0x1000000;
+                }
+                if thread {
+                    r.rdi &= !0x100000;
                 }
                 audit_write(b"mediate surface=owned-process-create\n");
                 self.run(index, r, domain);
@@ -946,7 +1083,14 @@ impl Supervisor<'_> {
                     .tasks
                     .iter()
                     .flatten()
-                    .find(|t| t.id.pid == target as u32 && t.alive && t.host != 0)
+                    .find(|t| {
+                        t.id.pid == target as u32
+                            && t.host != 0
+                            && self
+                                .processes
+                                .view(t.id)
+                                .is_ok_and(|v| v.state == ginux_process::TaskState::Running)
+                    })
                     .map(|t| t.host);
                 let result = found
                     .map(|host| unsafe { syscall2(SYS_KILL, host, signal as usize) } as i64)
@@ -960,11 +1104,12 @@ impl Supervisor<'_> {
             _ => {}
         }
         let decision = {
+            let group = self.task(index).group;
             let task = self.tasks[index].as_mut().unwrap();
             decide_launch(
                 task.host,
                 r,
-                &mut task.descriptors,
+                &mut self.groups[group].as_mut().unwrap().table,
                 &mut self.objects,
                 &mut task.call,
             )
@@ -1067,7 +1212,7 @@ impl Supervisor<'_> {
                 if r.r8 & 0x1000 == 0 {
                     return Err(-2);
                 }
-                match self.task(index).descriptors.exec_descriptor(r.rdi)? {
+                match self.table(index).exec_descriptor(r.rdi)? {
                     ExecDescriptor::Native(fd) => {
                         native_dirfd = fd as u64;
                         self.objects.filesystem.native_exec_fd(host, fd)?;
@@ -1078,10 +1223,7 @@ impl Supervisor<'_> {
                     }
                 }
             } else {
-                let dirfd = self
-                    .task(index)
-                    .descriptors
-                    .exec_path_dirfd(host, r.rdi, r.rsi)?;
+                let dirfd = self.table(index).exec_path_dirfd(host, r.rdi, r.rsi)?;
                 native_dirfd = (-100i64) as u64;
                 translated.rdi = dirfd;
                 self.objects
@@ -1111,7 +1253,7 @@ impl Supervisor<'_> {
                 if self.objects.filesystem.is_script(initial)? && r.orig_rax == 322 {
                     let path = crate::tracee_io::read_path(host, r.rsi)?;
                     if (path.is_empty() || (path.as_bytes()[0] != b'/' && r.rdi as i32 != -100))
-                        && self.task(index).descriptors.exec_cloexec(r.rdi)?
+                        && self.table(index).exec_cloexec(r.rdi)?
                     {
                         return Err(-2);
                     }
@@ -1153,11 +1295,7 @@ impl Supervisor<'_> {
 
     fn exec_step(&mut self, index: usize, r: &mut UserRegs, domain: &mut Domain) {
         let exec = self.task(index).exec.unwrap();
-        if let Some((fd, cloexec)) = self
-            .task(index)
-            .descriptors
-            .next_exec_native(exec.next_native)
-        {
+        if let Some((fd, cloexec)) = self.table(index).next_exec_native(exec.next_native) {
             let state = self.task_mut(index).exec.as_mut().unwrap();
             state.next_native = fd + 1;
             state.stage = ExecStage::Sync;
@@ -1276,7 +1414,7 @@ impl Supervisor<'_> {
     fn exec_completed(&mut self, index: usize, domain: &mut Domain) {
         self.objects
             .filesystem
-            .select_process(self.task(index).id.pid);
+            .select_process(self.processes.view(self.task(index).id).unwrap().tgid);
         if !self
             .task(index)
             .exec
@@ -1284,10 +1422,11 @@ impl Supervisor<'_> {
         {
             self.fail(domain, b"unreserved exec transition");
         }
-        let result = self.tasks[index]
+        let group = self.task(index).group;
+        let result = self.groups[group]
             .as_mut()
             .unwrap()
-            .descriptors
+            .table
             .exec_completed(&mut self.objects);
         if let Err(reason) = result {
             self.fail(domain, reason);
@@ -1339,7 +1478,7 @@ impl Supervisor<'_> {
             None
         };
         self.task_mut(index).exec.as_mut().unwrap().owned = None;
-        let old = core::mem::replace(&mut self.task_mut(index).image, image);
+        let old = core::mem::replace(&mut self.group_mut(index).image, image);
         if let Some(old) = old {
             if self.objects.filesystem.release_executable(old).is_err() {
                 self.fail(domain, b"replaced executable release failed");
@@ -1360,6 +1499,7 @@ impl Supervisor<'_> {
             child: slot,
             flags,
             child_tid,
+            parent_tid,
         } = self.task(parent).pending
         else {
             self.fail(domain, b"unreserved child event")
@@ -1401,6 +1541,22 @@ impl Supervisor<'_> {
             if ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize) < 0 {
                 self.fail(domain, b"child clone argument restoration failed");
             }
+        }
+        if let Some(address) = parent_tid {
+            if crate::tracee_io::store_u32(self.task(parent).host, address, self.task(slot).id.pid)
+                .is_err()
+            {
+                self.fail(domain, b"thread identity copyout failed");
+            }
+            let mut registers = self.registers(slot, domain);
+            registers.rdi = flags;
+            if ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize) < 0 {
+                self.fail(domain, b"thread birth register update failed");
+            }
+        }
+        if self.group(parent).creating == Some(parent) {
+            self.group_mut(parent).creating = None;
+            self.wake_needed = true;
         }
         audit_write(b"ginux: task registered virtual-pid=");
         audit_u64(self.task(slot).id.pid as u64);
@@ -1550,30 +1706,32 @@ impl Supervisor<'_> {
         }
         let pending = self.task(index).pending;
         match pending {
-            Pending::Fork { child, flags, .. } => {
+            Pending::Fork {
+                child,
+                flags,
+                parent_tid,
+                ..
+            } => {
                 r.rdi = flags;
                 if (r.rax as i64) < 0 {
-                    let result = self.tasks[child]
-                        .as_mut()
-                        .unwrap()
-                        .descriptors
-                        .release_exited(&mut self.objects);
-                    if let Err(reason) = result {
-                        self.fail(domain, reason)
-                    }
+                    self.release_group(child, domain);
                     let child_id = self.task(child).id;
-                    if self
-                        .processes
-                        .cancel_fork(self.task(index).id, child_id)
-                        .is_err()
-                    {
-                        self.fail(domain, b"fork rollback failed")
+                    let rollback = if parent_tid.is_some() {
+                        self.processes.cancel_thread(self.task(index).id, child_id)
+                    } else {
+                        self.processes.cancel_fork(self.task(index).id, child_id)
+                    };
+                    if self.group(index).creating == Some(index) {
+                        self.group_mut(index).creating = None;
+                        self.wake_needed = true;
                     }
-                    self.release_task_images(child, domain);
+                    if rollback.is_err() {
+                        self.fail(domain, b"fork rollback failed");
+                    }
                     self.tasks[child] = None;
                 } else {
                     if self.task(child).host == 0 || r.rax as usize != self.task(child).host {
-                        self.fail(domain, b"unregistered fork result")
+                        self.fail(domain, b"unregistered fork result");
                     }
                     r.rax = self.task(child).id.pid as u64;
                 }
@@ -1597,7 +1755,6 @@ impl Supervisor<'_> {
                     }
                     self.retired[self.retired_next] = (self.task(child).host, id.pid);
                     self.retired_next = (self.retired_next + 1) % TASKS;
-                    self.release_task_images(child, domain);
                     self.tasks[child] = None;
                     r.rax = id.pid as u64;
                     if original[1] != 0 {
@@ -1612,6 +1769,10 @@ impl Supervisor<'_> {
                         }
                     }
                 }
+                if let Some(child) = self.tasks[child].as_mut() {
+                    child.waiter = None;
+                }
+                self.wake_needed = true;
                 r.rdi = original[0];
                 r.rsi = original[1];
                 r.rdx = original[2];
@@ -1623,6 +1784,7 @@ impl Supervisor<'_> {
             Pending::None => {}
         }
         self.task_mut(index).pending = Pending::None;
+        self.retire_threads();
         if let Some(result) = self.task_mut(index).override_result.take() {
             r.rax = result as u64;
         }
@@ -1632,10 +1794,15 @@ impl Supervisor<'_> {
                 self.replace_cwd(index, None, domain);
             }
         }
+        let group = self.task(index).group;
         let task = self.tasks[index].as_mut().unwrap();
-        let result = task.call.finish(&mut task.descriptors, r);
-        if let Err(reason) = result {
-            self.fail(domain, reason)
+        match task.call.finish(
+            &mut self.groups[group].as_mut().unwrap().table,
+            r,
+            &mut self.objects,
+        ) {
+            Ok(changed) => self.wake_needed |= changed,
+            Err(reason) => self.fail(domain, reason),
         }
         audit_write(b"ginux: audit sequence=");
         audit_u64(self.task(index).sequence);
@@ -1645,7 +1812,7 @@ impl Supervisor<'_> {
         self.run(index, r, domain);
     }
     fn replace_cwd(&mut self, index: usize, next: Option<i32>, domain: &mut Domain) {
-        let old = core::mem::replace(&mut self.task_mut(index).cwd, next);
+        let old = core::mem::replace(&mut self.group_mut(index).cwd, next);
         if let Some(fd) = old {
             if self.objects.filesystem.close_cwd(fd).is_err() {
                 self.fail(domain, b"cwd reference release failed");
@@ -1672,6 +1839,16 @@ impl Supervisor<'_> {
                     .iter()
                     .position(|t| t.as_ref().is_some_and(|t| t.id == result.child))
                     .unwrap();
+                if self.task(child).waiter.is_some() {
+                    if r.rdx & 1 != 0 {
+                        self.emulate(index, r, 0, domain);
+                    } else {
+                        self.task_mut(index).blocked = Some(*r);
+                        audit_write(b"park surface=owned-child-wait\n");
+                    }
+                    return;
+                }
+                self.task_mut(child).waiter = Some(index);
                 let original = [r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9, r.orig_rax];
                 self.task_mut(index).pending = Pending::Wait {
                     child,
@@ -1690,7 +1867,9 @@ impl Supervisor<'_> {
             Err(ProcessError::NoExitedChild) => {
                 let has_child = self.tasks.iter().flatten().any(|t| {
                     self.processes.view(t.id).is_ok_and(|v| {
-                        v.parent == parent.pid && selected.is_none_or(|id| id == t.id.pid)
+                        v.parent == self.processes.view(parent).unwrap().tgid
+                            && v.id.pid == v.tgid
+                            && selected.is_none_or(|id| id == t.id.pid)
                     })
                 });
                 if !has_child {
@@ -1718,11 +1897,6 @@ impl Supervisor<'_> {
         }
     }
     fn release_task_images(&mut self, index: usize, domain: &mut Domain) {
-        if let Some(fd) = self.task_mut(index).cwd.take() {
-            if self.objects.filesystem.close_cwd(fd).is_err() {
-                self.fail(domain, b"task cwd release failed");
-            }
-        }
         let owned = self.task_mut(index).exec.take().and_then(|exec| exec.owned);
         if owned
             .and_then(|owned| owned.script)
@@ -1730,15 +1904,43 @@ impl Supervisor<'_> {
         {
             self.fail(domain, b"task interpreter reference release failed");
         }
-        let pending = owned.map(|owned| owned.image);
-        let committed = self.task_mut(index).image.take();
-        for image in [pending, committed].into_iter().flatten() {
-            if self.objects.filesystem.release_executable(image).is_err() {
+        if let Some(owned) = owned {
+            if self
+                .objects
+                .filesystem
+                .release_executable(owned.image)
+                .is_err()
+            {
                 self.fail(domain, b"task executable release failed");
             }
         }
     }
-
+    fn retire_threads(&mut self) {
+        for index in 0..TASKS {
+            let Some(task) = self.tasks[index].as_ref() else {
+                continue;
+            };
+            if task.alive
+                || self.processes.view(task.id).is_ok()
+                || self.tasks.iter().flatten().any(|parent| {
+                    parent.alive
+                        && matches!(parent.pending, Pending::Fork {child, ..} if child == index)
+                })
+            {
+                continue;
+            }
+            self.retired[self.retired_next] = (task.host, task.id.pid);
+            self.retired_next = (self.retired_next + 1) % TASKS;
+            self.tasks[index] = None;
+        }
+    }
+    fn record_death(&mut self, id: TaskId, status: i32) -> Result<(), ProcessError> {
+        if exited(status) {
+            self.processes.exit(id, (status >> 8) & 255)
+        } else {
+            self.processes.signaled(id, (status & 127) as u8)
+        }
+    }
     fn died(&mut self, index: usize, status: i32, domain: &mut Domain) {
         self.wake_needed = true;
         if !self.task(index).alive {
@@ -1759,10 +1961,35 @@ impl Supervisor<'_> {
             }
             self.fail(domain, b"inconsistent repeated task death");
         }
+        let id = self.task(index).id;
+        let group = self.task(index).group;
+        if let Pending::Fork {
+            child, parent_tid, ..
+        } = self.task(index).pending
+        {
+            if self.task(child).host == 0 {
+                self.release_group(child, domain);
+                let reserved = self.task(child).id;
+                let rollback = if parent_tid.is_some() {
+                    self.processes.cancel_thread(id, reserved)
+                } else {
+                    self.processes.cancel_fork(id, reserved)
+                };
+                if rollback.is_err() {
+                    self.fail(domain, b"unpublished task rollback failed");
+                }
+                self.tasks[child] = None;
+            }
+        }
+        if self.group(index).creating == Some(index) {
+            self.group_mut(index).creating = None;
+        }
+        if let Pending::Wait { child, .. } = self.task(index).pending {
+            if let Some(child) = self.tasks[child].as_mut() {
+                child.waiter = None;
+            }
+        }
         self.release_task_images(index, domain);
-        self.objects
-            .filesystem
-            .release_process_locks(self.task(index).id.pid);
         self.task_mut(index).alive = false;
         let mapping_aborted = self.task_mut(index).mapping.take().is_some();
         if mapping_aborted && !self.tearing_down {
@@ -1770,27 +1997,35 @@ impl Supervisor<'_> {
         }
         self.task_mut(index).wait_status = Some(status);
         self.task_mut(index).blocked = None;
-        let result = if exited(status) {
-            self.processes
-                .exit(self.task(index).id, (status >> 8) & 255)
-        } else {
-            self.processes
-                .signaled(self.task(index).id, (status & 127) as u8)
-        };
-        if result.is_err() {
-            self.fail(domain, b"virtual task exit failed")
-        }
-        let result = self.tasks[index]
+        if let Err(reason) = self.tasks[index]
             .as_mut()
             .unwrap()
-            .descriptors
-            .release_exited(&mut self.objects);
-        if let Err(reason) = result {
-            self.fail(domain, reason)
+            .call
+            .reset(&mut self.objects)
+        {
+            self.fail(domain, reason);
+        }
+        if id == self.groups[group].as_ref().unwrap().leader {
+            self.groups[group].as_mut().unwrap().status = Some(status);
+        } else if self.record_death(id, status).is_err() || self.processes.reap_thread(id).is_err()
+        {
+            self.fail(domain, b"virtual thread exit failed");
+        }
+        if let Some((leader, status)) = self.release_group(index, domain) {
+            let Some(status) = status else {
+                self.fail(domain, b"process ended without leader status");
+            };
+            if self.record_death(leader, status).is_err() {
+                self.fail(domain, b"virtual process exit failed");
+            }
+            if leader.pid == 1 {
+                self.root_status = Some(status);
+            }
         }
         audit_write(b"ginux: task exited virtual-pid=");
-        audit_u64(self.task(index).id.pid as u64);
+        audit_u64(id.pid as u64);
         audit_write(b"\n");
+        self.retire_threads();
     }
     fn teardown(&mut self, domain: &mut Domain, export: bool) {
         self.tearing_down = true;
@@ -1842,8 +2077,23 @@ impl Supervisor<'_> {
             }
         }
         for task in self.tasks.iter_mut().flatten() {
-            if let Err(reason) = task.descriptors.release_exited(&mut self.objects) {
-                supervision_error(domain, reason)
+            if let Err(reason) = task.call.reset(&mut self.objects) {
+                supervision_error(domain, reason);
+            }
+        }
+        for group in self.groups.iter_mut().flatten() {
+            if let Err(reason) = group.table.release_exited(&mut self.objects) {
+                supervision_error(domain, reason);
+            }
+            if let Some(cwd) = group.cwd.take() {
+                if self.objects.filesystem.close_cwd(cwd).is_err() {
+                    supervision_error(domain, b"process cwd release failed");
+                }
+            }
+            if let Some(image) = group.image.take() {
+                if self.objects.filesystem.release_executable(image).is_err() {
+                    supervision_error(domain, b"process image release failed");
+                }
             }
         }
         self.processes.shutdown(137);

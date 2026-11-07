@@ -113,6 +113,7 @@ pub struct DescriptorTable {
 pub struct DescriptorCall {
     pending: Option<Pending>,
     saved_args: Option<[u64; 7]>,
+    pinned: Option<Descriptor>,
     poll_wait: bool,
     poll_tick: bool,
     poll_deadline: Option<u64>,
@@ -124,11 +125,27 @@ impl DescriptorCall {
         Self {
             pending: None,
             saved_args: None,
+            pinned: None,
             poll_wait: false,
             poll_tick: false,
             poll_deadline: None,
             poll_input: [0; 128],
         }
+    }
+
+    pub fn native_mutation(&self) -> bool {
+        self.pending.is_some()
+    }
+    pub fn reset(&mut self, backends: &mut Backends) -> Result<(), &'static [u8]> {
+        if let Some(Descriptor {
+            handle: Handle::Owned(handle),
+            ..
+        }) = self.pinned.take()
+        {
+            backends.release(handle)?;
+        }
+        *self = Self::new();
+        Ok(())
     }
 
     pub fn needs_poll_tick(&self) -> bool {
@@ -145,6 +162,7 @@ impl DescriptorCall {
         &mut self,
         table: &mut DescriptorTable,
         r: &mut UserRegs,
+        backends: &mut Backends,
     ) -> Result<bool, &'static [u8]> {
         self.poll_wait = false;
         self.poll_tick = false;
@@ -186,6 +204,10 @@ impl DescriptorCall {
             r.r8 = args[4];
             r.r9 = args[5];
             r.orig_rax = args[6];
+            changed = true;
+        }
+        if self.pinned.is_some() {
+            self.reset(backends)?;
             changed = true;
         }
         Ok(changed)
@@ -399,7 +421,9 @@ impl DescriptorTable {
             }
             280 if r.rsi == 0 => {
                 call.save(r);
-                self.get(r.rdi)
+                call.pinned
+                    .map(Ok)
+                    .unwrap_or_else(|| self.get(r.rdi))
                     .and_then(|d| self.descriptor(pid, r, d, backends, call))
             }
             72 => {
@@ -424,7 +448,9 @@ impl DescriptorTable {
             0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55 | 74
             | 73 | 75 | 77 | 78 | 91 | 93 | 217 => {
                 call.save(r);
-                self.get(r.rdi)
+                call.pinned
+                    .map(Ok)
+                    .unwrap_or_else(|| self.get(r.rdi))
                     .and_then(|d| self.descriptor(pid, r, d, backends, call))
             }
             9 if r.r10 & 0x20 == 0 => {
@@ -737,6 +763,12 @@ impl DescriptorTable {
         };
         Ok(match decision {
             NativeDecision::Park { .. } => {
+                if call.pinned.is_none() {
+                    if let Handle::Owned(handle) = entry.handle {
+                        backends.refs.retain(handle);
+                    }
+                    call.pinned = Some(entry);
+                }
                 if network {
                     if !call.poll_tick {
                         let timeout = backends.devices.network.timeout(r.rdi as u32, r.orig_rax);
@@ -827,6 +859,9 @@ impl DescriptorTable {
             }
             _ => return Err(-22),
         };
+        if self.entries[target].is_some_and(|entry| entry.handle == Handle::Reserved) {
+            return Err(-16);
+        }
         entry.cloexec = cloexec;
         // Preserve the source in its own slot until target retirement completes.
         let decision = if self.entries[target].is_some() {

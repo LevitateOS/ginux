@@ -429,6 +429,23 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
         )
     }
 
+    /// Cancel a reserved native thread before it is allowed to run.
+    pub fn cancel_thread(&mut self, parent: TaskId, thread: TaskId) -> Result<(), ProcessError> {
+        let parent = self.tasks[self.index(parent)?];
+        let index = self.index(thread)?;
+        let task = self.tasks[index];
+        if parent.state != TaskState::Running
+            || task.tgid != parent.tgid
+            || task.id.pid == task.tgid
+            || task.state != TaskState::Running
+            || task.exec_epoch != 0
+        {
+            return Err(ProcessError::InvalidState);
+        }
+        self.tasks[index] = Task::empty();
+        Ok(())
+    }
+
     pub fn exec(&mut self, id: TaskId) -> Result<u32, ProcessError> {
         let index = self.index(id)?;
         let task = &mut self.tasks[index];
@@ -1810,6 +1827,40 @@ mod tests {
         );
         assert_eq!(table.view(child).unwrap().parent, parent.pid);
         assert_eq!(table.active(), 7);
+    }
+
+    #[test]
+    fn thread_reservation_rollback_retains_process_identity() {
+        let mut table: ProcessTable<6> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        let child = table.fork(init).unwrap();
+        let reserved = table.clone_thread(child).unwrap();
+        assert_eq!(
+            table.cancel_thread(init, reserved),
+            Err(ProcessError::InvalidState)
+        );
+        assert_eq!(
+            table.cancel_thread(child, child),
+            Err(ProcessError::InvalidState)
+        );
+        table.cancel_thread(child, reserved).unwrap();
+        assert_eq!(table.view(reserved), Err(ProcessError::InvalidTask));
+        let running = table.clone_thread(child).unwrap();
+        table.exit(child, 19).unwrap();
+        assert_eq!(
+            table.cancel_thread(child, running),
+            Err(ProcessError::InvalidState)
+        );
+        table.signaled(running, 9).unwrap();
+        table.reap_thread(running).unwrap();
+        assert_eq!(
+            table
+                .wait(init, WaitTarget::Specific(child.pid), 0)
+                .unwrap()
+                .status,
+            ChildStatus::Exited(19)
+        );
+        assert_eq!(table.active(), 1);
     }
 
     #[test]
