@@ -126,8 +126,47 @@ def main():
                         assert tar.extractfile('out/product').read() == b'result\0data'
 
 
+        def publication_parent_swap():
+            config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
+            config = config.replace('args = []', 'args = ["export-wait"]')
+            config = config.replace('assignments = []', 'assignments = ["memory:/out"]', 1)
+            path = work / 'publication-race.toml'
+            path.write_text(config)
+            parent = work / 'publication-parent'
+            parent.mkdir()
+            parked = work / 'publication-parked'
+            redirected = work / 'publication-redirected'
+            redirected.mkdir()
+            archive = parent / 'final.tar'
+            result = work / 'publication-result.json'
+            command = [binary, 'launch', str(path), str(root), '--result-file', str(result),
+                       '--export-file', str(archive)]
+            proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            try:
+                assert select.select([proc.stdout], [], [], 5)[0], 'export readiness missing'
+                assert proc.stdout.readline() == b'export-ready\n'
+                assert not list(parent.glob('.ginux-export-*')), 'named staging file is replaceable'
+                parent.rename(parked)
+                parent.symlink_to(redirected, target_is_directory=True)
+                fake_stage = redirected / '.ginux-export-host-marker'
+                fake_stage.write_bytes(b'host marker')
+                _, stderr = proc.communicate(b'G', timeout=10)
+            finally:
+                if proc.poll() is None:
+                    proc.kill(); proc.communicate(timeout=5)
+            record = json.loads(result.read_text())
+            assert proc.returncode == 1 and record['outcome'] == 'supervisor-error', (record, stderr)
+            assert b'export-file parent changed' in stderr, stderr
+            assert not archive.exists() and not (parked / 'final.tar').exists()
+            assert fake_stage.read_bytes() == b'host marker'
+
         if sys.argv[3:]:
             for mode in sys.argv[3:]:
+                if mode == 'publication-parent-swap':
+                    publication_parent_swap()
+                    print('PASS launch storage: publication-parent-swap')
+                    continue
                 if mode == 'bad-export-config':
                     invoke(['disk0'], ['export'], expected=2, export=True)
                     print('PASS launch storage: bad-export-config')
@@ -162,6 +201,7 @@ def main():
         invoke(['memory:/work', 'memory:/out'], ['flush'])
         invoke(['memory:/work', 'memory:/out'], ['export'], export=True)
         invoke(['memory:/work', 'memory:/out'], ['export-wait'], export=True)
+        publication_parent_swap()
         invoke(['memory:/work', 'memory:/out'], ['child-export'], export=True)
         invoke(['memory:/work', 'memory:/out'], ['failed-export'], expected=7, export=True)
         invoke(['memory:/work', 'memory:/out'], ['invalid-export-config'], expected=2, export=True)
