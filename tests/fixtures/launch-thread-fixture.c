@@ -181,6 +181,16 @@ long thread_main(word *stack)
         path_done=1;
         join(0);
         CHECK(mapped>0 && *(volatile char *)mapped=='M' && DO(11,mapped,4096,0)==0 && !error,103);
+    } else if (mode=='a') {
+        char token;
+        volatile word sentinel=0x71efbb003a5cd029UL;
+        CHECK(DO(77,3,4096,0)==0 && DO(1,3,"M",1)==1,134);
+        CHECK(DO(1,1,"pair-ready\n",11)==11 && DO(0,0,&token,1)==1 && token=='A',135);
+        CHECK(call(9,0,4096,1,2,3,0)==-24,136);
+        CHECK(sentinel==0x71efbb003a5cd029UL,137);
+        CHECK(DO(1,1,"pair-failed\n",12)==12 && DO(0,0,&token,1)==1 && token=='G',138);
+        long mapped=call(9,0,4096,1,2,3,0);
+        CHECK(mapped>0 && *(volatile char *)mapped=='M' && DO(11,mapped,4096,0)==0,139);
     } else if (mode=='w') {
         char token;
         volatile word sentinel=0x9be751ac6732d004UL;
