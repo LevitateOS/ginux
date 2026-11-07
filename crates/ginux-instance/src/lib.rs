@@ -1490,11 +1490,11 @@ fn parse_field(
             builder.storage = parse_list(value)?;
         }
         (Section::Storage, b"max_objects") => {
-            builder.mark(1u64 << 36)?;
+            builder.mark(1u64 << 52)?;
             builder.storage_max_objects = parse_u64(value)?;
         }
         (Section::Storage, b"max_bytes") => {
-            builder.mark(1u64 << 37)?;
+            builder.mark(1u64 << 53)?;
             builder.storage_max_bytes = parse_u64(value)?;
             if builder.storage_max_bytes == 0 {
                 return Err(ConfigError::InvalidValue);
@@ -1518,15 +1518,15 @@ fn parse_field(
             };
         }
         (Section::Network, b"endpoints") => {
-            builder.mark(1u64 << 38)?;
+            builder.mark(1u64 << 54)?;
             builder.network_endpoints = parse_list(value)?;
         }
         (Section::Network, b"max_connections") => {
-            builder.mark(1u64 << 39)?;
+            builder.mark(1u64 << 55)?;
             builder.network_max_connections = parse_u64(value)?;
         }
         (Section::Network, b"max_bytes") => {
-            builder.mark(1u64 << 40)?;
+            builder.mark(1u64 << 56)?;
             builder.network_max_bytes = parse_u64(value)?;
         }
         (Section::Network, b"interface") => {
