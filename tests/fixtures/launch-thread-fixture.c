@@ -179,7 +179,23 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-1 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='T' || mode=='U') {
+    if (mode=='B') {
+        long mapped=call(9,0,8192,3,0x22,(word)-1,0);
+        CHECK(mapped>0,169);
+        volatile unsigned char *split=(volatile unsigned char *)(mapped+4094);
+        split[0]=0x11; split[1]=0x22; split[2]=0x33; split[3]=0x44;
+        CHECK(DO(10,mapped+4096,4096,0)==0,170);
+        long inaccessible=spawn_thread((word)(stacks[0]+sizeof stacks[0]),(volatile int *)split,quick);
+        CHECK(DO(10,mapped+4096,4096,3)==0,171);
+        CHECK(inaccessible==-14 && split[0]==0x11 && split[1]==0x22 && split[2]==0x33 && split[3]==0x44,172);
+        CHECK(DO(10,mapped,4096,1)==0,173);
+        long partial=spawn_thread((word)(stacks[0]+sizeof stacks[0]),(volatile int *)split,quick);
+        CHECK(DO(10,mapped,4096,3)==0,174);
+        CHECK(partial==-14 && split[0]==0x11 && split[1]==0x22 && split[2]==0x33 && split[3]==0x44,175);
+        long valid=spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],quick);
+        join(0);
+        CHECK(!error && valid==2 && tid[0]==0,177);
+    } else if (mode=='T' || mode=='U') {
         long page=call(9,0,4096,3,0x22,(word)-1,0);
         CHECK(page>0,161);
         race_tid_page=(volatile word *)page;
