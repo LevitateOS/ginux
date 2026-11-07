@@ -45,6 +45,69 @@ impl Input {
         }
         Ok(())
     }
+
+    fn snapshot(&mut self, size: u64, before: &[u64; 18]) -> Result<Input, Error> {
+        // Copy into a private sealable inode before parsing any archive record.
+        // A host write after this copy cannot change validated restore bytes.
+        let fd = unsafe { syscall2(319, c"ginux-restore".as_ptr() as usize, 3) };
+        if fd < 3 {
+            if fd >= 0 {
+                unsafe { syscall1(3, fd as usize) };
+            }
+            return Err(b"restore snapshot allocation failed");
+        }
+        let snapshot = Input(fd as usize);
+        let mut buffer = [0u8; 64 * 1024];
+        let mut remaining = size;
+        while remaining != 0 {
+            let length = remaining.min(buffer.len() as u64) as usize;
+            self.exact(&mut buffer[..length])?;
+            let mut written = 0;
+            while written < length {
+                let count = unsafe {
+                    syscall3(
+                        1,
+                        snapshot.0,
+                        buffer[written..length].as_ptr() as usize,
+                        length - written,
+                    )
+                };
+                if count == -4 {
+                    continue;
+                }
+                if count <= 0 || count as usize > length - written {
+                    return Err(b"restore snapshot write failed");
+                }
+                written += count as usize;
+            }
+            remaining -= length as u64;
+        }
+        let mut extra = [0u8; 1];
+        if self.read(&mut extra)? != 0 {
+            return Err(b"restore source changed during snapshot");
+        }
+        let mut after = [0u64; 18];
+        if unsafe { syscall2(5, self.0, after.as_mut_ptr() as usize) } < 0
+            || before[0] != after[0]
+            || before[1] != after[1]
+            || before[6] != after[6]
+            || before[11..15] != after[11..15]
+        {
+            return Err(b"restore source changed during snapshot");
+        }
+        let seals = 0xf;
+        if unsafe { syscall3(72, snapshot.0, 1033, seals) } < 0 {
+            return Err(b"restore snapshot seal failed");
+        }
+        let actual = unsafe { syscall3(72, snapshot.0, 1034, 0) };
+        if actual < 0 || actual as usize & seals != seals {
+            return Err(b"restore snapshot seal failed");
+        }
+        if unsafe { syscall3(8, snapshot.0, 0, 0) } != 0 {
+            return Err(b"restore snapshot seek failed");
+        }
+        Ok(snapshot)
+    }
 }
 
 pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
@@ -73,7 +136,7 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
     if fd < 0 {
         return Err(b"cannot open restore archive");
     }
-    let mut input = Input(fd as usize);
+    let mut source = Input(fd as usize);
     let mut stat = [0u64; 18];
     let archive_bound = files
         .byte_limit()
@@ -84,12 +147,14 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
         )
         .and_then(|n| n.checked_add(1024))
         .ok_or(b"restore archive bound overflow".as_slice())?;
-    if unsafe { syscall2(5, input.0, stat.as_mut_ptr() as usize) } < 0
+    if unsafe { syscall2(5, source.0, stat.as_mut_ptr() as usize) } < 0
         || stat[3] & 0o170000 != 0o100000
         || stat[6] > archive_bound
     {
         return Err(b"restore archive is not a bounded regular file");
     }
+    let mut input = source.snapshot(stat[6], &stat)?;
+    core::mem::drop(source);
     let mut seen = MappedArray::new(files.capacity(), false)
         .map_err(|_| b"restore metadata allocation failed".as_slice())?;
     let mut long_name = [0u8; 256];
