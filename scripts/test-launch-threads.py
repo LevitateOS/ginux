@@ -17,7 +17,7 @@ def main():
     if len(sys.argv) < 3 or os.geteuid() != 0:
         sys.exit('usage (as root): test-launch-threads.py <ginux> <thread-fixture> [scenario ...]')
     binary, fixture = [str(Path(p).resolve()) for p in sys.argv[1:3]]
-    scenarios = ('basic', 'musl', 'umask', 'pin', 'limit', 'stress', 'Z-safe', 'z-race', 'V-flags', 'U-clone-tid', 'T-clone-tid-race', 'B-cross-tid', 'N-nonleader-tid', 'C-child-tid', 'x-path', 'y-mapping', 'k-scratch', 'v-private', 'n-mapping', 'j-leader-map', 'q-fixed', 'w-rollback', 'a-pair-fail', 'fork', 'early', 'rollback', 'tiny', 'teardown')
+    scenarios = ('basic', 'musl', 'umask', 'pin', 'limit', 'stress', 'Z-safe', 'z-race', 'V-flags', 'U-clone-tid', 'T-clone-tid-race', 'B-cross-tid', 'N-nonleader-tid', 'C-child-tid', 'X-scratch', 'x-path', 'y-mapping', 'k-scratch', 'v-private', 'n-mapping', 'j-leader-map', 'q-fixed', 'w-rollback', 'a-pair-fail', 'fork', 'early', 'rollback', 'tiny', 'teardown')
     selected = sys.argv[3:] or scenarios
     if any(mode not in scenarios for mode in selected):
         sys.exit('unknown thread scenario')
@@ -38,7 +38,8 @@ def main():
         for mode in (mode for mode in selected if mode != 'teardown'):
             path, result, audit_path = work / f'{mode}.toml', work / f'{mode}.json', work / f'{mode}.audit'
             result.unlink(missing_ok=True)
-            path.write_text(config.replace('args = []', 'args = ' + json.dumps([mode])))
+            case_config = config.replace('vcpus = 1', 'vcpus = 2') if mode == 'X-scratch' else config
+            path.write_text(case_config.replace('args = []', 'args = ' + json.dumps([mode])))
             with audit_path.open('wb') as audit:
                 proc = subprocess.Popen([binary, 'launch', str(path), str(root), '--result-file', str(result)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=audit)

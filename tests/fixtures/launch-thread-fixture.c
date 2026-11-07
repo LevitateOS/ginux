@@ -26,6 +26,28 @@ static long path_writer(void) {
     }
     return 0;
 }
+static volatile word path_scratch_rsp;
+static volatile int path_scratch_ready;
+static long path_scratch_writer(void) {
+    path_scratch_ready=1;
+    while(!path_done) {
+        word rsp=path_scratch_rsp;
+        if(!rsp) continue;
+        volatile word *slot=(volatile word *)(rsp-512);
+        // Replace the supervisor's canonical path with hidden image /work/hh.
+        slot[0]=0x68682f6b726f772fUL;
+        ((volatile char *)slot)[8]=0;
+    }
+    return 0;
+}
+// Publish the exact syscall stack pointer used by Rewrite::prepare.
+__attribute__((noinline)) static long open_scratch(void) {
+    word number=2;
+    __asm__ volatile("mov %%rsp,%1\n\tsyscall" : "+a"(number), "=m"(path_scratch_rsp)
+                     : "D"((word)"/./allowed"), "S"((word)0), "d"((word)0)
+                     : "rcx", "r11", "memory");
+    return (long)number;
+}
 static volatile word shared_action[4];
 static volatile int action_ready, action_flags_mode;
 static long sigchld_writer(void) {
@@ -298,6 +320,34 @@ long thread_main(word *stack)
         CHECK(call(13,17,(word)safe,0,8,0,0)==0,152);
         CHECK(successful+rejected==(mode=='Z'?64:1024),153);
         CHECK(!error && !exposed,154);
+    } else if (mode=='X') {
+        long control=open_scratch();
+        CHECK(control>=5,200);
+        char control_byte=0;
+        CHECK(DO(0,control,&control_byte,1)==1 && control_byte=='A',201);
+        CHECK(DO(3,control,0,0)==0,202);
+        path_scratch_rsp=0;
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],path_scratch_writer)==2,203);
+        while(!path_scratch_ready) __asm__ volatile("pause");
+        int exposed=0;
+        word allowed=0;
+        for(word i=0;i<2048 && !exposed && !error;++i) {
+            long fd=open_scratch();
+            path_scratch_rsp=0;
+            if(fd>=5) {
+                char value=0;
+                long read=DO(0,fd,&value,1);
+                if(read==1 && value=='A') ++allowed;
+                else if(read==1 && value=='S') exposed=1;
+                else error=207;
+                if(DO(3,fd,0,0)!=0) error=208;
+            }
+        }
+        path_done=1;
+        join(0);
+        CHECK(!error,204);
+        CHECK(!exposed,205);
+        CHECK(allowed>0,206);
     } else if (mode=='x') {
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],path_writer)==2,98);
         int exposed=0;
