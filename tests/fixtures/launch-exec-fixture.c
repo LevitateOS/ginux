@@ -37,6 +37,38 @@ long exec_main(word *stack)
     CHECK(call(267,-100,(word)"/proc/self/exe",(word)exe,4,0,0)==4,91);
     CHECK(DO(89,"/proc/self/exe",exe,0)==-22,92);
     CHECK(DO(89,"/proc/self/exe",1,8)==-14,93);
+    if (mode=='X') return 99; // Hidden image script must never run.
+    if (mode=='R') {
+        int status=0;
+        CHECK(DO(62,2,9,0)==0,95);
+        CHECK(DO(61,2,&status,0)==2 && (status&127)==9,96);
+        CHECK(DO(1,1,"shared-exec: PASS\n",18)==18,97);
+        return 0;
+    }
+    if (mode=='S') {
+        volatile char *shared=(volatile char *)call(9,0,4096,3,0x21,(word)-1,0);
+        CHECK((long)shared>0,98);
+        const char allowed[]="/bin/fixture", hidden[]="/work/hidden";
+        for(word i=0;i<sizeof allowed;++i) shared[i]=allowed[i];
+        volatile int *ready=(volatile int *)(shared+64);
+        long child=DO(57,0,0,0);
+        CHECK(child>=0,99);
+        if(!child) {
+            for(word iteration=0;;++iteration) {
+                const char *path=iteration&1?allowed:hidden;
+                for(word i=0;i<sizeof allowed-1;++i) shared[i]=path[i];
+                if(iteration==1024) *ready=1;
+            }
+        }
+        CHECK(child==2,100);
+        while(!*ready) __asm__ volatile("pause");
+        char *next[]={"fixture","R",0};
+        for(word i=0;i<1024;++i) {
+            long result=DO(59,shared,next,empty_env);
+            CHECK(result<0,101);
+        }
+        return 102;
+    }
     if (mode=='/') return 77; // Interpreter of the allowed image script.
     if (mode=='u') {
         char *args[]={"probe",0};

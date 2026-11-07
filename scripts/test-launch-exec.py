@@ -97,6 +97,19 @@ def main():
                         proc.kill()
                         proc.communicate(timeout=5)
             print(f'PASS launch exec: {mode}')
+        # A forked writer shares the pathname page but has a separate thread group.
+        # The image path under memory:/work must not become a kernel exec target.
+        (root / 'work/hidden').write_text('#!/bin/fixture X\n')
+        (root / 'work/hidden').chmod(0o755)
+        path, result = work / 'shared-path.toml', work / 'shared-path.json'
+        path.write_text(config.replace('args = []', 'args = ["S"]'))
+        proc = subprocess.run([binary, 'launch', str(path), str(root), '--result-file', str(result)],
+                              capture_output=True, timeout=20)
+        record = json.loads(result.read_text())
+        assert proc.returncode == 0 and proc.stdout == b'shared-exec: PASS\n', (proc.returncode, proc.stdout, proc.stderr[-4096:], record)
+        assert record == dict(version=1, outcome='exited', code=0, signal=None, generation=None), record
+        assert b'teardown tasks=0 owned-handles=0' in proc.stderr, proc.stderr
+        print('PASS launch exec: shared-path')
     print('test-launch-exec: PASS')
 
 
