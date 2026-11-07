@@ -289,10 +289,13 @@ fn complete(
         )
     };
     let current = linked == 0 && parent_is_current(&state) && published_inode_is_current(&state);
-    close(state.inode_fd);
-    close(state.parent_fd);
+    let inode_closed = close(state.inode_fd);
+    let parent_closed = close(state.parent_fd);
     if !current {
         return Err(b"export-file publication failed");
+    }
+    if inode_closed != 0 || parent_closed != 0 {
+        return Err(b"export-file reference close failed");
     }
     Ok(())
 }
