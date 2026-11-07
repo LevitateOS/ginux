@@ -9,6 +9,13 @@ static long call(long n, word a, word b, word c, word d, word e)
     return result;
 }
 #define DO(n,a,b,c) call(n,(word)(a),(word)(b),(word)(c),0,0)
+static long anonymous_pages(void) {
+    register word r10 __asm__("r10")=0x22, r8 __asm__("r8")=(word)-1, r9 __asm__("r9")=0;
+    long result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(9), "D"(0), "S"(8192), "d"(3),
+                     "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
+    return result;
+}
 #define CHECK(expr,code) do { if (!(expr)) return code; } while (0)
 static char buffer[4096];
 static char *many[4098];
@@ -165,6 +172,14 @@ long script_main(word *stack)
     CHECK(DO(59,"/work/program",many,next_env)==-7 && intact(),48);
     CHECK(DO(59,"/work/program",next,many)==-7 && intact(),49);
     CHECK(DO(59,"/work/program",next,1)==-14 && intact(),50);
+    long edge_pages=anonymous_pages();
+    CHECK(edge_pages>0,103);
+    char **edge=(char **)(edge_pages+4096-sizeof(char *));
+    edge[0]="/work/program";
+    CHECK(DO(10,edge_pages+4096,4096,0)==0,104);
+    CHECK(DO(59,"/work/program",edge,next_env)==-14 && intact(),105);
+    CHECK(DO(59,"/work/program",next,edge)==-14 && intact(),106);
+    CHECK(DO(11,edge_pages,8192,0)==0,107);
     long fd=DO(2,"/work/program",1,0); CHECK(fd==6 && DO(59,"/work/program",next,next_env)==-26 && DO(3,fd,0,0)==0,36);
     for(int n=0;n<3;++n) {
         CHECK(DO(59,"/work/program",1,next_env)==-14 && intact(),37);
