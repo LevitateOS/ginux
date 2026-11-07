@@ -137,8 +137,9 @@ pub fn decide_launch(
     registers: &mut UserRegs,
     descriptors: &mut crate::descriptors::DescriptorTable,
     backends: &mut crate::descriptors::Backends,
+    call: &mut crate::descriptors::DescriptorCall,
 ) -> NativeDecision {
-    descriptors.enter(pid, registers, backends)
+    descriptors.enter(pid, registers, backends, call)
 }
 
 /// Dispatch one process-supervision entry through the process-lane hook.

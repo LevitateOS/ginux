@@ -106,12 +106,90 @@ fn empty_regs() -> UserRegs {
 pub struct DescriptorTable {
     entries: [Option<Descriptor>; LIMIT],
     capacity: usize,
+}
+
+/// A traced task owns its in-flight syscall and poll state independently of
+/// the descriptor table it uses.
+pub struct DescriptorCall {
     pending: Option<Pending>,
     saved_args: Option<[u64; 7]>,
     poll_wait: bool,
     poll_tick: bool,
     poll_deadline: Option<u64>,
     poll_input: [u8; 128],
+}
+
+impl DescriptorCall {
+    pub const fn new() -> Self {
+        Self {
+            pending: None,
+            saved_args: None,
+            poll_wait: false,
+            poll_tick: false,
+            poll_deadline: None,
+            poll_input: [0; 128],
+        }
+    }
+
+    pub fn needs_poll_tick(&self) -> bool {
+        self.poll_tick
+    }
+
+    fn save(&mut self, r: &UserRegs) {
+        self.saved_args = Some([r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9, r.orig_rax]);
+    }
+
+    /// Called at the matching syscall exit, including emulated exits. Never
+    /// restore memory/TLS or signal state: only the arguments we translated.
+    pub fn finish(
+        &mut self,
+        table: &mut DescriptorTable,
+        r: &mut UserRegs,
+    ) -> Result<bool, &'static [u8]> {
+        self.poll_wait = false;
+        self.poll_tick = false;
+        self.poll_deadline = None;
+        let mut changed = false;
+        if let Some(pending) = self.pending.take() {
+            match pending {
+                Pending::Open { slot } => {
+                    if r.rax as i64 >= 0 {
+                        if r.rax >= LIMIT as u64 {
+                            return Err(b"native descriptor outside bounded table");
+                        }
+                        table.entries[slot].as_mut().unwrap().handle = Handle::Native {
+                            fd: r.rax as u32,
+                            console: false,
+                        };
+                        r.rax = slot as u64;
+                    } else {
+                        table.entries[slot] = None;
+                    }
+                }
+                Pending::Close { result } => {
+                    // Native handles are known live; EBADF means ownership drift.
+                    if r.rax as i64 == -9 {
+                        return Err(b"native descriptor close lost ownership");
+                    }
+                    if let Some(result) = result {
+                        r.rax = result as u64;
+                    }
+                }
+            }
+            changed = true;
+        }
+        if let Some(args) = self.saved_args.take() {
+            r.rdi = args[0];
+            r.rsi = args[1];
+            r.rdx = args[2];
+            r.r10 = args[3];
+            r.r8 = args[4];
+            r.r9 = args[5];
+            r.orig_rax = args[6];
+            changed = true;
+        }
+        Ok(changed)
+    }
 }
 
 impl DescriptorTable {
@@ -123,12 +201,6 @@ impl DescriptorTable {
         let mut table = Self {
             entries: [None; LIMIT],
             capacity: limits[0].min(LIMIT as u64) as usize,
-            pending: None,
-            saved_args: None,
-            poll_wait: false,
-            poll_tick: false,
-            poll_deadline: None,
-            poll_input: [0; 128],
         };
         for fd in 0..3 {
             // Bootstrap exec closes CLOEXEC stdio just like an already closed
@@ -146,16 +218,17 @@ impl DescriptorTable {
         Ok(table)
     }
 
-    pub fn needs_poll_tick(&self) -> bool {
-        self.poll_tick
-    }
-
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
     pub fn fork_copy(&self, refs: &mut ObjectReferences) -> Result<Self, &'static [u8]> {
-        if self.pending.is_some() || self.saved_args.is_some() {
+        if self
+            .entries
+            .iter()
+            .flatten()
+            .any(|d| d.handle == Handle::Reserved)
+        {
             return Err(b"cannot inherit unfinished descriptor syscall");
         }
         for entry in self.entries.iter().flatten() {
@@ -166,12 +239,6 @@ impl DescriptorTable {
         Ok(Self {
             entries: self.entries,
             capacity: self.capacity,
-            pending: None,
-            saved_args: None,
-            poll_wait: false,
-            poll_tick: false,
-            poll_deadline: None,
-            poll_input: [0; 128],
         })
     }
 
@@ -230,7 +297,12 @@ impl DescriptorTable {
 
     /// PTRACE_EVENT_EXEC is the commit point. Failed exec never calls this.
     pub fn exec_completed(&mut self, backends: &mut Backends) -> Result<(), &'static [u8]> {
-        if self.pending.is_some() || self.saved_args.is_some() {
+        if self
+            .entries
+            .iter()
+            .flatten()
+            .any(|d| d.handle == Handle::Reserved)
+        {
             return Err(b"exec overlapped unfinished descriptor syscall");
         }
         for entry in &mut self.entries {
@@ -255,11 +327,6 @@ impl DescriptorTable {
                 backends.release(handle)?;
             }
         }
-        self.pending = None;
-        self.saved_args = None;
-        self.poll_wait = false;
-        self.poll_tick = false;
-        self.poll_deadline = None;
         Ok(())
     }
 
@@ -297,63 +364,12 @@ impl DescriptorTable {
         Ok(slot)
     }
 
-    fn save(&mut self, r: &UserRegs) {
-        self.saved_args = Some([r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9, r.orig_rax]);
-    }
-
-    /// Called at the matching syscall exit, including emulated exits. Never
-    /// restore memory/TLS or signal state: only the arguments we translated.
-    pub fn finish(&mut self, r: &mut UserRegs) -> Result<bool, &'static [u8]> {
-        self.poll_wait = false;
-        self.poll_tick = false;
-        self.poll_deadline = None;
-        let mut changed = false;
-        if let Some(pending) = self.pending.take() {
-            match pending {
-                Pending::Open { slot } => {
-                    if r.rax as i64 >= 0 {
-                        if r.rax >= LIMIT as u64 {
-                            return Err(b"native descriptor outside bounded table");
-                        }
-                        self.entries[slot].as_mut().unwrap().handle = Handle::Native {
-                            fd: r.rax as u32,
-                            console: false,
-                        };
-                        r.rax = slot as u64;
-                    } else {
-                        self.entries[slot] = None;
-                    }
-                }
-                Pending::Close { result } => {
-                    // Native handles are known live; EBADF means ownership drift.
-                    if r.rax as i64 == -9 {
-                        return Err(b"native descriptor close lost ownership");
-                    }
-                    if let Some(result) = result {
-                        r.rax = result as u64;
-                    }
-                }
-            }
-            changed = true;
-        }
-        if let Some(args) = self.saved_args.take() {
-            r.rdi = args[0];
-            r.rsi = args[1];
-            r.rdx = args[2];
-            r.r10 = args[3];
-            r.r8 = args[4];
-            r.r9 = args[5];
-            r.orig_rax = args[6];
-            changed = true;
-        }
-        Ok(changed)
-    }
-
     pub fn enter(
         &mut self,
         pid: usize,
         r: &mut UserRegs,
         backends: &mut Backends,
+        call: &mut DescriptorCall,
     ) -> NativeDecision {
         // Resource changes cannot invalidate the public allocator or address-space bound.
         if r.orig_rax == 302 && matches!(r.rsi, 7 | 9) && r.rdx != 0 {
@@ -361,37 +377,37 @@ impl DescriptorTable {
         }
         let result = match r.orig_rax {
             2 | 257 => {
-                self.save(r);
-                self.open(pid, r, backends)
+                call.save(r);
+                self.open(pid, r, backends, call)
             }
             41 => {
-                self.save(r);
+                call.save(r);
                 self.socket(pid, r, backends)
             }
             22 | 53 | 293 => {
-                self.save(r);
+                call.save(r);
                 self.pipe(pid, r, backends)
             }
             3 => {
-                self.save(r);
+                call.save(r);
                 self.get(r.rdi)
-                    .and_then(|_| self.close(r.rdi as u32 as usize, r, pid, backends))
+                    .and_then(|_| self.close(r.rdi as u32 as usize, r, pid, backends, call))
             }
             32 | 33 | 292 => {
-                self.save(r);
-                self.dup(pid, r, backends)
+                call.save(r);
+                self.dup(pid, r, backends, call)
             }
             280 if r.rsi == 0 => {
-                self.save(r);
+                call.save(r);
                 self.get(r.rdi)
-                    .and_then(|d| self.descriptor(pid, r, d, backends))
+                    .and_then(|d| self.descriptor(pid, r, d, backends, call))
             }
             72 => {
-                self.save(r);
+                call.save(r);
                 match self.get(r.rdi) {
                     Err(e) => Err(e),
                     Ok(entry) => match r.rsi {
-                        0 | 1030 => self.dup(pid, r, backends),
+                        0 | 1030 => self.dup(pid, r, backends, call),
                         1 => Ok(ready(entry.cloexec as i64)),
                         2 if r.rdx & !1 == 0 => {
                             self.entries[r.rdi as u32 as usize]
@@ -401,18 +417,18 @@ impl DescriptorTable {
                             Ok(ready(0))
                         }
                         2 => Err(-22),
-                        _ => self.descriptor(pid, r, entry, backends),
+                        _ => self.descriptor(pid, r, entry, backends, call),
                     },
                 }
             }
             0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55 | 74
             | 73 | 75 | 77 | 78 | 91 | 93 | 217 => {
-                self.save(r);
+                call.save(r);
                 self.get(r.rdi)
-                    .and_then(|d| self.descriptor(pid, r, d, backends))
+                    .and_then(|d| self.descriptor(pid, r, d, backends, call))
             }
             9 if r.r10 & 0x20 == 0 => {
-                self.save(r);
+                call.save(r);
                 match self.get(r.r8) {
                     Ok(Descriptor {
                         handle: Handle::Native { fd, console: false },
@@ -426,21 +442,21 @@ impl DescriptorTable {
                 }
             }
             264 | 265 | 316 => {
-                self.save(r);
+                call.save(r);
                 self.rename_paths(pid, r, backends)
             }
             266 => {
-                self.save(r);
+                call.save(r);
                 self.path_handle(pid, r.rsi, r.rdx).map(|handle| {
                     r.rsi = handle;
                     backends.claim(pid, r)
                 })
             }
             258 | 260 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 => {
-                self.save(r);
+                call.save(r);
                 self.path_descriptor(pid, r, backends)
             }
-            7 | 271 => self.poll(pid, r, backends),
+            7 | 271 => self.poll(pid, r, backends, call),
             _ => Ok(backends.claim(pid, r)),
         };
         result.unwrap_or_else(ready)
@@ -511,6 +527,7 @@ impl DescriptorTable {
         pid: usize,
         r: &mut UserRegs,
         backends: &mut Backends,
+        call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
         let flags = if r.orig_rax == 2 { r.rsi } else { r.rdx };
         // Reserve before any create/truncate or native open can occur.
@@ -541,7 +558,7 @@ impl DescriptorTable {
                 })
             }
             Ok(NativeDecision::Contract(decision)) => {
-                self.pending = Some(Pending::Open { slot });
+                call.pending = Some(Pending::Open { slot });
                 Ok(NativeDecision::Contract(decision))
             }
             other => {
@@ -664,6 +681,7 @@ impl DescriptorTable {
         r: &mut UserRegs,
         entry: Descriptor,
         backends: &mut Backends,
+        call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
         let public_fd = r.rdi as u32;
         let network = matches!(entry.handle, Handle::Owned(h) if crate::network_hooks::LaunchNetwork::owns(h));
@@ -675,7 +693,7 @@ impl DescriptorTable {
             return Err(-88);
         }
         if network
-            && self
+            && call
                 .poll_deadline
                 .is_some_and(|end| monotonic_nanoseconds().is_ok_and(|now| now >= end))
         {
@@ -720,14 +738,14 @@ impl DescriptorTable {
         Ok(match decision {
             NativeDecision::Park { .. } => {
                 if network {
-                    if !self.poll_tick {
+                    if !call.poll_tick {
                         let timeout = backends.devices.network.timeout(r.rdi as u32, r.orig_rax);
                         if timeout != 0 {
-                            self.poll_deadline =
+                            call.poll_deadline =
                                 Some(monotonic_nanoseconds()?.checked_add(timeout).ok_or(-22)?);
                         }
                     }
-                    self.poll_tick = true;
+                    call.poll_tick = true;
                 }
                 NativeDecision::Park { fd: public_fd }
             }
@@ -741,6 +759,7 @@ impl DescriptorTable {
         r: &mut UserRegs,
         pid: usize,
         backends: &mut Backends,
+        call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
         let result = if r.orig_rax == 3 {
             None
@@ -765,7 +784,7 @@ impl DescriptorTable {
             Handle::Native { fd, .. } => {
                 r.orig_rax = 3;
                 r.rdi = fd as u64;
-                self.pending = Some(Pending::Close { result });
+                call.pending = Some(Pending::Close { result });
                 Ok(NativeDecision::Contract(decide_balanced(3)))
             }
             Handle::Owned(handle) => {
@@ -786,6 +805,7 @@ impl DescriptorTable {
         pid: usize,
         r: &mut UserRegs,
         backends: &mut Backends,
+        call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
         let source = r.rdi as i32;
         let mut entry = self.get(r.rdi)?;
@@ -810,7 +830,7 @@ impl DescriptorTable {
         entry.cloexec = cloexec;
         // Preserve the source in its own slot until target retirement completes.
         let decision = if self.entries[target].is_some() {
-            self.close(target, r, pid, backends)?
+            self.close(target, r, pid, backends, call)?
         } else {
             ready(target as i64)
         };
@@ -825,10 +845,11 @@ impl DescriptorTable {
         pid: usize,
         r: &UserRegs,
         backends: &mut Backends,
+        call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
         // Snapshot ppoll's relative timeout once, like the pollfd layout. A
         // parked task must retain its original deadline across scheduler ticks.
-        let timeout = if self.poll_wait {
+        let timeout = if call.poll_wait {
             -1
         } else if r.orig_rax == 271 {
             if r.r10 != 0 {
@@ -857,13 +878,13 @@ impl DescriptorTable {
         let count = r.rsi as usize;
         let mut bytes = [0u8; 128];
         let length = count * 8;
-        if self.poll_wait {
-            bytes = self.poll_input;
+        if call.poll_wait {
+            bytes = call.poll_input;
         } else {
             if copy_memory(pid, r.rdi, &mut bytes[..length], false)? != length as i64 {
                 return Err(-14);
             }
-            self.poll_input = bytes;
+            call.poll_input = bytes;
         }
         // Console OFDs are inherited unchanged from this supervisor. Only
         // explicitly tracked console handles can query those host descriptors.
@@ -930,10 +951,10 @@ impl DescriptorTable {
             ready_count += i64::from(revents != 0);
         }
         let now = monotonic_nanoseconds()?;
-        if !self.poll_wait && timeout > 0 {
-            self.poll_deadline = Some(now.checked_add(timeout as u64 * 1_000_000).ok_or(-22)?);
+        if !call.poll_wait && timeout > 0 {
+            call.poll_deadline = Some(now.checked_add(timeout as u64 * 1_000_000).ok_or(-22)?);
         }
-        if ready_count != 0 || timeout == 0 || self.poll_deadline.is_some_and(|end| now >= end) {
+        if ready_count != 0 || timeout == 0 || call.poll_deadline.is_some_and(|end| now >= end) {
             for i in 0..count {
                 let address = r.rdi.checked_add((i * 8 + 6) as u64).ok_or(-14)?;
                 if copy_memory(pid, address, &mut bytes[i * 8 + 6..i * 8 + 8], true)? != 2 {
@@ -942,11 +963,11 @@ impl DescriptorTable {
             }
             return Ok(ready(ready_count));
         }
-        self.poll_wait = true;
+        call.poll_wait = true;
         // Infinite owned-object waits need no timer: object progress/death
         // already wakes them. External console IO needs periodic observation.
-        self.poll_tick = network_wait
-            || self.poll_deadline.is_some()
+        call.poll_tick = network_wait
+            || call.poll_deadline.is_some()
             || consoles[..count].iter().any(|fd| fd.fd >= 0);
         Ok(NativeDecision::ParkPoll)
     }

@@ -1,7 +1,7 @@
 //! Task ownership for configured native launch. A newborn never runs before
 //! its process identity and descriptor snapshot are installed.
 
-use crate::descriptors::{Backends, DescriptorTable, ExecDescriptor};
+use crate::descriptors::{Backends, DescriptorCall, DescriptorTable, ExecDescriptor};
 use crate::dispatch::{
     balanced_surface_name, decide_launch, native_arguments_allowed, NativeDecision,
 };
@@ -75,6 +75,7 @@ struct Task {
     adopted_reaped: bool,
     wait_status: Option<i32>,
     descriptors: DescriptorTable,
+    call: DescriptorCall,
     image: Option<Executable>,
     cwd: Option<i32>,
     image_chdir: Option<u64>,
@@ -245,6 +246,7 @@ pub fn supervise(
         adopted_reaped: false,
         wait_status: None,
         descriptors,
+        call: DescriptorCall::new(),
         image: None,
         cwd: None,
         image_chdir: None,
@@ -270,7 +272,7 @@ pub fn supervise(
             .tasks
             .iter()
             .flatten()
-            .any(|t| t.blocked.is_some() && t.descriptors.needs_poll_tick());
+            .any(|t| t.blocked.is_some() && t.call.needs_poll_tick());
         if polling {
             let now = crate::descriptors::monotonic_nanoseconds()
                 .unwrap_or_else(|_| s.fail(domain, b"readiness clock failed"))
@@ -905,6 +907,7 @@ impl Supervisor<'_> {
                     adopted_reaped: false,
                     wait_status: None,
                     descriptors: table,
+                    call: DescriptorCall::new(),
                     image,
                     cwd,
                     image_chdir: None,
@@ -958,7 +961,13 @@ impl Supervisor<'_> {
         }
         let decision = {
             let task = self.tasks[index].as_mut().unwrap();
-            decide_launch(task.host, r, &mut task.descriptors, &mut self.objects)
+            decide_launch(
+                task.host,
+                r,
+                &mut task.descriptors,
+                &mut self.objects,
+                &mut task.call,
+            )
         };
         let decision = match decision {
             NativeDecision::Contract(decision) => {
@@ -1623,7 +1632,8 @@ impl Supervisor<'_> {
                 self.replace_cwd(index, None, domain);
             }
         }
-        let result = self.tasks[index].as_mut().unwrap().descriptors.finish(r);
+        let task = self.tasks[index].as_mut().unwrap();
+        let result = task.call.finish(&mut task.descriptors, r);
         if let Err(reason) = result {
             self.fail(domain, reason)
         }
