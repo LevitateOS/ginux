@@ -479,8 +479,11 @@ device types are not implemented by configured launch yet.
 
 Anonymous `pipe`/`pipe2` are emulated with supervisor-owned memory and virtual
 handles. Up to sixteen channel buffers hold 65536 bytes each; aliases use the common table.
-`pipe2` accepts only `O_CLOEXEC|O_NONBLOCK`. IO is bounded to 4096 bytes per call;
-writes of up to 4096 bytes are atomic. Reads consume only bytes successfully
+`pipe2` accepts only `O_CLOEXEC|O_NONBLOCK`. Copies use bounded 4096-byte chunks;
+writes of up to 4096 bytes are atomic. Blocking pipe writes retain task-owned
+progress across full-buffer waits until the requested bytes are written. Other
+tasks can drain the fixed buffer while that syscall remains stopped. Nonblocking
+writes and packet operations retain their bounded short-transfer behavior. Reads consume only bytes successfully
 copied out, so invalid/partially inaccessible destinations do not lose data.
 Read/write direction, EOF, SIGPIPE, metadata, seek rejection, descriptor/status
 flags, pipe-size queries and aliases across owners are supported.

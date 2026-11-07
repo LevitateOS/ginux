@@ -66,12 +66,27 @@ struct PipeFd {
     peer: Option<usize>,
 }
 
+/// Progress belongs to the task's current syscall, not its shared endpoint.
+pub struct WriteProgress {
+    vectors: Option<crate::tracee_io::IoVectors>,
+    written: usize,
+}
+impl WriteProgress {
+    pub const fn new() -> Self {
+        Self {
+            vectors: None,
+            written: 0,
+        }
+    }
+}
+
 pub enum ChannelResult {
     Ready(i64),
-    /// No bytes were consumed or published. The task must remain stopped until
-    /// peer progress, an interrupt, or termination; this is not guest EAGAIN.
+    /// Retain the task's syscall until peer progress or termination. Partial
+    /// blocking writes wake readers without returning a short guest result.
     Blocked {
         fd: u32,
+        progressed: bool,
     },
 }
 
@@ -88,7 +103,12 @@ impl LaunchChannels {
         }
     }
 
-    pub fn claim(&mut self, pid: usize, r: &UserRegs) -> Option<ChannelResult> {
+    pub fn claim(
+        &mut self,
+        pid: usize,
+        r: &UserRegs,
+        progress: &mut WriteProgress,
+    ) -> Option<ChannelResult> {
         let fd = r.rdi as u32;
         if !(PIPE_FD_BASE..0x4000_0000).contains(&fd) {
             return None;
@@ -134,7 +154,7 @@ impl LaunchChannels {
             {
                 return Some(ChannelResult::Ready(-95));
             }
-            return Some(match self.io(pid, slot, entry, r) {
+            return Some(match self.io(pid, slot, entry, r, progress) {
                 Ok(result) => result,
                 Err(error) => ChannelResult::Ready(error),
             });
@@ -356,12 +376,26 @@ impl LaunchChannels {
         slot: usize,
         entry: PipeFd,
         r: &UserRegs,
+        progress: &mut WriteProgress,
     ) -> Result<ChannelResult, i64> {
         let writing = matches!(r.orig_rax, 1 | 20 | 44);
-        let vectors = if matches!(r.orig_rax, 19 | 20) {
+        // The current blocking write retains its admitted mode and vector
+        // layout while another task can change the shared endpoint flags.
+        let nonblock = progress.vectors.is_none()
+            && (self.flags(entry) & NONBLOCK != 0
+                || matches!(r.orig_rax, 44 | 45) && r.r10 & 0x40 != 0);
+        let complete_write = writing && !nonblock && entry.peer.is_none();
+        let vectors = if let Some(vectors) = progress.vectors.take() {
+            vectors
+        } else if matches!(r.orig_rax, 19 | 20) {
             crate::tracee_io::IoVectors::read(pid, r.rsi, r.rdx)?
         } else {
             crate::tracee_io::IoVectors::single(r.rsi, r.rdx)
+        };
+        let vectors = if complete_write {
+            progress.vectors.get_or_insert(vectors)
+        } else {
+            &vectors
         };
         let requested = vectors.length;
         if entry.peer.is_none() && writing != entry.write {
@@ -370,8 +404,6 @@ impl LaunchChannels {
         if requested == 0 && entry.peer.is_none() {
             return Ok(ChannelResult::Ready(0));
         }
-        let nonblock =
-            self.flags(entry) & NONBLOCK != 0 || matches!(r.orig_rax, 44 | 45) && r.r10 & 0x40 != 0;
         let fd = PIPE_FD_BASE + slot as u32;
         let mut buffer = [0u8; IO_SIZE];
         let pipe = if writing {
@@ -387,7 +419,11 @@ impl LaunchChannels {
                 if r.orig_rax != 44 || r.r10 & 0x4000 == 0 {
                     let _ = unsafe { syscall2(SYS_KILL, pid, 13) };
                 }
-                return Err(-32);
+                return if progress.written != 0 {
+                    Ok(ChannelResult::Ready(progress.written as i64))
+                } else {
+                    Err(-32)
+                };
             }
             if p.packet && requested > IO_SIZE {
                 return Err(-90);
@@ -402,25 +438,47 @@ impl LaunchChannels {
                 return Ok(if nonblock {
                     ChannelResult::Ready(-11)
                 } else {
-                    ChannelResult::Blocked { fd }
+                    ChannelResult::Blocked {
+                        fd,
+                        progressed: false,
+                    }
                 });
             }
-            let count = requested.min(IO_SIZE).min(available);
-            let copied = vectors.copy(pid, &mut buffer[..count], false)?;
-            if atomic && copied != count {
-                return Err(-14);
-            }
-            if p.packet {
-                for byte in (copied as u16).to_le_bytes() {
-                    p.data[(p.head + p.len) % CAPACITY] = byte;
+            let mut written = if complete_write { progress.written } else { 0 };
+            let before = written;
+            loop {
+                let available = (CAPACITY - p.len).saturating_sub(overhead);
+                let count = (requested - written).min(IO_SIZE).min(available);
+                if count == 0 && written != requested {
+                    progress.written = written;
+                    return Ok(ChannelResult::Blocked {
+                        fd,
+                        progressed: written != before,
+                    });
+                }
+                let copied = match vectors.copy_from(pid, &mut buffer[..count], false, written) {
+                    Ok(n) => n,
+                    Err(_) if written != 0 => return Ok(ChannelResult::Ready(written as i64)),
+                    Err(error) => return Err(error),
+                };
+                if atomic && copied != count {
+                    return Err(-14);
+                }
+                if p.packet {
+                    for byte in (copied as u16).to_le_bytes() {
+                        p.data[(p.head + p.len) % CAPACITY] = byte;
+                        p.len += 1;
+                    }
+                }
+                for byte in &buffer[..copied] {
+                    p.data[(p.head + p.len) % CAPACITY] = *byte;
                     p.len += 1;
                 }
+                written += copied;
+                if !complete_write || written == requested || copied != count {
+                    return Ok(ChannelResult::Ready(written as i64));
+                }
             }
-            for byte in &buffer[..copied] {
-                p.data[(p.head + p.len) % CAPACITY] = *byte;
-                p.len += 1;
-            }
-            Ok(ChannelResult::Ready(copied as i64))
         } else {
             if p.len == 0 {
                 return Ok(if p.writers == 0 {
@@ -428,7 +486,10 @@ impl LaunchChannels {
                 } else if nonblock {
                     ChannelResult::Ready(-11)
                 } else {
-                    ChannelResult::Blocked { fd }
+                    ChannelResult::Blocked {
+                        fd,
+                        progressed: false,
+                    }
                 });
             }
             let overhead = if p.packet { 2 } else { 0 };

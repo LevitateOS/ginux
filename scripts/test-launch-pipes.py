@@ -75,12 +75,13 @@ def main():
             assert record['generation'] is None
 
         if sys.argv[3:]:
-            modes=('ordinary-packet','ordinary-fionbio','ordinary-streams','ordinary-vectors')
+            modes=('ordinary-packet','ordinary-fionbio','ordinary-streams','ordinary-vectors','ordinary-blocking-large')
             for mode in sys.argv[3:]:
                 if mode not in modes:sys.exit('unknown ordinary pipe mode')
                 invoke(['vectors'] if mode=='ordinary-vectors' else [mode],assigned=True)
             print('test-launch-pipes: PASS ('+', '.join(sys.argv[3:])+')')
             return
+        invoke(['ordinary-blocking-large'], assigned=True)
         invoke(['vectors'])
         invoke()
         invoke(assigned=True)

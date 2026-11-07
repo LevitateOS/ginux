@@ -34,8 +34,9 @@ pub fn classify(syscall: u64) -> Lane {
 
 /// Outcome of dispatching one native entry.
 pub enum NativeDecision {
-    /// An owned channel cannot progress yet; retain its syscall-entry stop.
-    Park { fd: u32 },
+    /// Retain an owned syscall entry until peer progress; wake peers when
+    /// this attempt published bytes before filling its bounded buffer.
+    Park { fd: u32, progressed: bool },
     /// A public-descriptor query waits for object readiness or a deadline.
     ParkPoll,
     /// A lane hook claimed the entry; emulate it with this result.
@@ -92,14 +93,17 @@ pub fn decide_objects(
     filesystem: &mut crate::fs_hooks::LaunchFs,
     devices: &mut crate::device_hooks::LaunchDevices,
     channels: &mut crate::channel_hooks::LaunchChannels,
+    progress: &mut crate::channel_hooks::WriteProgress,
 ) -> NativeDecision {
-    if let Some(result) = channels.claim(pid, registers) {
+    if let Some(result) = channels.claim(pid, registers, progress) {
         match result {
             crate::channel_hooks::ChannelResult::Ready(result) => NativeDecision::Hooked {
                 lane: Lane::Channel,
                 result,
             },
-            crate::channel_hooks::ChannelResult::Blocked { fd } => NativeDecision::Park { fd },
+            crate::channel_hooks::ChannelResult::Blocked { fd, progressed } => {
+                NativeDecision::Park { fd, progressed }
+            }
         }
     } else if let Some(result) = devices.network.claim(pid, registers) {
         match result {
@@ -109,6 +113,7 @@ pub fn decide_objects(
             },
             crate::network_hooks::Result::Blocked => NativeDecision::Park {
                 fd: registers.rdi as u32,
+                progressed: false,
             },
         }
     } else if let Some(result) = devices.claim(pid, registers, filesystem) {

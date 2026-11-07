@@ -1160,7 +1160,8 @@ impl Supervisor<'_> {
                 self.task_mut(index).blocked = Some(original);
                 audit_write(b"park surface=owned-poll\n");
             }
-            NativeDecision::Park { fd } => {
+            NativeDecision::Park { fd, progressed } => {
+                self.wake_needed |= progressed;
                 self.task_mut(index).blocked = Some(original);
                 audit_write(b"park\nginux: park surface=lane-channel fd=");
                 audit_u64(fd as u64);

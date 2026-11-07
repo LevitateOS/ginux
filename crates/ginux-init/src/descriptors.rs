@@ -82,7 +82,22 @@ pub struct Backends<'a> {
 }
 impl Backends<'_> {
     fn claim(&mut self, pid: usize, r: &UserRegs) -> NativeDecision {
-        decide_objects(pid, r, self.filesystem, self.devices, self.channels)
+        self.claim_with_write(pid, r, &mut crate::channel_hooks::WriteProgress::new())
+    }
+    fn claim_with_write(
+        &mut self,
+        pid: usize,
+        r: &UserRegs,
+        progress: &mut crate::channel_hooks::WriteProgress,
+    ) -> NativeDecision {
+        decide_objects(
+            pid,
+            r,
+            self.filesystem,
+            self.devices,
+            self.channels,
+            progress,
+        )
     }
     fn release(&mut self, handle: u32) -> Result<(), &'static [u8]> {
         if !self.refs.release(handle) {
@@ -118,6 +133,7 @@ pub struct DescriptorCall {
     poll_tick: bool,
     poll_deadline: Option<u64>,
     poll_input: [u8; 128],
+    channel_write: crate::channel_hooks::WriteProgress,
 }
 
 impl DescriptorCall {
@@ -130,6 +146,7 @@ impl DescriptorCall {
             poll_tick: false,
             poll_deadline: None,
             poll_input: [0; 128],
+            channel_write: crate::channel_hooks::WriteProgress::new(),
         }
     }
 
@@ -164,6 +181,7 @@ impl DescriptorCall {
         r: &mut UserRegs,
         backends: &mut Backends,
     ) -> Result<bool, &'static [u8]> {
+        self.channel_write = crate::channel_hooks::WriteProgress::new();
         self.poll_wait = false;
         self.poll_tick = false;
         self.poll_deadline = None;
@@ -753,16 +771,19 @@ impl DescriptorTable {
             Handle::Owned(handle) => r.rdi = handle as u64,
             Handle::Reserved => return Err(-9),
         }
-        let decision = match backends.claim(pid, r) {
+        let decision = match backends.claim_with_write(pid, r, &mut call.channel_write) {
             NativeDecision::Hooked { result: -11, .. }
                 if (r.orig_rax == 72 && r.rsi == 7) || (r.orig_rax == 73 && r.rsi & 4 == 0) =>
             {
-                NativeDecision::Park { fd: public_fd }
+                NativeDecision::Park {
+                    fd: public_fd,
+                    progressed: false,
+                }
             }
             decision => decision,
         };
         Ok(match decision {
-            NativeDecision::Park { .. } => {
+            NativeDecision::Park { progressed, .. } => {
                 if call.pinned.is_none() {
                     if let Handle::Owned(handle) = entry.handle {
                         backends.refs.retain(handle);
@@ -779,7 +800,10 @@ impl DescriptorTable {
                     }
                     call.poll_tick = true;
                 }
-                NativeDecision::Park { fd: public_fd }
+                NativeDecision::Park {
+                    fd: public_fd,
+                    progressed,
+                }
             }
             decision => decision,
         })

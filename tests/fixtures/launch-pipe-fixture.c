@@ -81,11 +81,42 @@ static long ordinary_vectors(void) {
     DO(1,1,"owned-pipes: PASS\n",18);
     return 0;
 }
+static long ordinary_blocking_large(void) {
+    static char large[196733];
+    for(word i=0;i<sizeof(large);++i) large[i]=(char)(i%251);
+    for(int vector=0;vector<2;++vector) {
+        int pair[2];CHECK(DO(22,pair,0,0)==0,190);
+        long child=DO(57,0,0,0);CHECK(child>=0,191);
+        if(child==0) {
+            CHECK(DO(3,pair[0],0,0)==0,192);
+            word iov[6]={(word)large,3000,(word)(large+3000),100000,
+                         (word)(large+103000),sizeof(large)-103000};
+            long n=vector?DO(20,pair[1],iov,3):DO(1,pair[1],large,sizeof(large));
+            DO(60,n==(long)sizeof(large)?0:193,0,0);__builtin_unreachable();
+        }
+        CHECK(DO(3,pair[1],0,0)==0,194);
+        word received=0;
+        for(;;) {
+            long n=DO(0,pair[0],buffer,sizeof(buffer));CHECK(n>=0,195);
+            if(n==0)break;
+            CHECK(received+(word)n<=sizeof(large),196);
+            for(long i=0;i<n;++i)CHECK(buffer[i]==large[received+(word)i],197);
+            received+=(word)n;
+        }
+        int status=-1;CHECK(DO(61,child,&status,0)==child && status==0,198);
+        CHECK(received==sizeof(large) && DO(3,pair[0],0,0)==0,199);
+    }
+    return 0;
+}
 long pipe_main(word *stack)
 {
     word argc = *stack;
     char **argv = (char **)(stack + 1);
     int pair[2];
+    if(argc>1 && named(argv[1],"ordinary-blocking-large")) {
+        long result=ordinary_blocking_large();if(result)return result;
+        DO(1,1,"owned-pipes: PASS\n",18);return 0;
+    }
     if(argc>1 && (named(argv[1],"ordinary-fionbio") || named(argv[1],"ordinary-streams"))){
         long result=named(argv[1],"ordinary-fionbio")?ordinary_fionbio():ordinary_streams();
         if(result)return result;

@@ -289,12 +289,28 @@ impl IoVectors {
         Ok(output)
     }
     pub fn copy(&self, pid: usize, buffer: &mut [u8], to_tracee: bool) -> Result<usize, i64> {
+        self.copy_from(pid, buffer, to_tracee, 0)
+    }
+    pub fn copy_from(
+        &self,
+        pid: usize,
+        buffer: &mut [u8],
+        to_tracee: bool,
+        mut offset: usize,
+    ) -> Result<usize, i64> {
         let mut copied = 0;
         for (address, length) in self.entries {
-            let count = length.min(buffer.len() - copied);
+            let skip = offset.min(length);
+            offset -= skip;
+            let count = (length - skip).min(buffer.len() - copied);
             if count == 0 {
                 continue;
             }
+            let address = match address.checked_add(skip as u64) {
+                Some(address) => address,
+                None if copied != 0 => break,
+                None => return Err(-14),
+            };
             match copy_memory(pid, address, &mut buffer[copied..copied + count], to_tracee) {
                 Ok(n) => {
                     copied += n as usize;
