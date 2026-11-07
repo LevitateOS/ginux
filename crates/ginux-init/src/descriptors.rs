@@ -82,16 +82,18 @@ pub struct Backends<'a> {
 }
 impl Backends<'_> {
     fn claim(&mut self, pid: usize, r: &UserRegs) -> NativeDecision {
-        self.claim_with_write(pid, r, &mut crate::channel_hooks::WriteProgress::new())
+        self.claim_with_write(pid, 0, r, &mut crate::channel_hooks::WriteProgress::new())
     }
     fn claim_with_write(
         &mut self,
         pid: usize,
+        signal_tgid: usize,
         r: &UserRegs,
         progress: &mut crate::channel_hooks::WriteProgress,
     ) -> NativeDecision {
         decide_objects(
             pid,
+            signal_tgid,
             r,
             self.filesystem,
             self.devices,
@@ -407,6 +409,7 @@ impl DescriptorTable {
     pub fn enter(
         &mut self,
         pid: usize,
+        signal_tgid: usize,
         r: &mut UserRegs,
         backends: &mut Backends,
         call: &mut DescriptorCall,
@@ -448,7 +451,7 @@ impl DescriptorTable {
                 call.pinned
                     .map(Ok)
                     .unwrap_or_else(|| self.get(r.rdi))
-                    .and_then(|d| self.descriptor(pid, r, d, backends, call))
+                    .and_then(|d| self.descriptor(pid, signal_tgid, r, d, backends, call))
             }
             72 => {
                 call.save(r);
@@ -465,7 +468,7 @@ impl DescriptorTable {
                             Ok(ready(0))
                         }
                         2 => Err(-22),
-                        _ => self.descriptor(pid, r, entry, backends, call),
+                        _ => self.descriptor(pid, signal_tgid, r, entry, backends, call),
                     },
                 }
             }
@@ -475,7 +478,7 @@ impl DescriptorTable {
                 call.pinned
                     .map(Ok)
                     .unwrap_or_else(|| self.get(r.rdi))
-                    .and_then(|d| self.descriptor(pid, r, d, backends, call))
+                    .and_then(|d| self.descriptor(pid, signal_tgid, r, d, backends, call))
             }
             9 if r.r10 & 0x20 == 0 => {
                 call.save(r);
@@ -728,6 +731,7 @@ impl DescriptorTable {
     fn descriptor(
         &mut self,
         pid: usize,
+        signal_tgid: usize,
         r: &mut UserRegs,
         entry: Descriptor,
         backends: &mut Backends,
@@ -784,7 +788,8 @@ impl DescriptorTable {
             Handle::Owned(handle) => r.rdi = handle as u64,
             Handle::Reserved => return Err(-9),
         }
-        let decision = match backends.claim_with_write(pid, r, &mut call.channel_write) {
+        let decision = match backends.claim_with_write(pid, signal_tgid, r, &mut call.channel_write)
+        {
             NativeDecision::Hooked { result: -11, .. }
                 if (r.orig_rax == 72 && r.rsi == 7) || (r.orig_rax == 73 && r.rsi & 4 == 0) =>
             {

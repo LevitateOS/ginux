@@ -17,6 +17,22 @@ static volatile int tid[32], gate, count, error;
 static volatile word thread_flags __attribute__((used))=0x3d0f00;
 static int pair[2];
 static char byte;
+static volatile int packet_signal_count, packet_signal_tid;
+static volatile long packet_write_result, packet_nosignal_result;
+void packet_signal_return(void);
+__asm__(".global packet_signal_return\npacket_signal_return:\nmov $15,%eax\nsyscall\nud2\n");
+static void packet_sigpipe(int signal) {
+    if(signal==13) { ++packet_signal_count; packet_signal_tid=(int)DO(186,0,0,0); }
+}
+static long packet_writer(void) {
+    while(!gate) {
+        long result=DO(202,&gate,0,0);
+        if(result!=0 && result!=-11 && result!=-4) { error=194; return 0; }
+    }
+    packet_write_result=DO(1,pair[0],"X",1);
+    packet_nosignal_result=call(44,pair[0],(word)"Y",1,0x4000,0,0);
+    return 0;
+}
 static volatile word mutable_path[2]={0x6465776f6c6c612fUL,0};
 static volatile int path_done;
 static long path_writer(void) {
@@ -250,7 +266,18 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-1 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='C') {
+    if (mode=='P') {
+        word action[4]={(word)packet_sigpipe,0x04000000,(word)packet_signal_return,0};
+        CHECK(call(13,13,(word)action,0,8,0,0)==0,195);
+        CHECK(call(53,1,5,0,(word)pair,0,0)==0 && pair[0]==5 && pair[1]==6,196);
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],packet_writer)==2,197);
+        CHECK(DO(3,pair[1],0,0)==0,198);
+        gate=1;CHECK(DO(202,&gate,1,1)>=0,199);
+        join(0);
+        CHECK(!error && packet_write_result==-32 && packet_nosignal_result==-32,201);
+        CHECK(packet_signal_count==1 && packet_signal_tid==2,202);
+        CHECK(DO(3,pair[0],0,0)==0,203);
+    } else if (mode=='C') {
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],nested_child_pointer)==2,192);
         join(0);
         CHECK(!error && child_pointer_result==3 && child_pointer_tid==3 &&

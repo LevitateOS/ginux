@@ -30,6 +30,7 @@ pub const SYS_EXECVE: usize = 59;
 pub const SYS_EXIT_HOST: usize = 60;
 pub const SYS_WAIT4: usize = 61;
 pub const SYS_KILL: usize = 62;
+pub const SYS_TGKILL: usize = 234;
 pub const SYS_PTRACE: usize = 101;
 pub const SYS_OPENAT_HOST: usize = 257;
 pub const SYS_SIGNALFD4: usize = 289;

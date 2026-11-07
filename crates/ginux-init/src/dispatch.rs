@@ -89,13 +89,14 @@ pub fn decide_native(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> NativeDecisi
 /// Resolve registered backend objects before the immutable native contract.
 pub fn decide_objects(
     pid: usize,
+    signal_tgid: usize,
     registers: &UserRegs,
     filesystem: &mut crate::fs_hooks::LaunchFs,
     devices: &mut crate::device_hooks::LaunchDevices,
     channels: &mut crate::channel_hooks::LaunchChannels,
     progress: &mut crate::channel_hooks::WriteProgress,
 ) -> NativeDecision {
-    if let Some(result) = channels.claim(pid, registers, progress) {
+    if let Some(result) = channels.claim(pid, signal_tgid, registers, progress) {
         match result {
             crate::channel_hooks::ChannelResult::Ready(result) => NativeDecision::Hooked {
                 lane: Lane::Channel,
@@ -105,7 +106,7 @@ pub fn decide_objects(
                 NativeDecision::Park { fd, progressed }
             }
         }
-    } else if let Some(result) = devices.network.claim(pid, registers) {
+    } else if let Some(result) = devices.network.claim(pid, signal_tgid, registers) {
         match result {
             crate::network_hooks::Result::Ready(result) => NativeDecision::Hooked {
                 lane: Lane::Device,
@@ -139,12 +140,13 @@ pub fn decide_objects(
 /// Configured launch resolves the public descriptor ABI before backend handles.
 pub fn decide_launch(
     pid: usize,
+    signal_tgid: usize,
     registers: &mut UserRegs,
     descriptors: &mut crate::descriptors::DescriptorTable,
     backends: &mut crate::descriptors::Backends,
     call: &mut crate::descriptors::DescriptorCall,
 ) -> NativeDecision {
-    descriptors.enter(pid, registers, backends, call)
+    descriptors.enter(pid, signal_tgid, registers, backends, call)
 }
 
 /// Dispatch one process-supervision entry through the process-lane hook.

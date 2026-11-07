@@ -1,6 +1,6 @@
 //! Configured TCP ownership. Only pre-granted numeric destinations can acquire
 //! a supervisor socket; the workload never receives its private descriptor.
-use crate::supervisor::{syscall2, UserRegs, SYS_KILL};
+use crate::supervisor::{syscall3, UserRegs, SYS_TGKILL};
 use crate::tracee_io::{copy_memory, write_stat, IoVectors, Stat};
 use ginux_devices::{BoundedTcp, LinuxTcpBackend, NetworkError, TcpEndpoint, TcpFamily};
 use ginux_instance::{InstanceConfig, NetworkBackend};
@@ -138,7 +138,7 @@ impl LaunchNetwork {
         state.connected = true;
         Ok(true)
     }
-    pub fn claim(&mut self, pid: usize, r: &UserRegs) -> Option<Result> {
+    pub fn claim(&mut self, pid: usize, signal_tgid: usize, r: &UserRegs) -> Option<Result> {
         if r.orig_rax == 41 {
             return Some(Result::Ready(self.open(r).unwrap_or_else(|e| e)));
         }
@@ -182,7 +182,7 @@ impl LaunchNetwork {
         }
         let slot = (r.rdi as u32 - FD_BASE) as usize;
         let state = self.sockets[slot];
-        let outcome = self.operation(pid, slot, r);
+        let outcome = self.operation(pid, signal_tgid, slot, r);
         Some(match outcome {
             Err(-11)
                 if state.is_some_and(|s| s.flags & 0o4000 == 0)
@@ -225,6 +225,7 @@ impl LaunchNetwork {
     fn operation(
         &mut self,
         pid: usize,
+        signal_tgid: usize,
         slot: usize,
         r: &UserRegs,
     ) -> core::result::Result<i64, i64> {
@@ -303,7 +304,7 @@ impl LaunchNetwork {
                         .map_err(errno);
                     if result == Err(-32) && !(r.orig_rax == 44 && r.r10 & 0x4000 != 0) {
                         // The backend suppresses host SIGPIPE; signal its guest caller.
-                        let _ = unsafe { syscall2(SYS_KILL, pid, 13) };
+                        let _ = unsafe { syscall3(SYS_TGKILL, signal_tgid, pid, 13) };
                     }
                     return result.map(|n| n as i64);
                 }

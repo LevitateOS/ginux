@@ -18,7 +18,7 @@ pub fn claim(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> Option<i64> {
     None
 }
 
-use crate::supervisor::{syscall2, UserRegs, SYS_KILL};
+use crate::supervisor::{syscall3, UserRegs, SYS_TGKILL};
 use crate::tracee_io::{copy_memory, read_path, write_stat, Stat};
 
 pub const PIPE_FD_BASE: u32 = 0x2000_0000;
@@ -106,6 +106,7 @@ impl LaunchChannels {
     pub fn claim(
         &mut self,
         pid: usize,
+        signal_tgid: usize,
         r: &UserRegs,
         progress: &mut WriteProgress,
     ) -> Option<ChannelResult> {
@@ -154,7 +155,7 @@ impl LaunchChannels {
             {
                 return Some(ChannelResult::Ready(-95));
             }
-            return Some(match self.io(pid, slot, entry, r, progress) {
+            return Some(match self.io(pid, signal_tgid, slot, entry, r, progress) {
                 Ok(result) => result,
                 Err(error) => ChannelResult::Ready(error),
             });
@@ -373,6 +374,7 @@ impl LaunchChannels {
     fn io(
         &mut self,
         pid: usize,
+        signal_tgid: usize,
         slot: usize,
         entry: PipeFd,
         r: &UserRegs,
@@ -417,7 +419,9 @@ impl LaunchChannels {
                 // Deliver the ordinary SIGPIPE to this supervised caller, not
                 // to the supervisor. Its disposition determines the outcome.
                 if r.orig_rax != 44 || r.r10 & 0x4000 == 0 {
-                    let _ = unsafe { syscall2(SYS_KILL, pid, 13) };
+                    // kill(2) is process-directed even when pid is a host TID.
+                    // The host thread-group ID prevents TID-reuse misdelivery.
+                    let _ = unsafe { syscall3(SYS_TGKILL, signal_tgid, pid, 13) };
                 }
                 return if progress.written != 0 {
                     Ok(ChannelResult::Ready(progress.written as i64))

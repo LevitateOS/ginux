@@ -1419,9 +1419,19 @@ impl Supervisor<'_> {
         }
         let decision = {
             let group = self.task(index).group;
+            let leader = self.groups[group].as_ref().unwrap().leader;
+            let signal_tgid = self
+                .tasks
+                .iter()
+                .flatten()
+                .find(|task| task.id == leader)
+                .map(|task| task.host)
+                .filter(|host| *host != 0)
+                .unwrap_or_else(|| self.fail(instance, b"thread group leader missing"));
             let task = self.tasks[index].as_mut().unwrap();
             decide_launch(
                 task.host,
+                signal_tgid,
                 r,
                 &mut self.groups[group].as_mut().unwrap().table,
                 &mut self.objects,
