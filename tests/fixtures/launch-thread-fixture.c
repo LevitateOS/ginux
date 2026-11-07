@@ -88,6 +88,25 @@ static void join(word i)
     }
 }
 static long quick(void) { return 0; }
+static volatile long nested_bad, nested_good, nested_seen_tid, nested_seen_parent;
+static long nested_quick(void) {
+    nested_seen_tid=DO(186,0,0,0);
+    nested_seen_parent=DO(110,0,0,0);
+    return 0;
+}
+static long nested_birth(void) {
+    long page=call(9,0,4096,3,0x22,(word)-1,0);
+    if(page<=0) { error=178; return 0; }
+    *(volatile int *)page=0x44332211;
+    if(DO(10,page,4096,1)!=0) { error=179; return 0; }
+    nested_bad=spawn_thread((word)(stacks[1]+sizeof stacks[1]),(volatile int *)page,nested_quick);
+    if(DO(10,page,4096,3)!=0) { error=180; return 0; }
+    if(nested_bad!=-14 || *(volatile int *)page!=0x44332211) { error=181; return 0; }
+    nested_good=spawn_thread((word)(stacks[1]+sizeof stacks[1]),&tid[1],nested_quick);
+    if(nested_good>1) join(1);
+    if(DO(11,page,4096,0)!=0) error=182;
+    return 0;
+}
 static long shared_umask(void) {
     if(DO(95,0077,0,0)!=0022)error=91;
     return 0;
@@ -179,7 +198,12 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-1 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='B') {
+    if (mode=='N') {
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],nested_birth)==2,183);
+        join(0);
+        CHECK(!error && nested_bad==-14 && nested_good==3 &&
+              nested_seen_tid==3 && nested_seen_parent==0 && tid[0]==0 && tid[1]==0,184);
+    } else if (mode=='B') {
         long mapped=call(9,0,8192,3,0x22,(word)-1,0);
         CHECK(mapped>0,169);
         volatile unsigned char *split=(volatile unsigned char *)(mapped+4094);
