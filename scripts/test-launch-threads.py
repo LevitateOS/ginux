@@ -16,7 +16,7 @@ def main():
     if len(sys.argv) < 3 or os.geteuid() != 0:
         sys.exit('usage (as root): test-launch-threads.py <ginux> <thread-fixture> [scenario ...]')
     binary, fixture = [str(Path(p).resolve()) for p in sys.argv[1:3]]
-    scenarios = ('basic', 'musl', 'umask', 'pin', 'limit', 'stress', 'x-path', 'y-mapping', 'k-scratch', 'v-private', 'fork', 'early', 'rollback', 'tiny', 'teardown')
+    scenarios = ('basic', 'musl', 'umask', 'pin', 'limit', 'stress', 'x-path', 'y-mapping', 'k-scratch', 'v-private', 'n-mapping', 'j-leader-map', 'fork', 'early', 'rollback', 'tiny', 'teardown')
     selected = sys.argv[3:] or scenarios
     if any(mode not in scenarios for mode in selected):
         sys.exit('unknown thread scenario')
@@ -50,7 +50,7 @@ def main():
                             assert proc.poll() is None, audit_path.read_text()
                             assert time.monotonic() < deadline, 'read did not acquire its pinned handle'
                             time.sleep(.01)
-                    if mode == 'early':
+                    if mode in ('early', 'j-leader-map'):
                         assert select.select([proc.stdout], [], [], 5)[0]
                         assert proc.stdout.readline() == b'leader-ready\n', audit_path.read_text()
                         tasks = Path(f'/proc/{proc.pid}/task/{proc.pid}/children').read_text().split()
@@ -62,7 +62,7 @@ def main():
                             assert time.monotonic() < deadline, 'leader did not exit while thread remained alive'
                             time.sleep(.01)
                         assert proc.poll() is None, 'instance ended before its remaining thread'
-                    stdout, _ = proc.communicate(b'G' if mode in ('pin', 'early') else None, timeout=10)
+                    stdout, _ = proc.communicate(b'G' if mode in ('pin', 'early', 'j-leader-map') else None, timeout=10)
                     assert proc.returncode == 0 and stdout == b'owned-threads: PASS\n', (mode, proc.returncode, stdout, audit_path.read_text())
                     record = json.loads(result.read_text())
                     assert record == {'version': 1, 'outcome': 'exited', 'code': 0, 'signal': None, 'generation': None}, record

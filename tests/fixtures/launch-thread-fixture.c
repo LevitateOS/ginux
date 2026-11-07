@@ -117,6 +117,21 @@ static long native_work(void)
     }
     return 0;
 }
+static long nonleader_mapping(void) {
+    long mapped=call(9,0,4096,1,2,3,0);
+    if(mapped<=0 || *(volatile char *)mapped!='M') { error=114; return 0; }
+    if(DO(11,mapped,4096,0)!=0) error=115;
+    return 0;
+}
+static long after_leader_mapping(void) {
+    char input;
+    if(DO(0,0,&input,1)!=1 || input!='G') return 119;
+    if(DO(77,3,4096,0)!=0 || DO(1,3,"M",1)!=1) return 120;
+    long mapped=call(9,0,4096,1,2,3,0);
+    if(mapped<=0 || *(volatile char *)mapped!='M' || DO(11,mapped,4096,0)!=0) return 121;
+    DO(1,1,"owned-threads: PASS\n",20);
+    return 0;
+}
 static long after_leader(void)
 {
     char input;
@@ -158,6 +173,11 @@ long thread_main(word *stack)
         path_done=1;
         join(0);
         CHECK(mapped>0 && *(volatile char *)mapped=='M' && DO(11,mapped,4096,0)==0 && !error,103);
+    } else if (mode=='n') {
+        CHECK(DO(77,3,4096,0)==0 && DO(1,3,"M",1)==1,116);
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],nonleader_mapping)==2,117);
+        join(0);
+        CHECK(!error && tid[0]==0,118);
     } else if (mode=='v') {
         CHECK(DO(77,3,4096,0)==0 && DO(1,3,"M",1)==1,109);
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],private_fd_probe)==2,110);
@@ -216,6 +236,10 @@ long thread_main(word *stack)
         }
         join(0);
         CHECK(!error && DO(0,4,&byte,1)==1 && byte=='a',65);
+    } else if (mode=='j') {
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],after_leader_mapping)==2,122);
+        CHECK(DO(1,1,"leader-ready\n",13)==13,123);
+        return 0;
     } else if (mode=='e') {
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],after_leader)==2,44);
         CHECK(DO(1,1,"leader-ready\n",13)==13,45);
