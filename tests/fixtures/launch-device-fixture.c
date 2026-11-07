@@ -67,6 +67,8 @@ long device_main(word *stack)
     CHECK(*(word *)(meta+32) == inode, 33);
     CHECK(call(262,fd,(word)"",(word)meta,0x1000,0,0) == 0, 34);
     CHECK(*(word *)(meta+8) == inode, 35);
+    CHECK(call(439,fd,(word)"",4,0x1000,0,0) == 0, 72);
+    CHECK(call(439,fd,(word)"",1,0x1000,0,0) == -13, 73);
     CHECK(DO(3,fd,0,0) == 0, 36);
     CHECK(DO(0,fd,meta,1) == -9, 37);
     long ro = DO(2,"/dev/null",0,0);

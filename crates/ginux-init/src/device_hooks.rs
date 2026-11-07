@@ -67,13 +67,13 @@ impl LaunchDevices {
                     .unwrap_or_else(|error| error),
             );
         }
-        if matches!(r.orig_rax, 262 | 332) {
+        if matches!(r.orig_rax, 262 | 332 | 439) {
             match read_path(pid, r.rsi) {
                 Ok(path) if path.is_empty() && (fd as i32) >= FD_BASE as i32 => {
                     return Some(
                         self.descriptor_call(pid, fd, r)
                             .unwrap_or_else(|error| error),
-                    )
+                    );
                 }
                 Ok(path) if path.is_empty() => return None,
                 Err(error) => return Some(error),
@@ -226,6 +226,17 @@ impl LaunchDevices {
                         r.orig_rax == 332,
                         false,
                     )
+                }
+            }
+            439 => {
+                if r.r10 & !0x1100 != 0 || r.rdx & !7 != 0 {
+                    Err(-22)
+                } else if r.r10 & 0x1000 == 0 {
+                    Err(-2)
+                } else if r.rdx & 1 != 0 {
+                    Err(-13)
+                } else {
+                    Ok(0)
                 }
             }
             16 => Err(-25),
