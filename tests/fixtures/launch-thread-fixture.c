@@ -17,6 +17,15 @@ static volatile int tid[32], gate, count, error;
 static volatile word thread_flags __attribute__((used))=0x3d0f00;
 static int pair[2];
 static char byte;
+static volatile word mutable_path[2]={0x6465776f6c6c612fUL,0};
+static volatile int path_done;
+static long path_writer(void) {
+    while(!path_done) {
+        mutable_path[0]=0x6465776f6c6c612fUL;
+        mutable_path[0]=0x68682f6b726f772fUL;
+    }
+    return 0;
+}
 long spawn_thread(word top, volatile int *tid, long (*fn)(void));
 __asm__(".global spawn_thread\nspawn_thread:\n"
         "mov %rdx,-16(%rdi)\nmov %rsi,%rdx\nmov %rsi,%r10\nmov %rdi,%rsi\nsub $16,%rsi\n"
@@ -100,7 +109,22 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-1 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='u') {
+    if (mode=='x') {
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],path_writer)==2,98);
+        int exposed=0;
+        for(word i=0;i<2048 && !exposed;++i) {
+            long fd=DO(2,mutable_path,0,0);
+            if(fd>=5) {
+                char value=0;
+                if(DO(0,fd,&value,1)==1 && value=='S') exposed=1;
+                DO(3,fd,0,0);
+            }
+        }
+        path_done=1;
+        join(0);
+        CHECK(!error,100);
+        CHECK(!exposed,99);
+    } else if (mode=='u') {
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],shared_umask)==2,92);
         join(0);CHECK(!error && DO(95,0022,0,0)==0077,93);
     } else if (mode=='t') {

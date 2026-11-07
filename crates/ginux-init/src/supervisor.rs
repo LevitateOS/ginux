@@ -40,6 +40,7 @@ pub const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
 
 pub const PTRACE_TRACEME: usize = 0;
 pub const PTRACE_SEIZE: usize = 0x4206;
+pub const PTRACE_INTERRUPT: usize = 0x4207;
 pub const PTRACE_PEEKTEXT: usize = 1;
 pub const PTRACE_POKETEXT: usize = 4;
 pub const PTRACE_CONT: usize = 7;

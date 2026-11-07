@@ -73,6 +73,8 @@ struct Task {
     id: TaskId,
     host: usize,
     alive: bool,
+    running: bool,
+    held_status: Option<i32>,
     adopted_reaped: bool,
     wait_status: Option<i32>,
     group: usize,
@@ -113,10 +115,48 @@ struct Supervisor<'a> {
     signal_fd: Option<usize>,
     root_status: Option<i32>,
     creation_failure_reported: bool,
+    path_guard: Option<usize>,
 }
 
 fn birth_stop(status: i32) -> bool {
     stopped(status) && (status as u32 >> 16) == 128 && ((status >> 8) & 255) == 5
+}
+
+fn path_call(syscall: u64) -> bool {
+    matches!(
+        syscall,
+        2 | 4
+            | 6
+            | 21
+            | 59
+            | 80
+            | 82
+            | 83
+            | 84
+            | 86
+            | 87
+            | 88
+            | 89
+            | 90
+            | 92
+            | 94
+            | 257
+            | 258
+            | 260
+            | 262
+            | 263
+            | 264
+            | 265
+            | 266
+            | 267
+            | 268
+            | 269
+            | 280
+            | 316
+            | 322
+            | 332
+            | 439
+    )
 }
 
 // Created only after the tracee's initial exec stop, so neither the blocked
@@ -259,6 +299,7 @@ pub fn supervise(
         signal_fd: None,
         root_status: None,
         creation_failure_reported: false,
+        path_guard: None,
     };
     s.groups[0] = Some(DescriptorGroup {
         table: descriptors,
@@ -274,6 +315,8 @@ pub fn supervise(
         id,
         host: root,
         alive: true,
+        running: false,
+        held_status: None,
         adopted_reaped: false,
         wait_status: None,
         group: 0,
@@ -319,14 +362,27 @@ pub fn supervise(
             s.fail(instance, reason);
         }
         status = 0;
-        let host = unsafe {
-            syscall4(
-                SYS_WAIT4,
-                usize::MAX,
-                &mut status as *mut _ as usize,
-                WALL | 1,
-                0,
-            )
+        let held = if s.path_guard.is_none() {
+            s.tasks
+                .iter_mut()
+                .flatten()
+                .find_map(|task| task.held_status.take().map(|status| (task.host, status)))
+        } else {
+            None
+        };
+        let host = if let Some((saved_host, saved_status)) = held {
+            status = saved_status;
+            saved_host as isize
+        } else {
+            unsafe {
+                syscall4(
+                    SYS_WAIT4,
+                    usize::MAX,
+                    &mut status as *mut _ as usize,
+                    WALL | 1,
+                    0,
+                )
+            }
         };
         if host == 0 {
             if let Err(reason) = wait_events(signal_fd, polling) {
@@ -359,7 +415,18 @@ pub fn supervise(
             }
             s.fail(instance, b"event from unregistered task");
         };
+        s.task_mut(index).running = false;
+        if s.path_guard.is_some_and(|owner| owner != index) {
+            if s.task(index).held_status.is_some() {
+                s.fail(instance, b"multiple held stops for one task");
+            }
+            s.task_mut(index).held_status = Some(status);
+            continue;
+        }
         if exited(status) || signaled(status) {
+            if s.path_guard == Some(index) {
+                s.release_path_guard(instance);
+            }
             s.died(index, status, instance);
             if let Some(status) = s.root_status {
                 s.teardown(instance, status == 0);
@@ -382,12 +449,20 @@ pub fn supervise(
             continue;
         }
         if event == 4 {
+            if s.path_guard == Some(index) {
+                s.release_path_guard(instance);
+            }
             s.exec_completed(index, instance);
             continue;
         }
         if event == 128 {
-            // A seized tracee reports a real group stop as EVENT_STOP.
-            // It cannot be forwarded as a normal signal-delivery stop.
+            // An interrupt requested by the path guard may arrive after its
+            // owner released the hold. Resume that synthetic SIGTRAP stop.
+            if birth_stop(status) {
+                s.resume(index, 0, instance);
+                continue;
+            }
+            // Real group stops cannot be forwarded as signal delivery.
             s.fail(instance, b"launch group stops are unsupported")
         }
         if event != 0 {
@@ -460,8 +535,21 @@ pub fn supervise(
             continue;
         }
         match info[0] as u8 {
-            1 => s.entry(index, &mut r, instance),
-            2 => s.syscall_exit(index, &mut r, instance),
+            1 => {
+                if path_call(r.orig_rax) {
+                    s.begin_path_guard(index, instance);
+                }
+                s.entry(index, &mut r, instance);
+                if s.path_guard == Some(index) && s.task(index).blocked.is_some() {
+                    s.release_path_guard(instance);
+                }
+            }
+            2 => {
+                s.syscall_exit(index, &mut r, instance);
+                if s.path_guard == Some(index) {
+                    s.release_path_guard(instance);
+                }
+            }
             _ => s.fail(instance, b"unknown syscall stop"),
         }
     }
@@ -563,10 +651,92 @@ impl Supervisor<'_> {
             // SIGKILL can end a ptrace stop between an object retry and
             // resume. Keep ownership until wait4 supplies the actual death.
             self.task_mut(index).blocked = None;
+            self.task_mut(index).running = false;
         } else if result < 0 {
             self.fail(instance, b"launch task resume failed")
+        } else {
+            self.task_mut(index).running = true;
         }
     }
+    fn begin_path_guard(&mut self, owner: usize, instance: &mut Instance) {
+        if self.path_guard.is_some() {
+            return;
+        }
+        let deadline = crate::descriptors::monotonic_nanoseconds()
+            .unwrap_or_else(|_| self.fail(instance, b"path peer-stop clock failed"))
+            .saturating_add(5_000_000_000);
+        let mut requested = [false; TASKS];
+        for (index, wanted) in requested.iter_mut().enumerate() {
+            let Some(task) = self.tasks[index].as_ref() else {
+                continue;
+            };
+            if index == owner || !task.running || task.host == 0 {
+                continue;
+            }
+            // A pending clone/fork cannot return to guest code before its
+            // ptrace event or syscall-exit stop. Its autoattached child is
+            // stopped too. Waiting for the parent here can deadlock while
+            // the child awaits supervisor handling, so defer both events.
+            if matches!(task.pending, Pending::Fork { .. }) {
+                continue;
+            }
+            *wanted = true;
+            let result = ptrace(PTRACE_INTERRUPT, task.host, 0, 0);
+            if result < 0 && result != -3 && result != -5 {
+                self.fail(instance, b"path peer interrupt failed");
+            }
+        }
+        for (index, wanted) in requested.iter().enumerate() {
+            if !*wanted {
+                continue;
+            }
+            let host = self.task(index).host;
+            loop {
+                let mut status = 0;
+                let waited = unsafe {
+                    syscall4(SYS_WAIT4, host, &mut status as *mut _ as usize, WALL | 1, 0)
+                };
+                if waited == 0 {
+                    if crate::descriptors::monotonic_nanoseconds()
+                        .map_or(true, |now| now >= deadline)
+                    {
+                        self.fail(instance, b"path peer interrupt timed out");
+                    }
+                    unsafe {
+                        syscall0(24);
+                    }
+                    continue;
+                }
+                if waited == -4 {
+                    continue;
+                }
+                if waited != host as isize {
+                    self.fail(instance, b"path peer stop missing");
+                }
+                let peer = self.task_mut(index);
+                peer.running = false;
+                peer.held_status = Some(status);
+                break;
+            }
+        }
+        self.path_guard = Some(owner);
+    }
+
+    fn release_path_guard(&mut self, instance: &mut Instance) {
+        let owner = self.path_guard.take().unwrap();
+        for index in 0..TASKS {
+            if index == owner || self.tasks[index].is_none() {
+                continue;
+            }
+            let status = self.task(index).held_status;
+            if status.is_some_and(birth_stop) {
+                self.task_mut(index).held_status = None;
+                self.resume(index, 0, instance);
+            }
+        }
+        self.wake_needed = true;
+    }
+
     fn run(&mut self, index: usize, r: &UserRegs, instance: &mut Instance) {
         let result = ptrace(
             PTRACE_SETREGS,
@@ -966,6 +1136,14 @@ impl Supervisor<'_> {
                 return;
             }
             56..=58 => {
+                if let Pending::Fork { flags, .. } = self.task(index).pending {
+                    if flags != r.rdi {
+                        self.fail(instance, b"restarted creation changed clone flags");
+                    }
+                    audit_write(b"mediate surface=owned-process-create restart\n");
+                    self.run(index, r, instance);
+                    return;
+                }
                 let flags = r.rdi;
                 let libc_fork = r.orig_rax == 56 && flags == 0x1200011;
                 let thread = r.orig_rax == 56 && matches!(flags, 0x3d0f00 | 0x7d0f00);
@@ -1087,6 +1265,8 @@ impl Supervisor<'_> {
                     id: child,
                     host: 0,
                     alive: true,
+                    running: false,
+                    held_status: None,
                     adopted_reaped: false,
                     wait_status: None,
                     group,
@@ -1202,7 +1382,11 @@ impl Supervisor<'_> {
             NativeDecision::Contract(decision) => match decision.action {
                 Action::Emulate if matches!(original.orig_rax, 60 | 231) => {
                     audit_write(b"emulate result=instance-stop\n");
-                    self.run(index, r, instance)
+                    self.run(index, r, instance);
+                    // exit and exit_group cannot return to guest memory. A thread-group
+                    // leader can remain a zombie until its final peer exits, without
+                    // producing another ptrace stop for PTRACE_INTERRUPT to collect.
+                    self.task_mut(index).running = false;
                 }
                 Action::Emulate => self.emulate(
                     index,
@@ -1766,6 +1950,12 @@ impl Supervisor<'_> {
                 ..
             } => {
                 r.rdi = flags;
+                if r.rax as i64 == -513 {
+                    // A peer stop can expose the kernel's internal fork restart.
+                    // Keep the reserved child identity for the reentered syscall.
+                    self.run(index, r, instance);
+                    return;
+                }
                 if (r.rax as i64) < 0 {
                     if r.rax as i64 == -11 {
                         self.report_creation_failure(
@@ -1943,15 +2133,24 @@ impl Supervisor<'_> {
         }
     }
     fn wake(&mut self, instance: &mut Instance) {
-        // Object operations, observed deaths and readiness ticks retry parked calls.
-        if !core::mem::replace(&mut self.wake_needed, false) {
+        // Do not resume a peer while a kernel pathname is in flight.
+        if self.path_guard.is_some() || !core::mem::replace(&mut self.wake_needed, false) {
             return;
         }
         for index in 0..TASKS {
+            if self.path_guard.is_some() {
+                break;
+            }
             let Some(mut r) = self.tasks[index].as_mut().and_then(|t| t.blocked.take()) else {
                 continue;
             };
+            if path_call(r.orig_rax) {
+                self.begin_path_guard(index, instance);
+            }
             self.entry(index, &mut r, instance);
+            if self.path_guard == Some(index) && self.task(index).blocked.is_some() {
+                self.release_path_guard(instance);
+            }
         }
     }
     fn release_task_images(&mut self, index: usize, instance: &mut Instance) {
