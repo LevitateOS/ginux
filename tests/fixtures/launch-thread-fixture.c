@@ -26,6 +26,18 @@ static long path_writer(void) {
     }
     return 0;
 }
+static volatile word victim_rsp;
+static volatile int scratch_ready;
+static long scratch_writer(void) {
+    scratch_ready=1;
+    while(!path_done) {
+        word address=victim_rsp;
+        if(!address) continue;
+        volatile word *frame=(volatile word *)(address-512);
+        if(frame[6]==address-512+96 && frame[9]==24) frame[6]=1;
+    }
+    return 0;
+}
 long spawn_thread(word top, volatile int *tid, long (*fn)(void));
 __asm__(".global spawn_thread\nspawn_thread:\n"
         "mov %rdx,-16(%rdi)\nmov %rsi,%rdx\nmov %rsi,%r10\nmov %rdi,%rsi\nsub $16,%rsi\n"
@@ -131,6 +143,16 @@ long thread_main(word *stack)
         path_done=1;
         join(0);
         CHECK(mapped>0 && *(volatile char *)mapped=='M' && DO(11,mapped,4096,0)==0 && !error,103);
+    } else if (mode=='k') {
+        CHECK(DO(77,3,4096,0)==0 && DO(1,3,"M",1)==1,104);
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],scratch_writer)==2,105);
+        while(!scratch_ready) __asm__ volatile("pause");
+        __asm__ volatile("mov %%rsp,%0":"=r"(victim_rsp));
+        long mapped=call(9,0,4096,1,2,3,0);
+        path_done=1;
+        join(0);
+        CHECK(mapped>0 && *(volatile char *)mapped=='M' && !error,106);
+        CHECK(DO(11,mapped,4096,0)==0,107);
     } else if (mode=='u') {
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],shared_umask)==2,92);
         join(0);CHECK(!error && DO(95,0022,0,0)==0077,93);
