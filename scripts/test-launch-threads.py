@@ -67,6 +67,8 @@ def main():
                     record = json.loads(result.read_text())
                     assert record == {'version': 1, 'outcome': 'exited', 'code': 0, 'signal': None, 'generation': None}, record
                     assert b'teardown tasks=0 owned-handles=0' in audit_path.read_bytes()
+                    if mode in ('limit', 'rollback'):
+                        assert audit_path.read_bytes().count(b'creation returns EAGAIN') + audit_path.read_bytes().count(b'creation returned EAGAIN') == 1, audit_path.read_text()
                 finally:
                     if proc.poll() is None:
                         proc.kill()

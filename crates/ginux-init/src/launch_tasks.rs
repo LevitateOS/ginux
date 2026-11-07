@@ -111,6 +111,7 @@ struct Supervisor<'a> {
     tearing_down: bool,
     signal_fd: Option<usize>,
     root_status: Option<i32>,
+    creation_failure_reported: bool,
 }
 
 // Created only after the tracee's initial exec stop, so neither the blocked
@@ -252,6 +253,7 @@ pub fn supervise(
         tearing_down: false,
         signal_fd: None,
         root_status: None,
+        creation_failure_reported: false,
     };
     s.groups[0] = Some(DescriptorGroup {
         table: descriptors,
@@ -487,6 +489,15 @@ impl Supervisor<'_> {
             self.fail(instance, reason);
         }
         Some((state.leader, state.status))
+    }
+
+    fn report_creation_failure(&mut self, reason: &[u8]) {
+        // Keep the first concrete resource failure visible after ordinary audit
+        // truncation, without permitting a failed-clone loop to flood stderr.
+        if !self.creation_failure_reported {
+            self.creation_failure_reported = true;
+            line_stderr(reason);
+        }
     }
 
     fn task(&self, index: usize) -> &Task {
@@ -966,6 +977,9 @@ impl Supervisor<'_> {
                     }
                 }
                 let Some(slot) = self.tasks.iter().position(|t| t.is_none()) else {
+                    self.report_creation_failure(
+                        b"ginux: launch task slots exhausted; creation returns EAGAIN",
+                    );
                     self.emulate(index, r, -11, instance);
                     return;
                 };
@@ -975,7 +989,12 @@ impl Supervisor<'_> {
                     self.processes.fork(id)
                 } {
                     Ok(child) => child,
-                    Err(_) => {
+                    Err(error) => {
+                        if error == ProcessError::TableFull {
+                            self.report_creation_failure(
+                                b"ginux: virtual process slots exhausted; creation returns EAGAIN",
+                            );
+                        }
                         self.emulate(index, r, -11, instance);
                         return;
                     }
@@ -1719,6 +1738,11 @@ impl Supervisor<'_> {
             } => {
                 r.rdi = flags;
                 if (r.rax as i64) < 0 {
+                    if r.rax as i64 == -11 {
+                        self.report_creation_failure(
+                            b"ginux: native task creation returned EAGAIN",
+                        );
+                    }
                     self.release_group(child, instance);
                     let child_id = self.task(child).id;
                     let rollback = if parent_tid.is_some() {
