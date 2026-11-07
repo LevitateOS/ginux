@@ -22,6 +22,16 @@ long image_io_main(word *stack)
         return 0;
     }
     long fd=DO(2,"/image",0,0); CHECK(fd>=3,1);
+    /* Pointer arguments must not be mistaken for internal network handles,
+       including a 64-bit address whose low word aliases the handle range. */
+    for (word address=0x60000000; address<=0x160000000; address+=0x100000000) {
+        CHECK(call(9,address,4096,3,0x100022,-1,0)==(long)address,40);
+        CHECK(DO(10,address,4096,1)==0,41);
+        CHECK(DO(11,address,4096,0)==0,42);
+        CHECK(call(9,address,4096,1,0x100002,fd,0)==(long)address,43);
+        CHECK(*(unsigned char *)address=='Q',44);
+        CHECK(DO(11,address,4096,0)==0,45);
+    }
     CHECK(DO(0,fd,buffer,2*1024*1024)==2*1024*1024,2);
     CHECK(buffer[0]=='Q' && buffer[2*1024*1024-1]=='Q',3);
     CHECK(call(17,fd,(word)buffer,2*1024*1024,16,0,0)==2*1024*1024,4);

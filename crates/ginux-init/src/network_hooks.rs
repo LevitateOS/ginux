@@ -1,7 +1,7 @@
 //! Configured TCP ownership. Only pre-granted numeric destinations can acquire
 //! a supervisor socket; the workload never receives its private descriptor.
-use crate::supervisor::{syscall2, UserRegs, SYS_KILL};
-use crate::tracee_io::{copy_memory, write_stat, IoVectors, Stat};
+use crate::supervisor::{SYS_KILL, UserRegs, syscall2};
+use crate::tracee_io::{IoVectors, Stat, copy_memory, write_stat};
 use ginux_devices::{BoundedTcp, LinuxTcpBackend, NetworkError, TcpEndpoint, TcpFamily};
 use ginux_instance::{InstanceConfig, NetworkBackend};
 
@@ -142,7 +142,42 @@ impl LaunchNetwork {
         if r.orig_rax == 41 {
             return Some(Result::Ready(self.open(r).unwrap_or_else(|e| e)));
         }
-        if !Self::owns(r.rdi as u32) {
+        // Only descriptor-taking calls may interpret argument zero as a
+        // network handle. mmap/mprotect/munmap take addresses here; ASLR (or
+        // a fixed mapping) can give their low word the same value as a handle.
+        if !matches!(
+            r.orig_rax,
+            0 | 1
+                | 3
+                | 5
+                | 8
+                | 16
+                | 17
+                | 18
+                | 19
+                | 20
+                | 32
+                | 33
+                | 42
+                | 44
+                | 45
+                | 48
+                | 51
+                | 52
+                | 54
+                | 55
+                | 72
+                | 73
+                | 74
+                | 75
+                | 77
+                | 78
+                | 91
+                | 93
+                | 217
+                | 292
+        ) || !Self::owns(r.rdi as u32)
+        {
             return None;
         }
         let slot = (r.rdi as u32 - FD_BASE) as usize;
