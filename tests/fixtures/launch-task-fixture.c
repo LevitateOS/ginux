@@ -283,26 +283,28 @@ long task_main(word *stack)
         int status;
         CHECK(DO(61,child,&status,0)==child && status==9,52);
         CHECK(DO(62,child,0,0)==-3 && DO(62,-1,9,0)==-95,53);
-    } else if (mode=='b') {
+    } else if (mode=='b' || mode=='B') {
         int pipe[2];
         CHECK(DO(22,pipe,0,0)==0,60);
-        long children[15];
-        for (word i=0;i<15;++i) {
+        long children[31];
+        for (word i=0;i<31;++i) {
             long child=DO(57,0,0,0);
             if (child==0) { CHECK(DO(0,pipe[0],buffer,1)==1,61); return 0; }
             CHECK(child>1,62);
             children[i]=child;
         }
         CHECK(DO(57,0,0,0)==-11,63);
-        CHECK(DO(56,17|0x800000,0,0)==-38,64); // CLONE_UNTRACED
-        CHECK(DO(56,17|0x20000000,0,0)==-38,65); // CLONE_NEWPID
-        CHECK(DO(56,17|0x400,0,0)==-38,66); // CLONE_FILES
-        for (word i=0;i<15;++i) CHECK(DO(62,children[i],9,0)==0,67);
-        for (word i=0;i<15;++i) { int status; CHECK(DO(61,children[i],&status,0)==children[i] && status==9,68); }
+        if (mode=='b') {
+            CHECK(DO(56,17|0x800000,0,0)==-38,64); // CLONE_UNTRACED
+            CHECK(DO(56,17|0x20000000,0,0)==-38,65); // CLONE_NEWPID
+            CHECK(DO(56,17|0x400,0,0)==-38,66); // CLONE_FILES
+        }
+        for (word i=0;i<31;++i) CHECK(DO(62,children[i],9,0)==0,67);
+        for (word i=0;i<31;++i) { int status; CHECK(DO(61,children[i],&status,0)==children[i] && status==9,68); }
         long child=DO(57,0,0,0);
         if (child==0) return 19;
         int status;
-        CHECK(child>16 && DO(61,child,&status,0)==child && status==(19<<8),69);
+        CHECK(child>32 && DO(61,child,&status,0)==child && status==(19<<8),69);
     } else if (mode=='o') {
         int pipe[2]; CHECK(DO(22,pipe,0,0)==0,70);
         long child=DO(57,0,0,0);

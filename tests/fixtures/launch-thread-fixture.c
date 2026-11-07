@@ -12,8 +12,8 @@ static long call(long n, word a, word b, word c, word d, word e, word f)
 }
 #define DO(n,a,b,c) call(n,(word)(a),(word)(b),(word)(c),0,0,0)
 #define CHECK(expr,code) if (!(expr)) return code
-static char stacks[16][16384] __attribute__((aligned(16)));
-static volatile int tid[16], gate, count, error;
+static char stacks[32][16384] __attribute__((aligned(16)));
+static volatile int tid[32], gate, count, error;
 static int pair[2];
 static char byte;
 long spawn_thread(word top, volatile int *tid, long (*fn)(void));
@@ -153,20 +153,20 @@ long thread_main(word *stack)
         CHECK(!error && DO(0,5,&byte,1)==0,27);
         CHECK(DO(1,6,"X",1)==-32,28); // Reader pin is released at return/exit.
     } else if (mode=='l') {
-        for (word i=0;i<15;++i) CHECK(spawn_thread((word)(stacks[i]+sizeof stacks[i]),&tid[i],bounded)>1,33);
-        CHECK(spawn_thread((word)(stacks[15]+sizeof stacks[15]),&tid[15],bounded)==-11 && tid[15]==0,34);
+        for (word i=0;i<31;++i) CHECK(spawn_thread((word)(stacks[i]+sizeof stacks[i]),&tid[i],bounded)>1,33);
+        CHECK(spawn_thread((word)(stacks[31]+sizeof stacks[31]),&tid[31],bounded)==-11 && tid[31]==0,34);
         gate=1;
-        DO(202,&gate,1,15);
-        for (word i=0;i<15;++i) join(i);
-        CHECK(!error && count==15,35);
+        DO(202,&gate,1,31);
+        for (word i=0;i<31;++i) join(i);
+        CHECK(!error && count==31,35);
         long replacement=-11;
-        for (word retry=0;retry<16 && replacement==-11;++retry) {
+        for (word retry=0;retry<32 && replacement==-11;++retry) {
             replacement=spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],bounded);
             if (replacement==-11) DO(39,0,0,0);
         }
-        CHECK(replacement>16,36);
+        CHECK(replacement>32,36);
         join(0);
-        CHECK(!error && count==16,37);
+        CHECK(!error && count==32,37);
     } else if (mode=='f') {
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],forked)==2,73);
         while (!gate && !error) DO(202,&gate,0,0);

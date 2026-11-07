@@ -16,7 +16,7 @@ use ginux_instance::Instance;
 use ginux_process::{Credentials, ProcessError, ProcessTable, TaskId, WaitTarget};
 use ginux_vfs::Executable;
 
-const TASKS: usize = 16;
+const TASKS: usize = 32;
 const WALL: usize = 0x4000_0000;
 // Linux x86-64: sys/ptrace and asm/unistd_64.h.
 const OPTIONS: usize = PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL | 2 | 4 | 8 | 16;

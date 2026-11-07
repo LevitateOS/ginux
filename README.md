@@ -493,7 +493,7 @@ data and wake blocked reads/writes; a self-pipe without a runnable peer still
 waits indefinitely. SIGKILL termination and reaping are supported. Signal-driven restart of emulated blocking operations remains unsupported;
 configured descriptor readiness is described below.
 
-Configured launch owns at most 16 task slots, including unreaped children.
+Configured launch owns at most 32 task slots, including unreaped children.
 Process creation accepts fork, vfork, and clone with `SIGCHLD`,
 `CLONE_VM|CLONE_VFORK|SIGCHLD`, or the libc-fork
 `CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD` flags. Native threads accept
