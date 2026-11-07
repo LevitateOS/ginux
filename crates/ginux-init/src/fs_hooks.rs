@@ -435,6 +435,36 @@ impl LaunchFs {
         );
     }
 
+    /// x86-64 statfs describes the virtual namespace, never the host mount.
+    /// Image files are read-only; writable objects report their charged quota.
+    pub(crate) fn statfs(&self, pid: usize, address: u64, writable: bool) -> Result<i64, i64> {
+        let mut fields = [0u64; 15];
+        fields[0] = 0x01021994; // TMPFS_MAGIC: instance memory namespace
+        fields[1] = 4096;
+        if writable {
+            fields[2] = self.byte_limit as u64 / 4096;
+            fields[3] = self
+                .byte_limit
+                .saturating_sub(self.fs.storage().allocated_bytes()) as u64
+                / 4096;
+            fields[4] = fields[3];
+        }
+        // fsid and spare fields deliberately carry no host identifiers.
+        fields[8] = 255;
+        fields[9] = 4096;
+        fields[10] = if writable { 0 } else { 1 }; // ST_RDONLY
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut(fields.as_mut_ptr().cast::<u8>(), 120) };
+        crate::supervisor::write_tracee_bytes_strict(pid, address as usize, bytes)?;
+        Ok(0)
+    }
+
+    pub(crate) fn statfs_path(&self, pid: usize, address: u64, output: u64) -> Result<i64, i64> {
+        let path = self.path(pid, address, (-100i64) as u64)?;
+        let resolved = self.resolve(pid, path.as_bytes(), true, false)?;
+        self.statfs(pid, output, self.owns_path(resolved.as_bytes()))
+    }
+
     fn owns_path(&self, path: &[u8]) -> bool {
         self.prefixes[..self.count]
             .iter()

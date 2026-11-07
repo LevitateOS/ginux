@@ -470,7 +470,7 @@ impl DescriptorTable {
                 }
             }
             0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55 | 74
-            | 73 | 75 | 77 | 78 | 91 | 93 | 217 => {
+            | 138 | 73 | 75 | 77 | 78 | 91 | 93 | 217 => {
                 call.save(r);
                 call.pinned
                     .map(Ok)
@@ -733,6 +733,13 @@ impl DescriptorTable {
         backends: &mut Backends,
         call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
+        if r.orig_rax == 138 {
+            return Ok(ready(backends.filesystem.statfs(
+                pid,
+                r.rsi,
+                matches!(entry.handle, Handle::Owned(_)),
+            )?));
+        }
         let public_fd = r.rdi as u32;
         let network = matches!(entry.handle, Handle::Owned(h) if crate::network_hooks::LaunchNetwork::owns(h));
         let packet = matches!(entry.handle, Handle::Owned(h) if backends.channels.is_socket(h));

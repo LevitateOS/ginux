@@ -949,6 +949,76 @@ impl Supervisor<'_> {
                 Ok(None) => {}
             }
         }
+        // Credentials belong to virtual processes. Never forward identity
+        // changes to host syscalls; children inherit and can irreversibly drop
+        // this virtual identity independently of the supervisor's credentials.
+        if matches!(r.orig_rax, 102 | 104 | 107 | 108) {
+            let credentials = self.processes.view(id).unwrap().credentials;
+            let value = if matches!(r.orig_rax, 102 | 107) {
+                credentials.uid
+            } else {
+                credentials.gid
+            };
+            self.emulate(index, r, value as i64, instance);
+            return;
+        }
+        if matches!(r.orig_rax, 105 | 106 | 113 | 114 | 116 | 117 | 119) {
+            let result = (|| -> Result<i64, i64> {
+                let current = self.processes.view(id).map_err(|_| -3)?.credentials;
+                if r.orig_rax == 116 {
+                    let count = usize::try_from(r.rdi).map_err(|_| -22)?;
+                    if count > ginux_process::MAX_GROUPS {
+                        return Err(-22);
+                    }
+                    let mut groups = [0u32; ginux_process::MAX_GROUPS];
+                    for (i, group) in groups[..count].iter_mut().enumerate() {
+                        let mut bytes = [0u8; 4];
+                        let address = r.rsi.checked_add((i * 4) as u64).ok_or(-14)?;
+                        if copy_memory(self.task(index).host, address, &mut bytes, false) != Ok(4) {
+                            return Err(-14);
+                        }
+                        *group = u32::from_ne_bytes(bytes);
+                    }
+                    self.processes
+                        .credentials_mut(id)
+                        .map_err(|_| -3)?
+                        .set_groups(&groups[..count])
+                        .map_err(|_| -1)?;
+                } else {
+                    let uid = matches!(r.orig_rax, 105 | 113 | 117);
+                    let old = if uid { current.uid } else { current.gid };
+                    let values = if matches!(r.orig_rax, 105 | 106) {
+                        [r.rdi, u64::MAX, u64::MAX]
+                    } else if matches!(r.orig_rax, 113 | 114) {
+                        [r.rdi, r.rsi, u64::MAX]
+                    } else {
+                        [r.rdi, r.rsi, r.rdx]
+                    };
+                    let value = crate::virtual_credential_target(old, &values).ok_or(-22)?;
+                    let credentials = self.processes.credentials_mut(id).map_err(|_| -3)?;
+                    if uid {
+                        credentials.set_uid(value)
+                    } else {
+                        credentials.set_gid(value)
+                    }
+                    .map_err(|_| -1)?;
+                }
+                Ok(0)
+            })()
+            .unwrap_or_else(|error| error);
+            self.emulate(index, r, result, instance);
+            return;
+        }
+        if r.orig_rax == 137 {
+            let host = self.task(index).host;
+            let result = self
+                .objects
+                .filesystem
+                .statfs_path(host, r.rdi, r.rsi)
+                .unwrap_or_else(|error| error);
+            self.emulate(index, r, result, instance);
+            return;
+        }
         match r.orig_rax {
             95 => {
                 let previous = self.group(index).creation_mask;
