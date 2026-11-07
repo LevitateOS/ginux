@@ -136,6 +136,14 @@ long exec_main(word *stack)
         CHECK(DO(59,"/malformed",next,next_env)==-8 && intact(),42);
         CHECK(DO(59,"/bin/second",1,next_env)==-14 && intact(),43);
         CHECK(DO(59,1,next,next_env)==-14 && intact(),44);
+        long edge_pages=call(9,0,8192,3,0x22,(word)-1,0);
+        CHECK(edge_pages>0,103);
+        char **edge=(char **)(edge_pages+4096-sizeof(char *));
+        edge[0]="/bin/second";
+        CHECK(DO(10,edge_pages+4096,4096,0)==0,104);
+        CHECK(DO(59,"/bin/second",edge,next_env)==-14 && intact(),105);
+        CHECK(DO(59,"/bin/second",next,edge)==-14 && intact(),106);
+        CHECK(DO(11,edge_pages,8192,0)==0,107);
         CHECK(DO(59,"/work/closed",next,next_env)==-13 && intact(),45);
         CHECK(DO(59,"/work/hidden",next,next_env)==-2 && intact(),46);
         CHECK(DO(59,"/owned-link",next,next_env)==-2 && intact(),70);
