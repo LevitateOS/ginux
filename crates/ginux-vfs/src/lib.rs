@@ -84,6 +84,8 @@ impl<'a> Index<'a> {
             if entry.path.is_empty()
                 || entry.path[0] != b'/'
                 || previous.is_some_and(|value| value >= entry.path)
+                || (entry.kind == NodeKind::File
+                    && entry.data_offset.checked_add(entry.size).is_none())
             {
                 return Err(VfsError::InvalidIndex);
             }
@@ -2155,6 +2157,15 @@ mod tests {
         vfs.unlink(b"/bin").unwrap();
         assert_eq!(vfs.open(b"/bin/sh", O_READ), Err(VfsError::NotFound));
         assert!(vfs.open(b"/usr/bin/tool", O_READ).is_ok());
+    }
+
+    #[test]
+    fn rejects_image_file_extent_overflow() {
+        let mut bytes = index_bytes();
+        assert!(Index::new(&bytes).is_ok());
+        let offset = HEADER_SIZE + RECORD_SIZE + 24;
+        bytes[offset..offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(Index::new(&bytes), Err(VfsError::InvalidIndex)));
     }
 
     #[test]
