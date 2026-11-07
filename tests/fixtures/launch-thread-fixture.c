@@ -117,6 +117,14 @@ static long native_work(void)
     }
     return 0;
 }
+__attribute__((noinline)) static long fixed_code_mapping(void) {
+    return call(9,(word)fixed_code_mapping & ~4095UL,4096,1,0x12,3,0);
+}
+__attribute__((noinline)) static long fixed_stack_mapping(void) {
+    word stack;
+    __asm__ volatile("mov %%rsp,%0":"=r"(stack));
+    return call(9,(stack-512)&~4095UL,4096,1,0x12,3,0);
+}
 static long nonleader_mapping(void) {
     long mapped=call(9,0,4096,1,2,3,0);
     if(mapped<=0 || *(volatile char *)mapped!='M') { error=114; return 0; }
@@ -173,6 +181,13 @@ long thread_main(word *stack)
         path_done=1;
         join(0);
         CHECK(mapped>0 && *(volatile char *)mapped=='M' && DO(11,mapped,4096,0)==0 && !error,103);
+    } else if (mode=='q') {
+        volatile word sentinel=0x517ac2dd5678beefUL;
+        CHECK(DO(77,3,4096,0)==0 && DO(1,3,"M",1)==1,124);
+        CHECK(fixed_code_mapping()==-95,125);
+        CHECK(fixed_stack_mapping()==-95 && sentinel==0x517ac2dd5678beefUL,126);
+        long mapped=call(9,0,4096,1,2,3,0);
+        CHECK(mapped>0 && *(volatile char *)mapped=='M' && DO(11,mapped,4096,0)==0,127);
     } else if (mode=='n') {
         CHECK(DO(77,3,4096,0)==0 && DO(1,3,"M",1)==1,116);
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],nonleader_mapping)==2,117);
