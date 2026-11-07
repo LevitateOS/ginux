@@ -26,6 +26,13 @@ static long path_writer(void) {
     }
     return 0;
 }
+static volatile word shared_action[4];
+static volatile int action_ready;
+static long sigchld_writer(void) {
+    action_ready=1;
+    while(!path_done) { shared_action[0]=0; shared_action[0]=1; }
+    return 0;
+}
 static volatile int private_done, private_checks;
 static long private_fd_probe(void) {
     char byte;
@@ -159,7 +166,27 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-1 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='x') {
+    if (mode=='Z' || mode=='z') {
+        word successful=0, rejected=0, exposed=0;
+        if(mode=='z') {
+            CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],sigchld_writer)==2,150);
+            while(!action_ready) __asm__ volatile("pause");
+        }
+        for(word i=0;i<(mode=='z'?1024:64) && !exposed;++i) {
+            long result=call(13,17,(word)shared_action,0,8,0,0);
+            word old[4]={0,0,0,0};
+            long query=call(13,17,0,(word)old,8,0,0);
+            if(query!=0 || (result!=0 && result!=-95)) { error=151; break; }
+            if(result==0) ++successful; else ++rejected;
+            if(result==0 && old[0]==1) exposed=1;
+        }
+        path_done=1;
+        if(mode=='z') join(0);
+        word safe[4]={0,0,0,0};
+        CHECK(call(13,17,(word)safe,0,8,0,0)==0,152);
+        CHECK(successful+rejected==(mode=='z'?1024:64),153);
+        CHECK(!error && !exposed,154);
+    } else if (mode=='x') {
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],path_writer)==2,98);
         int exposed=0;
         for(word i=0;i<2048 && !exposed;++i) {

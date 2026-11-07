@@ -571,6 +571,7 @@ impl Supervisor<'_> {
     }
     fn needs_argument_guard(&self, index: usize, r: &UserRegs) -> bool {
         path_call(r.orig_rax)
+            || (r.orig_rax == 13 && r.rdi == 17 && r.rsi != 0 && r.r10 == 8)
             || (r.orig_rax == 9
                 && r.r10 & 0x20 == 0
                 && self
