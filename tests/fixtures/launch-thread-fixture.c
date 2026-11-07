@@ -26,6 +26,21 @@ static long path_writer(void) {
     }
     return 0;
 }
+static volatile int private_done, private_checks;
+static long private_fd_probe(void) {
+    char byte;
+    while (!private_done) {
+        for (word fd=5;fd<8;++fd) {
+            if (DO(5,fd,&byte,0)!=-9 || DO(72,fd,1,0)!=-9 ||
+                DO(3,fd,0,0)!=-9 || call(9,0,4096,1,2,fd,0)!=-9) {
+                error=108;
+                return 0;
+            }
+        }
+        ++private_checks;
+    }
+    return 0;
+}
 static volatile word victim_rsp;
 static volatile int scratch_ready;
 static long scratch_writer(void) {
@@ -143,6 +158,21 @@ long thread_main(word *stack)
         path_done=1;
         join(0);
         CHECK(mapped>0 && *(volatile char *)mapped=='M' && DO(11,mapped,4096,0)==0 && !error,103);
+    } else if (mode=='v') {
+        CHECK(DO(77,3,4096,0)==0 && DO(1,3,"M",1)==1,109);
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],private_fd_probe)==2,110);
+        while(private_checks<32 && !error) __asm__ volatile("pause");
+        CHECK(!error,111);
+        for(word i=0;i<64 && !error;++i) {
+            long mapped=call(9,0,4096,1,2,3,0);
+            if(mapped<=0 || *(volatile char *)mapped!='M' || DO(11,mapped,4096,0)!=0) {
+                error=112;
+                break;
+            }
+        }
+        private_done=1;
+        join(0);
+        CHECK(!error && private_checks>=32,113);
     } else if (mode=='k') {
         CHECK(DO(77,3,4096,0)==0 && DO(1,3,"M",1)==1,104);
         CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],scratch_writer)==2,105);
