@@ -1,6 +1,6 @@
 //! Controlled copies and x86-64 metadata serialization for native tracees.
 use crate::supervisor::{syscall4, syscall6};
-use ginux_domain::Text;
+use ginux_instance::Text;
 use ginux_vfs::MAX_PATH;
 type Path = Text<MAX_PATH>;
 
@@ -138,7 +138,7 @@ pub fn image_link(pid: usize, member: &[u8]) -> Result<Path, i64> {
     Path::from_bytes(relative).map_err(|_| -36)
 }
 
-/// Linux file type bits are part of mode; identities belong to the domain.
+/// Linux file type bits are part of mode; identities belong to the instance.
 pub struct Stat {
     pub accessed: ginux_vfs::Timestamp,
     pub modified: ginux_vfs::Timestamp,
@@ -202,7 +202,7 @@ pub fn write_stat(pid: usize, address: u64, metadata: Stat, statx: bool) -> Resu
     Ok(0)
 }
 
-/// Native open/dup cannot obtain descriptors reserved for domain objects.
+/// Native open/dup cannot obtain descriptors reserved for instance objects.
 /// Keep an operator's lower soft/hard limits, and never raise either bound.
 pub fn reserve_native_descriptors(limit: usize) -> bool {
     let mut limits = [0u64; 2];

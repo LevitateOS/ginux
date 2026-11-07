@@ -322,7 +322,7 @@ pub trait BaseReader {
     fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), VfsError>;
 }
 
-/// Explicit domain inode timestamps, independent of host file identities.
+/// Explicit instance inode timestamps, independent of host file identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Timestamp {
     pub seconds: i64,

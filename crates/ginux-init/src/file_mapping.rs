@@ -72,7 +72,7 @@ impl MappingCall {
         put(&mut frame, 96, call.scratch + 112); // iovec
         put(&mut frame, 104, 1);
         if copy_memory(host, call.scratch, &mut frame, true) != Ok(256) {
-            // The caller fails the domain: a partial scratch write cannot be
+            // The caller fails the instance: a partial scratch write cannot be
             // returned as an ordinary mmap error while peer threads survive.
             return Err(b"mapping injection scratch copy failed");
         }

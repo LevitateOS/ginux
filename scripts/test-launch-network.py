@@ -21,7 +21,7 @@ def main():
     selected = sys.argv[3:] or modes
     if any(mode not in modes for mode in selected):
         sys.exit('unknown configured TCP mode')
-    template = (Path(__file__).resolve().parent.parent/'config/domain-gate5.toml').read_text()
+    template = (Path(__file__).resolve().parent.parent/'config/instance-gate5.toml').read_text()
     with tempfile.TemporaryDirectory(prefix='ginux-network-') as directory:
         work = Path(directory)
         root = work/'root'
@@ -68,7 +68,7 @@ def main():
                     network = (f'backend = "mediated"\nendpoints = ["127.0.0.1:{port}"]\n'
                                f'max_connections = 2\nmax_bytes = {8 if mode in ("quota", "budget") else 1048576}')
                     config = config.replace('backend = "none"', network)
-                path, result = work/'domain.toml', work/'result.json'
+                path, result = work/'instance.toml', work/'result.json'
                 path.write_text(config)
                 result.unlink(missing_ok=True)
                 command = [binary, 'launch', str(path), str(root), '--result-file', str(result)]

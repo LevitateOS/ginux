@@ -497,7 +497,7 @@ impl<const FRAMES: usize> IsolatedNetwork<FRAMES> {
     }
 }
 
-/// A numeric TCP destination granted before a domain starts. Hostname resolution
+/// A numeric TCP destination granted before a instance starts. Hostname resolution
 /// belongs to the caller; connecting never expands this set or performs DNS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TcpEndpoint {

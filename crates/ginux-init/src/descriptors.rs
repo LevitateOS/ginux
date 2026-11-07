@@ -35,7 +35,7 @@ enum Pending {
     Close { result: Option<i64> },
 }
 
-/// Owned backend handles are domain-wide; native kernel numbers are per task.
+/// Owned backend handles are instance-wide; native kernel numbers are per task.
 pub struct ObjectReferences {
     counts: [u16; 128 + crate::channel_hooks::FDS + crate::network_hooks::FDS],
 }

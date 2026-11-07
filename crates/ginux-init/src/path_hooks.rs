@@ -1,6 +1,6 @@
 //! Exact component lookup beneath the tracee root and temporary native path
 //! translation. Supervisor prefixes never enter a workload pathname.
-use crate::supervisor::{syscall1, syscall4, UserRegs, DOMAIN_GID, DOMAIN_UID};
+use crate::supervisor::{syscall1, syscall4, UserRegs, INSTANCE_GID, INSTANCE_UID};
 use crate::tracee_io::copy_memory;
 use ginux_vfs::{NodeKind, VfsError, MAX_PATH};
 pub struct ImageRoot(usize);
@@ -145,9 +145,9 @@ impl ImageRoot {
             0o40000 => {
                 let uid = (stat[3] >> 32) as u32;
                 let gid = stat[4] as u32;
-                let shift = if uid == DOMAIN_UID as u32 {
+                let shift = if uid == INSTANCE_UID as u32 {
                     6
-                } else if gid == DOMAIN_GID as u32 {
+                } else if gid == INSTANCE_GID as u32 {
                     3
                 } else {
                     0
@@ -190,8 +190,8 @@ impl Drop for ImageRoot {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ScriptHeader {
-    pub interpreter: ginux_domain::Text<MAX_PATH>,
-    pub argument: Option<ginux_domain::Text<MAX_PATH>>,
+    pub interpreter: ginux_instance::Text<MAX_PATH>,
+    pub argument: Option<ginux_instance::Text<MAX_PATH>>,
     pub payload: usize,
 }
 
@@ -218,10 +218,11 @@ pub(crate) fn script_metadata(bytes: &[u8]) -> Result<Option<ScriptHeader>, i64>
     if separator == start || separator == bytes.len() && bytes.len() == 256 {
         return Err(-8);
     }
-    let interpreter = ginux_domain::Text::from_bytes(&bytes[start..separator]).map_err(|_| -36)?;
+    let interpreter =
+        ginux_instance::Text::from_bytes(&bytes[start..separator]).map_err(|_| -36)?;
     let argument = (separator..end)
         .find(|n| !matches!(bytes[*n], b' ' | b'\t'))
-        .map(|first| ginux_domain::Text::from_bytes(&bytes[first..end]).map_err(|_| -36))
+        .map(|first| ginux_instance::Text::from_bytes(&bytes[first..end]).map_err(|_| -36))
         .transpose()?;
     Ok(Some(ScriptHeader {
         interpreter,

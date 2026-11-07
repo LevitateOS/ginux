@@ -5,9 +5,9 @@ use crate::fs_hooks::LaunchFs;
 use crate::supervisor::UserRegs;
 use crate::tracee_io::{read_path, write_stat, Stat};
 use ginux_devices::{DeviceError, DeviceKind, DeviceName, DeviceRegistry};
-use ginux_domain::DomainConfig;
+use ginux_instance::InstanceConfig;
 
-const DOMAIN: u64 = 1; // One domain per configured supervisor process.
+const INSTANCE: u64 = 1; // One instance per configured supervisor process.
 const FD_BASE: u32 = 0x4000_0000;
 const FDS: usize = 64;
 const CLOEXEC: u32 = 0o2000000;
@@ -31,7 +31,7 @@ impl LaunchDevices {
         self.flags.get(slot).copied().flatten().map(|_| 0x145)
     }
 
-    pub fn prepare(config: &DomainConfig) -> Result<Self, &'static [u8]> {
+    pub fn prepare(config: &InstanceConfig) -> Result<Self, &'static [u8]> {
         let mut registry = DeviceRegistry::new();
         for device in config.devices.as_slice() {
             if device.as_bytes() != b"null" {
@@ -39,7 +39,7 @@ impl LaunchDevices {
             }
             registry
                 .assign(
-                    DOMAIN,
+                    INSTANCE,
                     1,
                     DeviceName::new(b"null").unwrap(),
                     DeviceKind::Null,
@@ -151,7 +151,10 @@ impl LaunchDevices {
         if flags & 0o300 == 0o300 {
             return Err(-17);
         }
-        let fd = self.registry.open(DOMAIN, b"null").map_err(device_errno)?;
+        let fd = self
+            .registry
+            .open(INSTANCE, b"null")
+            .map_err(device_errno)?;
         // Creation and truncation do not mutate an existing character device.
         self.flags[(fd - FD_BASE) as usize] = Some(flags as u32 & !0o1300);
         Ok(fd as i64)
@@ -166,7 +169,7 @@ impl LaunchDevices {
                     Err(-9)
                 } else {
                     self.registry
-                        .read(DOMAIN, fd, &mut [])
+                        .read(INSTANCE, fd, &mut [])
                         .map(|n| n as i64)
                         .map_err(device_errno)
                 }
@@ -179,13 +182,13 @@ impl LaunchDevices {
                     // dereferenced. Bound discarded bytes per IO just like file IO.
                     let count = r.rdx.min(4096) as usize;
                     self.registry
-                        .write(DOMAIN, fd, &[0; 4096][..count])
+                        .write(INSTANCE, fd, &[0; 4096][..count])
                         .map(|n| n as i64)
                         .map_err(device_errno)
                 }
             }
             3 => {
-                self.registry.close(DOMAIN, fd).map_err(device_errno)?;
+                self.registry.close(INSTANCE, fd).map_err(device_errno)?;
                 self.flags[slot] = None;
                 Ok(0)
             }

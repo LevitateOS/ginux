@@ -5428,11 +5428,15 @@ fn supervise_native(
             decide_systemd(syscall, shared_network)
         } else {
             match decide_native(syscall, registers.rdi, registers.rsi, registers.rdx) {
+                NativeDecision::Park { .. } | NativeDecision::ParkPoll => {
+                    native_fail(instance, pid, b"unexpected configured channel wait")
+                }
                 NativeDecision::Contract(decision) => decision,
                 NativeDecision::Hooked { lane, result } => {
                     let lane_name: &[u8] = match lane {
                         Lane::Process => b"process",
                         Lane::Filesystem => b"filesystem",
+                        Lane::Device => b"device",
                         Lane::Channel => b"channel",
                         Lane::Contract => b"contract",
                     };

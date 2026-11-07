@@ -4,19 +4,13 @@
 //! input-file staging. Workload definitions stay with the entry points in
 //! `main.rs`; `launch` runs the executable and arguments from instance config.
 
-use ginux_core::{
-    balanced_identity_result, balanced_mediated_result, balanced_surface, Action, SYS_EXIT,
-    SYS_EXIT_GROUP,
-};
 use ginux_instance::{ConfigError, ExecutionBackend, ExecutionProfile, Instance, InstanceConfig};
 
 use crate::supervisor::{
-    exit_process, line, ptrace, stopped, syscall0, syscall1, syscall2, syscall3, syscall4,
-    syscall5, wait, write_all, UserRegs, AT_FDCWD, INSTANCE_GID, INSTANCE_UID, O_RDONLY,
-    PR_SET_NO_NEW_PRIVS, PTRACE_GETREGS, PTRACE_O_EXITKILL, PTRACE_O_TRACESYSGOOD,
-    PTRACE_SETOPTIONS, PTRACE_SETREGS, PTRACE_SYSCALL, PTRACE_TRACEME, SYS_CHDIR, SYS_CHROOT,
-    SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC, SYS_OPENAT_HOST, SYS_PRCTL,
-    SYS_PTRACE, SYS_READ_HOST, SYS_SETGID, SYS_SETGROUPS, SYS_SETUID, SYS_WRITE_HOST,
+    exit_process, line, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5, write_all,
+    AT_FDCWD, INSTANCE_GID, INSTANCE_UID, O_RDONLY, PR_SET_NO_NEW_PRIVS, PTRACE_TRACEME, SYS_CHDIR,
+    SYS_CHROOT, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK, SYS_FSYNC, SYS_OPENAT_HOST,
+    SYS_PRCTL, SYS_PTRACE, SYS_READ_HOST, SYS_SETGID, SYS_SETGROUPS, SYS_SETUID, SYS_WRITE_HOST,
 };
 
 pub const MAX_ELF_SIZE: usize = 64 * 1024;
@@ -417,7 +411,7 @@ pub fn launch_main(
     }
     stage_launch(&config);
     if unsafe { syscall5(SYS_PRCTL, 36, 1, 0, 0, 0) } < 0 {
-        launch_domain_fail(&mut domain, b"domain subreaper setup failed");
+        launch_instance_fail(&mut instance, b"instance subreaper setup failed");
     }
     let child = unsafe { syscall0(SYS_FORK) };
     if child < 0 {
@@ -428,7 +422,7 @@ pub fn launch_main(
     }
     supervise_launch(
         child as usize,
-        &mut domain,
+        &mut instance,
         &mut filesystem,
         &mut devices,
         &mut channels,
@@ -922,7 +916,7 @@ pub(crate) fn finish_signaled(signal: u64) {
 
 // Limits apply only to this child, before its exec. Kernel inheritance keeps
 // them on descendants; no cgroup mounts or host-global policy are modified.
-fn restrict_tracee_resources(config: &DomainConfig) -> bool {
+fn restrict_tracee_resources(config: &InstanceConfig) -> bool {
     let mut limits = [0usize; 2];
     if unsafe { syscall4(302, 0, 9, 0, limits.as_mut_ptr() as usize) } != 0 {
         return false;
@@ -958,7 +952,7 @@ fn restrict_tracee_resources(config: &DomainConfig) -> bool {
     unsafe { syscall3(203, 0, size as usize, mask.as_ptr() as usize) == 0 }
 }
 
-fn launch_tracee(root_path: *const u8, config: &DomainConfig, descriptor_limit: usize) -> ! {
+fn launch_tracee(root_path: *const u8, config: &InstanceConfig, descriptor_limit: usize) -> ! {
     static ROOT: &[u8] = b"/\0";
     if !restrict_tracee_resources(config) {
         tracee_setup_fail(
@@ -982,7 +976,7 @@ fn launch_tracee(root_path: *const u8, config: &DomainConfig, descriptor_limit: 
         );
     }
     // A caller's ignored SIGCHLD must not silently enable native auto-reap
-    // in a domain whose child lifetime is owned by the virtual process table.
+    // in a instance whose child lifetime is owned by the virtual process table.
     let default_sigchld = [0u64; 4];
     if unsafe { syscall4(13, 17, default_sigchld.as_ptr() as usize, 0, 8) } < 0 {
         tracee_setup_fail(
@@ -1065,7 +1059,7 @@ fn tracee_setup_fail(message: &[u8], code: usize) -> ! {
 
 fn supervise_launch(
     pid: usize,
-    domain: &mut Domain,
+    instance: &mut Instance,
     filesystem: &mut crate::fs_hooks::LaunchFs,
     devices: &mut crate::device_hooks::LaunchDevices,
     channels: &mut crate::channel_hooks::LaunchChannels,
@@ -1078,7 +1072,7 @@ fn supervise_launch(
         channels,
         refs: &mut refs,
     };
-    crate::launch_tasks::supervise(pid, domain, objects, descriptors)
+    crate::launch_tasks::supervise(pid, instance, objects, descriptors)
 }
 
 pub(crate) fn launch_exit_reason(code: i32) -> &'static [u8] {
@@ -1099,8 +1093,8 @@ pub(crate) fn launch_exit_reason(code: i32) -> &'static [u8] {
     }
 }
 
-pub(crate) fn launch_early_fail(domain: &mut Domain, reason: &[u8]) -> ! {
-    let _ = domain.task_exited(false);
+pub(crate) fn launch_early_fail(instance: &mut Instance, reason: &[u8]) -> ! {
+    let _ = instance.task_exited(false);
     launch_startup_fail(reason)
 }
 
@@ -1109,8 +1103,8 @@ fn launch_instance_fail(instance: &mut Instance, reason: &[u8]) -> ! {
     launch_startup_fail(reason)
 }
 
-pub(crate) fn supervision_error(domain: &mut Domain, reason: &[u8]) -> ! {
-    let _ = domain.task_exited(false);
+pub(crate) fn supervision_error(instance: &mut Instance, reason: &[u8]) -> ! {
+    let _ = instance.task_exited(false);
     write_stderr(b"ginux: launch supervision failure: ");
     write_stderr(reason);
     write_stderr(b"\n");

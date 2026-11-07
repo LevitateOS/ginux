@@ -13,7 +13,7 @@ def main():
     if len(sys.argv)<3 or os.geteuid()!=0:
         sys.exit('usage (as root): test-launch-directories.py <ginux> <directory-fixture> [scenario ...]')
     binary,fixture=[str(Path(p).resolve()) for p in sys.argv[1:3]]
-    template=(Path(__file__).resolve().parent.parent/'config/domain-gate5.toml').read_text()
+    template=(Path(__file__).resolve().parent.parent/'config/instance-gate5.toml').read_text()
     with tempfile.TemporaryDirectory(prefix='ginux-directories-') as directory:
         work=Path(directory)
         root=work/'root'
@@ -36,7 +36,7 @@ def main():
         for mode in (sys.argv[3:] or ['all', 'cwd', 'owned-cwd', 'ordinary-owned-cwd', 'ordinary-cwd-budget', 'hardlinks', 'ordinary-hardlinks', 'ordinary-hardlink-quota', 'ordinary-cross', 'ordinary-cross-exec', 'ordinary-image-dir-exec', 'cross']):
             if mode not in ('all', 'functional', 'cwd', 'owned-cwd', 'ordinary-owned-cwd', 'ordinary-cwd-budget', 'hardlinks', 'ordinary-hardlinks', 'ordinary-hardlink-quota', 'ordinary-cross', 'ordinary-cross-exec', 'ordinary-image-dir-exec', 'cross'):
                 sys.exit('unknown directory scenario')
-            # Each launch creates fresh domain storage; image cwd stays kernel-owned.
+            # Each launch creates fresh instance storage; image cwd stays kernel-owned.
             (work/'launch.toml').write_text(config.replace('args = []', 'args = ' + json.dumps([] if mode == 'all' else [mode])))
             if mode == 'ordinary-hardlink-quota':
                 (work/'launch.toml').write_text((work/'launch.toml').read_text().replace('memory_mib = 256', 'memory_mib = 16'))

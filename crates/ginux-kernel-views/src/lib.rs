@@ -33,7 +33,7 @@ pub struct IdentityView<'a> {
 }
 
 impl IdentityView<'_> {
-    /// Linux utsname layout with domain-owned identity and a virtual release.
+    /// Linux utsname layout with instance-owned identity and a virtual release.
     /// This release names the contract implementation, not the host kernel.
     pub fn uname(&self, machine: &[u8], output: &mut [u8]) -> Result<usize, ViewError> {
         const LENGTH: usize = 6 * 65;

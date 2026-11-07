@@ -7,7 +7,7 @@ use crate::storage_memory::{MappedArray, MemoryStorage};
 use crate::supervisor::UserRegs;
 use crate::tracee_io::{copy_memory, read_path};
 use core::sync::atomic::{AtomicBool, Ordering};
-use ginux_domain::{DomainConfig, Text};
+use ginux_instance::{InstanceConfig, Text};
 use ginux_vfs::{
     BaseReader, Entry, Executable, FileMetadata, Index, NodeKind, VfsError, VirtualFs, HEADER_SIZE,
     MAX_PATH, O_APPEND, O_CLOEXEC, O_CREATE, O_EXCLUSIVE, O_NONBLOCK, O_READ, O_TRUNC, O_WRITE,
@@ -56,8 +56,8 @@ pub struct LaunchFs {
 }
 
 impl LaunchFs {
-    /// Called once, before fork. Assignments are domain paths, never host paths.
-    pub fn prepare(config: &DomainConfig) -> Result<Self, &'static [u8]> {
+    /// Called once, before fork. Assignments are instance paths, never host paths.
+    pub fn prepare(config: &InstanceConfig) -> Result<Self, &'static [u8]> {
         let mut prefixes = [Path::empty(); 8];
         let mut count = 0;
         for assignment in config.storage.as_slice() {
@@ -1683,7 +1683,7 @@ pub(crate) fn valid_statx(flags: u64, mask: u64) -> bool {
 
 // Owned inode uid/gid are always virtual root, as projected by copy_metadata.
 // Preserving that identity is a real no-op; changing it is unsupported. No host
-// chown syscall is issued for a domain path or private backing descriptor.
+// chown syscall is issued for a instance path or private backing descriptor.
 fn preserve_owner(uid: u64, gid: u64) -> Result<i64, i64> {
     if [uid, gid]
         .iter()

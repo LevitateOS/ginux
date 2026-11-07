@@ -511,7 +511,9 @@ impl InstanceConfig {
             b"storage.max_objects" => self.storage_max_objects = parse_u64(value)?,
             b"storage.max_bytes" => {
                 self.storage_max_bytes = parse_u64(value)?;
-                if self.storage_max_bytes == 0 { return Err(ConfigError::InvalidValue); }
+                if self.storage_max_bytes == 0 {
+                    return Err(ConfigError::InvalidValue);
+                }
             }
             b"volumes.assignments" => self.volumes = parse_list(value)?,
             b"devices.assignments" => self.devices = parse_list(value)?,
@@ -1147,7 +1149,9 @@ fn parse_field(
         (Section::Storage, b"max_bytes") => {
             builder.mark(1u64 << 37)?;
             builder.storage_max_bytes = parse_u64(value)?;
-            if builder.storage_max_bytes == 0 { return Err(ConfigError::InvalidValue); }
+            if builder.storage_max_bytes == 0 {
+                return Err(ConfigError::InvalidValue);
+            }
         }
         (Section::Volumes, b"assignments") => {
             builder.mark(1 << 22)?;
@@ -1726,7 +1730,10 @@ policy = "stop"
         assert_eq!(config.storage_max_objects, 8192);
         assert_eq!(config.storage_max_bytes, 8388608);
         let normalized = config.normalized().unwrap();
-        assert_eq!(InstanceConfig::parse(normalized.as_bytes()).unwrap(), config);
+        assert_eq!(
+            InstanceConfig::parse(normalized.as_bytes()).unwrap(),
+            config
+        );
         for field in [
             "max_objects = 0",
             "max_objects = 1000001",

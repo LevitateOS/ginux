@@ -30,7 +30,7 @@ def main():
     binary, fixture = [str(Path(p).resolve()) for p in sys.argv[1:3]]
     ordinary = len(sys.argv)==4
     if ordinary and sys.argv[3]!='ordinary': sys.exit('unknown checkpoint selection')
-    template = (Path(__file__).resolve().parent.parent / 'config/domain-gate5.toml').read_text()
+    template = (Path(__file__).resolve().parent.parent / 'config/instance-gate5.toml').read_text()
     with tempfile.TemporaryDirectory(prefix='ginux-checkpoints-') as folder:
         work = Path(folder)
         root = work / 'root'

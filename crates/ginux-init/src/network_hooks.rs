@@ -3,7 +3,7 @@
 use crate::supervisor::{syscall2, UserRegs, SYS_KILL};
 use crate::tracee_io::{copy_memory, write_stat, IoVectors, Stat};
 use ginux_devices::{BoundedTcp, LinuxTcpBackend, NetworkError, TcpEndpoint, TcpFamily};
-use ginux_domain::{DomainConfig, NetworkBackend};
+use ginux_instance::{InstanceConfig, NetworkBackend};
 
 pub const FD_BASE: u32 = 0x6000_0000;
 pub const FDS: usize = 16;
@@ -44,7 +44,7 @@ pub struct LaunchNetwork {
     received: [Receive; FDS],
 }
 impl LaunchNetwork {
-    pub fn prepare(config: &DomainConfig) -> core::result::Result<Self, &'static [u8]> {
+    pub fn prepare(config: &InstanceConfig) -> core::result::Result<Self, &'static [u8]> {
         let mut network = None;
         if config.network_backend == NetworkBackend::Mediated {
             let mut endpoints = [TcpEndpoint {
@@ -54,7 +54,7 @@ impl LaunchNetwork {
             }; 8];
             let texts = config.network_endpoints.as_slice();
             for (index, text) in texts.iter().enumerate() {
-                let address = ginux_domain::parse_network_endpoint(text.as_bytes())
+                let address = ginux_instance::parse_network_endpoint(text.as_bytes())
                     .map_err(|_| b"invalid numeric network endpoint".as_slice())?;
                 endpoints[index] = match address {
                     core::net::SocketAddr::V4(v4) => TcpEndpoint::ipv4(v4.ip().octets(), v4.port()),

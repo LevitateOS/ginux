@@ -20,7 +20,7 @@ def main():
     selected = sys.argv[3:] or scenarios
     if any(mode not in scenarios for mode in selected):
         sys.exit('unknown thread scenario')
-    template = (Path(__file__).resolve().parent.parent / 'config/domain-gate5.toml').read_text()
+    template = (Path(__file__).resolve().parent.parent / 'config/instance-gate5.toml').read_text()
     with tempfile.TemporaryDirectory(prefix='ginux-threads-') as directory:
         work = Path(directory)
         root = work / 'root'
@@ -61,7 +61,7 @@ def main():
                             assert proc.poll() is None, audit_path.read_text()
                             assert time.monotonic() < deadline, 'leader did not exit while thread remained alive'
                             time.sleep(.01)
-                        assert proc.poll() is None, 'domain ended before its remaining thread'
+                        assert proc.poll() is None, 'instance ended before its remaining thread'
                     stdout, _ = proc.communicate(b'G' if mode in ('pin', 'early') else None, timeout=10)
                     assert proc.returncode == 0 and stdout == b'owned-threads: PASS\n', (mode, proc.returncode, stdout, audit_path.read_text())
                     record = json.loads(result.read_text())

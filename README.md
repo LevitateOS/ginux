@@ -292,7 +292,7 @@ by a configured-launch task loop. Non-x86-64 syscall ABIs and job-control
 group stops fail explicitly. Audit output is capped at 64 KiB plus a truncation
 notice. `[resources].memory_mib` caps each tracee process's virtual address space
 with hard/soft `RLIMIT_AS`, preserving lower operator limits. This includes
-anonymous and image mappings; it is not an aggregate domain RSS limit.
+anonymous and image mappings; it is not an aggregate instance RSS limit.
 `[resources].vcpus` restricts the child to at most that many logical CPUs selected
 from the launcher's allowed affinity mask. This bounds eligible CPUs, not CPU
 time. Limits are installed only in the child before exec; no host-global cgroup
@@ -301,9 +301,9 @@ Self affinity queries (zero, current virtual PID or thread-group ID) report the
 actual eligible CPU subset through a buffer of at most 1024 bytes. Affinity mutation and address-space limit mutation
 are denied; unrelated virtual PIDs are not native scheduler targets.
 
-Configured `uname` returns `Linux`, the domain id as nodename, the kernel-views
+Configured `uname` returns `Linux`, the instance id as nodename, the kernel-views
 package version with `-ginux` as its virtual release, version `ginux`, machine
-`x86_64`, and an empty domainname. This identifies the virtual implementation;
+`x86_64`, and an empty final UTS field. This identifies the virtual implementation;
 it does not report host kernel/hostname data or promise the host kernel's ABI.
 The shared native syscall contract and `sysinfo` behavior are unchanged.
 
@@ -415,7 +415,7 @@ sharing open descriptions and owned-object lifetimes. Successful exec closes
 CLOEXEC entries; failed exec preserves the table. Owned directory-fd operations
 are supported; configured readiness is described below.
 Guest-memory copies respect page protections, including partial read copyout.
-No writable host descriptor is exposed. Data disappears at domain teardown;
+No writable host descriptor is exposed. Data disappears at instance teardown;
 explicit export and restore are described below. There is no retained storage generation.
 
 Owned executable files with an execute bit and no open writers may be replaced
@@ -430,7 +430,7 @@ exit or successful replacement releases it. Failed exec closes its temporary
 backing, releases its proposed pin and preserves public descriptors. CLOEXEC
 retirement still commits only after successful exec. Threads retain their
 process executable pin until the last thread exits.
-Readlink of /proc/self/exe and /proc/thread-self/exe returns the current domain
+Readlink of /proc/self/exe and /proc/thread-self/exe returns the current instance
 executable name, with a deleted suffix for an unlinked owned executable; native
 memfd names and supervisor prefixes are not part of that interface.
 
@@ -443,7 +443,7 @@ environment are preserved, with argv[0] replaced as for kernel shebang execution
 Image interpreters use a transient non-CLOEXEC script backing, retired before
 the interpreter's first syscall. Stack reconstruction is bounded to 4096 caller
 arguments, 4096 environment entries and 64 auxiliary pairs. Unsupported stack
-layouts fail the domain after exec rather than resuming a replaced address space.
+layouts fail the instance after exec rather than resuming a replaced address space.
 Descriptor-based scripts require a non-CLOEXEC public file or directory descriptor;
 otherwise execveat fails with ENOENT. The interpreter can reopen /dev/fd/<public>
 (or an owned directory suffix) read-only through the virtual descriptor owner,
@@ -458,7 +458,7 @@ Writable shared mappings are unsupported. A temporary read-only descriptor
 transfer requires host pidfd_open/pidfd_getfd and ptrace access. Temporary native
 descriptors and stack scratch retire before the original mmap returns. Fixed
 maps cannot replace the replay instruction or scratch region. Transfer failure,
-signal interruption or death stops the domain if cleanup cannot complete safely.
+signal interruption or death stops the instance if cleanup cannot complete safely.
 Threads remain unsupported in configured launch; nonleader mapping integration
 is not provided here. File capacity charging remains unchanged, but guest mappings,
 private COW pages and mappings retained after unlink are not aggregate RAM-accounted.
@@ -469,7 +469,7 @@ image entries beneath it are hidden. The script descriptor reopen operation
 described above is separate from directory enumeration. `[devices].assignments = ["null"]` exposes
 `/dev/null` through the existing device registry: reads return EOF and writes
 discard up to 4096 bytes per call. Stat/fstat/fstatat/statx report a character
-device with domain-owned identity and major/minor 1:3. Open access modes,
+device with instance-owned identity and major/minor 1:3. Open access modes,
 close-on-exec descriptor flags, seek, close and basic access queries are
 supported; device metadata cannot be changed. There are 64 open-device slots.
 Unknown and duplicate assignments fail before launch. Device aliases share the
@@ -622,7 +622,7 @@ private staging file, which is never a published archive. Consumers must require
 both successful completion and a valid archive. This is final export, without
 retained storage.
 Owned regular files support fsync/fdatasync against their supervisor backing;
-these calls do not imply persistence after the in-memory domain ends.
+these calls do not imply persistence after the in-memory instance ends.
 
 A host coordinator may pass `--control-fd <inherited Unix stream socket>` for
 mid-run filesystem snapshots. The supervisor keeps the socket private. Requests
@@ -631,7 +631,7 @@ pathname length1–512, and non-NUL pathname bytes. Destinations must be fresh.
 Only after complete archive write/sync/close and no-overwrite publication does
 it reply GXA1, the matching little-endian u64 sequence and u64 zero status.
 Valid partial frames are buffered within the fixed bound. Invalid requests,
-peer loss and capture failure stop the domain. The host owns request deadlines,
+peer loss and capture failure stop the instance. The host owns request deadlines,
 directory durability, paired state and workload acknowledgment. Capture serializes
 with mediated owned filesystem mutation; it does not save process memory or live
 handles. Private signal/control readiness wakes the supervisor without a periodic
