@@ -450,8 +450,10 @@ impl LaunchFs {
         Ok(())
     }
 
-    pub fn export(&self) -> Result<(), &'static [u8]> {
-        crate::storage_export::finish(|archive| self.write_archive(archive))
+    pub fn stage_export(
+        &self,
+    ) -> Result<Option<crate::storage_export::PendingExport>, &'static [u8]> {
+        crate::storage_export::stage(|archive| self.write_archive(archive))
     }
 
     pub fn snapshot(&self, path: *const u8) -> Result<(), &'static [u8]> {

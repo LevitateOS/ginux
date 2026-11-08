@@ -2588,11 +2588,11 @@ impl Supervisor<'_> {
         let settled = control_closed
             .and(event_closed)
             .and(self.objects.filesystem.cleanup_error().map_or(Ok(()), Err));
-        let exported = settled.and_then(|_| {
+        let staged = settled.and_then(|_| {
             if export {
-                self.objects.filesystem.export()
+                self.objects.filesystem.stage_export()
             } else {
-                crate::storage_export::cancel()
+                crate::storage_export::cancel().map(|_| None)
             }
         });
         self.objects.devices.network.audit_summary();
@@ -2623,8 +2623,23 @@ impl Supervisor<'_> {
             }
         }
         let released = self.objects.filesystem.teardown();
+        // Capture needs live backing bytes; publication must wait until their
+        // final release has succeeded. A backing release failure must leave no
+        // final archive name.
+        let exported = match (staged, released) {
+            (Ok(Some(archive)), Ok(())) => archive.publish(),
+            (Ok(Some(archive)), Err(reason)) => {
+                let _ = archive.cancel();
+                Err(reason)
+            }
+            (Ok(None), result) => result,
+            (Err(reason), _) => {
+                let _ = crate::storage_export::cancel();
+                Err(reason)
+            }
+        };
         line_stderr(b"ginux: teardown tasks=0 owned-handles=0");
-        if let Err(reason) = exported.and(released) {
+        if let Err(reason) = exported {
             supervision_error(instance, reason);
         }
     }

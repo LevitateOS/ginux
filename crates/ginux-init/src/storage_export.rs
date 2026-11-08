@@ -235,24 +235,46 @@ pub fn cancel() -> Result<(), Error> {
     Ok(())
 }
 
-pub fn finish(write: impl FnOnce(&mut Archive) -> Result<(), Error>) -> Result<(), Error> {
+/// A synced archive whose writer has closed, but which has no published name.
+/// Its caller must publish or cancel it after settling owned storage cleanup.
+#[must_use = "publish or cancel the staged archive"]
+pub struct PendingExport(Export);
+
+impl PendingExport {
+    pub fn cancel(self) -> Result<(), Error> {
+        let inode_closed = close(self.0.inode_fd);
+        let parent_closed = close(self.0.parent_fd);
+        if inode_closed != 0 || parent_closed != 0 {
+            return Err(b"export-file reference close failed");
+        }
+        Ok(())
+    }
+
+    pub fn publish(self) -> Result<(), Error> {
+        publish(self.0)
+    }
+}
+
+pub fn stage(
+    write: impl FnOnce(&mut Archive) -> Result<(), Error>,
+) -> Result<Option<PendingExport>, Error> {
     let Some(state) = take() else {
-        return Ok(());
+        return Ok(None);
     };
-    complete(state, write)
+    complete(state, write).map(Some)
 }
 
 pub fn capture(
     path: *const u8,
     write: impl FnOnce(&mut Archive) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    complete(create(path)?, write)
+    complete(create(path)?, write)?.publish()
 }
 
 fn complete(
     state: Export,
     write: impl FnOnce(&mut Archive) -> Result<(), Error>,
-) -> Result<(), Error> {
+) -> Result<PendingExport, Error> {
     let mut archive = Archive(state.fd);
     let result = write(&mut archive)
         .and_then(|_| archive.bytes(&[0; 1024]))
@@ -274,6 +296,10 @@ fn complete(
         close(state.parent_fd);
         return Err(b"export-file close failed");
     }
+    Ok(PendingExport(state))
+}
+
+fn publish(state: Export) -> Result<(), Error> {
     if !parent_is_current(&state) {
         close(state.inode_fd);
         close(state.parent_fd);
