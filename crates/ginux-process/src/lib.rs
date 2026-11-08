@@ -1697,6 +1697,118 @@ mod tests {
     }
 
     #[test]
+    fn exited_parent_hands_children_and_their_threads_to_init() {
+        let mut table: ProcessTable<6> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        let parent = table.fork(init).unwrap();
+        let child = table.fork(parent).unwrap();
+        let child_thread = table.clone_thread(child).unwrap();
+        table.exit(parent, 37).unwrap();
+        assert_eq!(table.view(child).unwrap().parent, init.pid);
+        assert_eq!(table.view(child_thread).unwrap().parent, init.pid);
+        assert_eq!(
+            table
+                .wait(init, WaitTarget::Specific(parent.pid), 0)
+                .unwrap()
+                .status,
+            ChildStatus::Exited(37)
+        );
+        table.exit(child_thread, 0).unwrap();
+        table.reap_thread(child_thread).unwrap();
+        table.exit(child, 23).unwrap();
+        assert_eq!(
+            table
+                .wait(init, WaitTarget::Specific(child.pid), 0)
+                .unwrap()
+                .status,
+            ChildStatus::Exited(23)
+        );
+    }
+
+    #[test]
+    fn signaled_parent_hands_children_to_init() {
+        let mut table: ProcessTable<4> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        let parent = table.fork(init).unwrap();
+        let child = table.fork(parent).unwrap();
+        table.signaled(parent, 9).unwrap();
+        assert_eq!(table.view(child).unwrap().parent, init.pid);
+        table.exit(child, 23).unwrap();
+        assert_eq!(
+            table
+                .wait(init, WaitTarget::Specific(child.pid), 0)
+                .unwrap()
+                .status,
+            ChildStatus::Exited(23)
+        );
+    }
+
+    #[test]
+    fn init_reaps_a_child_that_exited_before_its_parent() {
+        let mut table: ProcessTable<4> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        let parent = table.fork(init).unwrap();
+        let child = table.fork(parent).unwrap();
+        table.exit(child, 5).unwrap();
+        table.exit(parent, 0).unwrap();
+        assert_eq!(
+            table
+                .wait(init, WaitTarget::Specific(child.pid), 0)
+                .unwrap()
+                .status,
+            ChildStatus::Exited(5)
+        );
+        assert_eq!(table.view(child), Err(ProcessError::InvalidTask));
+    }
+
+    #[test]
+    fn children_stay_with_their_process_while_a_thread_runs() {
+        let mut table: ProcessTable<4> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        let parent = table.fork(init).unwrap();
+        let parent_thread = table.clone_thread(parent).unwrap();
+        // A fork from a thread belongs to its process, not to the thread.
+        let child = table.fork(parent_thread).unwrap();
+        assert_eq!(table.view(child).unwrap().parent, parent.pid);
+        table.exit(parent, 0).unwrap();
+        assert_eq!(table.view(child).unwrap().parent, parent.pid);
+        table.signaled(parent_thread, 9).unwrap();
+        assert_eq!(table.view(child).unwrap().parent, init.pid);
+    }
+
+    #[test]
+    fn grandchildren_keep_their_living_parent() {
+        let mut table: ProcessTable<4> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        let parent = table.fork(init).unwrap();
+        let child = table.fork(parent).unwrap();
+        let grandchild = table.fork(child).unwrap();
+        table.exit(parent, 0).unwrap();
+        assert_eq!(table.view(child).unwrap().parent, init.pid);
+        assert_eq!(table.view(grandchild).unwrap().parent, child.pid);
+    }
+
+    #[test]
+    fn an_init_thread_reaps_orphans_after_the_init_leader_exits() {
+        let mut table: ProcessTable<6> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        let init_thread = table.clone_thread(init).unwrap();
+        let parent = table.fork(init).unwrap();
+        let child = table.fork(parent).unwrap();
+        table.exit(init, 0).unwrap();
+        table.exit(parent, 0).unwrap();
+        assert_eq!(table.view(child).unwrap().parent, init.pid);
+        table.exit(child, 19).unwrap();
+        assert_eq!(
+            table
+                .wait(init_thread, WaitTarget::Specific(child.pid), 0)
+                .unwrap()
+                .status,
+            ChildStatus::Exited(19)
+        );
+    }
+
+    #[test]
     fn exited_and_signaled_parents_reparent_children() {
         for signal in [false, true] {
             let mut table: ProcessTable<6> = ProcessTable::new();

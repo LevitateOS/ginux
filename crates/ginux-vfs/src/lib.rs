@@ -3161,6 +3161,85 @@ mod tests {
     }
 
     #[test]
+    fn chunked_copy_up_preserves_all_bytes_and_reclaims_partial_failure() {
+        struct ChunkReader {
+            fail_second: bool,
+        }
+        impl BaseReader for ChunkReader {
+            fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), VfsError> {
+                if self.fail_second && offset >= 4096 {
+                    return Err(VfsError::Io);
+                }
+                for (i, byte) in output.iter_mut().enumerate() {
+                    *byte = ((offset as usize + i) % 251) as u8;
+                }
+                Ok(())
+            }
+        }
+        let mut bytes = std::vec![0; HEADER_SIZE + 2 * RECORD_SIZE];
+        encode_header(2, (&mut bytes[..HEADER_SIZE]).try_into().unwrap());
+        for (i, (path, kind, size)) in [
+            (b"/".as_slice(), NodeKind::Directory, 0),
+            (b"/large".as_slice(), NodeKind::File, 9000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let start = HEADER_SIZE + i * RECORD_SIZE;
+            encode_record(
+                Entry {
+                    path,
+                    kind,
+                    mode: 0o777,
+                    uid: 0,
+                    gid: 0,
+                    size,
+                    data_offset: 0,
+                    link: b"",
+                },
+                (&mut bytes[start..start + RECORD_SIZE]).try_into().unwrap(),
+            )
+            .unwrap();
+        }
+        for fail_second in [false, true] {
+            let mut fs: VirtualFs<'_, ChunkReader, 1, 16, 2, InlineStorage<1, 12000>> =
+                VirtualFs::with_storage(
+                    Index::new(&bytes).unwrap(),
+                    ChunkReader { fail_second },
+                    InlineStorage::default(),
+                );
+            let image = fs.open(b"/large", O_READ).unwrap();
+            let original = fs.fstat(image).unwrap();
+            let mut prefix = [0; 3];
+            assert_eq!(fs.read(image, &mut prefix), Ok(3));
+            assert_eq!(prefix, [0, 1, 2]);
+            let opened = fs.open(b"/large", O_READ | O_WRITE);
+            if fail_second {
+                assert_eq!(opened, Err(VfsError::Io));
+                assert_eq!(fs.overlay_files(), 0);
+                assert_eq!(fs.fstat(image), Ok(original));
+                assert_eq!(fs.seek(image, 0, 1), Ok(3));
+                let mut untouched = [0; 2];
+                assert_eq!(fs.read(image, &mut untouched), Ok(2));
+                assert_eq!(untouched, [3, 4]);
+                let new = fs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
+                assert_eq!(fs.write(new, b"ok"), Ok(2));
+                fs.seek(new, 0, 0).unwrap();
+                let mut output = [0; 2];
+                assert_eq!(fs.read(new, &mut output), Ok(2));
+                assert_eq!(&output, b"ok");
+            } else {
+                let fd = opened.unwrap();
+                let mut output = [0; 9000];
+                assert_eq!(fs.read(fd, &mut output), Ok(9000));
+                for (i, byte) in output.into_iter().enumerate() {
+                    assert_eq!(byte, (i % 251) as u8);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn directory_records_merge_names_and_keep_cookies_explicit() {
         let bytes = index_bytes();
         let mut vfs: VirtualFs<'_, Reader, 4, 32, 4> =
