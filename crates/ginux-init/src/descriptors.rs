@@ -260,6 +260,17 @@ impl DescriptorTable {
         Ok(table)
     }
 
+    pub fn console_descriptor(&self, fd: u64) -> bool {
+        matches!(
+            self.get(fd).map(|d| d.handle),
+            Ok(Handle::Native { console: true, .. })
+        )
+    }
+
+    pub fn network_descriptor(&self, fd: u64) -> bool {
+        matches!(self.get(fd).map(|d| d.handle), Ok(Handle::Owned(handle)) if crate::network_hooks::LaunchNetwork::owns(handle))
+    }
+
     pub fn capacity(&self) -> usize {
         self.capacity
     }

@@ -17,7 +17,7 @@ def main():
     if len(sys.argv) < 3 or os.geteuid() != 0:
         sys.exit("usage (as root): test-launch.py <ginux binary> <launch fixture>")
     binary, fixture = (str(Path(arg).resolve()) for arg in sys.argv[1:3])
-    template = (Path(__file__).resolve().parent.parent / "config/instance-gate5.toml").read_text()
+    template = (Path(__file__).resolve().parent.parent / "config/instance-configured.toml").read_text()
     with tempfile.TemporaryDirectory(prefix="ginux-launch-") as directory:
         work = Path(directory)
         # CI checkouts may live below a private home directory. The
@@ -179,7 +179,8 @@ def main():
         # every syscall record before it is complete.
         lines = proc.stderr.splitlines()
         record = re.compile(rb"ginux: audit sequence=\d+ phase=(exit result=-?\d+|"
-                            rb"entry syscall=\d+(?: virtual-pid=\d+)? action=\S.* result=\S+)")
+                            rb"entry syscall=\d+(?: virtual-pid=\d+)? operation=[a-z0-9._-]+ "
+                            rb"policy-source=[a-z0-9._-]+(?: policy-rule=\d+)? action=\S.* result=\S+)")
         if (b"ginux: audit truncated budget=65536" not in lines
                 or any(line.startswith(b"ginux: audit sequence=") and not record.fullmatch(line)
                        for line in lines)):

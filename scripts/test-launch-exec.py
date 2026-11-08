@@ -18,7 +18,7 @@ def main():
     if len(sys.argv) != 5 or os.geteuid() != 0:
         sys.exit('usage (as root): test-launch-exec.py <ginux> <exec-fixture> <interpreter-fixture> <allowed-interpreter-fixture>')
     binary, fixture, interpreter, allowed_interpreter = [str(Path(p).resolve()) for p in sys.argv[1:]]
-    template = (Path(__file__).resolve().parent.parent / 'config/instance-gate5.toml').read_text()
+    template = (Path(__file__).resolve().parent.parent / 'config/instance-configured.toml').read_text()
     with tempfile.TemporaryDirectory(prefix='ginux-exec-') as directory:
         work = Path(directory)
         root = work / 'root'

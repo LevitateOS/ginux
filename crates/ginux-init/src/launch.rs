@@ -4,7 +4,12 @@
 //! input-file staging. Workload definitions stay with the entry points in
 //! `main.rs`; `launch` runs the executable and arguments from instance config.
 
-use ginux_instance::{ConfigError, ExecutionBackend, ExecutionProfile, Instance, InstanceConfig};
+use ginux_contract::{
+    syscall_semantic_operation, EffectiveContract, EffectiveRule, Kind, Provenance, Status,
+};
+use ginux_instance::{
+    AuditMode, ConfigError, ExecutionBackend, ExecutionProfile, Instance, InstanceConfig,
+};
 
 use crate::supervisor::{
     exit_process, line, managed_host_identity, ptrace, standard_stream_refusal, syscall0, syscall1,
@@ -411,6 +416,22 @@ pub fn launch_main(
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     let config = launch_load_config(config_path);
     launch_validate(&config);
+    let contract = config
+        .effective_contract()
+        .unwrap_or_else(|error| launch_rejected(error.as_str()));
+    if let Some(rule) = contract
+        .rules()
+        .iter()
+        .find(|rule| launch_cannot_enforce(rule))
+    {
+        write_stderr(b"ginux: launch config rejected reason=unenforced-deny operation=");
+        line_stderr(rule.operation.id.as_bytes());
+        write_completion_result(OUTCOME_SUPERVISOR_ERROR, false, 0, false, 0);
+        exit_process(2);
+    }
+    unsafe {
+        AUDIT_DISABLED = config.audit_mode == AuditMode::Disabled;
+    }
     if let Some(reason) = standard_stream_refusal() {
         launch_startup_fail(reason);
     }
@@ -427,6 +448,10 @@ pub fn launch_main(
     }
     let mut channels = crate::channel_hooks::LaunchChannels::new();
     print_launch_config(&config);
+    write_stderr(b"ginux: launch contract instance=");
+    write_stderr(config.id.as_bytes());
+    write_stderr(b" digest=");
+    line_stderr(contract.digest());
     let mut instance = Instance::create(config);
     if instance.start().is_err() {
         launch_instance_fail(&mut instance, b"invalid launch start transition");
@@ -497,10 +522,31 @@ pub fn launch_main(
         &mut devices,
         &mut channels,
         descriptors,
+        &contract,
     )
 }
 
 fn launch_validate(config: &InstanceConfig) {
+    // These are accepted instance fields, but their owners are the systemd
+    // backend. Never silently launch with a requested restriction or hook ignored.
+    if !config.filesystem_write_deny.as_slice().is_empty()
+        || !config.pre_boot_hooks.as_slice().is_empty()
+    {
+        launch_startup_fail(
+            b"launch does not support filesystem write-deny rules or pre-boot hooks",
+        );
+    }
+    if !config.ingress_allow.as_slice().is_empty()
+        || !config.ingress_deny.as_slice().is_empty()
+        || !config.egress_allow.as_slice().is_empty()
+        || !config.egress_deny.as_slice().is_empty()
+        || !config.port_forwards.as_slice().is_empty()
+    {
+        launch_startup_fail(
+            b"launch requires numeric mediated endpoints, not shared-network policy",
+        );
+    }
+
     if config.execution_profile != ExecutionProfile::Balanced
         || config.execution_backend != ExecutionBackend::PtraceNative
     {
@@ -653,6 +699,7 @@ static mut RESULT_FD: isize = -1;
 
 static mut AUDIT_BYTES: usize = 0;
 static mut AUDIT_CAPPED: bool = false;
+static mut AUDIT_DISABLED: bool = false;
 // One audit record is staged here and written whole once its newline
 // arrives, so the budget never splits a record and the truncation notice
 // always starts its own line.
@@ -799,7 +846,7 @@ pub fn launch_usage() -> ! {
 
 pub(crate) fn audit_write(bytes: &[u8]) {
     let record = unsafe {
-        if AUDIT_CAPPED {
+        if AUDIT_DISABLED || AUDIT_CAPPED {
             return;
         }
         let start = AUDIT_RECORD_LEN;
@@ -1173,6 +1220,7 @@ fn supervise_launch(
     devices: &mut crate::device_hooks::LaunchDevices,
     channels: &mut crate::channel_hooks::LaunchChannels,
     descriptors: crate::descriptors::DescriptorTable,
+    contract: &EffectiveContract,
 ) -> ! {
     let mut refs = crate::descriptors::ObjectReferences::new();
     let objects = crate::descriptors::Backends {
@@ -1181,7 +1229,7 @@ fn supervise_launch(
         channels,
         refs: &mut refs,
     };
-    crate::launch_tasks::supervise(pid, instance, objects, descriptors)
+    crate::launch_tasks::supervise(pid, instance, objects, descriptors, contract)
 }
 
 pub(crate) fn launch_exit_reason(code: i32) -> &'static [u8] {
@@ -1265,4 +1313,93 @@ fn write_stderr_u64(mut value: u64) {
         value /= 10;
     }
     write_stderr(&buffer[index..]);
+}
+
+// Host vDSO reads and synthetic /proc,/sys/cgroup views cannot currently be
+// withheld by configured launch. Refuse explicit denials instead of promising
+// confinement the backend cannot provide. Implicit absence is documented.
+fn launch_cannot_enforce(rule: &EffectiveRule) -> bool {
+    let explicit = matches!(
+        rule.provenance,
+        Provenance::InstanceDeny | Provenance::RecipeDeny | Provenance::ExactDeny
+    );
+    explicit
+        && matches!(rule.operation.status, Status::Complete | Status::Partial)
+        && match rule.operation.kind {
+            Kind::Syscall => rule
+                .operation
+                .abi_number
+                .is_some_and(|n| [96, 201, 228, 229, 309].contains(&n)),
+            _ => ![
+                "filesystem.path.read",
+                "filesystem.path.write",
+                "device.console.read",
+                "device.console.write",
+                "ioctl.tty.get_winsize",
+                "memory.virtual.manage",
+                "signal.virtual.deliver",
+                "credential.virtual.set",
+                "network.inet.tcp.bind",
+                "network.inet.tcp.connect",
+                "network.inet.udp.bind",
+                "network.inet.udp.connect",
+            ]
+            .contains(&rule.operation.id),
+        }
+}
+
+pub(crate) fn audit_rule(rule: Option<&EffectiveRule>) {
+    audit_write(b" operation=");
+    audit_write(rule.map_or(b"unknown".as_slice(), |r| r.operation.id.as_bytes()));
+    audit_write(b" policy-source=");
+    if let Some(rule) = rule {
+        audit_write(rule.source.as_bytes());
+        audit_write(b" policy-rule=");
+        audit_u64(rule.source_rule as u64);
+    } else {
+        audit_write(b"default-deny");
+    }
+}
+
+/// Classify the original public call before any register translation or hook
+/// effects. The descriptor owner preserves console and TCP identity on aliases.
+pub(crate) fn launch_semantic_operation(
+    r: &crate::supervisor::UserRegs,
+    table: &crate::descriptors::DescriptorTable,
+) -> Option<&'static str> {
+    let path = |flags: u64| {
+        if flags as u32 & (3 | 0o100 | 0o1000 | 0o2000 | 0o20000000) != 0 {
+            "filesystem.path.write"
+        } else {
+            "filesystem.path.read"
+        }
+    };
+    match r.orig_rax {
+        0 | 19 if table.console_descriptor(r.rdi) => Some("device.console.read"),
+        1 | 20 if table.console_descriptor(r.rdi) => Some("device.console.write"),
+        0 | 1 | 19 | 20 | 42 | 44..=48 | 51 | 52 | 54 | 55 if table.network_descriptor(r.rdi) => {
+            Some("network.inet.tcp.connect")
+        }
+        41 if r.rdi as u32 == 2 || r.rdi as u32 == 10 => Some("network.inet.tcp.connect"),
+        2 => Some(path(r.rsi)),
+        257 => Some(path(r.rdx)),
+        4 | 5 | 6 | 17 | 21 | 78 | 79 | 80 | 81 | 89 | 217 | 262 | 267 | 269 | 332 | 439 => {
+            Some("filesystem.path.read")
+        }
+        1
+        | 18
+        | 20
+        | 76
+        | 77
+        | 82..=88
+        | 90..=94
+        | 132
+        | 258
+        | 260
+        | 263..=266
+        | 268
+        | 280
+        | 316 => Some("filesystem.path.write"),
+        n => syscall_semantic_operation(n, r.rsi),
+    }
 }

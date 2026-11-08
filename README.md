@@ -292,6 +292,36 @@ It drops to UID/GID 1000 before executing the workload. The configuration must
 select `profile = "balanced"` and `backend = "ptrace-native"`. Only the `null`
 device assignment and memory-storage backend described below are supported.
 
+Launch resolves the configured contract and checks it before every workload
+syscall's clock, task, descriptor, storage or network handler. Explicit denials
+return EPERM; absent grants return ENOSYS. A grant only permits the existing
+implementation to handle the call; assignments, endpoint/byte limits and
+argument checks still apply. Denials take precedence over grants. An explicit
+syscall denial also wins over an ungranted semantic family.
+
+`config/instance-configured.toml` selects `[contract] profile =
+"configured-balanced-v2"`, which explicitly opts into configured catalog 2.
+It adds `lstat`, `readv`, `pipe`, `nanosleep`, `link`, `sched_getaffinity`,
+`clock_getres`, `faccessat`, `renameat2` and `execveat` to catalog 1. The
+original profiles, catalog-1 selectors/digests and native dispatch authority
+remain unchanged. Self-contained contracts can explicitly select `catalog = 2`
+instead. Validation/inspection report the selected catalog and digest; contract
+diffs include operations added or removed by a catalog change.
+
+Entry audit records name the deciding operation, policy source and rule index.
+Console and TCP classification follows tracked descriptors through aliases,
+fork and reuse. Legacy `[contract]` selectors retain upstream's rule index 0;
+self-contained recipe rules carry their actual zero-based index. Disabled audit
+suppresses decision records, while configuration, completion and failure
+diagnostics remain available. Audit records remain bounded to 64 KiB.
+
+The host vDSO can answer clock reads without a syscall. Launch therefore rejects
+explicit clock/vDSO denials before starting a workload. It likewise rejects
+explicit `/proc`, `/sys` and cgroup semantic denials, filesystem `write_deny`
+rules and pre-boot hooks that this backend cannot enforce. Leaving those
+semantic operations ungranted does not withhold their non-syscall effects.
+This is not a claim of complete deny-by-default mediation of those surfaces.
+
 `[instance].workdir` is optional and defaults to `/work`; `/` is also supported.
 The bootstrap creates the working directory if its parent exists, then enters
 it after dropping privileges. Init and working-directory paths are limited to

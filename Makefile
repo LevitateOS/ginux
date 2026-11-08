@@ -267,6 +267,11 @@ build-launch-fixture:
 	mkdir -p .artifacts/launch
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fixture.c -o .artifacts/launch/launch-fixture
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/native-fixture.c -o .artifacts/launch/native-fixture
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-contract-fixture.c -o .artifacts/launch/launch-contract-fixture
+
+.PHONY: test-launch-contract
+test-launch-contract:
+	python3 scripts/test-launch-contract.py $(GINUX) .artifacts/launch/launch-contract-fixture .artifacts/launch/contract-evidence
 
 test-launch:
 	python3 scripts/test-launch.py $(GINUX) .artifacts/launch/launch-fixture

@@ -19,7 +19,7 @@ def main():
     ordinary = len(sys.argv) == 4
     if ordinary and sys.argv[3] != 'ordinary':
         sys.exit('unknown restore selection')
-    template = (Path(__file__).resolve().parent.parent / 'config/instance-gate5.toml').read_text()
+    template = (Path(__file__).resolve().parent.parent / 'config/instance-configured.toml').read_text()
     with tempfile.TemporaryDirectory(prefix='ginux-restore-') as folder:
         work = Path(folder)
         root = work / 'root'

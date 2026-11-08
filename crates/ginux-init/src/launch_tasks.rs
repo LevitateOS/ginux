@@ -11,6 +11,7 @@ use crate::launch::{
 };
 use crate::supervisor::*;
 use crate::tracee_io::copy_memory;
+use ginux_contract::{Action as ContractAction, EffectiveContract};
 use ginux_core::{balanced_identity_result, balanced_surface, Action};
 use ginux_instance::Instance;
 use ginux_process::{Credentials, ProcessError, ProcessTable, TaskId, WaitTarget};
@@ -107,6 +108,7 @@ struct Supervisor<'a> {
     groups: [Option<DescriptorGroup>; TASKS],
     processes: ProcessTable<TASKS>,
     objects: Backends<'a>,
+    contract: &'a EffectiveContract,
     unknown_stops: [usize; TASKS],
     retired: [(usize, u32); TASKS],
     retired_next: usize,
@@ -247,6 +249,7 @@ pub fn supervise(
     instance: &mut Instance,
     objects: Backends,
     descriptors: DescriptorTable,
+    contract: &EffectiveContract,
 ) -> ! {
     let mut status = 0;
     let waited = loop {
@@ -291,6 +294,7 @@ pub fn supervise(
         groups: core::array::from_fn(|_| None),
         processes,
         objects,
+        contract,
         unknown_stops: [0; TASKS],
         retired: [(0, 0); TASKS],
         retired_next: 0,
@@ -873,7 +877,23 @@ impl Supervisor<'_> {
         audit_u64(r.orig_rax);
         audit_write(b" virtual-pid=");
         audit_u64(self.task(index).id.pid as u64);
+        let rule = self.contract.runtime_rule(
+            r.orig_rax,
+            crate::launch::launch_semantic_operation(r, self.table(index)),
+        );
+        crate::launch::audit_rule(rule);
         audit_write(b" action=");
+        // All workload calls pass here before clock/task/storage/FD effects.
+        // Internal supervisor replay stages above are already-owned transactions.
+        if let ContractAction::Deny(errno) = rule.map_or(ContractAction::Deny(38), |r| r.action) {
+            audit_write(b"deny result=-");
+            audit_u64(errno as u64);
+            audit_write(b"\n");
+            self.task_mut(index).override_result = Some(-(errno as i64));
+            r.orig_rax = u64::MAX;
+            self.run(index, r, instance);
+            return;
+        }
         let original = *r;
         let id = self.task(index).id;
         let parent_group = self.task(index).group;

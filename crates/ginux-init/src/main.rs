@@ -5678,22 +5678,10 @@ fn supervise_native(
                 (2, 49) => Some("network.inet.udp.bind"),
                 _ => None,
             }
-        } else if matches!(syscall, 9..=12) {
-            Some("memory.virtual.manage")
-        } else if matches!(syscall, 13 | 14 | 62 | 127..=130 | 289) {
-            Some("signal.virtual.deliver")
-        } else if matches!(syscall, 96 | 228 | 229) {
-            Some("time.clock.read")
-        } else if matches!(syscall, 105 | 106 | 116 | 117 | 119 | 122 | 123) {
-            Some("credential.virtual.set")
         } else {
-            None
+            ginux_contract::syscall_semantic_operation(syscall, registers.rsi)
         };
-        let semantic_rule = semantic_operation.and_then(|id| contract.operation_rule(id));
-        let syscall_rule = contract.syscall_rule(syscall);
-        let contract_rule = semantic_rule
-            .filter(|rule| matches!(rule.action, ContractAction::Deny(_)))
-            .or(syscall_rule);
+        let contract_rule = contract.runtime_rule(syscall, semantic_operation);
         let contract_action = contract_rule
             .map(|rule| rule.action)
             .unwrap_or(ContractAction::Deny(38));
@@ -7893,7 +7881,9 @@ fn instance_validate_main(config_path: *const u8) -> ! {
         .unwrap_or_else(|error| config_rejected(error));
     write_all(b"Contract valid: instance=");
     write_all(config.id.as_bytes());
-    write_all(b" catalog=1 digest=");
+    write_all(b" catalog=");
+    write_u64(contract.catalog_version() as u64);
+    write_all(b" digest=");
     write_all(contract.digest());
     write_all(b" operations=");
     write_u64(contract.rules().len() as u64);
@@ -7912,7 +7902,7 @@ fn instance_explain_main(config_path: *const u8, operation: *const u8) -> ! {
         .iter()
         .find(|rule| rule.operation.id.as_bytes() == operation)
     else {
-        line(b"Contract operation is not present in catalog version 1.");
+        line(b"Contract operation is not present in the selected catalog.");
         exit_process(2)
     };
     write_all(b"Operation: ");
@@ -7942,15 +7932,30 @@ fn instance_diff_main(left_path: *const u8, right_path: *const u8) -> ! {
         .effective_contract()
         .unwrap_or_else(|error| config_rejected(error));
     let mut changes = 0u64;
-    for (left_rule, right_rule) in left.rules().iter().zip(right.rules()) {
-        if left_rule.action != right_rule.action {
+    for left_rule in left.rules() {
+        match right.operation_rule(left_rule.operation.id) {
+            Some(right_rule) if left_rule.action == right_rule.action => {}
+            Some(right_rule) => {
+                changes += 1;
+                write_all(b"Changed: ");
+                write_all(left_rule.operation.id.as_bytes());
+                write_all(b" ");
+                write_all(left_rule.action.name().as_bytes());
+                write_all(b" -> ");
+                line(right_rule.action.name().as_bytes());
+            }
+            None => {
+                changes += 1;
+                write_all(b"Removed: ");
+                line(left_rule.operation.id.as_bytes());
+            }
+        }
+    }
+    for rule in right.rules() {
+        if left.operation_rule(rule.operation.id).is_none() {
             changes += 1;
-            write_all(b"Changed: ");
-            write_all(left_rule.operation.id.as_bytes());
-            write_all(b" ");
-            write_all(left_rule.action.name().as_bytes());
-            write_all(b" -> ");
-            line(right_rule.action.name().as_bytes());
+            write_all(b"Added: ");
+            line(rule.operation.id.as_bytes());
         }
     }
     write_all(b"Contract differences: ");
@@ -7976,7 +7981,9 @@ fn instance_inspect_main(config_path: *const u8) -> ! {
     }
     write_all(b"Contract: instance=");
     write_all(config.id.as_bytes());
-    write_all(b" catalog=1 digest=");
+    write_all(b" catalog=");
+    write_u64(contract.catalog_version() as u64);
+    write_all(b" digest=");
     write_all(contract.digest());
     write_all(b"\nDecisions: emulate=");
     write_u64(emulate);

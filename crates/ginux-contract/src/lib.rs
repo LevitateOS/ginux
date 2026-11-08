@@ -166,6 +166,91 @@ macro_rules! operation {
     };
 }
 
+/// Explicit configured-launch catalog additions; catalog 1 stays unchanged.
+pub const CONFIGURED_CATALOG_VERSION: u32 = 2;
+pub static CONFIGURED_OPERATIONS: &[Operation] = &[
+    syscall!(
+        "lstat",
+        6,
+        Partial,
+        Action::Mediate,
+        "instance path",
+        "test-launch-directories"
+    ),
+    syscall!(
+        "readv",
+        19,
+        Partial,
+        Action::Mediate,
+        "bounded instance vectors",
+        "test-launch-pipes"
+    ),
+    syscall!(
+        "pipe",
+        22,
+        Partial,
+        Action::Mediate,
+        "owned bounded pipe",
+        "test-launch-pipes"
+    ),
+    syscall!(
+        "nanosleep",
+        35,
+        Partial,
+        Action::Mediate,
+        "bounded configured monotonic wait",
+        "test-launch"
+    ),
+    syscall!(
+        "link",
+        86,
+        Partial,
+        Action::Mediate,
+        "owned shared inode",
+        "test-launch-directories"
+    ),
+    syscall!(
+        "sched_getaffinity",
+        204,
+        Partial,
+        Action::Mediate,
+        "virtual task and operator CPU mask",
+        "test-launch-tasks"
+    ),
+    syscall!(
+        "clock_getres",
+        229,
+        Partial,
+        Action::Mediate,
+        "supported global clocks only",
+        "test-launch"
+    ),
+    syscall!(
+        "faccessat",
+        269,
+        Partial,
+        Action::Mediate,
+        "instance path and access mode",
+        "test-launch-storage"
+    ),
+    syscall!(
+        "renameat2",
+        316,
+        Partial,
+        Action::Mediate,
+        "owned paths and validated flags",
+        "test-launch-directories"
+    ),
+    syscall!(
+        "execveat",
+        322,
+        Partial,
+        Action::Mediate,
+        "owned or image executable",
+        "test-launch-exec"
+    ),
+];
+
 pub static CATALOG: &[Operation] = &[
     syscall!(
         "read",
@@ -1654,6 +1739,7 @@ pub enum ContractError {
     TooManyOperations,
     DuplicateOperation,
     UnsupportedPromotion,
+    UnknownCatalog,
 }
 
 impl fmt::Display for ContractError {
@@ -1666,6 +1752,7 @@ impl fmt::Display for ContractError {
             Self::TooManyOperations => "contract-operation-capacity",
             Self::DuplicateOperation => "duplicate-catalog-operation",
             Self::UnsupportedPromotion => "unsupported-contract-promotion",
+            Self::UnknownCatalog => "unsupported-contract-catalog",
         })
     }
 }
@@ -1768,6 +1855,7 @@ const EMPTY_RULE: EffectiveRule = EffectiveRule {
 
 #[derive(Clone, Copy)]
 pub struct EffectiveContract {
+    catalog_version: u32,
     rules: [EffectiveRule; MAX_OPERATIONS],
     len: usize,
     digest: [u8; DIGEST_HEX_BYTES],
@@ -1776,10 +1864,15 @@ pub struct EffectiveContract {
 impl EffectiveContract {
     pub const fn empty() -> Self {
         Self {
+            catalog_version: CATALOG_VERSION,
             rules: [EMPTY_RULE; MAX_OPERATIONS],
             len: 0,
             digest: [0; DIGEST_HEX_BYTES],
         }
+    }
+
+    pub const fn catalog_version(&self) -> u32 {
+        self.catalog_version
     }
 
     pub fn rules(&self) -> &[EffectiveRule] {
@@ -1805,17 +1898,71 @@ impl EffectiveContract {
     pub fn operation_rule(&self, id: &str) -> Option<&EffectiveRule> {
         self.rules().iter().find(|rule| rule.operation.id == id)
     }
+    /// The rule that decides a syscall at runtime. A denial of its semantic
+    /// operation wins, unless the operation is merely not granted and the
+    /// syscall is explicitly denied; otherwise the syscall's own rule decides,
+    /// so a semantic allowance cannot grant a syscall the contract does not
+    /// list or denies.
+    pub fn runtime_rule(&self, number: u64, semantic: Option<&str>) -> Option<&EffectiveRule> {
+        let syscall = self.syscall_rule(number);
+        let explicit_deny = |rule: &EffectiveRule| {
+            matches!(rule.action, Action::Deny(_)) && rule.provenance != Provenance::DefaultDeny
+        };
+        match semantic
+            .and_then(|id| self.operation_rule(id))
+            .filter(|rule| matches!(rule.action, Action::Deny(_)))
+        {
+            Some(rule)
+                if rule.provenance == Provenance::DefaultDeny
+                    && syscall.is_some_and(explicit_deny) =>
+            {
+                syscall
+            }
+            Some(rule) => Some(rule),
+            None => syscall,
+        }
+    }
+}
+
+/// The semantic operation of a syscall whose number alone decides it (for
+/// ioctl, together with its request). Path- and descriptor-dependent
+/// operations are classified by the lane that can inspect them.
+pub const fn syscall_semantic_operation(number: u64, request: u64) -> Option<&'static str> {
+    match number {
+        // The kernel reads an ioctl request as a 32-bit value.
+        16 if request as u32 == 0x5413 => Some("ioctl.tty.get_winsize"),
+        9..=12 | 25 | 28 => Some("memory.virtual.manage"),
+        13..=15 | 62 | 127..=130 | 289 | 424 => Some("signal.virtual.deliver"),
+        96 | 228 | 229 => Some("time.clock.read"),
+        105 | 106 | 113 | 114 | 116 | 117 | 119 | 122 | 123 => Some("credential.virtual.set"),
+        _ => None,
+    }
+}
+
+fn catalog_operations(version: u32) -> impl Iterator<Item = &'static Operation> {
+    CATALOG.iter().chain(
+        if version == CONFIGURED_CATALOG_VERSION {
+            CONFIGURED_OPERATIONS
+        } else {
+            &[]
+        }
+        .iter(),
+    )
 }
 
 pub fn validate_catalog() -> Result<(), ContractError> {
-    if CATALOG.len() > MAX_OPERATIONS {
+    if CATALOG.len() + CONFIGURED_OPERATIONS.len() > MAX_OPERATIONS {
         return Err(ContractError::TooManyOperations);
     }
-    for (index, operation) in CATALOG.iter().enumerate() {
-        if CATALOG[..index].iter().any(|existing| {
-            existing.id == operation.id
-                || (operation.abi_number.is_some() && existing.abi_number == operation.abi_number)
-        }) {
+    for (index, operation) in catalog_operations(CONFIGURED_CATALOG_VERSION).enumerate() {
+        if catalog_operations(CONFIGURED_CATALOG_VERSION)
+            .take(index)
+            .any(|existing| {
+                existing.id == operation.id
+                    || (operation.abi_number.is_some()
+                        && existing.abi_number == operation.abi_number)
+            })
+        {
             return Err(ContractError::DuplicateOperation);
         }
     }
@@ -1829,8 +1976,14 @@ pub fn resolve(
     deny: &[&[u8]],
 ) -> Result<EffectiveContract, ContractError> {
     validate_catalog()?;
+    let catalog = if profile == b"configured-balanced-v2" {
+        CONFIGURED_CATALOG_VERSION
+    } else {
+        CATALOG_VERSION
+    };
     let mut effective = EffectiveContract::empty();
-    for operation in CATALOG {
+    effective.catalog_version = catalog;
+    for operation in catalog_operations(catalog) {
         effective.rules[effective.len] = EffectiveRule {
             operation,
             action: Action::Deny(38),
@@ -1867,9 +2020,20 @@ pub fn resolve(
 }
 
 pub fn resolve_recipe(recipe: Recipe<'_>) -> Result<EffectiveContract, ContractError> {
+    resolve_recipe_catalog(CATALOG_VERSION, recipe)
+}
+
+pub fn resolve_recipe_catalog(
+    catalog: u32,
+    recipe: Recipe<'_>,
+) -> Result<EffectiveContract, ContractError> {
+    if !matches!(catalog, CATALOG_VERSION | CONFIGURED_CATALOG_VERSION) {
+        return Err(ContractError::UnknownCatalog);
+    }
     validate_catalog()?;
     let mut effective = EffectiveContract::empty();
-    for operation in CATALOG {
+    effective.catalog_version = catalog;
+    for operation in catalog_operations(catalog) {
         effective.rules[effective.len] = EffectiveRule {
             operation,
             action: Action::Deny(38),
@@ -2153,9 +2317,11 @@ fn apply_profile(effective: &mut EffectiveContract, profile: &[u8]) -> Result<()
                 )?;
             }
         }
-        b"gate5-balanced-v1" | b"gate9-systemd-v1" => {
+        b"gate5-balanced-v1" | b"gate9-systemd-v1" | b"configured-balanced-v2" => {
             let source = if profile == b"gate5-balanced-v1" {
                 "gate5-balanced-v1"
+            } else if profile == b"configured-balanced-v2" {
+                "configured-balanced-v2"
             } else {
                 "gate9-systemd-v1"
             };
@@ -2262,7 +2428,7 @@ fn contract_digest(contract: &EffectiveContract) -> [u8; DIGEST_HEX_BYTES] {
     // FNV-1a is used only as a stable identity, not as a trust primitive. The
     // catalog and normalized configuration remain the authoritative inputs.
     let mut hash = 0xcbf29ce484222325u64;
-    hash = hash_bytes(hash, &CATALOG_VERSION.to_le_bytes());
+    hash = hash_bytes(hash, &contract.catalog_version.to_le_bytes());
     for rule in contract.rules() {
         hash = hash_bytes(hash, rule.operation.id.as_bytes());
         hash = hash_bytes(hash, rule.action.name().as_bytes());
@@ -2298,6 +2464,99 @@ const fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_catalog_requires_an_explicit_opt_in() {
+        let original = resolve(b"gate5-balanced-v1", &[], &[], &[]).unwrap();
+        let configured = resolve(b"configured-balanced-v2", &[], &[], &[]).unwrap();
+        assert_eq!(original.catalog_version(), 1);
+        assert_eq!(configured.catalog_version(), 2);
+        assert_ne!(original.digest(), configured.digest());
+        for operation in CONFIGURED_OPERATIONS {
+            let number = operation.abi_number.unwrap();
+            assert!(original.syscall_rule(number).is_none());
+            assert_eq!(configured.syscall_action(number), Action::Mediate);
+            assert_eq!(
+                ginux_core::decide_systemd(number, true).action,
+                ginux_core::Action::Deny(38)
+            );
+        }
+        for (old, new) in original.rules().iter().zip(configured.rules()) {
+            assert_eq!(old.operation.id, new.operation.id);
+            assert_eq!(old.action, new.action);
+        }
+        assert_eq!(
+            resolve(b"gate5-balanced-v1", &[], &[b"syscall.nanosleep"], &[]).err(),
+            Some(ContractError::UnmatchedSelector)
+        );
+    }
+
+    #[test]
+    fn runtime_rule_keeps_semantic_and_syscall_denials() {
+        let semantic =
+            resolve(b"gate5-balanced-v1", &[], &[], &[b"filesystem.path.write"]).unwrap();
+        let rule = semantic
+            .runtime_rule(2, Some("filesystem.path.write"))
+            .unwrap();
+        assert_eq!(rule.action, Action::Deny(1));
+        assert_eq!(rule.provenance, Provenance::InstanceDeny);
+        assert_eq!(rule.operation.id, "filesystem.path.write");
+        let syscall = resolve(b"gate5-balanced-v1", &[], &[], &[b"syscall.open"]).unwrap();
+        assert_eq!(
+            syscall
+                .runtime_rule(2, Some("filesystem.path.write"))
+                .unwrap()
+                .action,
+            Action::Deny(1)
+        );
+        assert!(syscall
+            .runtime_rule(999, Some("filesystem.path.write"))
+            .is_none());
+        let minimal = resolve(b"minimal-v1", &[], &[b"filesystem.path.read"], &[]).unwrap();
+        assert_eq!(
+            minimal
+                .runtime_rule(2, Some("filesystem.path.read"))
+                .unwrap()
+                .action,
+            Action::Deny(38)
+        );
+        // An explicit syscall denial wins over a family that is only not
+        // granted, so the operator's rule decides and is audited.
+        let write = resolve(b"minimal-v1", &[], &[], &[b"syscall.write"]).unwrap();
+        let rule = write.runtime_rule(1, Some("device.console.write")).unwrap();
+        assert_eq!(rule.action, Action::Deny(1));
+        assert_eq!(rule.operation.id, "syscall.write");
+    }
+
+    #[test]
+    fn syscall_semantic_operations_are_catalogued() {
+        for number in 0..512 {
+            for request in [0, 0x5413] {
+                if let Some(id) = syscall_semantic_operation(number, request) {
+                    assert!(CATALOG.iter().any(|operation| operation.id == id), "{id}");
+                }
+            }
+        }
+        assert_eq!(syscall_semantic_operation(16, 0), None);
+        assert_eq!(
+            syscall_semantic_operation(16, (1 << 32) | 0x5413),
+            Some("ioctl.tty.get_winsize")
+        );
+        assert_eq!(syscall_semantic_operation(0, 0), None);
+        // mremap, madvise, rt_sigreturn (which installs a signal mask),
+        // pidfd_send_signal, setreuid and setregid belong to the family their
+        // syscall acts on, so its denial covers them.
+        for (number, id) in [
+            (25, "memory.virtual.manage"),
+            (28, "memory.virtual.manage"),
+            (15, "signal.virtual.deliver"),
+            (424, "signal.virtual.deliver"),
+            (113, "credential.virtual.set"),
+            (114, "credential.virtual.set"),
+        ] {
+            assert_eq!(syscall_semantic_operation(number, 0), Some(id));
+        }
+    }
 
     #[test]
     fn catalog_is_unique_and_bounded() {

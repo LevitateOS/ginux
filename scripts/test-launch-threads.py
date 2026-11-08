@@ -21,7 +21,7 @@ def main():
     selected = sys.argv[3:] or scenarios
     if any(mode not in scenarios for mode in selected):
         sys.exit('unknown thread scenario')
-    template = (Path(__file__).resolve().parent.parent / 'config/instance-gate5.toml').read_text()
+    template = (Path(__file__).resolve().parent.parent / 'config/instance-configured.toml').read_text()
     with tempfile.TemporaryDirectory(prefix='ginux-threads-') as directory:
         work = Path(directory)
         root = work / 'root'

@@ -710,7 +710,7 @@ impl InstanceConfig {
                 return Err(ConfigError::InvalidContract);
             }
         } else if self.contract_recipe_version != 1
-            || self.contract_catalog_version != ginux_contract::CATALOG_VERSION as u64
+            || !matches!(self.contract_catalog_version, 1 | 2)
             || !self.contract_profile.is_empty()
             || !self.contract_templates.as_slice().is_empty()
             || !self.contract_allow.as_slice().is_empty()
@@ -902,18 +902,21 @@ impl InstanceConfig {
             let (deny, deny_len) = text_list_refs(&self.contract_recipe_deny);
             let (exact_allow, exact_allow_len) = text_list_refs(&self.contract_exact_allow);
             let (exact_deny, exact_deny_len) = text_list_refs(&self.contract_exact_deny);
-            return ginux_contract::resolve_recipe(ginux_contract::Recipe {
-                read: &read[..read_len],
-                write: &write[..write_len],
-                execute: &execute[..execute_len],
-                connect: &connect[..connect_len],
-                listen: &listen[..listen_len],
-                process: &process[..process_len],
-                system: &system[..system_len],
-                deny: &deny[..deny_len],
-                exact_allow: &exact_allow[..exact_allow_len],
-                exact_deny: &exact_deny[..exact_deny_len],
-            })
+            return ginux_contract::resolve_recipe_catalog(
+                self.contract_catalog_version as u32,
+                ginux_contract::Recipe {
+                    read: &read[..read_len],
+                    write: &write[..write_len],
+                    execute: &execute[..execute_len],
+                    connect: &connect[..connect_len],
+                    listen: &listen[..listen_len],
+                    process: &process[..process_len],
+                    system: &system[..system_len],
+                    deny: &deny[..deny_len],
+                    exact_allow: &exact_allow[..exact_allow_len],
+                    exact_deny: &exact_deny[..exact_deny_len],
+                },
+            )
             .map_err(|_| ConfigError::InvalidContract);
         }
         let mut templates = [&[][..]; ASSIGNMENT_ITEMS];
@@ -2077,6 +2080,21 @@ mode = "stderr"
 [failure]
 policy = "stop"
 "#;
+
+    #[test]
+    fn configured_catalog_is_explicit_and_round_trips() {
+        let text = VALID.replace("minimal-v1", "configured-balanced-v2");
+        let config = InstanceConfig::parse(text.as_bytes()).unwrap();
+        assert_eq!(config.effective_contract().unwrap().catalog_version(), 2);
+        let normalized = config.normalized().unwrap();
+        assert_eq!(
+            InstanceConfig::parse(normalized.as_bytes()).unwrap(),
+            config
+        );
+        let original = InstanceConfig::parse(VALID.as_bytes()).unwrap();
+        assert_eq!(original.effective_contract().unwrap().catalog_version(), 1);
+        assert_ne!(original.contract_digest, config.contract_digest);
+    }
 
     #[test]
     fn storage_bounds_are_explicit_and_round_trip() {

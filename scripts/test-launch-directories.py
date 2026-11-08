@@ -13,7 +13,7 @@ def main():
     if len(sys.argv)<3 or os.geteuid()!=0:
         sys.exit('usage (as root): test-launch-directories.py <ginux> <directory-fixture> [scenario ...]')
     binary,fixture=[str(Path(p).resolve()) for p in sys.argv[1:3]]
-    template=(Path(__file__).resolve().parent.parent/'config/instance-gate5.toml').read_text()
+    template=(Path(__file__).resolve().parent.parent/'config/instance-configured.toml').read_text()
     with tempfile.TemporaryDirectory(prefix='ginux-directories-') as directory:
         work=Path(directory)
         root=work/'root'

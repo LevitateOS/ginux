@@ -5,6 +5,12 @@ same TOML file as its image, resources, devices, and networking. Runtime
 enforcement receives only the compiled operation table and deterministic
 digest; it never interprets globs while managed code is running.
 
+Configured launch also supports an explicit catalog 2 containing its additional
+implemented syscall forms. Select `[contract] profile = "configured-balanced-v2"`
+or `catalog = 2` in a self-contained contract. Catalog 1 and its wildcard
+expansions remain unchanged. See the README's configured-launch section for
+the operation list, enforcement order, audit behavior and backend limitations.
+
 ```toml
 [userspace.contract]
 version = 1

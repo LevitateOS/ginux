@@ -1,0 +1,36 @@
+schema_version = 1
+
+[instance]
+id = "gate5-demo"
+root = "docker.io/rockylinux/rockylinux@sha256:e372170ca8630f0f03e9b70fdd0bf4a3ce3426b0de7cdba615f06337389de176"
+init = "/bin/bash"
+args = []
+environment = ["container=ginux"]
+
+[resources]
+# Maximum eligible logical CPUs within the operator affinity mask.
+vcpus = 1
+# Per-process virtual address-space bound, not aggregate RSS.
+memory_mib = 256
+
+[execution]
+profile = "balanced"
+backend = "ptrace-native"
+
+[contract]
+profile = "configured-balanced-v2"
+
+[storage]
+assignments = []
+
+[devices]
+assignments = []
+
+[network]
+backend = "none"
+
+[audit]
+mode = "stderr"
+
+[failure]
+policy = "stop"
