@@ -410,6 +410,8 @@ pub fn launch_main(
     restore_path: *const u8,
 ) -> ! {
     stage_result_path(result_path);
+    close_undeclared_inherited_descriptors(control_fd)
+        .unwrap_or_else(|reason| launch_startup_fail(reason));
     crate::storage_export::prepare(export_path)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     crate::checkpoint_control::prepare(control_fd)
@@ -524,6 +526,33 @@ pub fn launch_main(
         descriptors,
         &contract,
     )
+}
+
+/// Only the coordinator channel is an inherited supervisor resource. Drop all
+/// other nonstandard descriptors before reserving bounded private backing FDs.
+/// The result descriptor was opened here and must survive startup failures.
+fn close_undeclared_inherited_descriptors(control: Option<usize>) -> Result<(), &'static [u8]> {
+    let control = match control {
+        Some(fd) if fd <= i32::MAX as usize => Some(fd as u32),
+        Some(_) => return Err(b"control fd exceeds host descriptor range"),
+        None => None,
+    };
+    let mut retained = [control, u32::try_from(unsafe { RESULT_FD }).ok()];
+    retained.sort_unstable();
+    let mut first = 3u32;
+    for fd in retained.into_iter().flatten() {
+        if fd < first {
+            continue;
+        }
+        if first < fd && unsafe { syscall3(436, first as usize, fd as usize - 1, 0) } < 0 {
+            return Err(b"inherited supervisor descriptor cleanup failed");
+        }
+        first = fd + 1;
+    }
+    if unsafe { syscall3(436, first as usize, u32::MAX as usize, 0) } < 0 {
+        return Err(b"inherited supervisor descriptor cleanup failed");
+    }
+    Ok(())
 }
 
 fn launch_validate(config: &InstanceConfig) {

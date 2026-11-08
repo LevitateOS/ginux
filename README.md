@@ -284,6 +284,13 @@ Ginux is available under the Apache License 2.0. See [`LICENSE`](LICENSE) and
 
 ## Configured native launch
 
+The configured supervisor retains only standard streams and an explicitly
+supplied coordinator control socket from its caller. Other inherited FDs are
+closed before private storage reservation. Its own result/export descriptors
+remain private. The workload's public descriptor capacity is captured from the
+original soft limit and is never enlarged by the supervisor's private reserve.
+
+
 On x86-64 Linux, `ginux launch <config> <root> [--result-file <fresh host path>]`
 executes `[instance].init` with the configured arguments and environment inside
 the supplied host root directory. The bootstrap requires chroot and credential
