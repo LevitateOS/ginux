@@ -627,9 +627,22 @@ descriptors are ignored; closed descriptors report POLLNVAL. Image files remain
 unsupported for this operation. Error/hangup bits are reported independently of
 the requested mask. Zero through 300000 ms and negative infinite waits are
 supported. Queries park and wake on object progress; finite/console waits also
-use a 1 ms supervisor tick. Internal monotonic time does not enable guest clocks.
+use a 1 ms supervisor tick.
 General nonfatal signal interruption/restart remains unfinished. The shared
 native syscall contract is unchanged; this is configured-launch readiness.
+
+Configured launch permits `clock_gettime` and `clock_getres` for host
+`CLOCK_REALTIME` and `CLOCK_MONOTONIC` only. These are global host clocks,
+not virtual instance time; CPU clocks and dynamic/fd clocks return EPERM.
+`nanosleep` and `clock_nanosleep` accept relative waits and absolute deadlines
+on those two clocks, at most 300 seconds into the future. Requests are copied
+once. Scalar kernel poll waits of at most 100 ms preserve peer progress and
+recheck absolute realtime deadlines. Millisecond rounding can delay completion.
+Relative waits use monotonic time; interrupted waits return EINTR even with
+SA_RESTART, with remaining time for relative requests only. A realtime clock
+adjustment cannot extend a request beyond 300 seconds of monotonic time;
+that limit returns ETIMEDOUT. Invalid times or unsupported flags return EINVAL.
+This does not change native execution's clock policy or virtualize vDSO time.
 
 Configured local `AF_UNIX` / `SOCK_SEQPACKET` pairs consume two channel buffers
 and support duplex messages up to4096 bytes, aliases, nonblocking IO and poll.
@@ -689,8 +702,8 @@ Owned inode access and modification timestamps can be set explicitly through
 `utimensat` and descriptor `futimens`, including no-follow, nanoseconds and
 `UTIME_OMIT`/`UTIME_NOW`. Aliases share times; stat/statx return them. New owned objects
 and VFS index metadata start at zero; reads/writes do not update times automatically.
-`UTIME_NOW` uses the supervisor's native realtime clock, without allowing new
-workload clock syscalls. These operations require existing owned objects.
+`UTIME_NOW` uses the supervisor's native realtime clock.
+These operations require existing owned objects.
 Archives retain only whole-second nonnegative USTAR mtime. Access time and runtime
 nanoseconds are not persisted; unrepresentable mtimes fail export explicitly.
 

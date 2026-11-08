@@ -14,6 +14,7 @@ use ginux_instance::{AuditMode, HookFailurePolicy};
 
 mod channel_hooks;
 mod checkpoint_control;
+mod clock_hooks;
 mod descriptors;
 mod device_hooks;
 mod dispatch;

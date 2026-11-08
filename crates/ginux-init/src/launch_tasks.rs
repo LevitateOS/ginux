@@ -88,6 +88,7 @@ struct Task {
     mapping: Option<crate::file_mapping::MappingCall>,
     path_rewrite: Option<crate::path_hooks::Rewrite>,
     waiter: Option<usize>,
+    sleep: Option<crate::clock_hooks::Sleep>,
 }
 
 struct DescriptorGroup {
@@ -330,6 +331,7 @@ pub fn supervise(
         mapping: None,
         path_rewrite: None,
         waiter: None,
+        sleep: None,
     });
     if ptrace(PTRACE_SETOPTIONS, root, 0, OPTIONS) < 0 {
         s.fail(instance, b"launch ptrace setup failed");
@@ -470,6 +472,19 @@ pub fn supervise(
         }
         let signal = ((status >> 8) & 255) as usize;
         if signal != 133 {
+            // A signal can arrive between two bounded sleep quanta, before
+            // the replay enters the kernel. Complete the original syscall
+            // before allowing the guest's handler to issue its own calls.
+            if let Some(sleep) = s.task_mut(index).sleep.take() {
+                let mut registers = s.registers(index, instance);
+                registers.rax = (-4i64) as u64;
+                if let Err(result) = sleep.finish(host, &mut registers) {
+                    sleep.restore(&mut registers, result);
+                }
+                if ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize) < 0 {
+                    s.fail(instance, b"sleep interruption register update failed");
+                }
+            }
             if s.task(index).mapping.is_some()
                 || s.task(index).exec.is_some_and(|e| {
                     matches!(
@@ -779,6 +794,13 @@ impl Supervisor<'_> {
         self.run(index, r, instance);
     }
     fn entry(&mut self, index: usize, r: &mut UserRegs, instance: &mut Instance) {
+        if let Some(sleep) = self.task(index).sleep {
+            match sleep.enter(r) {
+                Ok(()) => self.run(index, r, instance),
+                Err(_) => self.fail(instance, b"sleep clock failed"),
+            }
+            return;
+        }
         self.objects
             .filesystem
             .select_process(self.processes.view(self.task(index).id).unwrap().tgid);
@@ -863,6 +885,24 @@ impl Supervisor<'_> {
         {
             self.task_mut(index).blocked = Some(original);
             audit_write(b"park surface=descriptor-snapshot\n");
+            return;
+        }
+        if let Some(result) = crate::clock_hooks::read(self.task(index).host, r) {
+            self.emulate(index, r, result, instance);
+            return;
+        }
+        if matches!(r.orig_rax, 35 | 230) {
+            match crate::clock_hooks::Sleep::begin(self.task(index).host, r) {
+                Ok(sleep) => {
+                    if sleep.enter(r).is_err() {
+                        self.fail(instance, b"sleep clock failed");
+                    }
+                    self.task_mut(index).sleep = Some(sleep);
+                    audit_write(b"mediate surface=configured-global-clock-sleep\n");
+                    self.run(index, r, instance);
+                }
+                Err(result) => self.emulate(index, r, result, instance),
+            }
             return;
         }
         if r.orig_rax == ginux_core::SYS_UNAME {
@@ -1360,6 +1400,7 @@ impl Supervisor<'_> {
                     pending: Pending::None,
                     override_result: None,
                     blocked: None,
+                    sleep: None,
                     sequence: 0,
                     exec: None,
                     mapping: None,
@@ -1894,6 +1935,17 @@ impl Supervisor<'_> {
         self.resume(parent, 0, instance);
     }
     fn syscall_exit(&mut self, index: usize, r: &mut UserRegs, instance: &mut Instance) {
+        if let Some(sleep) = self.task(index).sleep {
+            match sleep.finish(self.task(index).host, r) {
+                Ok(true) => {
+                    self.run(index, r, instance);
+                    return;
+                }
+                Ok(false) => {}
+                Err(result) => sleep.restore(r, result),
+            }
+            self.task_mut(index).sleep = None;
+        }
         if let Some(mut mapping) = self.task_mut(index).mapping.take() {
             match mapping.exit(self.task(index).host, r) {
                 Ok(crate::file_mapping::Progress::Run(next)) => {

@@ -23,6 +23,63 @@ static void child_handler(int signal, const int *info, void *context) {
     child_signal=(signal==17 && info[4]==2 && info[5]==0 && info[6]==37 && DO(39,0,0,0)==1)?1:-1;
 }
 struct flock {short kind,whence;int padding;long start,len;int pid,padding2;};
+struct clock_time { long seconds, nanos; };
+static volatile int clock_signal;
+static void clock_handler(int signal, const int *info, void *context) {
+    (void)info;(void)context;
+    struct clock_time t;
+    if(signal==17 && DO(228,1,&t,0)==0) ++clock_signal;
+}
+static unsigned long clock_ns(struct clock_time t) {
+    return (unsigned long)t.seconds*1000000000UL+t.nanos;
+}
+static long configured_clocks(void) {
+    struct clock_time start, end, request={0,120000000}, remaining={-1,-1};
+    CHECK(DO(228,0,&start,0)==0 && start.seconds>0,241);
+    CHECK(DO(228,1,&start,0)==0 && DO(229,1,&end,0)==0,242);
+    CHECK(DO(229,0,0,0)==0 && DO(228,1,0,0)==-14,243);
+    long denied[]={2,3,4,5,6,7,-1,-5,-29};
+    for(unsigned i=0;i<sizeof denied/sizeof denied[0];++i) {
+        CHECK(DO(228,denied[i],&end,0)==-1 && DO(229,denied[i],0,0)==-1,244);
+        CHECK(call(230,denied[i],0,(word)&request,0,0,0)==-1,245);
+    }
+    CHECK(DO(228,0x100000001UL,&end,0)==0,246);
+    CHECK(DO(35,&request,&remaining,0)==0 && remaining.seconds==-1,247);
+    CHECK(DO(228,1,&end,0)==0 && clock_ns(end)-clock_ns(start)>=120000000UL,248);
+    for(word clock=0;clock<=1;++clock) {
+        CHECK(call(230,clock,0,(word)&request,0,0,0)==0,249);
+        CHECK(DO(228,clock,&end,0)==0,250);
+        end.nanos+=120000000;if(end.nanos>=1000000000){++end.seconds;end.nanos-=1000000000;}
+        CHECK(call(230,clock,1,(word)&end,1,0,0)==0,251);
+        CHECK(DO(228,clock,&start,0)==0 && clock_ns(start)>=clock_ns(end),252);
+    }
+    request.seconds=0;request.nanos=0;
+    CHECK(call(230,0,1,(word)&request,1,0,0)==0,253);
+    request.seconds=-1;CHECK(DO(35,&request,0,0)==-22,254);
+    request.seconds=0;request.nanos=1000000000;CHECK(DO(35,&request,0,0)==-22,255);
+    request.seconds=301;request.nanos=0;CHECK(DO(35,&request,0,0)==-22,256);
+    CHECK(DO(35,1,0,0)==-14 && call(230,1,2,(word)&request,0,0,0)==-22,257);
+    word handler[4]={(word)clock_handler,0x14000004,(word)signal_return,0};
+    CHECK(call(13,17,(word)handler,0,8,0,0)==0,258);
+    for(int kind=0;kind<3;++kind) {
+        long child=DO(57,0,0,0);CHECK(child>=0,259);
+        if(child==0) {
+            struct clock_time brief={0,150000000};
+            if(DO(35,&brief,0,0)!=0) DO(60,38,0,0);
+            DO(60,37,0,0);return 260;
+        }
+        request.seconds=2;request.nanos=0;remaining.seconds=-1;remaining.nanos=-1;
+        if(kind==2) {CHECK(DO(228,0,&request,0)==0,265);request.seconds+=2;}
+        long result=kind==0 ? DO(35,&request,&remaining,0) :
+            call(230,kind==1?1:0,kind==2,(word)&request,(word)&remaining,0,0);
+        CHECK(result==-4 && clock_signal==kind+1,261);
+        if(kind==2) {CHECK(remaining.seconds==-1 && remaining.nanos==-1,266);}
+        else {CHECK(remaining.seconds>=0 && clock_ns(remaining)>0 && clock_ns(remaining)<2000000000UL,262);}
+        int status=-1;CHECK(DO(61,child,&status,0)==child && status==(37<<8),263);
+    }
+    CHECK(DO(1,1,"owned-tasks: PASS\n",18)==18,264);
+    return 0;
+}
 static long lock_exec(void) {
     long fd=DO(2,"/work/exec-lock",0102,0600); CHECK(fd==3 && DO(32,fd,0,0)==4 && DO(72,4,2,1)==0,151);
     int ready[2], go[2]; CHECK(DO(22,ready,0,0)==0 && ready[1]==6 && DO(22,go,0,0)==0 && go[0]==7,152);
@@ -110,6 +167,7 @@ long task_main(word *stack)
     word argc=*stack;
     char **argv=(char **)(stack+1);
     char mode=argc>1 ? argv[1][0] : 'f';
+    if(mode=='Z') return configured_clocks();
     if(mode=='U') {
         long result=ordinary_umask(argc>1 && argv[1][5]=='E');if(result)return result;
         if(argv[1][5]!='E') { DO(1,1,"owned-tasks: PASS\n",18); }
