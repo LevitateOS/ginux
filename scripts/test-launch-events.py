@@ -26,7 +26,7 @@ def main():
         (root / "bin/fixture").chmod(0o755)
         template = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
         template = template.replace('assignments = []', 'assignments = ["memory:/work"]', 1)
-        for mode in ("basic", "level", "edge", "oneshot", "aliases", "pipes", "fork", "read", "write", "time", "capacity", "keep-exec", "deny", "network", "v-limit", "g-copy"):
+        for mode in ("basic", "level", "edge", "oneshot", "aliases", "pipes", "fork", "read", "write", "time", "capacity", "keep-exec", "deny", "network", "v-limit", "g-copy", "z-combined"):
             with socket.socket() as server:
                 server.bind(("127.0.0.1", 0))
                 server.listen()
@@ -45,8 +45,10 @@ def main():
                         errors.append(repr(error))
                 thread = None
                 text = template.replace('args = []', 'args = ' + json.dumps([mode, str(port)]))
+                if mode in ("network", "z-combined"):
+                    connections = 16 if mode == "z-combined" else 1
+                    text = text.replace('backend = "none"', f'backend = "mediated"\nendpoints = ["127.0.0.1:{port}"]\nmax_connections = {connections}\nmax_bytes = 1024')
                 if mode == "network":
-                    text = text.replace('backend = "none"', f'backend = "mediated"\nendpoints = ["127.0.0.1:{port}"]\nmax_connections = 1\nmax_bytes = 1024')
                     thread = threading.Thread(target=peer, daemon=True)
                     thread.start()
                 if mode == "deny":

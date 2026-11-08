@@ -122,14 +122,14 @@ long event_main(word *stack) {
         CHECK(call(281,ep,(word)events,1,0,1,8)==-14,77);
         CHECK(DO(219,0,0,0)==-38,78);
     } else if(mode=='c') {
-        int aliases[17]; aliases[0]=counter;
-        for(int i=1;i<17;++i) { aliases[i]=DO(32,counter,0,0); CHECK(aliases[i]>=3,79); }
-        for(int i=0;i<16;++i) CHECK(ctl(ep,1,aliases[i],1,i+1)==0,80);
-        CHECK(ctl(ep,1,aliases[16],1,17)==-28,81);
+        int aliases[33]; aliases[0]=counter;
+        for(int i=1;i<33;++i) { aliases[i]=DO(32,counter,0,0); CHECK(aliases[i]>=3,79); }
+        for(int i=0;i<32;++i) CHECK(ctl(ep,1,aliases[i],1,i+1)==0,80);
+        CHECK(ctl(ep,1,aliases[32],1,33)==-28,81);
         value=1; CHECK(DO(1,counter,&value,8)==8,82);
         word seen=0;
-        for(int i=0;i<16;++i) { CHECK(wait_event(ep,1,0)==1,83); seen|=1UL<<events[0].data; }
-        CHECK(seen==0x1fffe,84);
+        for(int i=0;i<32;++i) { CHECK(wait_event(ep,1,0)==1,83); seen|=1UL<<events[0].data; }
+        CHECK(seen==0x1fffffffeUL,84);
         CHECK(DO(3,ep,0,0)==0,85);
         for(int i=1;i<16;++i) CHECK(DO(290,0,0,0)>=3,86);
         CHECK(DO(290,0,0,0)==-24,87);
@@ -152,6 +152,19 @@ long event_main(word *stack) {
         CHECK(DO(33,counter,50,0)==50 && DO(292,counter,51,02000000)==51,89);
         char *args[]={"/bin/fixture","x",0};
         CHECK(DO(59,args[0],args,0)==0,90); return 91;
+    } else if(mode=='z') {
+        CHECK(ctl(ep,1,counter,1,1)==0,117);
+        value=1; CHECK(DO(1,counter,&value,8)==8,118);
+        for(int i=0;i<14;++i) {
+            int next=DO(290,1,04000,0); CHECK(next>=3 && ctl(ep,1,next,1,i+2)==0,119);
+        }
+        for(int i=0;i<16;++i) {
+            int next=DO(41,2,1,0); CHECK(next>=3 && ctl(ep,1,next,4,i+16)==0,120);
+        }
+        CHECK(DO(41,2,1,0)==-24,121); // Existing TCP allocation cap still applies.
+        CHECK(wait_event(ep,32,0)==31,122);
+        word seen=0; for(int i=0;i<31;++i) seen|=1UL<<events[i].data;
+        CHECK(seen==0xfffffffeUL,123);
     } else if(mode=='n') {
         unsigned port=0; for(char *p=argv[2];*p;++p) port=port*10+*p-'0';
         unsigned char addr[16]={2,0,port>>8,port,127,0,0,1};

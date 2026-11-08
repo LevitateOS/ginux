@@ -42,7 +42,8 @@ or complete memory-map ABI.
 Configured launch implements `eventfd2`, `epoll_create1`, `epoll_ctl`,
 `epoll_wait` and bounded `epoll_pwait` through the public descriptor table.
 Counters and epoll instances share the existing 16-object channel pool with
-pipes and packet channels. Each epoll instance has at most 16 registrations;
+pipes and packet channels. Each epoll instance has at most 32 registrations,
+covering the existing 16 TCP sockets and 16 channel objects together;
 the existing public descriptor limit (including a lower operator limit) applies.
 No host eventfd or epoll descriptor is created or exposed. Counters support
 8-byte scalar transfers, semaphore/nonblocking modes, overflow backpressure,
@@ -60,7 +61,7 @@ are always reported; RDHUP observes actual TCP peer write-half closure and is
 not synthesized from pipe HUP. Events carry the caller's snapshotted 64-bit data.
 
 Waits support zero, finite timeouts up to 300000 ms and negative infinite waits.
-`maxevents` is output capacity and may exceed the 16 registrations. A parked
+`maxevents` is output capacity and may exceed the 32 registrations. A parked
 wait pins its epoll object; copyout failure does not consume pending delivery.
 `epoll_pwait` accepts a null signal-mask pointer or an 8-byte kernel mask equal
 to the calling task's current mask (ignoring unmaskable KILL/STOP bits). Other
