@@ -794,6 +794,7 @@ impl Supervisor<'_> {
         r.orig_rax = u64::MAX;
         audit_write(b"emulate result=");
         audit_i64(result);
+        self.objects.devices.network.audit_attempt();
         audit_write(b"\n");
         self.run(index, r, instance);
     }
@@ -1522,12 +1523,16 @@ impl Supervisor<'_> {
         match decision {
             NativeDecision::ParkPoll => {
                 self.task_mut(index).blocked = Some(original);
-                audit_write(b"park surface=owned-poll\n");
+                audit_write(b"park surface=owned-poll");
+                self.objects.devices.network.audit_attempt();
+                audit_write(b"\n");
             }
             NativeDecision::Park { fd, progressed } => {
                 self.wake_needed |= progressed;
                 self.task_mut(index).blocked = Some(original);
-                audit_write(b"park\nginux: park surface=lane-channel fd=");
+                audit_write(b"park");
+                self.objects.devices.network.audit_attempt();
+                audit_write(b"\nginux: park surface=lane-channel fd=");
                 audit_u64(fd as u64);
                 audit_write(b"\n");
             }
@@ -2543,6 +2548,7 @@ impl Supervisor<'_> {
                 crate::storage_export::cancel()
             }
         });
+        self.objects.devices.network.audit_summary();
         self.objects.filesystem.teardown();
         if let Err(reason) = exported {
             supervision_error(instance, reason);

@@ -100,6 +100,19 @@ detail remains bounded to 8,192 records with logarithmic dropped-event
 reporting. The generated catalog inventory is
 [`abi-contract-coverage.md`](abi-contract-coverage.md).
 
+Configured launch additionally records `network-endpoint` and `egress` on
+connect attempts, using the address decoded by the network owner. On teardown,
+`ginux: network-summary version=1 endpoints=N` is followed by at most eight
+numeric endpoint records with `attempted` and `connected` booleans. The summary
+has a fixed size bound and remains available after the configured syscall audit
+reaches its 64 KiB cap. `attempted` records use of an eligible endpoint, including
+a failed backend connection; `connected` requires observed handshake completion.
+A missing summary (for example after supervisor termination) is unknown usage,
+not evidence that a grant was unused. Disabled audit emits neither summary nor
+endpoint detail. This changes configured diagnostics only, not contract authority
+or native policy. `instance-validate` advertises `configured-network-audit=1`
+so consumers can reject a runtime that lacks these diagnostics before launch.
+
 ## Filesystem and elevation constraints
 
 The same instance recipe can impose final workload constraints that are more

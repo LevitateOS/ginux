@@ -19,6 +19,7 @@ struct Socket {
     nodelay: bool,
     read_timeout: u64,
     write_timeout: u64,
+    endpoint: Option<TcpEndpoint>,
 }
 struct Receive {
     bytes: [u8; IO],
@@ -38,14 +39,27 @@ pub enum Result {
     Ready(i64),
     Blocked,
 }
+#[derive(Clone, Copy)]
+struct Usage {
+    endpoint: Option<TcpEndpoint>,
+    attempted: bool,
+    connected: bool,
+}
 pub struct LaunchNetwork {
     network: Option<BoundedTcp<LinuxTcpBackend, 8, FDS>>,
     sockets: [Option<Socket>; FDS],
     received: [Receive; FDS],
+    usage: [Usage; 8],
+    last_attempt: Option<(TcpEndpoint, &'static str)>,
 }
 impl LaunchNetwork {
     pub fn prepare(config: &InstanceConfig) -> core::result::Result<Self, &'static [u8]> {
         let mut network = None;
+        let mut usage = [Usage {
+            endpoint: None,
+            attempted: false,
+            connected: false,
+        }; 8];
         if config.network_backend == NetworkBackend::Mediated {
             let mut endpoints = [TcpEndpoint {
                 family: TcpFamily::Ipv4,
@@ -61,6 +75,7 @@ impl LaunchNetwork {
                     core::net::SocketAddr::V6(v6) => TcpEndpoint::ipv6(v6.ip().octets(), v6.port()),
                 }
                 .map_err(|_| b"invalid TCP endpoint".as_slice())?;
+                usage[index].endpoint = Some(endpoints[index]);
             }
             network = Some(
                 BoundedTcp::new(
@@ -76,8 +91,53 @@ impl LaunchNetwork {
             network,
             sockets: [None; FDS],
             received: [const { Receive::new() }; FDS],
+            usage,
+            last_attempt: None,
         })
     }
+    /// Append the endpoint actually decoded by the network owner to this call's
+    /// existing audit record. No second read of mutable tracee memory is used.
+    pub fn audit_attempt(&mut self) {
+        if let Some((endpoint, outcome)) = self.last_attempt.take() {
+            use core::fmt::Write;
+            let _ = write!(
+                NetworkAudit(false),
+                " network-endpoint={} egress={}",
+                socket_address(endpoint),
+                outcome
+            );
+        }
+    }
+
+    /// At most eight fixed-size records, independent of the syscall audit cap.
+    /// This lets a consumer distinguish an unused grant from a truncated trace.
+    pub fn audit_summary(&self) {
+        if !crate::launch::audit_enabled() {
+            return;
+        }
+        use core::fmt::Write;
+        let count = self
+            .usage
+            .iter()
+            .filter(|usage| usage.endpoint.is_some())
+            .count();
+        let _ = writeln!(
+            NetworkAudit(true),
+            "ginux: network-summary version=1 endpoints={count}"
+        );
+        for usage in &self.usage {
+            if let Some(endpoint) = usage.endpoint {
+                let _ = writeln!(
+                    NetworkAudit(true),
+                    "ginux: network-summary endpoint={} attempted={} connected={}",
+                    socket_address(endpoint),
+                    usage.attempted,
+                    usage.connected
+                );
+            }
+        }
+    }
+
     pub fn owns(handle: u32) -> bool {
         (FD_BASE..FD_BASE + FDS as u32).contains(&handle)
     }
@@ -136,6 +196,11 @@ impl LaunchNetwork {
             return Err(-(error as i64));
         }
         state.connected = true;
+        for usage in &mut self.usage {
+            if usage.endpoint.is_some() && usage.endpoint == state.endpoint {
+                usage.connected = true;
+            }
+        }
         Ok(true)
     }
     pub fn claim(&mut self, pid: usize, signal_tgid: usize, r: &UserRegs) -> Option<Result> {
@@ -218,6 +283,7 @@ impl LaunchNetwork {
             nodelay: false,
             read_timeout: 0,
             write_timeout: 0,
+            endpoint: None,
         });
         self.received[slot as usize] = Receive::new();
         Ok((FD_BASE + slot) as i64)
@@ -252,7 +318,22 @@ impl LaunchNetwork {
                 if !state.connecting {
                     let endpoint = read_endpoint(pid, r.rsi, r.rdx)?;
                     let net = self.network.as_mut().ok_or(-9)?;
-                    net.connect(handle, endpoint).map_err(errno)?;
+                    for usage in &mut self.usage {
+                        if usage.endpoint == Some(endpoint) {
+                            usage.attempted = true;
+                        }
+                    }
+                    let outcome = net.connect(handle, endpoint);
+                    self.last_attempt = Some((
+                        endpoint,
+                        match outcome {
+                            Ok(()) => "accepted",
+                            Err(NetworkError::PermissionDenied) => "denied",
+                            Err(_) => "error",
+                        },
+                    ));
+                    outcome.map_err(errno)?;
+                    self.sockets[slot].as_mut().unwrap().endpoint = Some(endpoint);
                     self.sockets[slot].as_mut().unwrap().connecting = true;
                     if state.nodelay {
                         net.set_nodelay(handle, true).map_err(errno)?;
@@ -543,4 +624,29 @@ fn errno(error: NetworkError) -> i64 {
         NetworkError::Backend(n) => -(n as i64),
         NetworkError::InvalidEndpoint => -22,
     }
+}
+
+struct NetworkAudit(bool);
+impl core::fmt::Write for NetworkAudit {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        if self.0 {
+            crate::launch::write_stderr(value.as_bytes());
+        } else {
+            crate::launch::audit_write(value.as_bytes());
+        }
+        Ok(())
+    }
+}
+fn socket_address(endpoint: TcpEndpoint) -> core::net::SocketAddr {
+    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    let address = match endpoint.family {
+        TcpFamily::Ipv4 => IpAddr::V4(Ipv4Addr::new(
+            endpoint.address[0],
+            endpoint.address[1],
+            endpoint.address[2],
+            endpoint.address[3],
+        )),
+        TcpFamily::Ipv6 => IpAddr::V6(Ipv6Addr::from(endpoint.address)),
+    };
+    SocketAddr::new(address, endpoint.port)
 }

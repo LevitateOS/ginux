@@ -844,6 +844,10 @@ pub fn launch_usage() -> ! {
     exit_process(2)
 }
 
+pub(crate) fn audit_enabled() -> bool {
+    unsafe { !AUDIT_DISABLED }
+}
+
 pub(crate) fn audit_write(bytes: &[u8]) {
     let record = unsafe {
         if AUDIT_DISABLED || AUDIT_CAPPED {
@@ -1277,7 +1281,7 @@ fn launch_startup_fail(reason: &[u8]) -> ! {
     exit_process(2)
 }
 
-fn write_stderr(bytes: &[u8]) {
+pub(crate) fn write_stderr(bytes: &[u8]) {
     let mut offset = 0;
     while offset < bytes.len() {
         let result = unsafe {
