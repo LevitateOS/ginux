@@ -579,6 +579,11 @@ pub trait TcpBackend {
     fn read(&mut self, handle: Self::Handle, output: &mut [u8]) -> Result<usize, NetworkError>;
     fn write(&mut self, handle: Self::Handle, input: &[u8]) -> Result<usize, NetworkError>;
     fn readiness(&mut self, handle: Self::Handle) -> Result<TcpReadiness, NetworkError>;
+    /// Optional peer write-half closure, separate from a full socket hangup.
+    /// Backends without this observation retain their existing readiness API.
+    fn read_half_closed(&mut self, _handle: Self::Handle) -> Result<bool, NetworkError> {
+        Err(NetworkError::Backend(95))
+    }
     fn socket_error(&mut self, handle: Self::Handle) -> Result<i32, NetworkError>;
     fn endpoint(&mut self, handle: Self::Handle, peer: bool) -> Result<TcpEndpoint, NetworkError>;
     fn set_nodelay(&mut self, handle: Self::Handle, enabled: bool) -> Result<(), NetworkError>;
@@ -707,6 +712,11 @@ impl<B: TcpBackend, const ENDPOINTS: usize, const SOCKETS: usize>
     pub fn readiness(&mut self, socket: u32) -> Result<TcpReadiness, NetworkError> {
         let handle = self.handle(socket)?;
         self.backend.readiness(handle)
+    }
+
+    pub fn read_half_closed(&mut self, socket: u32) -> Result<bool, NetworkError> {
+        let handle = self.handle(socket)?;
+        self.backend.read_half_closed(handle)
     }
 
     pub fn socket_error(&mut self, socket: u32) -> Result<i32, NetworkError> {
@@ -905,6 +915,25 @@ impl TcpBackend for LinuxTcpBackend {
             hangup: fd.revents & 0x10 != 0,
             error: fd.revents & 8 != 0,
         })
+    }
+
+    fn read_half_closed(&mut self, handle: Self::Handle) -> Result<bool, NetworkError> {
+        #[repr(C)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+        let mut fd = PollFd {
+            fd: handle.0,
+            events: 0x2000,
+            revents: 0,
+        };
+        Self::result(unsafe { Self::call(7, [&mut fd as *mut PollFd as usize, 1, 0, 0, 0, 0]) })?;
+        if fd.revents & 0x20 != 0 {
+            return Err(NetworkError::InvalidDescriptor);
+        }
+        Ok(fd.revents & 0x2000 != 0)
     }
 
     fn socket_error(&mut self, handle: Self::Handle) -> Result<i32, NetworkError> {

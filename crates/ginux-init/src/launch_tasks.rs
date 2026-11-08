@@ -1152,7 +1152,7 @@ impl Supervisor<'_> {
                     if let Some(name) = self.table(index).self_fd_path(
                         host,
                         path.as_bytes(),
-                        &self.objects.filesystem,
+                        self.objects.filesystem,
                     ) {
                         let result = name
                             .and_then(|name| {
@@ -2287,6 +2287,13 @@ impl Supervisor<'_> {
         self.retire_threads();
         if let Some(result) = self.task_mut(index).override_result.take() {
             r.rax = result as u64;
+        }
+        // A supervisor stop can interrupt an admitted timed futex with the
+        // kernel's internal ERESTART_RESTARTBLOCK. Do not let it become an
+        // ungranted restart_syscall: expose EINTR and let userspace retry the
+        // original operation through its normal contract checks.
+        if r.orig_rax == ginux_core::SYS_FUTEX && r.rax as i64 == -516 {
+            r.rax = (-4i64) as u64;
         }
         if let Some(original) = self.task_mut(index).image_chdir.take() {
             r.rdi = original;

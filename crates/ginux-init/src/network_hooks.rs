@@ -174,6 +174,19 @@ impl LaunchNetwork {
             Err(_) => 8,
         })
     }
+    pub fn read_half_closed(&mut self, handle: u32) -> bool {
+        if !Self::owns(handle) {
+            return false;
+        }
+        let slot = (handle - FD_BASE) as usize;
+        if !self.sockets[slot].is_some_and(|state| state.connected) {
+            return false;
+        }
+        self.network
+            .as_mut()
+            .is_some_and(|net| net.read_half_closed(slot as u32).unwrap_or(false))
+    }
+
     fn complete(&mut self, slot: usize) -> core::result::Result<bool, i64> {
         let state = self.sockets[slot].ok_or(-9)?;
         if state.failure != 0 {

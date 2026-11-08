@@ -18,6 +18,7 @@ pub fn claim(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> Option<i64> {
     None
 }
 
+use crate::event_hooks::Event;
 use crate::supervisor::{syscall3, UserRegs, SYS_TGKILL};
 use crate::tracee_io::{copy_memory, read_path, write_stat, Stat};
 
@@ -33,6 +34,7 @@ const APPEND: u32 = 0o2000;
 #[derive(Clone, Copy)]
 struct Pipe {
     live: bool,
+    event: Event,
     packet: bool,
     data: [u8; CAPACITY],
     head: usize,
@@ -47,6 +49,7 @@ impl Pipe {
     const fn empty() -> Self {
         Self {
             live: false,
+            event: Event::None,
             packet: false,
             data: [0; CAPACITY],
             head: 0,
@@ -70,12 +73,16 @@ struct PipeFd {
 pub struct WriteProgress {
     vectors: Option<crate::tracee_io::IoVectors>,
     written: usize,
+    event_value: Option<u64>,
+    event_nonblock: Option<bool>,
 }
 impl WriteProgress {
     pub const fn new() -> Self {
         Self {
             vectors: None,
             written: 0,
+            event_value: None,
+            event_nonblock: None,
         }
     }
 }
@@ -93,6 +100,8 @@ pub enum ChannelResult {
 pub struct LaunchChannels {
     pipes: [Pipe; PIPES],
     descriptors: [Option<PipeFd>; FDS],
+    epolls: [crate::event_hooks::Epoll; PIPES],
+    epoll_count: usize,
 }
 
 impl LaunchChannels {
@@ -100,6 +109,8 @@ impl LaunchChannels {
         Self {
             pipes: [Pipe::empty(); PIPES],
             descriptors: [None; FDS],
+            epolls: [crate::event_hooks::Epoll::new(); PIPES],
+            epoll_count: 0,
         }
     }
 
@@ -150,6 +161,12 @@ impl LaunchChannels {
             Err(error) => return Some(ChannelResult::Ready(error)),
         };
         if matches!(r.orig_rax, 0 | 1 | 19 | 20 | 44 | 45) {
+            if !matches!(self.pipes[entry.pipe].event, Event::None) {
+                return Some(
+                    self.event_io(pid, slot, entry, r, progress)
+                        .unwrap_or_else(ChannelResult::Ready),
+                );
+            }
             if matches!(r.orig_rax, 44 | 45)
                 && (entry.peer.is_none() || r.r10 & !(0x40 | 0x4000) != 0 || r.r8 != 0 || r.r9 != 0)
             {
@@ -165,7 +182,14 @@ impl LaunchChannels {
                 self.close(slot);
                 Ok(0)
             }
-            5 => Self::stat(pid, r.rsi, false, entry.pipe, entry.peer.is_some()),
+            5 => Self::stat(
+                pid,
+                r.rsi,
+                false,
+                entry.pipe,
+                entry.peer.is_some(),
+                !matches!(self.pipes[entry.pipe].event, Event::None),
+            ),
             8 | 17 | 18 => Err(-29),
             16 if r.rsi == 0x5421 => {
                 // FIONBIO changes the shared open-file status, not this
@@ -191,9 +215,16 @@ impl LaunchChannels {
             16 => Err(-25),
             72 => match r.rsi {
                 3 => Ok(self.flags(entry) as i64),
+                4 if !matches!(self.pipes[entry.pipe].event, Event::None)
+                    && r.rdx & !((NONBLOCK | 3) as u64) != 0 =>
+                {
+                    Err(-22)
+                }
                 4 if r.rdx & !((NONBLOCK | APPEND | 3) as u64) == 0 => {
                     let flags = (r.rdx as u32 & (NONBLOCK | APPEND))
-                        | if entry.peer.is_some() {
+                        | if entry.peer.is_some()
+                            || !matches!(self.pipes[entry.pipe].event, Event::None)
+                        {
                             2
                         } else {
                             u32::from(entry.write)
@@ -201,6 +232,7 @@ impl LaunchChannels {
                     self.set_flags(entry, flags);
                     Ok(0)
                 }
+                1032 if !matches!(self.pipes[entry.pipe].event, Event::None) => Err(-9),
                 1032 => Ok(CAPACITY as i64),
                 _ => Err(-95),
             },
@@ -220,6 +252,7 @@ impl LaunchChannels {
                         r.orig_rax == 332,
                         entry.pipe,
                         entry.peer.is_some(),
+                        !matches!(self.pipes[entry.pipe].event, Event::None),
                     )
                 }
             }
@@ -246,6 +279,7 @@ impl LaunchChannels {
             .ok_or(-24)?;
         let p = &mut self.pipes[pipe];
         p.live = true;
+        p.event = Event::None;
         p.packet = false;
         p.head = 0;
         p.len = 0;
@@ -298,12 +332,103 @@ impl LaunchChannels {
         self.close((handle - PIPE_FD_BASE) as usize);
     }
 
+    /// Event objects share the existing bounded pipe/object pool. They add no
+    /// host descriptor and never bypass the public descriptor allocator.
+    pub fn allocate_event(&mut self, event: Event, flags: u32) -> Result<u32, i64> {
+        let pipe = self.pipes.iter().position(|p| !p.live).ok_or(-24)?;
+        let slot = self
+            .descriptors
+            .iter()
+            .position(Option::is_none)
+            .ok_or(-24)?;
+        let object = &mut self.pipes[pipe];
+        object.live = true;
+        object.event = event;
+        object.packet = false;
+        object.head = 0;
+        object.len = 0;
+        object.readers = 1;
+        object.writers = 1;
+        object.read_flags = 2 | (flags & NONBLOCK);
+        object.write_flags = object.read_flags;
+        if matches!(event, Event::Epoll) {
+            self.epolls[pipe] = crate::event_hooks::Epoll::new();
+            self.epoll_count += 1;
+        }
+        self.descriptors[slot] = Some(PipeFd {
+            pipe,
+            write: false,
+            peer: None,
+        });
+        Ok(PIPE_FD_BASE + slot as u32)
+    }
+
+    pub fn event(&self, handle: u32) -> Option<&Event> {
+        let entry = self
+            .entry(handle.checked_sub(PIPE_FD_BASE)? as usize)
+            .ok()?;
+        Some(&self.pipes[entry.pipe].event)
+    }
+
+    pub fn epoll(&self, handle: u32) -> Option<&crate::event_hooks::Epoll> {
+        let entry = self
+            .entry(handle.checked_sub(PIPE_FD_BASE)? as usize)
+            .ok()?;
+        if !matches!(self.pipes[entry.pipe].event, Event::Epoll) {
+            return None;
+        }
+        Some(&self.epolls[entry.pipe])
+    }
+
+    pub fn epoll_mut(&mut self, handle: u32) -> Option<&mut crate::event_hooks::Epoll> {
+        let entry = self
+            .entry(handle.checked_sub(PIPE_FD_BASE)? as usize)
+            .ok()?;
+        if !matches!(self.pipes[entry.pipe].event, Event::Epoll) {
+            return None;
+        }
+        Some(&mut self.epolls[entry.pipe])
+    }
+
+    pub fn has_epolls(&self) -> bool {
+        self.epoll_count != 0
+    }
+
+    pub fn epolls(&self) -> [Option<u32>; PIPES] {
+        let mut output = [None; PIPES];
+        let mut count = 0;
+        for (slot, entry) in self.descriptors.iter().enumerate() {
+            if entry.is_some_and(|entry| matches!(self.pipes[entry.pipe].event, Event::Epoll)) {
+                output[count] = Some(PIPE_FD_BASE + slot as u32);
+                count += 1;
+            }
+        }
+        output
+    }
+
     /// Current readiness of a live owned endpoint. ERR/HUP do not depend on
     /// the requested event mask; buffered bytes and HUP may coexist.
     pub fn readiness(&self, handle: u32) -> Option<u16> {
         let slot = handle.checked_sub(PIPE_FD_BASE)? as usize;
         let entry = self.entry(slot).ok()?;
         let pipe = &self.pipes[entry.pipe];
+        match pipe.event {
+            Event::Counter { value, .. } => {
+                return Some(
+                    (if value != 0 { 0x41 } else { 0 })
+                        | (if value < u64::MAX - 1 { 0x104 } else { 0 }),
+                )
+            }
+            Event::Epoll => {
+                let epoll = &self.epolls[entry.pipe];
+                return Some(if epoll.watches.iter().flatten().any(|w| w.pending != 0) {
+                    0x41
+                } else {
+                    0
+                });
+            }
+            Event::None => {}
+        }
         if let Some(peer) = entry.peer {
             let output = &self.pipes[peer];
             return Some(
@@ -350,6 +475,19 @@ impl LaunchChannels {
 
     fn close(&mut self, slot: usize) {
         if let Some(entry) = self.descriptors[slot].take() {
+            if !matches!(self.pipes[entry.pipe].event, Event::None) {
+                if matches!(self.pipes[entry.pipe].event, Event::Epoll) {
+                    self.epoll_count -= 1;
+                }
+                let object = &mut self.pipes[entry.pipe];
+                object.live = false;
+                object.event = Event::None;
+                object.readers = 0;
+                object.writers = 0;
+                object.len = 0;
+                object.head = 0;
+                return;
+            }
             self.close_direction(entry.pipe, entry.write);
             if let Some(peer) = entry.peer {
                 self.close_direction(peer, true);
@@ -369,6 +507,78 @@ impl LaunchChannels {
             pipe.len = 0;
             pipe.head = 0;
         }
+    }
+
+    fn event_io(
+        &mut self,
+        pid: usize,
+        slot: usize,
+        entry: PipeFd,
+        r: &UserRegs,
+        progress: &mut WriteProgress,
+    ) -> Result<ChannelResult, i64> {
+        let (value, semaphore) = match self.pipes[entry.pipe].event {
+            Event::Counter { value, semaphore } => (value, semaphore),
+            _ => return Err(-22),
+        };
+        let nonblock = *progress
+            .event_nonblock
+            .get_or_insert(self.flags(entry) & NONBLOCK != 0);
+        let blocked = || {
+            if nonblock {
+                ChannelResult::Ready(-11)
+            } else {
+                ChannelResult::Blocked {
+                    fd: PIPE_FD_BASE + slot as u32,
+                    progressed: false,
+                }
+            }
+        };
+        match r.orig_rax {
+            0 => {
+                if r.rdx < 8 {
+                    return Err(-22);
+                }
+                if value == 0 {
+                    return Ok(blocked());
+                }
+                let read = if semaphore { 1 } else { value };
+                let mut bytes = read.to_ne_bytes();
+                if copy_memory(pid, r.rsi, &mut bytes, true)? != 8 {
+                    return Err(-14);
+                }
+                if let Event::Counter { value, .. } = &mut self.pipes[entry.pipe].event {
+                    *value -= read;
+                }
+            }
+            1 => {
+                if r.rdx != 8 {
+                    return Err(-22);
+                }
+                let incoming = if let Some(value) = progress.event_value {
+                    value
+                } else {
+                    let mut bytes = [0; 8];
+                    if copy_memory(pid, r.rsi, &mut bytes, false)? != 8 {
+                        return Err(-14);
+                    }
+                    let value = u64::from_ne_bytes(bytes);
+                    if value == u64::MAX {
+                        return Err(-22);
+                    }
+                    progress.event_value = Some(value);
+                    value
+                };
+                let Some(next) = value.checked_add(incoming).filter(|n| *n < u64::MAX) else {
+                    return Ok(blocked());
+                };
+                if let Event::Counter { value, .. } = &mut self.pipes[entry.pipe].event {
+                    *value = next;
+                }
+            }
+            _ => return Err(-95),
+        }
+        Ok(ChannelResult::Ready(8))
     }
 
     fn io(
@@ -517,7 +727,14 @@ impl LaunchChannels {
         }
     }
 
-    fn stat(pid: usize, address: u64, statx: bool, pipe: usize, socket: bool) -> Result<i64, i64> {
+    fn stat(
+        pid: usize,
+        address: u64,
+        statx: bool,
+        pipe: usize,
+        socket: bool,
+        event: bool,
+    ) -> Result<i64, i64> {
         write_stat(
             pid,
             address,
@@ -526,7 +743,13 @@ impl LaunchChannels {
                 modified: ginux_vfs::Timestamp::ZERO,
                 links: 1,
                 inode: 0x2_0000_0000 + pipe as u64,
-                mode: if socket { 0o140600 } else { 0o10600 },
+                mode: if event {
+                    0o600
+                } else if socket {
+                    0o140600
+                } else {
+                    0o10600
+                },
                 size: 0,
                 device_major: 0,
                 device_minor: 0,

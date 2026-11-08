@@ -19,6 +19,7 @@ mod clock_hooks;
 mod descriptors;
 mod device_hooks;
 mod dispatch;
+mod event_hooks;
 mod exec_image;
 mod exec_script;
 mod file_locks;

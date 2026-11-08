@@ -4,6 +4,7 @@
 use crate::channel_hooks::LaunchChannels;
 use crate::device_hooks::LaunchDevices;
 use crate::dispatch::{decide_objects, Lane, NativeDecision};
+use crate::event_hooks::{Event, Key, ALLOWED_EVENTS, WATCHES};
 use crate::fs_hooks::LaunchFs;
 use crate::supervisor::{syscall2, syscall3, syscall4, UserRegs};
 use crate::tracee_io::{copy_memory, read_path};
@@ -38,11 +39,13 @@ enum Pending {
 /// Owned backend handles are instance-wide; native kernel numbers are per task.
 pub struct ObjectReferences {
     counts: [u16; 128 + crate::channel_hooks::FDS + crate::network_hooks::FDS],
+    generations: [u64; 128 + crate::channel_hooks::FDS + crate::network_hooks::FDS],
 }
 impl ObjectReferences {
     pub const fn new() -> Self {
         Self {
             counts: [0; 128 + crate::channel_hooks::FDS + crate::network_hooks::FDS],
+            generations: [0; 128 + crate::channel_hooks::FDS + crate::network_hooks::FDS],
         }
     }
     pub fn active(&self) -> usize {
@@ -62,6 +65,11 @@ impl ObjectReferences {
     }
     fn retain(&mut self, handle: u32) {
         let i = Self::index(handle);
+        if self.counts[i] == 0 {
+            self.generations[i] = self.generations[i]
+                .checked_add(1)
+                .expect("owned descriptor generation overflow");
+        }
         self.counts[i] = self.counts[i]
             .checked_add(1)
             .expect("owned descriptor reference overflow");
@@ -72,6 +80,16 @@ impl ObjectReferences {
         self.counts[i] -= 1;
         self.counts[i] == 0
     }
+    fn key(&self, handle: u32) -> Key {
+        Key {
+            handle,
+            generation: self.generations[Self::index(handle)],
+        }
+    }
+    fn current(&self, key: Key) -> bool {
+        let index = Self::index(key.handle);
+        self.counts[index] != 0 && self.generations[index] == key.generation
+    }
 }
 
 pub struct Backends<'a> {
@@ -81,6 +99,48 @@ pub struct Backends<'a> {
     pub refs: &'a mut ObjectReferences,
 }
 impl Backends<'_> {
+    fn readiness(&mut self, handle: u32) -> Option<u16> {
+        self.channels
+            .readiness(handle)
+            .or_else(|| self.filesystem.readiness(handle))
+            .or_else(|| self.devices.readiness(handle))
+    }
+
+    fn refresh_epolls(&mut self) {
+        if !self.channels.has_epolls() {
+            return;
+        }
+        for handle in self.channels.epolls().into_iter().flatten() {
+            let Some(snapshot) = self.channels.epoll(handle).copied() else {
+                continue;
+            };
+            for (index, watch) in snapshot.watches.into_iter().enumerate() {
+                let Some(watch) = watch else {
+                    continue;
+                };
+                let current = self.refs.current(watch.key);
+                let available = if current {
+                    let mut available = self.readiness(watch.key.handle).unwrap_or(8 | 16);
+                    if watch.events & 0x2000 != 0
+                        && self.devices.network.read_half_closed(watch.key.handle)
+                    {
+                        available |= 0x2000;
+                    }
+                    available
+                } else {
+                    0
+                };
+                if let Some(epoll) = self.channels.epoll_mut(handle) {
+                    if !current {
+                        epoll.watches[index] = None;
+                    } else if let Some(watch) = &mut epoll.watches[index] {
+                        watch.observe(available);
+                    }
+                }
+            }
+        }
+    }
+
     fn claim(&mut self, pid: usize, r: &UserRegs) -> NativeDecision {
         self.claim_with_write(pid, 0, r, &mut crate::channel_hooks::WriteProgress::new())
     }
@@ -461,6 +521,20 @@ impl DescriptorTable {
         backends: &mut Backends,
         call: &mut DescriptorCall,
     ) -> NativeDecision {
+        backends.refresh_epolls();
+        let result = self.enter_inner(pid, signal_tgid, r, backends, call);
+        backends.refresh_epolls();
+        result
+    }
+
+    fn enter_inner(
+        &mut self,
+        pid: usize,
+        signal_tgid: usize,
+        r: &mut UserRegs,
+        backends: &mut Backends,
+        call: &mut DescriptorCall,
+    ) -> NativeDecision {
         // Resource changes cannot invalidate the public allocator or address-space bound.
         if r.orig_rax == 302 && matches!(r.rsi, 7 | 9) && r.rdx != 0 {
             return ready(-1);
@@ -472,6 +546,31 @@ impl DescriptorTable {
             return ready(-1);
         }
         let result = match r.orig_rax {
+            290 => {
+                let flags = r.rsi as u32;
+                if flags & !(0o2000000 | 0o4000 | 1) != 0 {
+                    Err(-22)
+                } else {
+                    self.create_event(
+                        Event::Counter {
+                            value: u64::from(r.rdi as u32),
+                            semaphore: flags & 1 != 0,
+                        },
+                        flags,
+                        backends,
+                    )
+                }
+            }
+            291 => {
+                let flags = r.rdi as u32;
+                if flags & !0o2000000 != 0 {
+                    Err(-22)
+                } else {
+                    self.create_event(Event::Epoll, flags, backends)
+                }
+            }
+            233 => self.epoll_control(pid, r, backends),
+            232 | 281 => self.epoll_wait(pid, r, backends, call),
             2 | 257 => {
                 call.save(r);
                 self.open(pid, r, backends, call)
@@ -964,6 +1063,158 @@ impl DescriptorTable {
         self.entries[target] = Some(entry);
         Ok(decision)
     }
+    fn create_event(
+        &mut self,
+        event: Event,
+        flags: u32,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        let slot = self.reserve(flags & CLOEXEC as u32 != 0)?;
+        match backends.channels.allocate_event(event, flags) {
+            Ok(handle) => {
+                backends.refs.retain(handle);
+                self.entries[slot].as_mut().unwrap().handle = Handle::Owned(handle);
+                Ok(ready(slot as i64))
+            }
+            Err(error) => {
+                self.entries[slot] = None;
+                Err(error)
+            }
+        }
+    }
+
+    fn epoll_control(
+        &mut self,
+        pid: usize,
+        r: &UserRegs,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        let handle = match self.get(r.rdi)?.handle {
+            Handle::Owned(handle)
+                if matches!(backends.channels.event(handle), Some(Event::Epoll)) =>
+            {
+                handle
+            }
+            _ => return Err(-22),
+        };
+        let operation = r.rsi as i32;
+        if !(1..=3).contains(&operation) {
+            return Err(-22);
+        }
+        let target = match self.get(r.rdx)?.handle {
+            Handle::Owned(target)
+                if crate::network_hooks::LaunchNetwork::owns(target)
+                    || backends.channels.readiness(target).is_some()
+                        && !matches!(backends.channels.event(target), Some(Event::Epoll)) =>
+            {
+                target
+            }
+            _ => return Err(-1),
+        };
+        let (events, data) = if operation == 2 {
+            (0, 0)
+        } else {
+            let mut event = [0; 12];
+            if copy_memory(pid, r.r10, &mut event, false)? != 12 {
+                return Err(-14);
+            }
+            let events = u32::from_ne_bytes(event[..4].try_into().unwrap());
+            if events & !ALLOWED_EVENTS != 0 {
+                return Err(-22);
+            }
+            (events, u64::from_ne_bytes(event[4..].try_into().unwrap()))
+        };
+        let key = backends.refs.key(target);
+        let Some(epoll) = backends.channels.epoll_mut(handle) else {
+            return Err(-9);
+        };
+        epoll.control(operation, key, r.rdx as u32, events, data)?;
+        Ok(ready(0))
+    }
+
+    fn epoll_wait(
+        &mut self,
+        pid: usize,
+        r: &UserRegs,
+        backends: &mut Backends,
+        call: &mut DescriptorCall,
+    ) -> Result<NativeDecision, i64> {
+        let descriptor = call.pinned.map(Ok).unwrap_or_else(|| self.get(r.rdi))?;
+        let handle = match descriptor.handle {
+            Handle::Owned(handle)
+                if matches!(backends.channels.event(handle), Some(Event::Epoll)) =>
+            {
+                handle
+            }
+            _ => return Err(-22),
+        };
+        if r.orig_rax == 281 && r.r8 != 0 && !call.poll_wait {
+            // A no-op mask needs no temporary signal-mask implementation.
+            // Snapshot it once, then retain admission across parked retries.
+            if r.r9 != 8 {
+                return Err(-22);
+            }
+            let mut bytes = [0; 8];
+            if copy_memory(pid, r.r8, &mut bytes, false)? != 8 {
+                return Err(-14);
+            }
+            let requested = u64::from_ne_bytes(bytes);
+            let mut current = 0u64;
+            if crate::supervisor::ptrace(0x420a, pid, 8, &mut current as *mut _ as usize) < 0 {
+                return Err(-95);
+            }
+            let unmaskable = (1u64 << (9 - 1)) | (1u64 << (19 - 1));
+            if requested & !unmaskable != current & !unmaskable {
+                return Err(-95);
+            }
+        }
+        let maximum = r.rdx as i32;
+        if maximum <= 0 {
+            return Err(-22);
+        }
+        // maxevents is output capacity, not an input array. At most WATCHES
+        // bounded events can be returned even when the caller has more room.
+        let maximum = (maximum as usize).min(WATCHES);
+        let timeout = r.r10 as i32;
+        if timeout > 300000 {
+            return Err(-22);
+        }
+        let now = monotonic_nanoseconds()?;
+        if !call.poll_wait && timeout > 0 {
+            call.poll_deadline = Some(now.checked_add(timeout as u64 * 1_000_000).ok_or(-22)?);
+        }
+        let Some(epoll) = backends.channels.epoll(handle) else {
+            return Err(-9);
+        };
+        let mut bytes = [0; WATCHES * 12];
+        let mut selected = [0; WATCHES];
+        let count = epoll.pending(maximum, &mut bytes, &mut selected);
+        let network = epoll
+            .watches
+            .iter()
+            .flatten()
+            .any(|w| crate::network_hooks::LaunchNetwork::owns(w.key.handle));
+        if count != 0 || timeout == 0 || call.poll_deadline.is_some_and(|end| now >= end) {
+            if count != 0 {
+                if copy_memory(pid, r.rsi, &mut bytes[..count * 12], true)? != (count * 12) as i64 {
+                    return Err(-14);
+                }
+                let Some(epoll) = backends.channels.epoll_mut(handle) else {
+                    return Err(-9);
+                };
+                epoll.acknowledge(&selected[..count]);
+            }
+            return Ok(ready(count as i64));
+        }
+        if call.pinned.is_none() {
+            backends.refs.retain(handle);
+            call.pinned = Some(descriptor);
+        }
+        call.poll_wait = true;
+        call.poll_tick = network || call.poll_deadline.is_some();
+        Ok(NativeDecision::ParkPoll)
+    }
+
     fn poll(
         &mut self,
         pid: usize,
@@ -1052,12 +1303,7 @@ impl DescriptorTable {
                     // Assigned regular memory files/directories and null are
                     // immediately ready. Pipes supply their own live state.
                     network_wait |= crate::network_hooks::LaunchNetwork::owns(handle);
-                    let available = backends
-                        .channels
-                        .readiness(handle)
-                        .or_else(|| backends.filesystem.readiness(handle))
-                        .or_else(|| backends.devices.readiness(handle))
-                        .ok_or(-95)?;
+                    let available = backends.readiness(handle).ok_or(-95)?;
                     available & (events | 8 | 16)
                 }
                 _ => 32, // POLLNVAL, even when events is zero.

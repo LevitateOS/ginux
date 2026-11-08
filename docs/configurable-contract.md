@@ -23,6 +23,37 @@ invalid. This is a configured metadata view, not a procfs mount: it adds no
 directory enumeration, host-process view or proc-path open authority, and does
 not change native policy. Explicit contract denial still precedes the view.
 
+Configured launch implements `eventfd2`, `epoll_create1`, `epoll_ctl`,
+`epoll_wait` and bounded `epoll_pwait` through the public descriptor table.
+Counters and epoll instances share the existing 16-object channel pool with
+pipes and packet channels. Each epoll instance has at most 16 registrations;
+the existing public descriptor limit (including a lower operator limit) applies.
+No host eventfd or epoll descriptor is created or exposed. Counters support
+8-byte scalar transfers, semaphore/nonblocking modes, overflow backpressure,
+shared status flags and per-descriptor close-on-exec. Vector/socket transfers
+on counters are unsupported.
+
+Epoll watches already-owned counters, pipes, packet endpoints and granted TCP
+sockets. Image/native descriptors, filesystem files and nested epoll instances
+are unsupported. Registrations retain object identity and the registered public
+number: aliases may be registered separately, survive closure of the original
+number while an alias remains, and never retarget a reused object or descriptor.
+Level readiness, edge transitions (drain until EAGAIN), one-shot rearming and
+round-robin delivery of ready registrations are bounded by this set. ERR/HUP
+are always reported; RDHUP observes actual TCP peer write-half closure and is
+not synthesized from pipe HUP. Events carry the caller's snapshotted 64-bit data.
+
+Waits support zero, finite timeouts up to 300000 ms and negative infinite waits.
+`maxevents` is output capacity and may exceed the 16 registrations. A parked
+wait pins its epoll object; copyout failure does not consume pending delivery.
+`epoll_pwait` accepts a null signal-mask pointer or an 8-byte kernel mask equal
+to the calling task's current mask (ignoring unmaskable KILL/STOP bits). Other
+temporary masks return EOPNOTSUPP: general signal interruption/restart semantics
+are not promised. An interrupted admitted futex exposing the kernel's internal
+ERESTART_RESTARTBLOCK returns EINTR for userspace retry; `restart_syscall` is
+not granted. Native policy, catalog membership and explicit-deny precedence
+are unchanged. These are configured facilities, not a general Linux ABI claim.
+
 ```toml
 [userspace.contract]
 version = 1

@@ -351,9 +351,11 @@ test-launch-exec:
 build-launch-poll-fixture:
 	mkdir -p .artifacts/launch
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-poll-fixture.c -o .artifacts/launch/launch-poll-fixture
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-event-fixture.c -o .artifacts/launch/launch-event-fixture
 
 test-launch-poll:
 	python3 scripts/test-launch-poll.py $(GINUX) .artifacts/launch/launch-poll-fixture
+	python3 scripts/test-launch-events.py $(GINUX) .artifacts/launch/launch-event-fixture
 
 .PHONY: build-launch-directory-fixture test-launch-directories
 build-launch-directory-fixture:
