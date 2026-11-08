@@ -433,8 +433,15 @@ pub fn supervise(
         };
         s.task_mut(index).running = false;
         if s.argument_guard.is_some_and(|owner| owner != index) {
-            if s.task(index).held_status.is_some() {
-                s.fail(instance, b"multiple held stops for one task");
+            if let Some(saved) = s.task(index).held_status {
+                // exit_group can terminate a peer while its earlier syscall or
+                // interrupt stop is held. The terminal event supersedes that
+                // now-invalid stop; never resume it or inspect stale registers.
+                // Conflicting nonterminal or repeated terminal events still
+                // require explicit ownership rather than silently overwriting.
+                if !stopped(saved) || !(exited(status) || signaled(status)) {
+                    s.fail(instance, b"multiple held stops for one task");
+                }
             }
             s.task_mut(index).held_status = Some(status);
             continue;
