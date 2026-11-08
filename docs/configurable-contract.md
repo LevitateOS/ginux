@@ -23,6 +23,22 @@ invalid. This is a configured metadata view, not a procfs mount: it adds no
 directory enumeration, host-process view or proc-path open authority, and does
 not change native policy. Explicit contract denial still precedes the view.
 
+Configured `/proc/self/maps` is a read-only stack projection. An exact-path
+read open snapshots only the registered process's `[stack]` range and mapping
+permissions; it contains no other mappings, inode/device identities or file
+paths. The supervisor scans at most 1 MiB of its stopped tracee's maps with a
+512-byte line bound and fails closed on missing/invalid stack metadata or an
+exceeded bound. Stat/access identify a deterministic read-only regular file.
+The anonymous snapshot uses existing VFS byte/object/descriptor quotas and the
+public FD table, including lower operator limits. Read, pread, readv, seek,
+aliases and fork/exec use the existing descriptor owner; a fresh open takes a
+new snapshot. It is never a writable namespace or export entry. Construction
+temporarily needs an extra VFS descriptor. Mmap, descriptor-path reopen and
+metadata mutation are unsupported. Broader proc paths, directory enumeration
+and host process access remain unavailable; explicit denial precedes all view
+effects. This supplies libc initial-stack discovery without a general procfs
+or complete memory-map ABI.
+
 Configured launch implements `eventfd2`, `epoll_create1`, `epoll_ctl`,
 `epoll_wait` and bounded `epoll_pwait` through the public descriptor table.
 Counters and epoll instances share the existing 16-object channel pool with

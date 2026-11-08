@@ -736,7 +736,15 @@ impl DescriptorTable {
         } else {
             r.rdx &= !CLOEXEC;
         }
-        let decision = if let Some(decision) = self.open_descriptor_path(pid, r, backends) {
+        let address = if r.orig_rax == 2 { r.rdi } else { r.rsi };
+        let stack_view =
+            read_path(pid, address).is_ok_and(|path| path.as_bytes() == crate::stack_view::PATH);
+        let decision = if stack_view {
+            backends
+                .filesystem
+                .open_stack_snapshot(pid, flags)
+                .map(ready)
+        } else if let Some(decision) = self.open_descriptor_path(pid, r, backends) {
             decision
         } else if r.orig_rax == 257 {
             self.path_descriptor(pid, r, backends)

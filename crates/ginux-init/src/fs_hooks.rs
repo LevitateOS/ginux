@@ -54,6 +54,7 @@ pub struct LaunchFs {
     process: u32,
     locks: crate::file_locks::Locks,
     flocks: crate::file_locks::Locks,
+    stack_snapshots: [bool; 64],
 }
 
 impl LaunchFs {
@@ -181,6 +182,7 @@ impl LaunchFs {
             process: 1,
             locks: crate::file_locks::Locks::new(),
             flocks: crate::file_locks::Locks::new(),
+            stack_snapshots: [false; 64],
             fs,
             byte_limit: limit,
             prefixes,
@@ -969,6 +971,9 @@ impl LaunchFs {
             .filter(|n| *n < 64)
             .ok_or(-95)? as i32
             + 3;
+        if self.stack_snapshots[(fd - 3) as usize] {
+            return Err(-95);
+        }
         const ALLOWED: u64 = 0o4000 | 0o100000 | 0o200000 | 0o400000 | 0o2000000;
         if flags & !ALLOWED != 0 {
             return Err(-13);
@@ -994,6 +999,7 @@ impl LaunchFs {
         let status = if flags & 0o2000000 != 0 { O_CLOEXEC } else { 0 }
             | if flags & 0o4000 != 0 { O_NONBLOCK } else { 0 };
         let reopened = self.fs.reopen_readonly(fd, status).map_err(errno)?;
+        self.stack_snapshots[(reopened - 3) as usize] = false;
         Ok(FD_BASE as i64 + reopened as i64 - 3)
     }
 
@@ -1089,6 +1095,9 @@ impl LaunchFs {
             .checked_sub(FD_BASE as u32)
             .filter(|n| *n < 64)
             .ok_or(-9)?;
+        if self.stack_snapshots[slot as usize] {
+            return Err(-95);
+        }
         let (storage, object) = self.fs.readable_storage(slot as i32 + 3).map_err(errno)?;
         let fd = storage.backing(object).map_err(errno)?;
         crate::file_mapping::readonly_reference(fd)
@@ -1271,6 +1280,48 @@ impl LaunchFs {
         Some(result.unwrap_or_else(|error| error))
     }
 
+    /// A read-only anonymous snapshot consumes existing filesystem object,
+    /// byte and descriptor budgets. It never becomes a namespace/export entry.
+    pub fn open_stack_snapshot(&mut self, pid: usize, flags: u64) -> Result<i64, i64> {
+        const ALLOWED: u64 = 0o4000 | 0o100000 | 0o400000 | 0o2000000;
+        if flags & 0o200000 != 0 {
+            return Err(-20);
+        }
+        if flags & !ALLOWED != 0 {
+            return Err(-13);
+        }
+        let content = crate::stack_view::snapshot(pid)?;
+        let path = b"/.ginux-stack-snapshot";
+        let fd = self
+            .fs
+            .open(path, O_CREATE | O_EXCLUSIVE | O_WRITE | O_READ)
+            .map_err(errno)?;
+        // Unlink before any workload can observe the private construction name.
+        if let Err(error) = self.fs.unlink(path) {
+            let _ = self.fs.close(fd);
+            return Err(errno(error));
+        }
+        let result = (|| {
+            self.fs.fchmod(fd, 0o444).map_err(errno)?;
+            if self.fs.write(fd, content.as_bytes()).map_err(errno)? != content.as_bytes().len() {
+                return Err(-5);
+            }
+            let status = if flags & 0o4000 != 0 { O_NONBLOCK } else { 0 };
+            self.fs.reopen_readonly(fd, status).map_err(errno)
+        })();
+        let closed = self.fs.close(fd);
+        let readonly = match (result, closed) {
+            (Ok(readonly), Ok(())) => readonly,
+            (Ok(readonly), Err(error)) => {
+                let _ = self.fs.close(readonly);
+                return Err(errno(error));
+            }
+            (Err(error), _) => return Err(error),
+        };
+        self.stack_snapshots[(readonly - 3) as usize] = true;
+        Ok(FD_BASE as i64 + readonly as i64 - 3)
+    }
+
     fn open(&mut self, path: &[u8], flags: u64, mode: u64) -> Result<i64, i64> {
         // Unsupported directory/path-only behavior never falls through to native storage.
         const ALLOWED: u64 = 3
@@ -1305,6 +1356,7 @@ impl LaunchFs {
             let status = if flags & 0o2000000 != 0 { O_CLOEXEC } else { 0 }
                 | if flags & 0o4000 != 0 { O_NONBLOCK } else { 0 };
             let fd = self.fs.open_directory(path, status).map_err(errno)?;
+            self.stack_snapshots[(fd - 3) as usize] = false;
             return Ok(FD_BASE as i64 + fd as i64 - 3);
         }
         if flags & 0o200000 != 0 {
@@ -1329,6 +1381,7 @@ impl LaunchFs {
         }
         let existed = self.fs.metadata(path).is_ok();
         let fd = self.fs.open(path, translated).map_err(errno)?;
+        self.stack_snapshots[(fd - 3) as usize] = false;
         if !existed && flags & 0o100 != 0 {
             self.fs
                 .fchmod(fd, mode as u32 & 0o777 & !self.creation_mask)
@@ -1444,6 +1497,24 @@ impl LaunchFs {
     }
 
     fn descriptor_call(&mut self, pid: usize, r: &UserRegs, fd: i32) -> i64 {
+        if fd >= 3 && self.stack_snapshots.get((fd - 3) as usize) == Some(&true) {
+            if matches!(r.orig_rax, 77 | 91 | 93 | 260 | 280) {
+                return -30;
+            }
+            let metadata = match r.orig_rax {
+                5 => Some(crate::stack_view::stat(pid, r.rsi, false)),
+                262 if r.r10 & 0x1000 != 0 && r.r10 & !0x1900 == 0 => {
+                    Some(crate::stack_view::stat(pid, r.rdx, false))
+                }
+                332 if r.rdx & 0x1000 != 0 && valid_statx(r.rdx, r.r10) => {
+                    Some(crate::stack_view::stat(pid, r.r8, true))
+                }
+                _ => None,
+            };
+            if let Some(result) = metadata {
+                return result.unwrap_or_else(|error| error);
+            }
+        }
         let result = match r.orig_rax {
             0 => self.read(pid, fd, r.rsi, r.rdx, None),
             17 => self.read(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
@@ -1452,7 +1523,11 @@ impl LaunchFs {
             18 => self.write(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
             3 => {
                 self.flocks.release((fd - 3) as u32, None);
-                self.fs.close(fd).map(|_| 0).map_err(errno)
+                let result = self.fs.close(fd).map(|_| 0).map_err(errno);
+                if result.is_ok() {
+                    self.stack_snapshots[(fd - 3) as usize] = false;
+                }
+                result
             }
             5 => self
                 .fs

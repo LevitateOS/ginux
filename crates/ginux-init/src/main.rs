@@ -30,6 +30,7 @@ mod launch_tasks;
 mod network_hooks;
 mod path_hooks;
 mod process_hooks;
+mod stack_view;
 mod storage_export;
 mod storage_memory;
 mod storage_restore;

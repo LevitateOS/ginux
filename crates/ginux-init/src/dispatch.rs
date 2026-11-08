@@ -96,7 +96,12 @@ pub fn decide_objects(
     channels: &mut crate::channel_hooks::LaunchChannels,
     progress: &mut crate::channel_hooks::WriteProgress,
 ) -> NativeDecision {
-    if let Some(result) = channels.claim(pid, signal_tgid, registers, progress) {
+    if let Some(result) = crate::stack_view::metadata(pid, registers) {
+        NativeDecision::Hooked {
+            lane: Lane::Filesystem,
+            result: result.unwrap_or_else(|error| error),
+        }
+    } else if let Some(result) = channels.claim(pid, signal_tgid, registers, progress) {
         match result {
             crate::channel_hooks::ChannelResult::Ready(result) => NativeDecision::Hooked {
                 lane: Lane::Channel,
