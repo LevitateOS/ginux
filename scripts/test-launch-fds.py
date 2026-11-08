@@ -12,10 +12,11 @@ import tempfile
 
 def main():
     if len(sys.argv) not in (3,4) or os.geteuid()!=0:
-        sys.exit('usage (as root): test-launch-fds.py <ginux> <fd-fixture> [limits]')
+        sys.exit('usage (as root): test-launch-fds.py <ginux> <fd-fixture> [limits|policy-read]')
     binary,fixture=[str(Path(p).resolve()) for p in sys.argv[1:3]]
-    only_limits = len(sys.argv)==4
-    if only_limits and sys.argv[3]!='limits': sys.exit('unknown fd scenario')
+    selected = sys.argv[3] if len(sys.argv)==4 else None
+    only_limits = selected == 'limits'
+    if selected not in (None, 'limits', 'policy-read'): sys.exit('unknown fd scenario')
     template=(Path(__file__).resolve().parent.parent/'config/instance-configured.toml').read_text()
     with tempfile.TemporaryDirectory(prefix='ginux-fds-') as directory:
         work=Path(directory)
@@ -30,6 +31,21 @@ def main():
         config=config.replace('[storage]\nassignments = []','[storage]\nassignments = ["memory:/work"]')
         config=config.replace('[devices]\nassignments = []','[devices]\nassignments = ["null"]')
         (work/'launch.toml').write_text(config)
+        if selected == 'policy-read':
+            config=config.replace('args = []','args = ["read-policy"]')
+            config=config.replace('[contract]','[contract]\ndeny = ["filesystem.path.read"]',1)
+            path=work/'policy.toml'
+            path.write_text(config)
+            result=work/'policy.json'
+            proc=subprocess.run([binary,'launch',str(path),str(root),'--result-file',str(result)],capture_output=True,timeout=20)
+            assert proc.returncode==0,(proc.returncode,proc.stderr)
+            assert proc.stdout==b'contract-read: PASS\n',proc.stdout
+            assert json.loads(result.read_text())['code']==0
+            for number in (0,19):
+                records=[line for line in proc.stderr.splitlines() if f'phase=entry syscall={number} '.encode() in line]
+                assert len(records)==2 and all(b'operation=filesystem.path.read' in line and b'action=deny result=-1' in line for line in records),records
+            print('test-launch-fds: PASS (file read/readv denial before effects, low-32-bit FD aliases)')
+            return
         if not only_limits:
             for i in range(2):
                 result=work/f'{i}.json'

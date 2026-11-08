@@ -1432,9 +1432,8 @@ pub(crate) fn launch_semantic_operation(
         41 if r.rdi as u32 == 2 || r.rdi as u32 == 10 => Some("network.inet.tcp.connect"),
         2 => Some(path(r.rsi)),
         257 => Some(path(r.rdx)),
-        4 | 5 | 6 | 17 | 21 | 78 | 79 | 80 | 81 | 89 | 217 | 262 | 267 | 269 | 332 | 439 => {
-            Some("filesystem.path.read")
-        }
+        0 | 4 | 5 | 6 | 17 | 19 | 21 | 78 | 79 | 80 | 81 | 89 | 217 | 262 | 267 | 269 | 332
+        | 439 => Some("filesystem.path.read"),
         1
         | 18
         | 20

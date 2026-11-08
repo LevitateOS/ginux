@@ -384,6 +384,8 @@ impl DescriptorTable {
     }
 
     fn get(&self, fd: u64) -> Result<Descriptor, i64> {
+        // Linux FD arguments are 32-bit. Narrow before public-table lookup;
+        // high register bits never select a backend/native private descriptor.
         let fd = fd as i32;
         if fd < 0 {
             return Err(-9);

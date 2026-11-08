@@ -284,6 +284,13 @@ Ginux is available under the Apache License 2.0. See [`LICENSE`](LICENSE) and
 
 ## Configured native launch
 
+Configured Linux FD syscall arguments use the low 32 bits of the register.
+Lookup and policy classification use that same public descriptor identity;
+a high-bit alias has the same grant or denial as its low-bit value. Private
+backend handles are not public descriptors, and no 64-bit canonical-FD rejection
+is promised. Ordinary file read/readv operations require filesystem read authority,
+while console and TCP aliases retain their respective semantic policy families.
+
 The configured supervisor retains only standard streams and an explicitly
 supplied coordinator control socket from its caller. Other inherited FDs are
 closed before private storage reservation. Its own result/export descriptors

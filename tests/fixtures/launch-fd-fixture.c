@@ -15,6 +15,20 @@ static char bytes[256];
 static char meta[256] __attribute__((aligned(8)));
 long fd_main(word *stack)
 {
+    if (*stack>1 && ((char **)(stack+1))[1][0]=='r') {
+        long fd=DO(2,"/work/read-policy",0102,0600);
+        CHECK(fd==3 && DO(1,fd,"ok",2)==2,60);
+        CHECK(DO(8,fd,0,0)==0,61);
+        word alias=(1UL<<32)|(word)fd;
+        struct { word base, length; } vector={(word)bytes,1};
+        CHECK(DO(0,fd,bytes,1)==-1 && DO(0,alias,bytes,1)==-1,62);
+        CHECK(DO(19,fd,&vector,1)==-1 && DO(19,alias,&vector,1)==-1,63);
+        CHECK(DO(8,fd,0,1)==0 && DO(1,fd,"z",1)==1,64);
+        CHECK(DO(3,alias,0,0)==0,65);
+        static const char pass[]="contract-read: PASS\n";
+        DO(1,1,pass,sizeof pass-1);
+        return 0;
+    }
     if (*stack>1 && ((char **)(stack+1))[1][0]=='w') {
         word limits[2]={3,256};
         CHECK(call(302,0,(1UL<<32)|7,(word)limits,0,0,0)==-1,49);
