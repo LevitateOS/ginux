@@ -448,7 +448,9 @@ pub fn launch_main(
         .check_image(root_path)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     if let Err(reason) = crate::storage_restore::restore(restore_path, &mut filesystem) {
-        filesystem.teardown();
+        filesystem
+            .teardown()
+            .unwrap_or_else(|cleanup| launch_startup_fail(cleanup));
         launch_startup_fail(reason);
     }
     let mut channels = crate::channel_hooks::LaunchChannels::new();

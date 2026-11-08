@@ -502,7 +502,11 @@ impl LaunchFs {
         }
     }
 
-    pub fn teardown(&mut self) {
+    pub fn cleanup_error(&self) -> Option<&'static [u8]> {
+        self.fs.storage().cleanup_error()
+    }
+
+    pub fn teardown(&mut self) -> Result<(), &'static [u8]> {
         assert_eq!(
             self.fs.executable_pins(),
             0,
@@ -514,6 +518,7 @@ impl LaunchFs {
             0,
             "overlay teardown retained bytes"
         );
+        self.cleanup_error().map_or(Ok(()), Err)
     }
 
     /// x86-64 statfs describes the virtual namespace, never the host mount.

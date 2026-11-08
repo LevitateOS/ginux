@@ -297,6 +297,12 @@ must be a real directory: image symlink and file prefixes fail startup. Missing
 parents may be synthesized; a link or file at the assigned name itself is hidden
 by the empty memory directory. This matches the configured-storage foundation.
 
+A private storage close error stops execution before the next guest resume.
+Teardown attempts the remaining releases and reports a structured supervisor
+failure; it never substitutes a successful workload result or retries a closed
+numeric FD. Successful unlink/final-close and mapping references keep their
+existing lifetime rules.
+
 The configured supervisor retains only standard streams and an explicitly
 supplied coordinator control socket from its caller. Other inherited FDs are
 closed before private storage reservation. Its own result/export descriptors

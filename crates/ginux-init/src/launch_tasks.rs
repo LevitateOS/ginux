@@ -690,6 +690,11 @@ impl Supervisor<'_> {
             .unwrap_or_else(|_| self.fail(instance, b"launch register read failed"))
     }
     fn resume(&mut self, index: usize, signal: usize, instance: &mut Instance) {
+        if !self.tearing_down {
+            if let Some(reason) = self.objects.filesystem.cleanup_error() {
+                self.fail(instance, reason);
+            }
+        }
         let result = ptrace(PTRACE_SYSCALL, self.task(index).host, 0, signal);
         if result == -3 {
             // SIGKILL can end a ptrace stop between an object retry and
@@ -2580,7 +2585,9 @@ impl Supervisor<'_> {
         } else {
             Ok(())
         };
-        let settled = control_closed.and(event_closed);
+        let settled = control_closed
+            .and(event_closed)
+            .and(self.objects.filesystem.cleanup_error().map_or(Ok(()), Err));
         let exported = settled.and_then(|_| {
             if export {
                 self.objects.filesystem.export()
@@ -2615,11 +2622,11 @@ impl Supervisor<'_> {
                     rule.map_or(0, |rule| rule.source_rule), errno, denial.count, denial.first_sequence, denial.first_pid, denial.first_syscall));
             }
         }
-        self.objects.filesystem.teardown();
-        if let Err(reason) = exported {
+        let released = self.objects.filesystem.teardown();
+        line_stderr(b"ginux: teardown tasks=0 owned-handles=0");
+        if let Err(reason) = exported.and(released) {
             supervision_error(instance, reason);
         }
-        line_stderr(b"ginux: teardown tasks=0 owned-handles=0");
     }
     fn fail(&mut self, instance: &mut Instance, reason: &[u8]) -> ! {
         self.teardown(instance, false);

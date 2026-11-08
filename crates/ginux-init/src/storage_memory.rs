@@ -85,6 +85,7 @@ pub struct MemoryStorage {
     files: MappedArray<Mapping>,
     limit: usize,
     allocated: usize,
+    close_failed: bool,
 }
 
 impl MemoryStorage {
@@ -96,8 +97,14 @@ impl MemoryStorage {
             files: MappedArray::new(objects, Mapping::EMPTY)?,
             limit,
             allocated: 0,
+            close_failed: false,
         })
     }
+    pub fn cleanup_error(&self) -> Option<&'static [u8]> {
+        self.close_failed
+            .then_some(b"overlay backing close failed".as_slice())
+    }
+
     pub fn allocated_bytes(&self) -> usize {
         self.allocated
     }
@@ -243,7 +250,11 @@ impl OverlayStorage for MemoryStorage {
         }
         if file.descriptor >= 0 {
             let result = unsafe { syscall1(3, file.descriptor as usize) };
-            assert_eq!(result, 0, "overlay backing close failed");
+            // Linux retires the FD before reporting late close errors. Never
+            // retry a numeric FD that may already refer to another resource.
+            // The supervisor checks this sticky error before guest resume and
+            // after teardown, producing a completion record instead of panic.
+            self.close_failed |= result != 0;
         }
     }
 }
