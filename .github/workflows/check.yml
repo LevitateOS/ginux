@@ -1,6 +1,7 @@
 name: check
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
@@ -45,3 +46,5 @@ jobs:
       - run: sudo make test-launch-owned-exec
       - run: sudo make test-launch-scripts
       - run: sudo make test-launch-network
+      - run: make build-launch-image-io-fixture
+      - run: sudo make test-launch-image-io
