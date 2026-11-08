@@ -66,6 +66,10 @@ long native_fixture_main(void)
     long fd = call3(2, (word)"/scenario", 0, 0);
     if (fd < 0 || call3(0, fd, (word)scenario, sizeof scenario - 1) <= 0) return 80;
     switch (scenario[0]) {
+    case 'y': {
+        print_result("GINUX_FIXTURE: yield=", call3(24, 0, 0, 0));
+        return 0;
+    }
     case 'f': {
         /* fork: the native loop has no child supervision, so it must be denied. */
         long pid = call3(57, 0, 0, 0);

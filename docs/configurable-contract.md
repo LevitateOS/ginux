@@ -5,16 +5,16 @@ same TOML file as its image, resources, devices, and networking. Runtime
 enforcement receives only the compiled operation table and deterministic
 digest; it never interprets globs while managed code is running.
 
-Configured launch also supports an explicit catalog 2 containing its additional
+Configured launch also supports explicit downstream catalog 1002 containing its additional
 implemented syscall forms. Select `[contract] profile = "configured-balanced-v2"`
-or `catalog = 2` in a self-contained contract. Catalog 1 and its wildcard
-expansions remain unchanged. See the README's configured-launch section for
+or `catalog = 1002` in a self-contained contract. Upstream Gate 11 owns catalog 2;
+the former local catalog 2 is retired to avoid a version collision. See the README's configured-launch section for
 the operation list, enforcement order, audit behavior and backend limitations.
 
 ```toml
 [userspace.contract]
 version = 1
-catalog = 1
+catalog = 2
 default = "deny"
 read = ["fs.**", "proc.**", "sys.**", "time.**"]
 write = ["fs.**", "dev.console.write"]

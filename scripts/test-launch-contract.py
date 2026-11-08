@@ -17,7 +17,7 @@ def main():
     template = (Path(__file__).resolve().parent.parent / 'config/instance-gate5.toml').read_text()
     template = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
     template = template.replace('assignments = []', 'assignments = ["memory:/work"]', 1)
-    recipe = ('[userspace.contract]\nversion = 1\ncatalog = 1\ndefault = "deny"\n'
+    recipe = ('[userspace.contract]\nversion = 1\ncatalog = 2\ndefault = "deny"\n'
               'read = ["**"]\nwrite = ["**"]\nexecute = ["**"]\nconnect = ["**"]\n'
               'listen = ["**"]\nprocess = ["**"]\nsystem = ["**"]\n')
     legacy = '[contract]\nprofile = "gate5-balanced-v1"'
@@ -107,10 +107,10 @@ def main():
         check('refuse-path-policy', startup=True,
               extra='\n[userspace.filesystem]\nwrite_deny = ["/work"]\n')
         check('refuse-hooks', startup=True, extra='\n[hooks]\npre_boot = ["/bin/fixture"]\n')
-        configured_recipe = recipe.replace('catalog = 1', 'catalog = 2')
+        configured_recipe = recipe.replace('catalog = 2', 'catalog = 1002')
         check('recipe-v2-allows-sleep', 's', contract=configured_recipe)
         check('recipe-v2-denies-sleep', 's', -1, configured_recipe + 'exact_deny = ["syscall.nanosleep"]\n', operation='syscall.nanosleep', source='exact-deny')
-        check('unknown-catalog-refused', contract=recipe.replace('catalog = 1', 'catalog = 99'), startup=True)
+        check('unknown-catalog-refused', contract=recipe.replace('catalog = 2', 'catalog = 99'), startup=True)
         check('zero-match-refused', contract=recipe + 'deny = ["unknown.operation"]\n', startup=True)
         check('refuse-v2-clock-resolution-deny', contract=configured + '\ndeny = ["syscall.clock_getres"]', startup=True)
         check('allowed-after-denials')

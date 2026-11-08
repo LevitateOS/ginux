@@ -2,8 +2,8 @@
 
 use core::fmt;
 
-pub const CATALOG_VERSION: u32 = 1;
-pub const MAX_OPERATIONS: usize = 192;
+pub const CATALOG_VERSION: u32 = 2;
+pub const MAX_OPERATIONS: usize = 193;
 pub const DIGEST_HEX_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +131,7 @@ pub struct Operation {
     pub abi_number: Option<u64>,
     pub status: Status,
     pub action: Action,
+    pub direct_safe: bool,
     pub constraint: &'static str,
     pub evidence: &'static str,
     pub limitation: &'static str,
@@ -144,6 +145,23 @@ macro_rules! syscall {
             abi_number: Some($number),
             status: Status::$status,
             action: $action,
+            direct_safe: false,
+            constraint: $constraint,
+            evidence: $evidence,
+            limitation: "x86-64 Linux ABI only",
+        }
+    };
+}
+
+macro_rules! direct_syscall {
+    ($name:literal, $number:literal, $status:ident, $action:expr, $constraint:literal, $evidence:literal) => {
+        Operation {
+            id: concat!("syscall.", $name),
+            kind: Kind::Syscall,
+            abi_number: Some($number),
+            status: Status::$status,
+            action: $action,
+            direct_safe: true,
             constraint: $constraint,
             evidence: $evidence,
             limitation: "x86-64 Linux ABI only",
@@ -159,6 +177,7 @@ macro_rules! operation {
             abi_number: None,
             status: Status::$status,
             action: $action,
+            direct_safe: false,
             constraint: $constraint,
             evidence: $evidence,
             limitation: $limitation,
@@ -166,8 +185,9 @@ macro_rules! operation {
     };
 }
 
-/// Explicit configured-launch catalog additions; catalog 1 stays unchanged.
-pub const CONFIGURED_CATALOG_VERSION: u32 = 2;
+/// Explicit configured-launch additions in a downstream version namespace.
+/// Upstream catalog versions retain their upstream meaning.
+pub const CONFIGURED_CATALOG_VERSION: u32 = 1002;
 pub static CONFIGURED_OPERATIONS: &[Operation] = &[
     syscall!(
         "lstat",
@@ -411,6 +431,14 @@ pub static CATALOG: &[Operation] = &[
         Action::Mediate,
         "instance path",
         "test-native-vfs"
+    ),
+    direct_syscall!(
+        "sched_yield",
+        24,
+        Complete,
+        Action::Mediate,
+        "pre-effect contract approval",
+        "bench"
     ),
     syscall!(
         "mremap",
@@ -1840,6 +1868,7 @@ const EMPTY_OPERATION: Operation = Operation {
     abi_number: None,
     status: Status::Denied,
     action: Action::Deny(38),
+    direct_safe: false,
     constraint: "",
     evidence: "",
     limitation: "",
@@ -1853,10 +1882,14 @@ const EMPTY_RULE: EffectiveRule = EffectiveRule {
     source_rule: 0,
 };
 
+const SYSCALL_RULE_SLOTS: usize = 512;
+const NO_SYSCALL_RULE: u16 = u16::MAX;
+
 #[derive(Clone, Copy)]
 pub struct EffectiveContract {
     catalog_version: u32,
     rules: [EffectiveRule; MAX_OPERATIONS],
+    syscall_rules: [u16; SYSCALL_RULE_SLOTS],
     len: usize,
     digest: [u8; DIGEST_HEX_BYTES],
 }
@@ -1866,6 +1899,7 @@ impl EffectiveContract {
         Self {
             catalog_version: CATALOG_VERSION,
             rules: [EMPTY_RULE; MAX_OPERATIONS],
+            syscall_rules: [NO_SYSCALL_RULE; SYSCALL_RULE_SLOTS],
             len: 0,
             digest: [0; DIGEST_HEX_BYTES],
         }
@@ -1890,6 +1924,13 @@ impl EffectiveContract {
     }
 
     pub fn syscall_rule(&self, number: u64) -> Option<&EffectiveRule> {
+        if let Ok(number) = usize::try_from(number) {
+            if let Some(index) = self.syscall_rules.get(number).copied() {
+                if index != NO_SYSCALL_RULE {
+                    return self.rules.get(usize::from(index));
+                }
+            }
+        }
         self.rules()
             .iter()
             .find(|rule| rule.operation.abi_number == Some(number))
@@ -1920,6 +1961,20 @@ impl EffectiveContract {
             }
             Some(rule) => Some(rule),
             None => syscall,
+        }
+    }
+
+    fn index_syscalls(&mut self) {
+        for index in 0..self.len {
+            let Some(number) = self.rules[index].operation.abi_number else {
+                continue;
+            };
+            let Ok(number) = usize::try_from(number) else {
+                continue;
+            };
+            if let Some(slot) = self.syscall_rules.get_mut(number) {
+                *slot = index as u16;
+            }
         }
     }
 }
@@ -1993,6 +2048,7 @@ pub fn resolve(
         };
         effective.len += 1;
     }
+    effective.index_syscalls();
     apply_profile(&mut effective, profile)?;
     for template in templates {
         apply_template(&mut effective, template)?;
@@ -2043,6 +2099,7 @@ pub fn resolve_recipe_catalog(
         };
         effective.len += 1;
     }
+    effective.index_syscalls();
     for (verb, selectors) in [
         (AccessVerb::Read, recipe.read),
         (AccessVerb::Write, recipe.write),
@@ -2431,6 +2488,7 @@ fn contract_digest(contract: &EffectiveContract) -> [u8; DIGEST_HEX_BYTES] {
     hash = hash_bytes(hash, &contract.catalog_version.to_le_bytes());
     for rule in contract.rules() {
         hash = hash_bytes(hash, rule.operation.id.as_bytes());
+        hash = hash_bytes(hash, &[rule.operation.direct_safe as u8]);
         hash = hash_bytes(hash, rule.action.name().as_bytes());
         hash = hash_bytes(hash, rule.provenance.name().as_bytes());
         hash = hash_bytes(hash, rule.source.as_bytes());
@@ -2469,8 +2527,8 @@ mod tests {
     fn configured_catalog_requires_an_explicit_opt_in() {
         let original = resolve(b"gate5-balanced-v1", &[], &[], &[]).unwrap();
         let configured = resolve(b"configured-balanced-v2", &[], &[], &[]).unwrap();
-        assert_eq!(original.catalog_version(), 1);
-        assert_eq!(configured.catalog_version(), 2);
+        assert_eq!(original.catalog_version(), CATALOG_VERSION);
+        assert_eq!(configured.catalog_version(), CONFIGURED_CATALOG_VERSION);
         assert_ne!(original.digest(), configured.digest());
         for operation in CONFIGURED_OPERATIONS {
             let number = operation.abi_number.unwrap();
@@ -2582,6 +2640,16 @@ mod tests {
     }
 
     #[test]
+    fn systemd_profile_mediates_sched_yield_through_the_index() {
+        let contract = resolve(b"gate9-systemd-v1", &[], &[], &[]).unwrap();
+        let rule = contract.syscall_rule(24).unwrap();
+        assert_eq!(rule.operation.id, "syscall.sched_yield");
+        assert_eq!(rule.action, Action::Mediate);
+        assert!(rule.operation.direct_safe);
+        assert_eq!(contract.syscall_action(24), Action::Mediate);
+    }
+
+    #[test]
     fn templates_and_overrides_are_deterministic() {
         let first = resolve(
             b"minimal-v1",
@@ -2654,7 +2722,7 @@ mod tests {
             .filter(|rule| rule.provenance == Provenance::InstanceAllow)
             .count();
         assert_eq!(selected, 2);
-        assert_eq!(CATALOG_VERSION, 1);
+        assert_eq!(CATALOG_VERSION, 2);
     }
 
     #[test]

@@ -87,6 +87,12 @@ pub enum ExecutionBackend {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchMode {
+    Paranoid,
+    Selective,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkBackend {
     None,
     Mediated,
@@ -154,6 +160,7 @@ pub struct InstanceConfig {
     pub memory_mib: u64,
     pub execution_profile: ExecutionProfile,
     pub execution_backend: ExecutionBackend,
+    pub dispatch_mode: DispatchMode,
     pub contract_profile: Text<IDENTIFIER_BYTES>,
     pub contract_templates: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     pub contract_allow: TextList<POLICY_ITEMS, POLICY_BYTES>,
@@ -301,6 +308,7 @@ struct ConfigBuilder {
     memory_mib: u64,
     execution_profile: ExecutionProfile,
     execution_backend: ExecutionBackend,
+    dispatch_mode: DispatchMode,
     contract_profile: Text<IDENTIFIER_BYTES>,
     contract_templates: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     contract_allow: TextList<POLICY_ITEMS, POLICY_BYTES>,
@@ -364,6 +372,7 @@ impl ConfigBuilder {
             memory_mib: 0,
             execution_profile: ExecutionProfile::Security,
             execution_backend: ExecutionBackend::Interpreter,
+            dispatch_mode: DispatchMode::Selective,
             contract_profile: Text::empty(),
             contract_templates: TextList::empty(),
             contract_allow: TextList::empty(),
@@ -462,6 +471,7 @@ impl ConfigBuilder {
             memory_mib: self.memory_mib,
             execution_profile: self.execution_profile,
             execution_backend: self.execution_backend,
+            dispatch_mode: self.dispatch_mode,
             contract_profile: self.contract_profile,
             contract_templates: self.contract_templates,
             contract_allow: self.contract_allow,
@@ -582,6 +592,13 @@ impl InstanceConfig {
                     b"interpreter" => ExecutionBackend::Interpreter,
                     b"ptrace-sysemu" => ExecutionBackend::PtraceSysemu,
                     b"ptrace-native" => ExecutionBackend::PtraceNative,
+                    _ => return Err(ConfigError::InvalidValue),
+                }
+            }
+            b"execution.dispatch" => {
+                self.dispatch_mode = match parse_string::<32>(value)?.as_bytes() {
+                    b"paranoid" => DispatchMode::Paranoid,
+                    b"selective" => DispatchMode::Selective,
                     _ => return Err(ConfigError::InvalidValue),
                 }
             }
@@ -710,7 +727,7 @@ impl InstanceConfig {
                 return Err(ConfigError::InvalidContract);
             }
         } else if self.contract_recipe_version != 1
-            || !matches!(self.contract_catalog_version, 1 | 2)
+            || !matches!(self.contract_catalog_version, 2 | 1002)
             || !self.contract_profile.is_empty()
             || !self.contract_templates.as_slice().is_empty()
             || !self.contract_allow.as_slice().is_empty()
@@ -980,6 +997,11 @@ impl InstanceConfig {
             ExecutionBackend::Interpreter => b"interpreter",
             ExecutionBackend::PtraceSysemu => b"ptrace-sysemu",
             ExecutionBackend::PtraceNative => b"ptrace-native",
+        })?;
+        output.raw(b"\ndispatch = ")?;
+        output.quoted(match self.dispatch_mode {
+            DispatchMode::Paranoid => b"paranoid",
+            DispatchMode::Selective => b"selective",
         })?;
         if self.contract_recipe_version == 0 {
             output.raw(b"\n\n[contract]\nprofile = ")?;
@@ -1385,6 +1407,14 @@ fn parse_field(
                 b"interpreter" => ExecutionBackend::Interpreter,
                 b"ptrace-sysemu" => ExecutionBackend::PtraceSysemu,
                 b"ptrace-native" => ExecutionBackend::PtraceNative,
+                _ => return Err(ConfigError::InvalidValue),
+            };
+        }
+        (Section::Execution, b"dispatch") => {
+            builder.mark(1u64 << 57)?;
+            builder.dispatch_mode = match parse_string::<32>(value)?.as_bytes() {
+                b"paranoid" => DispatchMode::Paranoid,
+                b"selective" => DispatchMode::Selective,
                 _ => return Err(ConfigError::InvalidValue),
             };
         }
@@ -2085,14 +2115,14 @@ policy = "stop"
     fn configured_catalog_is_explicit_and_round_trips() {
         let text = VALID.replace("minimal-v1", "configured-balanced-v2");
         let config = InstanceConfig::parse(text.as_bytes()).unwrap();
-        assert_eq!(config.effective_contract().unwrap().catalog_version(), 2);
+        assert_eq!(config.effective_contract().unwrap().catalog_version(), 1002);
         let normalized = config.normalized().unwrap();
         assert_eq!(
             InstanceConfig::parse(normalized.as_bytes()).unwrap(),
             config
         );
         let original = InstanceConfig::parse(VALID.as_bytes()).unwrap();
-        assert_eq!(original.effective_contract().unwrap().catalog_version(), 1);
+        assert_eq!(original.effective_contract().unwrap().catalog_version(), 2);
         assert_ne!(original.contract_digest, config.contract_digest);
     }
 
@@ -2164,6 +2194,7 @@ policy = "stop"
         assert_eq!(config.schema_version, 1);
         assert_eq!(config.id.as_bytes(), b"demo");
         assert_eq!(config.execution_profile, ExecutionProfile::Security);
+        assert_eq!(config.dispatch_mode, DispatchMode::Selective);
         assert_eq!(config.contract_digest.as_bytes().len(), 64);
         let normalized = config.normalized().unwrap();
         let reparsed = InstanceConfig::parse(normalized.as_bytes()).unwrap();
@@ -2171,14 +2202,42 @@ policy = "stop"
     }
 
     #[test]
+    fn dispatch_mode_is_strict_and_defaults_to_selective() {
+        let defaulted = InstanceConfig::parse(VALID.as_bytes()).unwrap();
+        assert_eq!(defaulted.dispatch_mode, DispatchMode::Selective);
+
+        let paranoid = VALID.replace(
+            "backend = \"interpreter\"",
+            "backend = \"interpreter\"\ndispatch = \"paranoid\"",
+        );
+        let paranoid = InstanceConfig::parse(paranoid.as_bytes()).unwrap();
+        assert_eq!(paranoid.dispatch_mode, DispatchMode::Paranoid);
+        assert_eq!(
+            InstanceConfig::parse(paranoid.normalized().unwrap().as_bytes())
+                .unwrap()
+                .dispatch_mode,
+            DispatchMode::Paranoid
+        );
+
+        let unknown = VALID.replace(
+            "backend = \"interpreter\"",
+            "backend = \"interpreter\"\ndispatch = \"automatic\"",
+        );
+        assert_eq!(
+            InstanceConfig::parse(unknown.as_bytes()),
+            Err(ConfigError::InvalidValue)
+        );
+    }
+
+    #[test]
     fn self_contained_contract_recipe_round_trips_and_rejects_mixing() {
         let recipe = VALID.replace(
             "[contract]\nprofile = \"minimal-v1\"",
-            "[userspace.contract]\nversion = 1\ncatalog = 1\ndefault = \"deny\"\nread = [\"fs.**\", \"proc.**\"]\nwrite = [\"fs.**\"]\nexecute = [\"syscall.execve\"]\nconnect = [\"network.**\"]\nlisten = [\"network.**\"]\nprocess = [\"signal.**\"]\nsystem = [\"syscall.getpid\"]\ndeny = [\"dev.mmio.direct\"]\nexact_allow = []\nexact_deny = []",
+            "[userspace.contract]\nversion = 1\ncatalog = 2\ndefault = \"deny\"\nread = [\"fs.**\", \"proc.**\"]\nwrite = [\"fs.**\"]\nexecute = [\"syscall.execve\"]\nconnect = [\"network.**\"]\nlisten = [\"network.**\"]\nprocess = [\"signal.**\"]\nsystem = [\"syscall.getpid\"]\ndeny = [\"dev.mmio.direct\"]\nexact_allow = []\nexact_deny = []",
         );
         let config = InstanceConfig::parse(recipe.as_bytes()).unwrap();
         assert_eq!(config.contract_recipe_version, 1);
-        assert_eq!(config.contract_catalog_version, 1);
+        assert_eq!(config.contract_catalog_version, 2);
         assert_eq!(config.contract_read.as_slice()[0].as_bytes(), b"fs.**");
         assert_eq!(
             config

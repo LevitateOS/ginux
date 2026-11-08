@@ -9,9 +9,9 @@ import tempfile
 
 
 def main():
-    if len(sys.argv) != 3 or os.geteuid() != 0:
+    if len(sys.argv) not in (3, 4) or os.geteuid() != 0:
         sys.exit("usage (as root): test-native-supervision.py <ginux binary> <native fixture>")
-    binary, fixture = (str(Path(arg).resolve()) for arg in sys.argv[1:])
+    binary, fixture = (str(Path(arg).resolve()) for arg in sys.argv[1:3])
     config = Path(__file__).resolve().parent.parent / "config/instance-gate5.toml"
     with tempfile.TemporaryDirectory(prefix="ginux-native-") as directory:
         work = Path(directory)
@@ -39,6 +39,25 @@ def main():
             if not ok:
                 raise RuntimeError(f"{name}: exit={code}\n{output}")
             print(f"PASS native {name}")
+
+        # Gate 11 direct dispatch must preserve explicit denial in both modes.
+        for dispatch in ("selective", "paranoid"):
+            for denied in (False, True):
+                instance = work / f"yield-{dispatch}-{denied}.toml"
+                text = config.read_text().replace('dispatch = "paranoid"',
+                                                  f'dispatch = "{dispatch}"')
+                if denied:
+                    text = text.replace('profile = "gate5-balanced-v1"',
+                                        'profile = "gate5-balanced-v1"\ndeny = ["syscall.sched_yield"]')
+                instance.write_text(text)
+                code, out = run("yield", instance)
+                expected = -1 if denied else 0
+                check(f"{dispatch} yield {'denied' if denied else 'allowed'}",
+                      code == 0 and f"GINUX_FIXTURE: yield={expected}\n" in out,
+                      code, out)
+        if len(sys.argv) == 4 and sys.argv[3] == "dispatch":
+            print("test-native-dispatch: PASS")
+            return
 
         # Host directories must not reach the chrooted workload: as a
         # standard stream the instance does not start, and every other
