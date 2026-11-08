@@ -71,7 +71,8 @@ else
         printf '%s\n' 'missing required command: cargo' >&2
         exit 1
     }
-    cargo run -q -p ginux-vfs-index -- assemble "$rootfs_tmp" "$index_tmp" "$@"
+    # The assembler is a host tool; native target flags omit the C runtime.
+    RUSTFLAGS='' cargo run -q -p ginux-vfs-index -- assemble "$rootfs_tmp" "$index_tmp" "$@"
 fi
 mv "$rootfs_tmp" "$rootfs"
 mv "$index_tmp" "$index"
