@@ -17,7 +17,7 @@ def main():
     if len(sys.argv) < 3 or os.geteuid() != 0:
         sys.exit('usage (as root): test-launch-network.py <ginux> <network-fixture> [modes...]')
     binary, fixture = [str(Path(p).resolve()) for p in sys.argv[1:3]]
-    modes = ('io', 'nonblock', 'deny', 'quota', 'timeout', 'hold', 'hold-kill', 'slots', 'off', 'ordinary-hold', 'budget', 'audit-cap', 'audit-disabled')
+    modes = ('io', 'nonblock', 'deny', 'quota', 'timeout', 'hold', 'hold-kill', 'slots', 'off', 'ordinary-hold', 'budget', 'audit-cap', 'audit-disabled', 'denial-cap')
     selected = sys.argv[3:] or modes
     if any(mode not in modes for mode in selected):
         sys.exit('unknown configured TCP mode')
@@ -70,6 +70,12 @@ def main():
                     config = config.replace('backend = "none"', network)
                 if mode == 'audit-disabled':
                     config = config.replace('mode = "stderr"', 'mode = "disabled"')
+                if mode == 'denial-cap':
+                    config = config.replace('[contract]\nprofile = "configured-balanced-v2"',
+                        '[userspace.contract]\nversion = 1\ncatalog = 2\ndefault = "deny"\n'
+                        'read = ["syscall.**"]\nwrite = ["syscall.**"]\n'
+                        'execute = ["syscall.**"]\nprocess = ["syscall.**"]\n'
+                        'system = ["syscall.**"]\nconnect = []')
                 path, result = work/'instance.toml', work/'result.json'
                 path.write_text(config)
                 result.unlink(missing_ok=True)
@@ -108,17 +114,21 @@ def main():
                     assert b'teardown tasks=0 owned-handles=0' in proc.stderr
                     if mode == 'audit-disabled':
                         assert b'network-summary' not in proc.stderr
+                        assert b'denial-summary' not in proc.stderr
                     else:
                         count = 0 if mode == 'off' else 1
                         assert f'ginux: network-summary version=1 endpoints={count}\n'.encode() in proc.stderr
                         if count:
-                            attempted = mode not in ('deny', 'slots')
+                            attempted = mode not in ('deny', 'slots', 'denial-cap')
                             expected = f'endpoint=127.0.0.1:{port} attempted={str(attempted).lower()} connected={str(attempted).lower()}'
                             assert expected.encode() in proc.stderr, proc.stderr.decode()
                         if mode == 'deny':
                             assert f'network-endpoint=127.0.0.1:{connect_port} egress=denied'.encode() in proc.stderr
                         if mode == 'audit-cap':
                             assert b'ginux: audit truncated budget=65536' in proc.stderr
+                        if mode == 'denial-cap':
+                            assert b'ginux: audit truncated budget=65536' in proc.stderr
+                            assert b'ginux: denial-summary operation=network.inet.tcp.connect policy-source=default-deny policy-rule=0 result=-38 count=1 ' in proc.stderr
                 if thread:
                     thread.join(6)
                     assert not thread.is_alive() and not failure, (mode, failure)

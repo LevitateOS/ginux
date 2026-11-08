@@ -7887,7 +7887,7 @@ fn instance_validate_main(config_path: *const u8) -> ! {
     write_all(contract.digest());
     write_all(b" operations=");
     write_u64(contract.rules().len() as u64);
-    write_all(b" configured-network-audit=1\n");
+    write_all(b" configured-network-audit=1 configured-denial-audit=1\n");
     exit_process(0)
 }
 

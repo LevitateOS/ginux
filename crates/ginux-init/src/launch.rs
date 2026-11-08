@@ -848,6 +848,22 @@ pub(crate) fn audit_enabled() -> bool {
     unsafe { !AUDIT_DISABLED }
 }
 
+/// Fixed-size summaries bypass only the syscall trace budget. Callers bound
+/// their records by the configured endpoint or compiled operation table.
+pub(crate) fn audit_summary(arguments: core::fmt::Arguments<'_>) {
+    if !audit_enabled() {
+        return;
+    }
+    struct Writer;
+    impl core::fmt::Write for Writer {
+        fn write_str(&mut self, value: &str) -> core::fmt::Result {
+            write_stderr(value.as_bytes());
+            Ok(())
+        }
+    }
+    let _ = core::fmt::write(&mut Writer, arguments);
+}
+
 pub(crate) fn audit_write(bytes: &[u8]) {
     let record = unsafe {
         if AUDIT_DISABLED || AUDIT_CAPPED {

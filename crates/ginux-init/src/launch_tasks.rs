@@ -103,12 +103,21 @@ struct DescriptorGroup {
     creation_mask: u32,
 }
 
+#[derive(Clone, Copy)]
+struct Denial {
+    count: u64,
+    first_sequence: u64,
+    first_pid: u32,
+    first_syscall: u64,
+}
+
 struct Supervisor<'a> {
     tasks: [Option<Task>; TASKS],
     groups: [Option<DescriptorGroup>; TASKS],
     processes: ProcessTable<TASKS>,
     objects: Backends<'a>,
     contract: &'a EffectiveContract,
+    denials: [Option<Denial>; ginux_contract::MAX_OPERATIONS + 1],
     unknown_stops: [usize; TASKS],
     retired: [(usize, u32); TASKS],
     retired_next: usize,
@@ -295,6 +304,7 @@ pub fn supervise(
         processes,
         objects,
         contract,
+        denials: [None; ginux_contract::MAX_OPERATIONS + 1],
         unknown_stops: [0; TASKS],
         retired: [(0, 0); TASKS],
         retired_next: 0,
@@ -887,6 +897,22 @@ impl Supervisor<'_> {
         // All workload calls pass here before clock/task/storage/FD effects.
         // Internal supervisor replay stages above are already-owned transactions.
         if let ContractAction::Deny(errno) = rule.map_or(ContractAction::Deny(38), |r| r.action) {
+            let slot = rule
+                .and_then(|rule| {
+                    self.contract
+                        .rules()
+                        .iter()
+                        .position(|candidate| candidate.operation.id == rule.operation.id)
+                })
+                .unwrap_or(ginux_contract::MAX_OPERATIONS);
+            let first_pid = self.task(index).id.pid;
+            let denial = self.denials[slot].get_or_insert(Denial {
+                count: 0,
+                first_sequence: self.sequence,
+                first_pid,
+                first_syscall: r.orig_rax,
+            });
+            denial.count = denial.count.saturating_add(1);
             audit_write(b"deny result=-");
             audit_u64(errno as u64);
             audit_write(b"\n");
@@ -2549,6 +2575,32 @@ impl Supervisor<'_> {
             }
         });
         self.objects.devices.network.audit_summary();
+        let count = self
+            .denials
+            .iter()
+            .filter(|denial| denial.is_some())
+            .count();
+        crate::launch::audit_summary(format_args!(
+            "ginux: denial-summary version=1 operations={count}\n"
+        ));
+        for (index, denial) in self.denials.iter().enumerate() {
+            if let Some(denial) = denial {
+                let rule = self.contract.rules().get(index);
+                let errno = rule
+                    .and_then(|rule| {
+                        if let ContractAction::Deny(errno) = rule.action {
+                            Some(errno)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(38);
+                crate::launch::audit_summary(format_args!(
+                    "ginux: denial-summary operation={} policy-source={} policy-rule={} result=-{} count={} first-sequence={} first-pid={} first-syscall={}\n",
+                    rule.map_or("unknown", |rule| rule.operation.id), rule.map_or("default-deny", |rule| rule.source),
+                    rule.map_or(0, |rule| rule.source_rule), errno, denial.count, denial.first_sequence, denial.first_pid, denial.first_syscall));
+            }
+        }
         self.objects.filesystem.teardown();
         if let Err(reason) = exported {
             supervision_error(instance, reason);

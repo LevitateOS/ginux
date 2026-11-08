@@ -15,6 +15,10 @@ long network_main(word *stack)
 {
     char **argv=(char **)(stack+1); char mode=argv[1][0];
     if(mode=='a'){for(unsigned i=0;i<2000;++i)CHECK(DO(39,0,0,0)>0,46);}
+    if(mode=='d' && argv[1][3]=='i'){
+        for(unsigned i=0;i<2000;++i)CHECK(DO(39,0,0,0)>0,47);
+        CHECK(DO(41,2,1,0)==-38,48);return 0;
+    }
     unsigned port=0; for(char *p=argv[2];*p;++p)port=port*10+*p-'0';
     address[2]=port>>8; address[3]=port;
     if(mode=='o' && argv[1][1]=='f'){CHECK(DO(41,2,1,0)==-13,10);return 0;}

@@ -110,8 +110,13 @@ a failed backend connection; `connected` requires observed handshake completion.
 A missing summary (for example after supervisor termination) is unknown usage,
 not evidence that a grant was unused. Disabled audit emits neither summary nor
 endpoint detail. This changes configured diagnostics only, not contract authority
-or native policy. `instance-validate` advertises `configured-network-audit=1`
-so consumers can reject a runtime that lacks these diagnostics before launch.
+or native policy. A separate `ginux: denial-summary` records first occurrence,
+count, errno and winning rule for each denied catalog operation (at most
+`MAX_OPERATIONS`, plus one unknown-operation bucket), independently of the trace
+cap. Absence after interrupted teardown remains unobserved. Disabled auditing
+suppresses both summaries. `instance-validate` advertises
+`configured-network-audit=1 configured-denial-audit=1` so consumers can reject a
+runtime that lacks these diagnostics before launch.
 
 ## Filesystem and elevation constraints
 
