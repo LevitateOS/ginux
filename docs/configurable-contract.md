@@ -39,6 +39,22 @@ and host process access remain unavailable; explicit denial precedes all view
 effects. This supplies libc initial-stack discovery without a general procfs
 or complete memory-map ABI.
 
+Configured filesystem opens additionally accept bounded `O_PATH` references.
+They follow the confined pathname and retain an immutable metadata-only kind in
+the public descriptor table. Supported accompanying flags are `O_DIRECTORY`,
+`O_CLOEXEC`, `O_LARGEFILE` and `O_NOCTTY`; other combinations, including
+`O_NOFOLLOW`, return EOPNOTSUPP. Stat, relative stat/access/readlink metadata,
+the owned FD-name view, duplication, descriptor flags, close and fork/exec
+lifetime are supported. `F_GETFL` reports `O_PATH` and requested `O_DIRECTORY`.
+Data I/O, directory enumeration, seek, mapping, descriptor execution, fchdir,
+status/metadata mutation and descriptor-path reopen are denied. A metadata
+directory cannot supply authority for relative open, exec or mutation; absolute
+pathnames retain their ordinary independent checks. Poll reports POLLNVAL and
+epoll does not watch filesystem references. References consume the existing
+public and filesystem descriptor quotas, including lower operator limits.
+Explicit contract denial precedes allocation and metadata effects. This is a
+configured subset, with native policy and catalog membership unchanged.
+
 Configured launch implements `eventfd2`, `epoll_create1`, `epoll_ctl`,
 `epoll_wait` and bounded `epoll_pwait` through the public descriptor table.
 Counters and epoll instances share the existing 16-object channel pool with

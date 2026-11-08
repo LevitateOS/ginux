@@ -1323,7 +1323,10 @@ impl LaunchFs {
     }
 
     fn open(&mut self, path: &[u8], flags: u64, mode: u64) -> Result<i64, i64> {
-        // Unsupported directory/path-only behavior never falls through to native storage.
+        // Public descriptors retain O_PATH as an immutable metadata-only kind.
+        // The VFS reference supplies stat/name/lifetime, never data authority.
+        let flags = flags & !0o10000000;
+        // Unsupported flag combinations never fall through to native storage.
         const ALLOWED: u64 = 3
             | 0o100
             | 0o200

@@ -16,6 +16,7 @@ pub enum ExecDescriptor {
     Owned(u32),
 }
 const CLOEXEC: u64 = 0o2000000;
+const PATH_ONLY: u64 = 0o10000000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Handle {
@@ -28,6 +29,8 @@ enum Handle {
 struct Descriptor {
     handle: Handle,
     cloexec: bool,
+    // Immutable metadata-only kind; copies/aliases must never gain data access.
+    path_flags: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -324,6 +327,7 @@ impl DescriptorTable {
                         console: true,
                     },
                     cloexec: false,
+                    path_flags: 0,
                 });
             }
         }
@@ -395,7 +399,11 @@ impl DescriptorTable {
     }
 
     pub fn mapping_file(&self, fd: u64) -> Result<Option<u32>, i64> {
-        match self.get(fd)?.handle {
+        let entry = self.get(fd)?;
+        if entry.path_flags != 0 {
+            return Err(-9);
+        }
+        match entry.handle {
             Handle::Native { .. } => Ok(None),
             Handle::Owned(handle) if (1048576..1048640).contains(&handle) => Ok(Some(handle)),
             _ => Err(-95),
@@ -403,7 +411,11 @@ impl DescriptorTable {
     }
 
     pub fn exec_descriptor(&self, fd: u64) -> Result<ExecDescriptor, i64> {
-        match self.get(fd)?.handle {
+        let entry = self.get(fd)?;
+        if entry.path_flags != 0 {
+            return Err(-9);
+        }
+        match entry.handle {
             Handle::Native { fd, console: false } => Ok(ExecDescriptor::Native(fd)),
             Handle::Owned(handle) if (1048576..1048640).contains(&handle) => {
                 Ok(ExecDescriptor::Owned(handle))
@@ -519,6 +531,7 @@ impl DescriptorTable {
         self.entries[slot] = Some(Descriptor {
             handle: Handle::Reserved,
             cloexec,
+            path_flags: 0,
         });
         Ok(slot)
     }
@@ -639,6 +652,7 @@ impl DescriptorTable {
             9 if r.r10 & 0x20 == 0 => {
                 call.save(r);
                 match self.get(r.r8) {
+                    Ok(Descriptor { path_flags, .. }) if path_flags != 0 => Err(-9),
                     Ok(Descriptor {
                         handle: Handle::Native { fd, console: false },
                         ..
@@ -697,11 +711,26 @@ impl DescriptorTable {
         r: &mut UserRegs,
         backends: &mut Backends,
     ) -> Result<NativeDecision, i64> {
-        r.rdi = self.path_handle(pid, r.rdi, r.rsi)?;
+        r.rdi = self.path_reference(
+            pid,
+            r.rdi,
+            r.rsi,
+            matches!(r.orig_rax, 262 | 267 | 269 | 332 | 439),
+        )?;
         Ok(backends.claim(pid, r))
     }
 
     fn path_handle(&self, pid: usize, dirfd: u64, address: u64) -> Result<u64, i64> {
+        self.path_reference(pid, dirfd, address, false)
+    }
+
+    fn path_reference(
+        &self,
+        pid: usize,
+        dirfd: u64,
+        address: u64,
+        metadata: bool,
+    ) -> Result<u64, i64> {
         let path = read_path(pid, address)?;
         if path.as_bytes().first() == Some(&b'/') {
             return Ok((-100i64) as u64);
@@ -709,7 +738,11 @@ impl DescriptorTable {
         if dirfd as i32 == -100 {
             return Ok(dirfd);
         }
-        match self.get(dirfd)?.handle {
+        let entry = self.get(dirfd)?;
+        if entry.path_flags != 0 && !metadata {
+            return Err(-9);
+        }
+        match entry.handle {
             Handle::Owned(handle) if path.is_empty() || (1048576..1048640).contains(&handle) => {
                 Ok(handle as u64)
             }
@@ -739,8 +772,17 @@ impl DescriptorTable {
         call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
         let flags = if r.orig_rax == 2 { r.rsi } else { r.rdx };
+        if flags & PATH_ONLY != 0
+            && flags & !(PATH_ONLY | CLOEXEC | 0o100000 | 0o400 | 0o200000) != 0
+        {
+            return Err(-95);
+        }
         // Reserve before any create/truncate or native open can occur.
         let slot = self.reserve(flags & CLOEXEC != 0)?;
+        if flags & PATH_ONLY != 0 {
+            self.entries[slot].as_mut().unwrap().path_flags =
+                (flags & (PATH_ONLY | 0o200000)) as u32;
+        }
         if r.orig_rax == 2 {
             r.rsi &= !CLOEXEC;
         } else {
@@ -820,7 +862,11 @@ impl DescriptorTable {
             if fd >= LIMIT as u64 {
                 return Err(-2);
             }
-            let handle = match self.get(fd).map_err(|_| -2)?.handle {
+            let entry = self.get(fd).map_err(|_| -2)?;
+            if entry.path_flags != 0 {
+                return Err(-9);
+            }
+            let handle = match entry.handle {
                 Handle::Owned(handle) if (1048576..1048640).contains(&handle) => handle,
                 _ => return Err(-95),
             };
@@ -901,6 +947,14 @@ impl DescriptorTable {
         backends: &mut Backends,
         call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
+        if entry.path_flags != 0 {
+            if r.orig_rax == 72 && r.rsi == 3 {
+                return Ok(ready(entry.path_flags as i64));
+            }
+            if r.orig_rax != 5 {
+                return Err(-9);
+            }
+        }
         if r.orig_rax == 138 {
             return Ok(ready(backends.filesystem.statfs(
                 pid,
@@ -1298,6 +1352,7 @@ impl DescriptorTable {
                 continue;
             }
             let revents = match self.get(fd as u64) {
+                Ok(Descriptor { path_flags, .. }) if path_flags != 0 => 32,
                 Ok(Descriptor {
                     handle: Handle::Native { fd, console: true },
                     ..
