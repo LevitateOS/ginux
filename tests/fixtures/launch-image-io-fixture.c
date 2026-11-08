@@ -11,8 +11,21 @@ static long call(long n, word a, word b, word c, word d, word e, word f)
 #define CHECK(condition,code) if (!(condition)) return code
 static unsigned char buffer[2*1024*1024+32];
 static word info[15];
+static long system_view(int denied) {
+    unsigned char view[128];
+    for (unsigned i=0;i<sizeof view;++i) view[i]=0xa5;
+    long result=DO(99,view+8,0,0);
+    CHECK(result==(denied ? -1 : 0),50);
+    for (unsigned i=0;i<sizeof view;++i)
+        CHECK(view[i]==(!denied && i>=8 && i<120 ? 0 : 0xa5),51);
+    return 0;
+}
 long image_io_main(word *stack)
 {
+    int denied=stack[0]>1 && ((char *)stack[2])[0]=='D';
+    long system_result=system_view(denied);
+    if (system_result) return system_result;
+    if (stack[0]>1 && (denied || ((char *)stack[2])[0]=='S')) return 0;
     if(stack[0]>1) {
         CHECK(DO(102,0,0,0)==12345 && DO(107,0,0,0)==12345,30);
         CHECK(DO(104,0,0,0)==23456 && DO(108,0,0,0)==23456,31);

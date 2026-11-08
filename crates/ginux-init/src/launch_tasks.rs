@@ -3,7 +3,7 @@
 
 use crate::descriptors::{Backends, DescriptorCall, DescriptorTable, ExecDescriptor};
 use crate::dispatch::{
-    balanced_surface_name, decide_launch, native_arguments_allowed, NativeDecision,
+    balanced_surface_name, decide_launch, launch_arguments_allowed, NativeDecision,
 };
 use crate::launch::{
     audit_i64, audit_u64, audit_write, finish_exited, finish_signaled, launch_early_fail,
@@ -952,6 +952,20 @@ impl Supervisor<'_> {
             }
             return;
         }
+        if r.orig_rax == 99 {
+            // x86-64 struct sysinfo is 112 bytes. A deterministic empty system
+            // view exposes neither host topology nor a fictitious RAM budget.
+            let bytes = [0u8; 112];
+            let result = crate::supervisor::write_tracee_bytes_strict(
+                self.task(index).host,
+                r.rdi as usize,
+                &bytes,
+            )
+            .map(|_| 0)
+            .unwrap_or_else(|error| error);
+            self.emulate(index, r, result, instance);
+            return;
+        }
         if r.orig_rax == ginux_core::SYS_UNAME {
             let identity = ginux_kernel_views::IdentityView {
                 hostname: instance.config().id.as_bytes(),
@@ -1581,7 +1595,7 @@ impl Supervisor<'_> {
                     balanced_identity_result(original.orig_rax).unwrap_or(0),
                     instance,
                 ),
-                Action::Mediate if native_arguments_allowed(r.orig_rax, r) => {
+                Action::Mediate if launch_arguments_allowed(r.orig_rax, r) => {
                     audit_write(b"mediate surface=");
                     audit_write(balanced_surface_name(balanced_surface(r.orig_rax)));
                     audit_write(b"\n");

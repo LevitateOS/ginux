@@ -5,7 +5,7 @@
 //! and mediates supported process calls through its own event loop.
 
 use ginux_core::{
-    balanced_arguments_allowed, decide_balanced, Action, BalancedSurface, Decision, SYS_FORK,
+    configured_arguments_allowed, decide_balanced, Action, BalancedSurface, Decision, SYS_FORK,
 };
 
 use crate::supervisor::UserRegs;
@@ -155,8 +155,8 @@ pub fn process_entry(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> Option<i64> 
     crate::process_hooks::claim(syscall, rdi, rsi, rdx)
 }
 
-pub fn native_arguments_allowed(syscall: u64, registers: &UserRegs) -> bool {
-    balanced_arguments_allowed(syscall, registers.rdi, registers.rsi, registers.rdx)
+pub fn launch_arguments_allowed(syscall: u64, registers: &UserRegs) -> bool {
+    configured_arguments_allowed(syscall, registers.rdi, registers.rsi, registers.rdx)
 }
 
 pub fn balanced_surface_name(surface: BalancedSurface) -> &'static [u8] {

@@ -401,12 +401,12 @@ pub const fn balanced_arguments_allowed(syscall: u64, arg0: u64, arg1: u64, arg2
     const PROT_WRITE: u64 = 2;
     const PROT_EXEC: u64 = 4;
     match syscall {
-        0 => arg2 <= 64 * 1024 * 1024,
+        0 => arg2 <= 1024 * 1024,
         1 => matches!(arg0, 1 | 2) && arg2 <= 4096,
         20 => matches!(arg0, 1 | 2) && arg2 <= 16,
         2 => arg1 & (O_ACCMODE | MUTATING_OPEN_FLAGS) == 0,
         9 | 10 => arg2 & (PROT_WRITE | PROT_EXEC) != (PROT_WRITE | PROT_EXEC),
-        17 => arg2 <= 64 * 1024 * 1024,
+        17 => arg2 <= 1024 * 1024,
         // ioctl is outside the balanced surface; native systemd mode falls
         // back to this check for both.
         16 | 72 => !signal_driven_io(syscall, arg1, arg2),
@@ -419,27 +419,43 @@ pub const fn balanced_arguments_allowed(syscall: u64, arg0: u64, arg1: u64, arg2
     }
 }
 
+/// Configured image reads have a separate finite request bound. Native callers
+/// retain the balanced policy and its existing transfer errors.
+pub const fn configured_arguments_allowed(syscall: u64, arg0: u64, arg1: u64, arg2: u64) -> bool {
+    match syscall {
+        0 | 17 => arg2 <= 64 * 1024 * 1024,
+        _ => balanced_arguments_allowed(syscall, arg0, arg1, arg2),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn balanced_image_reads_allow_large_headers_with_a_finite_bound() {
+    fn configured_image_reads_allow_large_headers_with_a_finite_bound() {
         for syscall in [0, 17] {
-            assert!(balanced_arguments_allowed(syscall, 3, 0x1000, 1_862_989));
-            assert!(balanced_arguments_allowed(
+            assert!(configured_arguments_allowed(syscall, 3, 0x1000, 1_862_989));
+            assert!(configured_arguments_allowed(
                 syscall,
                 3,
                 0x1000,
                 64 * 1024 * 1024
             ));
-            assert!(!balanced_arguments_allowed(
+            assert!(!configured_arguments_allowed(
                 syscall,
                 3,
                 0x1000,
                 64 * 1024 * 1024 + 1
             ));
-            assert!(!balanced_arguments_allowed(syscall, 3, 0x1000, u64::MAX));
+            assert!(!configured_arguments_allowed(syscall, 3, 0x1000, u64::MAX));
+            assert!(balanced_arguments_allowed(syscall, 3, 0x1000, 1024 * 1024));
+            assert!(!balanced_arguments_allowed(
+                syscall,
+                3,
+                0x1000,
+                1024 * 1024 + 1
+            ));
         }
     }
 
