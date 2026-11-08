@@ -152,6 +152,16 @@ long event_main(word *stack) {
         CHECK(DO(33,counter,50,0)==50 && DO(292,counter,51,02000000)==51,89);
         char *args[]={"/bin/fixture","x",0};
         CHECK(DO(59,args[0],args,0)==0,90); return 91;
+    } else if(mode=='u') {
+        CHECK(ctl(ep,1,counter,(1U<<31)|1,333)==0,124);
+        int alias=DO(32,counter,0,0); CHECK(alias>=3,125);
+        for(int i=0;i<12;++i) {
+            value=1; CHECK(DO(1,i%2 ? alias : counter,&value,8)==8,126);
+            CHECK(wait_event(ep,1,0)==1 && events[0].data==333 && events[0].events==1,127);
+            CHECK(wait_event(ep,1,0)==0,128);
+            CHECK(DO(1,counter,1,8)==-14 && wait_event(ep,1,0)==0,129);
+        }
+        CHECK(DO(0,counter,&value,8)==8 && value==12,130);
     } else if(mode=='z') {
         CHECK(ctl(ep,1,counter,1,1)==0,117);
         value=1; CHECK(DO(1,counter,&value,8)==8,118);

@@ -151,7 +151,12 @@ impl Backends<'_> {
         r: &UserRegs,
         progress: &mut crate::channel_hooks::WriteProgress,
     ) -> NativeDecision {
-        decide_objects(
+        let counter = matches!(r.orig_rax, 0 | 1)
+            && matches!(
+                self.channels.event(r.rdi as u32),
+                Some(Event::Counter { .. })
+            );
+        let decision = decide_objects(
             pid,
             signal_tgid,
             r,
@@ -159,7 +164,12 @@ impl Backends<'_> {
             self.devices,
             self.channels,
             progress,
-        )
+        );
+        if counter && matches!(&decision, NativeDecision::Hooked { result: 8, .. }) {
+            self.channels
+                .notify_counter(r.rdi as u32, if r.orig_rax == 1 { 1 } else { 4 });
+        }
+        decision
     }
     fn release(&mut self, handle: u32) -> Result<(), &'static [u8]> {
         if !self.refs.release(handle) {

@@ -36,6 +36,12 @@ impl Watch {
             armed: true,
         }
     }
+    pub fn notify(&mut self, events: u32) {
+        // Eventfd's waitqueue reports successful writes even while the count
+        // stays nonzero. Edge-triggered users may intentionally leave it unread.
+        self.observed &= !events;
+    }
+
     pub fn observe(&mut self, available: u16) {
         let available = u32::from(available);
         let ready = available & (self.events | 8 | 16) & 0x201f;

@@ -26,7 +26,7 @@ def main():
         (root / "bin/fixture").chmod(0o755)
         template = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
         template = template.replace('assignments = []', 'assignments = ["memory:/work"]', 1)
-        for mode in ("basic", "level", "edge", "oneshot", "aliases", "pipes", "fork", "read", "write", "time", "capacity", "keep-exec", "deny", "network", "v-limit", "g-copy", "z-combined"):
+        for mode in ("basic", "level", "edge", "oneshot", "aliases", "pipes", "fork", "read", "write", "time", "capacity", "keep-exec", "deny", "network", "v-limit", "g-copy", "z-combined", "undrained"):
             with socket.socket() as server:
                 server.bind(("127.0.0.1", 0))
                 server.listen()

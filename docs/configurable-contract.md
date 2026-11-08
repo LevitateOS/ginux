@@ -55,8 +55,12 @@ sockets. Image/native descriptors, filesystem files and nested epoll instances
 are unsupported. Registrations retain object identity and the registered public
 number: aliases may be registered separately, survive closure of the original
 number while an alias remains, and never retarget a reused object or descriptor.
-Level readiness, edge transitions (drain until EAGAIN), one-shot rearming and
-round-robin delivery of ready registrations are bounded by this set. ERR/HUP
+Level readiness, edge transitions, event-counter read/write notifications,
+one-shot rearming and
+round-robin delivery of ready registrations are bounded by this set.
+Successful counter writes notify IN even when the counter stays nonzero, so
+edge-triggered wakeup loops may intentionally leave it unread; reads notify OUT.
+Other edge-triggered I/O still requires draining until EAGAIN. ERR/HUP
 are always reported; RDHUP observes actual TCP peer write-half closure and is
 not synthesized from pipe HUP. Events carry the caller's snapshotted 64-bit data.
 

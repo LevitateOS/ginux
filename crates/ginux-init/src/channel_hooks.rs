@@ -394,6 +394,18 @@ impl LaunchChannels {
         self.epoll_count != 0
     }
 
+    pub fn notify_counter(&mut self, handle: u32, events: u32) {
+        for (index, object) in self.pipes.iter().enumerate() {
+            if object.live && matches!(object.event, Event::Epoll) {
+                for watch in self.epolls[index].watches.iter_mut().flatten() {
+                    if watch.key.handle == handle {
+                        watch.notify(events);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn epolls(&self) -> [Option<u32>; PIPES] {
         let mut output = [None; PIPES];
         let mut count = 0;
