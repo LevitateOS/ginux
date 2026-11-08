@@ -444,6 +444,9 @@ pub fn launch_main(
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     let mut filesystem = crate::fs_hooks::LaunchFs::prepare(&config)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
+    filesystem
+        .check_image(root_path)
+        .unwrap_or_else(|reason| launch_startup_fail(reason));
     if let Err(reason) = crate::storage_restore::restore(restore_path, &mut filesystem) {
         filesystem.teardown();
         launch_startup_fail(reason);

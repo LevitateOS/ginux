@@ -197,6 +197,87 @@ impl LaunchFs {
         })
     }
 
+    /// Match the prepared storage foundation: an assignment replaces its final
+    /// image component, but no earlier component may be a link or regular file.
+    pub fn check_image(&self, root: *const u8) -> Result<(), &'static [u8]> {
+        if self.count == 0 {
+            return Ok(());
+        }
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+        // O_PATH | O_DIRECTORY | O_CLOEXEC, beneath root without any links.
+        let how = OpenHow {
+            flags: 0x290000,
+            mode: 0,
+            resolve: 0x0e,
+        };
+        let root = unsafe {
+            crate::supervisor::syscall4(
+                257,
+                (-100isize) as usize,
+                root as usize,
+                how.flags as usize,
+                0,
+            )
+        };
+        if root < 0 {
+            return Err(b"launch root unavailable");
+        }
+        let checked = (|| {
+            for prefix in &self.prefixes[..self.count] {
+                let relative = &prefix.as_bytes()[1..];
+                for end in 1..relative.len() {
+                    if relative[end] != b'/' {
+                        continue;
+                    }
+                    let mut name = [0u8; MAX_PATH + 1];
+                    name[..end].copy_from_slice(&relative[..end]);
+                    let fd = unsafe {
+                        crate::supervisor::syscall4(
+                            437,
+                            root as usize,
+                            name.as_ptr() as usize,
+                            &how as *const _ as usize,
+                            core::mem::size_of::<OpenHow>(),
+                        )
+                    };
+                    match fd {
+                        -2 => break, // Missing image parents are synthesized in memory.
+                        -40 => {
+                            return Err(
+                                b"storage assignment passes through an image link".as_slice()
+                            )
+                        }
+                        -20 => {
+                            return Err(b"storage assignment lies beneath an image file".as_slice())
+                        }
+                        fd if fd < 0 => {
+                            return Err(
+                                b"storage assignment cannot be checked in the image".as_slice()
+                            )
+                        }
+                        fd => {
+                            if unsafe { crate::supervisor::syscall1(3, fd as usize) } != 0 {
+                                return Err(b"storage assignment directory close failed".as_slice());
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        let closed = unsafe { crate::supervisor::syscall1(3, root as usize) };
+        checked.and(if closed == 0 {
+            Ok(())
+        } else {
+            Err(b"storage assignment root close failed")
+        })
+    }
+
     pub fn readiness(&self, handle: u32) -> Option<u16> {
         let slot = handle.checked_sub(FD_BASE as u32)?;
         if slot >= 64 {

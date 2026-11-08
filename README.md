@@ -291,6 +291,12 @@ backend handles are not public descriptors, and no 64-bit canonical-FD rejection
 is promised. Ordinary file read/readv operations require filesystem read authority,
 while console and TCP aliases retain their respective semantic policy families.
 
+Memory assignment prefixes are checked against the supplied image before restore
+or workload execution. Every existing image component above the assigned name
+must be a real directory: image symlink and file prefixes fail startup. Missing
+parents may be synthesized; a link or file at the assigned name itself is hidden
+by the empty memory directory. This matches the configured-storage foundation.
+
 The configured supervisor retains only standard streams and an explicitly
 supplied coordinator control socket from its caller. Other inherited FDs are
 closed before private storage reservation. Its own result/export descriptors
