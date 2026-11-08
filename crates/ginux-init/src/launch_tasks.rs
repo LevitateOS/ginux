@@ -1146,6 +1146,34 @@ impl Supervisor<'_> {
                 } else {
                     (r.rsi, r.rdx, r.r10, r.rdi)
                 };
+                // Snapshot the FD name once. This is a virtual metadata view,
+                // never permission to open a host proc path or backend handle.
+                if let Ok(path) = crate::tracee_io::read_path(host, address) {
+                    if let Some(name) = self.table(index).self_fd_path(
+                        host,
+                        path.as_bytes(),
+                        &self.objects.filesystem,
+                    ) {
+                        let result = name
+                            .and_then(|name| {
+                                if size == 0 {
+                                    return Err(-22);
+                                }
+                                let count = name.as_bytes().len().min(size as usize);
+                                let mut bytes = [0; ginux_vfs::MAX_PATH];
+                                bytes[..count].copy_from_slice(&name.as_bytes()[..count]);
+                                if copy_memory(host, output, &mut bytes[..count], true)?
+                                    != count as i64
+                                {
+                                    return Err(-14);
+                                }
+                                Ok(count as i64)
+                            })
+                            .unwrap_or_else(|error| error);
+                        self.emulate(index, r, result, instance);
+                        return;
+                    }
+                }
                 let path = self.objects.filesystem.path(host, address, dirfd);
                 if path.as_ref().is_ok_and(|path| {
                     matches!(

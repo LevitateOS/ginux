@@ -842,6 +842,28 @@ impl<
         }
     }
 
+    /// A currently named filesystem object held by this descriptor. Unlinked
+    /// objects and names now bound to another inode have no path in this view.
+    pub fn descriptor_path(&self, descriptor: i32) -> Result<&[u8], VfsError> {
+        let state = self.descriptors[self.descriptor(descriptor)?];
+        if state.directory {
+            return self.directory_path(descriptor);
+        }
+        let path = if state.overlay {
+            let file = &self.overlay[state.object];
+            if file.state == 2 {
+                return Err(VfsError::NotFound);
+            }
+            file.path.as_bytes()
+        } else {
+            self.index.entry(state.object)?.path
+        };
+        if self.metadata_no_follow(path)?.inode != self.fstat(descriptor)?.inode {
+            return Err(VfsError::NotFound);
+        }
+        Ok(path)
+    }
+
     /// Inspect without consuming a cookie. The ABI adapter commits the next
     /// cookie only after complete directory records reach caller memory.
     pub fn directory_entry(

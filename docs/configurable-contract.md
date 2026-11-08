@@ -11,6 +11,18 @@ or `catalog = 1002` in a self-contained contract. Upstream Gate 11 owns catalog 
 the former local catalog 2 is retired to avoid a version collision. See the README's configured-launch section for
 the operation list, enforcement order, audit behavior and backend limitations.
 
+Configured `readlink` and absolute-path `readlinkat` additionally recognize
+`/proc/self/fd/N` for a live public filesystem descriptor owned by the caller.
+Names come from the image/chroot or owned-filesystem owner, never from treating
+`N` as a host descriptor. Aliases, fork and close-on-exec follow the public table.
+The owned view reports a currently tracked name for the inode; unlinked or
+replaced names, closed descriptors and non-filesystem objects return ENOENT.
+Decimal path components are bounded names and do not wrap to a low-32-bit FD.
+Output truncates to the supplied size without a NUL terminator; a zero size is
+invalid. This is a configured metadata view, not a procfs mount: it adds no
+directory enumeration, host-process view or proc-path open authority, and does
+not change native policy. Explicit contract denial still precedes the view.
+
 ```toml
 [userspace.contract]
 version = 1

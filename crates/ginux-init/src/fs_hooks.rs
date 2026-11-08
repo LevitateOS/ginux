@@ -946,6 +946,15 @@ impl LaunchFs {
         self.check_exec(pid, image)
     }
 
+    pub fn descriptor_path(&self, handle: u32) -> Result<Path, i64> {
+        let slot = handle
+            .checked_sub(FD_BASE as u32)
+            .filter(|slot| *slot < 64)
+            .ok_or(-2)?;
+        let path = self.fs.descriptor_path(slot as i32 + 3).map_err(errno)?;
+        Path::from_bytes(path).map_err(|_| -36)
+    }
+
     /// Readonly reopening through a public descriptor resolved by its owner.
     /// It cannot import a native fd or grant host filesystem write authority.
     pub fn open_descriptor(

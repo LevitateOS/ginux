@@ -323,9 +323,11 @@ test-launch-pipes:
 build-launch-fd-fixture:
 	mkdir -p .artifacts/launch
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fd-fixture.c -o .artifacts/launch/launch-fd-fixture
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fd-path-fixture.c -o .artifacts/launch/launch-fd-path-fixture
 
 test-launch-fds:
 	python3 scripts/test-launch-fds.py $(GINUX) .artifacts/launch/launch-fd-fixture
+	python3 scripts/test-launch-fd-paths.py $(GINUX) .artifacts/launch/launch-fd-path-fixture
 
 .PHONY: build-launch-task-fixture test-launch-tasks
 build-launch-task-fixture:

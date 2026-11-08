@@ -344,6 +344,40 @@ impl DescriptorTable {
     pub fn exec_path_dirfd(&self, pid: usize, fd: u64, address: u64) -> Result<u64, i64> {
         self.path_handle(pid, fd, address)
     }
+
+    /// Only a calling task's live public filesystem descriptors have a name.
+    /// Path digits do not use the i32 syscall-argument narrowing rule.
+    pub fn self_fd_path(
+        &self,
+        pid: usize,
+        path: &[u8],
+        filesystem: &LaunchFs,
+    ) -> Option<Result<ginux_instance::Text<{ ginux_vfs::MAX_PATH }>, i64>> {
+        let digits = path.strip_prefix(b"/proc/self/fd/")?;
+        Some((|| {
+            if digits.is_empty() {
+                return Err(-2);
+            }
+            let mut fd = 0usize;
+            for digit in digits {
+                if !digit.is_ascii_digit() {
+                    return Err(-2);
+                }
+                fd = fd
+                    .checked_mul(10)
+                    .and_then(|fd| fd.checked_add((digit - b'0') as usize))
+                    .filter(|fd| *fd < LIMIT)
+                    .ok_or(-2)?;
+            }
+            match self.get(fd as u64).map_err(|_| -2)?.handle {
+                Handle::Native { fd, console: false } => crate::tracee_io::image_fd_path(pid, fd),
+                Handle::Owned(handle) if (1048576..1048640).contains(&handle) => {
+                    filesystem.descriptor_path(handle)
+                }
+                _ => Err(-2),
+            }
+        })())
+    }
     pub fn exec_cloexec(&self, fd: u64) -> Result<bool, i64> {
         Ok(self.get(fd)?.cloexec)
     }
