@@ -135,12 +135,16 @@ def main():
         (root / "bin").symlink_to("usr/bin")
         (root / "proc/1").mkdir(parents=True)
         (root / "proc/sys/kernel").mkdir(parents=True)
-        code, out = run("sigchld", systemd_config)
-        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
-        check("SIGCHLD reaches a handler", code == 0 and fixture == [
-            "GINUX_FIXTURE: sigaction=0", "GINUX_FIXTURE: fork-ok=1",
-            "GINUX_FIXTURE: sigchld-poll=1", "GINUX_FIXTURE: sigchld-handled=1",
-            "GINUX_FIXTURE: wait-ok=1", "GINUX_FIXTURE: child-status=7"], code, out)
+        for scenario in ("sigchld-busy", "sigchld"):
+            code, out = run(scenario, systemd_config)
+            fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+            expected = ["GINUX_FIXTURE: sigaction=0", "GINUX_FIXTURE: fork-ok=1"]
+            if scenario == "sigchld-busy":
+                expected.append("GINUX_FIXTURE: sigchld-userspace=1")
+            expected += ["GINUX_FIXTURE: sigchld-poll=1", "GINUX_FIXTURE: sigchld-handled=1",
+                         "GINUX_FIXTURE: wait-ok=1", "GINUX_FIXTURE: child-status=7"]
+            check(f"SIGCHLD reaches a handler ({scenario})",
+                  code == 0 and fixture == expected, code, out)
     print("test-native-supervision: PASS")
 
 

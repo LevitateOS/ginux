@@ -5369,7 +5369,15 @@ fn supervise_native(
             write_all(b"GINUX_NATIVE_PROCESS_AUDIT: sigchld delivered parent=");
             write_u64(task.virtual_id.pid as u64);
             write_all(b"\n");
-            if ptrace(PTRACE_SYSCALL, host_pid, 0, 17) < 0 {
+            // Preserve the hybrid dispatch phase. Asking for a syscall stop
+            // while returning to userspace would stop at the next entry,
+            // before its seccomp event, with no mediated exit outstanding.
+            let request = if task.awaiting_exit {
+                PTRACE_SYSCALL
+            } else {
+                PTRACE_CONT
+            };
+            if ptrace(request, host_pid, 0, 17) < 0 {
                 native_fail(instance, pid, b"native SIGCHLD resume failed");
             }
             continue;

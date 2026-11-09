@@ -149,14 +149,29 @@ long native_fixture_main(void)
             short events, revents;
         } poll_fd;
         int fds[2];
+        int start_fds[2];
+        int userspace = scenario[7] == '-';
         int status = 0;
         long pid;
         if (call4(293, (word)fds, 0, 0, 0) < 0) return 82;
+        if (userspace && call4(293, (word)start_fds, 0, 0, 0) < 0) return 83;
         sigchld_pipe = fds[1];
         print_result("GINUX_FIXTURE: sigaction=", call4(13, 17, (word)&action, 0, 8));
         pid = call3(57, 0, 0, 0);
-        if (pid == 0) return 7;
+        if (pid == 0) {
+            char go;
+            if (userspace && call3(0, start_fds[0], (word)&go, 1) != 1) return 84;
+            return 7;
+        }
         print_result("GINUX_FIXTURE: fork-ok=", pid > 0);
+        if (userspace) {
+            /* Let the child exit only after the parent is ready to stay in
+             * userspace. No poll or other syscall can supply an exit stop
+             * while the parent waits for the actual signal handler. */
+            if (call3(1, start_fds[1], (word)"g", 1) != 1) return 85;
+            while (!sigchld_seen) __asm__ volatile("pause");
+            print_result("GINUX_FIXTURE: sigchld-userspace=", sigchld_seen);
+        }
         poll_fd.fd = fds[0];
         poll_fd.events = 1; /* POLLIN */
         poll_fd.revents = 0;
