@@ -17,10 +17,15 @@ def main():
     template = (Path(__file__).resolve().parent.parent / 'config/instance-gate5.toml').read_text()
     template = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
     template = template.replace('assignments = []', 'assignments = ["memory:/work"]', 1)
-    recipe = ('[userspace.contract]\nversion = 1\ncatalog = 2\ndefault = "deny"\n'
-              'read = ["**"]\nwrite = ["**"]\nexecute = ["**"]\nconnect = ["**"]\n'
-              'listen = ["**"]\nprocess = ["**"]\nsystem = ["**"]\n')
-    legacy = '[contract]\nprofile = "gate5-balanced-v1"'
+    def policy(catalog=2, allow=('*',), deny=(), syscall_allow=(), syscall_deny=()):
+        text = (f'[contract]\nversion = 1\ncatalog = {catalog}\ndefault = "deny"\n'
+                f'allow = {json.dumps(allow)}\ndeny = {json.dumps(deny)}\n')
+        if syscall_allow or syscall_deny:
+            text += ('[contract.syscalls]\ncontrol = "paranoid"\ndefault = "deny"\n'
+                     f'allow = {json.dumps(syscall_allow)}\ndeny = {json.dumps(syscall_deny)}\n')
+        return text
+    legacy = policy()
+    recipe = policy()
     receipts = []
     with tempfile.TemporaryDirectory(prefix='ginux-contract-') as tmp:
         root = Path(tmp) / 'root'
@@ -34,7 +39,7 @@ def main():
                   audit=True, operation=None, source=None, extra='', stdout=b''):
             if sys.argv[4:] and name not in sys.argv[4:]:
                 return
-            config = template.replace(legacy, contract)
+            config = template.split('[contract]')[0] + contract + '[storage]' + template.split('[storage]', 1)[1]
             config = config.replace('args = []', 'args = ' + json.dumps([op, str(expected)]))
             if not audit:
                 config = config.replace('mode = "stderr"', 'mode = "disabled"')
@@ -68,7 +73,7 @@ def main():
             print('PASS contract ' + name, flush=True)
 
         # Every failure control has an allowed workload counterpart.
-        configured = '[contract]\nprofile = "configured-balanced-v2"'
+        configured = policy(1002)
         for op in ['r', 'w', 'c', 'm', 'g', 'i', 'f', 'b']:
             check('allow-' + op, op)
         for op in ['s', 'p']:
@@ -80,39 +85,55 @@ def main():
                              ('filesystem.path.write', 'w'), ('memory.virtual.manage', 'm'),
                              ('credential.virtual.set', 'g'), ('signal.virtual.deliver', 'i'),
                              ('device.console.write', 'a'), ('device.console.read', 'b')]:
-            check('deny-' + selector, op, -1, (configured if op in ['s', 'p'] else legacy) + '\ndeny = ["' + selector + '"]',
-                  operation=selector, source='instance-deny')
-        check('recipe-deny', 'r', -1, recipe + 'deny = ["syscall.open"]\n',
-              operation='syscall.open', source='deny')
-        check('exact-deny', 'r', -1, recipe + 'exact_deny = ["syscall.open"]\n',
+            check('deny-' + selector, op, -1, policy(1002 if op in ['s', 'p'] else 2, deny=(selector,)),
+                  operation=selector, source='exact-deny')
+        check('recipe-deny', 'r', -1, policy(deny=('syscall.open',)),
+              operation='syscall.open', source='exact-deny')
+        check('exact-deny', 'r', -1, policy(syscall_deny=('open',)),
               operation='syscall.open', source='exact-deny')
         check('deny-beats-exact-allow', 'r', -1,
-              recipe + 'deny = ["syscall.open"]\nexact_allow = ["syscall.open"]\n',
-              operation='syscall.open', source='deny')
-        check('default-deny', 'r', -38, '[contract]\nprofile = "minimal-v1"',
+              policy(deny=('syscall.open',), syscall_allow=('open',)),
+              operation='syscall.open', source='exact-deny')
+        check('default-deny', 'r', -38, policy(allow=('syscall.getpid','syscall.getppid','syscall.gettid','syscall.write','syscall.exit','syscall.exit_group')),
               operation='filesystem.path.read', source='default-deny')
         check('explicit-beats-family-default', 'a', -1,
-              '[contract]\nprofile = "minimal-v1"\nallow = ["syscall.dup"]\ndeny = ["syscall.write"]',
-              operation='syscall.write', source='instance-deny')
+              policy(allow=('syscall.dup','syscall.exit','syscall.exit_group'), deny=('syscall.write',)),
+              operation='syscall.write', source='exact-deny')
         check('no-network', 'n', -13)
         check('network-family-deny', 'n', -1,
-              legacy + '\ndeny = ["network.inet.tcp.connect"]',
-              operation='network.inet.tcp.connect', source='instance-deny')
+              policy(deny=('network.inet.tcp.connect',)),
+              operation='network.inet.tcp.connect', source='exact-deny')
         check('unknown-syscall', 'u', -38)
         check('disabled-audit', audit=False)
-        check('disabled-audit-denial', 'r', -1, legacy + '\ndeny = ["syscall.open"]', audit=False)
+        check('disabled-audit-denial', 'r', -1, policy(deny=('syscall.open',)), audit=False)
         for selector in ['time.clock.read', 'syscall.clock_gettime', 'proc.process.read', 'proc.system.read',
                          'sys.device.read', 'cgroup.virtual.manage']:
-            check('refuse-' + selector, contract=legacy + '\ndeny = ["' + selector + '"]', startup=True)
+            check('refuse-' + selector, contract=policy(deny=(selector,)), startup=True)
         check('refuse-path-policy', startup=True,
-              extra='\n[userspace.filesystem]\nwrite_deny = ["/work"]\n')
+              extra='\n[contract.filesystem]\ndeny = ["/work"]\n')
         check('refuse-hooks', startup=True, extra='\n[hooks]\npre_boot = ["/bin/fixture"]\n')
+        for name, fields in [
+            ('filesystem-read', '[contract.filesystem]\nread = ["/"]'),
+            ('filesystem-write', '[contract.filesystem]\nwrite = ["/"]'),
+            ('filesystem-create', '[contract.filesystem]\ncreate = ["/"]'),
+            ('privileges', '[contract.privileges]\nsetuid = ["/"]'),
+            ('devices', '[contract.devices]\nread = ["/dev/null"]'),
+            ('process-limit', '[contract.process]\nmax_processes = 8'),
+            ('thread-limit', '[contract.process]\nmax_threads = 8'),
+            ('signals', '[contract.process]\nsignals = ["*"]'),
+            ('ptrace', '[contract.process]\nptrace = "allow"'),
+            ('namespace', '[contract.process]\nnamespace_create = ["user"]'),
+            ('proc', '[contract.kernel]\nproc_read = ["/"]'),
+            ('sys', '[contract.kernel]\nsys_read = ["/"]'),
+        ]:
+            check('refuse-native-' + name, startup=True, extra='\n' + fields + '\n')
+
         configured_recipe = recipe.replace('catalog = 2', 'catalog = 1002')
         check('recipe-v2-allows-sleep', 's', contract=configured_recipe)
-        check('recipe-v2-denies-sleep', 's', -1, configured_recipe + 'exact_deny = ["syscall.nanosleep"]\n', operation='syscall.nanosleep', source='exact-deny')
+        check('recipe-v2-denies-sleep', 's', -1, policy(1002, syscall_deny=('nanosleep',)), operation='syscall.nanosleep', source='exact-deny')
         check('unknown-catalog-refused', contract=recipe.replace('catalog = 2', 'catalog = 99'), startup=True)
-        check('zero-match-refused', contract=recipe + 'deny = ["unknown.operation"]\n', startup=True)
-        check('refuse-v2-clock-resolution-deny', contract=configured + '\ndeny = ["syscall.clock_getres"]', startup=True)
+        check('zero-match-refused', contract=policy(deny=('unknown.operation',)), startup=True)
+        check('refuse-v2-clock-resolution-deny', contract=policy(1002, deny=('syscall.clock_getres',)), startup=True)
         check('allowed-after-denials')
     print('test-launch-contract: PASS (' + str(len(receipts)) + ' cases)')
 

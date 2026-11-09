@@ -33,7 +33,7 @@ def main():
         (work/'launch.toml').write_text(config)
         if selected == 'policy-read':
             config=config.replace('args = []','args = ["read-policy"]')
-            config=config.replace('[contract]','[contract]\ndeny = ["filesystem.path.read"]',1)
+            config=config.replace('deny = ["device.mmio.direct"', 'deny = ["filesystem.path.read", "device.mmio.direct"', 1)
             path=work/'policy.toml'
             path.write_text(config)
             result=work/'policy.json'

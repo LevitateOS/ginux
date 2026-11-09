@@ -170,13 +170,14 @@ make run-host           # general interactive Rocky host with Ginux installed
 make demo-gate-9        # Gate 9 checkpoint through the same host workflow
 ```
 
-Instance recipes may select the syscall dispatch model under `[execution]`:
+Instance recipes select syscall control under `[contract.syscalls]`:
 
 ```toml
-[execution]
-profile = "balanced"
-backend = "ptrace-native"
-dispatch = "selective" # default; use "paranoid" for all-syscall mediation
+[contract.syscalls]
+control = "selective" # default; use "paranoid" for all-syscall mediation
+default = "deny"
+allow = ["*"]
+deny = []
 ```
 
 `selective` is the default and permits direct host execution only
@@ -193,37 +194,70 @@ performance regressions. `make demo-gate-11` runs a bounded human-inspectable
 comparison and returns nonzero when a mandatory row misses its budget.
 
 `make run-host` boots the QEMU Rocky host and logs you into its ordinary shell.
-Ginux is installed in `PATH`. The first `instance create` downloads and verifies
-the pinned Rocky OCI image with live per-layer progress; later creates reuse the
+Ginux is installed in `PATH`. The first `create` or `import` downloads and verifies
+the pinned Rocky OCI image with live per-layer progress; later operations reuse the
 cache. The writable Rocky host overlay persists across `make run-host` sessions,
 so cached images, instance definitions, roots, and stopped status remain available.
 A complete first session is:
 
 ```sh
-ginux instance create rocky /etc/ginux/examples/rocky-systemd.toml
-ginux instance list
-ginux instance status rocky
-ginux instance start rocky --attach
+ginux create rocky
+ginux list
+ginux status rocky
+ginux start rocky --attach
 ```
 
-The instance specification also supports typed CLI overrides, network
-interface/source selection, ingress and egress port policy, translated ports,
-volumes, virtual identity, and ordered pre-boot hooks. Hooks run only as
+`create` starts from the documented default recipe. Use
+`ginux import NAME FILE` to create or atomically replace an instance from a
+self-contained recipe, `ginux export NAME` to print that recipe, and
+`ginux edit NAME` to validate and atomically apply an editor session.
+
+Instances are contract-locked by default. For an explicit maintenance window,
+stop the instance, run `ginux unlock NAME`, perform the required maintenance,
+stop it again, and run `ginux lock NAME`. `ginux list` and `ginux status NAME`
+show the current state, and starting an unlocked instance prints a warning.
+Unlocking relaxes configurable recipe restrictions only; Ginux still owns the
+virtual kernel boundary, rejects unsupported authority, reduces host identity,
+and applies `NoNewPrivs`. Lock state is host deployment state and is never
+written into an exported portable recipe.
+
+Syscall auditing is disabled by default. Add `--audit` to `ginux start` to
+record per-syscall decisions in the instance's `audit.log`; audit records are
+kept separate from the attached console.
+
+The instance specification supports typed recipe overrides, ingress and egress
+contract policy, volumes, virtual identity, and ordered pre-boot hooks. Host
+network attachment and translated ports are deployment settings, supplied as
+repeatable flags when the instance is created or changed:
+
+```sh
+ginux import web /etc/ginux/examples/rocky-systemd.toml \
+    --network eth0:1 \
+    --forward protocol=tcp,external_port=8080,instance_port=80 \
+    --forward protocol=tcp,external_port=8443,instance_port=443
+ginux set web \
+    --network default \
+    --forward none
+```
+
+Omitting `--network` uses the host's default network. Multiple flags are
+validated and persisted atomically; an invalid combination changes nothing.
+Hooks run only as
 mediated instance processes; Ginux does not support arbitrary host-context hooks.
 See [Gate 9.75 instance specification](docs/gate-9.75-instance-specification.md)
 for the schema, precedence rules, examples, and verification targets.
 
-The same instance file contains a self-contained `[userspace.contract]`
-recipe. Human-facing `read`, `write`, `execute`, `connect`, `listen`, `process`,
-and `system` rules use bounded `*` and recursive `**` resource selectors;
-explicit denies always win. The contract is part of the instance rather than a
-separate operator object. Validate and inspect the complete instance recipe
-before launch:
+The same instance file contains a self-contained hierarchical contract under
+`[contract]` and its `syscalls`, `filesystem`, `network`, `devices`,
+`privileges`, `process`, and `kernel` subsections. Syscall names accept bounded
+globs compiled against the pinned catalog; explicit denies always win. The
+contract is part of the instance rather than a separate operator object.
+Validate and inspect the complete instance recipe before launch:
 
 ```sh
-ginux instance validate /etc/ginux/examples/rocky-systemd.toml
-ginux instance inspect /etc/ginux/examples/rocky-systemd.toml
-ginux instance explain /etc/ginux/examples/rocky-systemd.toml filesystem.path.write
+ginux validate /etc/ginux/examples/rocky-systemd.toml
+ginux inspect /etc/ginux/examples/rocky-systemd.toml
+ginux explain /etc/ginux/examples/rocky-systemd.toml filesystem.path.write
 ```
 
 See [Self-contained userspace contract](docs/configurable-contract.md) for the
@@ -233,8 +267,8 @@ The attached terminal becomes the Ginux instance console. Log in as `root` with
 password `ginux`, explore normally, press `Ctrl-]` to detach while leaving the
 instance running, and run `kill -RTMIN+4 1` as instance root to
 shut down systemd and return to the host. Detached operation uses
-`ginux instance start rocky`, `ginux instance status rocky`, and
-`ginux instance stop rocky`. Exit the Rocky host shell to stop QEMU cleanly.
+`ginux start rocky`, `ginux status rocky`, and
+`ginux stop rocky`. Exit the Rocky host shell to stop QEMU cleanly.
 This stops the VM without deleting its persistent overlay; `make clean` resets
 that host state. `make demo-gate-9` uses the same operator workflow;
 `make run-systemd` remains as a compatibility alias, and
@@ -348,8 +382,8 @@ implementation to handle the call; assignments, endpoint/byte limits and
 argument checks still apply. Denials take precedence over grants. An explicit
 syscall denial also wins over an ungranted semantic family.
 
-`config/instance-configured.toml` selects `[contract] profile =
-"configured-balanced-v2"`, which explicitly opts into downstream catalog 1002.
+`config/instance-configured.toml` selects `[contract] version = 1` and
+`catalog = 1002`, using the upstream hierarchical format.
 It adds `lstat`, `readv`, `pipe`, `nanosleep`, `link`, `sched_getaffinity`,
 `clock_getres`, `faccessat`, `renameat2` and `execveat` to upstream catalog 2.
 Gate 11 advances the upstream catalog from 1 to 2 and adds direct-safe
@@ -362,9 +396,8 @@ launch retains its existing mediated handlers and bounded audit contract.
 
 Entry audit records name the deciding operation, policy source and rule index.
 Console and TCP classification follows tracked descriptors through aliases,
-fork and reuse. Legacy `[contract]` selectors retain upstream's rule index 0;
-self-contained recipe rules carry their actual zero-based index. Disabled audit
-suppresses decision records, while configuration, completion and failure
+fork and reuse. Self-contained contract rules carry their actual zero-based
+index. Disabled audit suppresses decision records, while configuration, completion and failure
 diagnostics remain available. Audit records remain bounded to 64 KiB.
 
 The host vDSO can answer clock reads without a syscall. Launch therefore rejects

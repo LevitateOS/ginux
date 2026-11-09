@@ -71,11 +71,10 @@ def main():
                 if mode == 'audit-disabled':
                     config = config.replace('mode = "stderr"', 'mode = "disabled"')
                 if mode == 'denial-cap':
-                    config = config.replace('[contract]\nprofile = "configured-balanced-v2"',
-                        '[userspace.contract]\nversion = 1\ncatalog = 2\ndefault = "deny"\n'
-                        'read = ["syscall.**"]\nwrite = ["syscall.**"]\n'
-                        'execute = ["syscall.**"]\nprocess = ["syscall.**"]\n'
-                        'system = ["syscall.**"]\nconnect = []')
+                    config = (config.split('[contract]')[0] +
+                        '[contract]\nversion = 1\ncatalog = 2\ndefault = "deny"\n'
+                        'allow = ["syscall.*"]\ndeny = []\n[storage]' +
+                        config.split('[storage]', 1)[1])
                 path, result = work/'instance.toml', work/'result.json'
                 path.write_text(config)
                 result.unlink(missing_ok=True)

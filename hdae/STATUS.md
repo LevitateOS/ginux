@@ -29,8 +29,8 @@
 - Runtime isolation unit: instance.
 - Policy unit: versioned contract.
 - The gate map has expanded through human-directed insertions while preserving
-  numeric order; Gates 1 through 10.5 are accepted and closed. Gate 11 is the
-  active checkpoint.
+  numeric order; Gates 1 through 10.5 are accepted and closed. Gate 11 remains
+  partial in pull request 249, and the human authorized stacked Gate 12 work.
 - Gate 9.75 was added and authorized on 2026-11-04 for comprehensive instance
   configuration, CLI overrides, network selection and policy, port translation,
   volumes, access, identity, resources, devices, and pre-boot hooks.
@@ -124,6 +124,33 @@
   presented.
 - The ordered gate batch is authorized, but every open gate remains a human
   checkpoint requiring a working demonstration and explicit acceptance.
+- Gate 12 is technically passed on `hdae/contract-network-ux`. The active
+  configuration now uses `[contract]` plus `syscalls`, `filesystem`, `network`,
+  `devices`, `privileges`, `process`, and synthetic `kernel` subsections.
+  Syscall globs compile against catalog version 2, unmatched globs fail closed,
+  and explicit deny wins.
+- Gate 12 host networking is deployment state rather than portable recipe
+  content. Both `instance create` and `instance set` accept repeatable
+  `--network` and `--forward` flags, validate the complete candidate, and
+  commit atomically. Rocky integration proves simultaneous forwards, default
+  attachment, recipe/deployment separation, and unchanged state after an
+  invalid multi-flag update.
+- Fresh Gate 12 evidence passed `make check`, `make test-contract`,
+  `make test-config`, `make test-instance`, `make test-contract-runtime`,
+  `make test-network`, the complete `make test-systemd` matrix, aggregate
+  `make test`, and `make demo-gate-12`.
+- Gate 12.25 is technically passed on `hdae/top-level-instance-cli`. Ginux now
+  manages instances through concise top-level `create`, `import`, `set`,
+  `edit`, `export`, inspection, and lifecycle commands; the removed command
+  group has no compatibility alias. Default creation, atomic recipe updates,
+  deployment-state separation, full Rocky systemd behavior, and aggregate
+  regressions pass.
+- Gate 12.5 is technically passed on `hdae/contract-maintenance-lock`.
+  Instances default fail-closed to a persistent locked contract; top-level
+  `lock` and `unlock` require a stopped instance, preserve the portable recipe,
+  materialize a bounded maintenance contract atomically, expose their state in
+  lifecycle output, and warn on unlocked starts. A clean Rocky workflow proved
+  denial while locked, success while unlocked, and denial again after relock.
 
 ## Governing outcome and invariants
 
@@ -142,8 +169,10 @@ scope, threat model, and invariants.
 - Active skill: `hdae-development`
 - Skill path: `.agents/skills/hdae-development/SKILL.md`
 - Reload after context shift: required
-- Active gate: Gate 11, performance characterization and optimization, is
-  active on `hdae/performance-characterization`.
+- Active gate: Gate 12.5, contract maintenance lock, is technically passed and
+  delivered in pull request https://github.com/gmkurtzer/ginux/pull/254.
+  Gate 12.25 is technically passed and delivered in pull request
+  https://github.com/gmkurtzer/ginux/pull/253.
 - Last evidence: `make check`, `make test-contract`, Rocky QEMU
   `make test-config`, `make test-contract-runtime`, `make test-systemd`, the
   complete aggregate `make test`, and the Gate 10.5 human demonstration pass.
@@ -229,10 +258,10 @@ scope, threat model, and invariants.
   observed non-PI futexes did not materially improve the result. The residual
   selective deficit is the host seccomp/task-work floor under QEMU TCG, not a
   missed Ginux allow rule or userspace hot path.
-- Exact next action: update pull request 249 with the completed selective and
-  paranoid evidence. Gate 11 remains partial under the unchanged 4% budget;
-  do not publish an accepted baseline, merge the pull request, or close the
-  gate without human direction.
+- Exact next action: implement persistent fail-closed `lock`/`unlock` state,
+  bounded maintenance materialization, visibility, warnings, and focused
+  regressions. Do not merge or close any pull request. Gate 11 remains partial
+  in pull request 249 beneath this stacked series.
 - Human direction on 2026-11-07 resolved the Gate 11 dispatch boundary. Each
   instance will configure `paranoid` or `selective` dispatch. Paranoid preserves
   a Ginux userspace decision for every syscall. Selective directly executes
@@ -538,31 +567,45 @@ scope, threat model, and invariants.
 
 ## Exact next action
 
-Review pull request https://github.com/gmkurtzer/ginux/pull/249 and the completed
-selective and paranoid evidence. Selective passes every CPU, memory, and mutex
-row, while all five thread-yield allocations remain at 0.917x to 0.953x;
-paranoid reaches 0.027x to 0.035x on thread-yield. Do not publish an accepted
-baseline, merge the pull request, or close Gate 11 while these rows exceed the
-unchanged 4% budget.
+Record the Gate 12.5 pull-request checkpoint, then begin Gate 13 boundary
+hardening on a dedicated branch based on Gate 12.5. Do not merge or close any
+pull request.
 
 ## Context recovery
 
 - Active skill: `hdae-development`
 - Skill path: `.agents/skills/hdae-development/SKILL.md`
 - Reload after context shift: required
-- Active gate: Gate 11, performance characterization and optimization, is
-  partial on `hdae/performance-characterization`.
+- Active work: Gate 12 is technically passed and delivered in pull request 251;
+  Gate 12.1 is technically passed and delivered in pull request 252; Gate
+  12.25 is technically passed and delivered in pull request 253. Gate 12.5 is
+  technically passed and delivered in pull request 254 from
+  `hdae/contract-maintenance-lock`. Gate 11 remains partial on its parent
+  branch and in pull request 249.
+- Gate 12.25 delivery: pull request
+  https://github.com/gmkurtzer/ginux/pull/253 is open from
+  `hdae/top-level-instance-cli` against the Gate 12.1 branch.
 - Delivery: pull request https://github.com/gmkurtzer/ginux/pull/249 is open
   against `main`; it must not be merged or closed without explicit human
   authorization.
-- Last evidence: clean retained commit `190a625c` removes all temporary
-  diagnostics. The final five-second, five-repetition matrix passes every CPU,
-  memory, and mutex row; all five thread rows remain 4.75% to 8.27% behind
-  native. Same-harness constant-allow and no-seccomp controls isolate the
-  residual to the host seccomp/task-work path under QEMU TCG. Fresh `make check`,
-  `make test-contract`, `make test-bench-compare`, `make test-contract-runtime`,
-  aggregate `make test`, `make test-native-vfs`, and the complete Rocky
-  `make test-systemd` matrix pass on isolated QEMU state.
+- Gate 12 delivery: pull request https://github.com/gmkurtzer/ginux/pull/251 is
+  open from `hdae/contract-network-ux` against the Gate 11 branch.
+- Gate 12.1 delivery: pull request https://github.com/gmkurtzer/ginux/pull/252
+  is open from `hdae/virtual-kernel-filesystems` against the Gate 12 branch.
+- Last evidence: Gate 12.1 passed `make check`, `make test-kernel-views`,
+  `make test-process`, the complete `make test-systemd` matrix, aggregate
+  `make test`, and `make demo-gate-12.1`. The demo proved on-demand proc/sys
+  access, live virtual-PID lifecycle, virtual metadata, no host leakage, empty
+  backing mountpoints, multi-user systemd boot, and controlled shutdown.
+- Gate 12.25 evidence: `make check`, `make demo-gate-12.25`, `make
+  test-instance`, `make test-config`, `make test-systemd`, `make
+  test-systemd-interactive`, and aggregate `make test` passed.
+- Gate 12.5 evidence: `make check`, `make test-gate125-lock`, the complete clean
+  Rocky `make test-systemd-interactive` workflow, `make test-config`, `make
+  test-instance`, `make test-systemd`, aggregate `make test`, and `make
+  demo-gate-12.5` passed. Rocky proved locked denial, unlocked maintenance
+  success, and denial after relocking while retaining mandatory host-boundary
+  backstops.
 - Completed paranoid work: the benchmark harness records dispatch mode and
   rejects cross-mode baseline comparison. The retained single-broker path has
   constant-time and precomputed contract decisions, bounded audit, and no

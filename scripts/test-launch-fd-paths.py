@@ -28,7 +28,7 @@ def main():
             text = config
             if mode == "deny":
                 text = text.replace('args = []', 'args = ["deny"]')
-                text = text.replace('[contract]', '[contract]\ndeny = ["syscall.readlink", "syscall.readlinkat"]')
+                text = text.replace('deny = ["device.mmio.direct"', 'deny = ["syscall.readlink", "syscall.readlinkat", "device.mmio.direct"', 1)
             path = work / (mode + ".toml")
             result = work / (mode + ".json")
             path.write_text(text)

@@ -18,7 +18,17 @@ profile = "balanced"
 backend = "ptrace-native"
 
 [contract]
-profile = "configured-balanced-v2"
+version = 1
+catalog = 1002
+default = "deny"
+allow = ["*"]
+deny = ["device.mmio.direct", "device.dma.direct", "network.packet.raw"]
+
+[contract.syscalls]
+control = "paranoid"
+default = "deny"
+allow = ["*"]
+deny = []
 
 [storage]
 assignments = []

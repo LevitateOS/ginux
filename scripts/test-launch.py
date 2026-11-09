@@ -173,8 +173,16 @@ def main():
             secret.seek(0)
             invoke(["descriptor", str(secret.fileno())], 0, "exited", pass_fds=(secret.fileno(),))
         proc = invoke(["budget"], 0, "exited")
-        if proc.stderr.count(b"audit truncated") != 1 or len(proc.stderr) > 68000:
-            raise RuntimeError("audit output was not bounded")
+        # Contract normalization has more fields after the upstream schema
+        # migration. Bound the actual trace independently of that preamble.
+        config_begin = proc.stderr.index(b"ginux: effective config begin\n")
+        config_end = proc.stderr.index(b"ginux: effective config end\n")
+        config_bytes = config_end - config_begin
+        trace_bytes = sum(len(line) + 1 for line in proc.stderr.splitlines()
+                          if line.startswith(b"ginux: audit sequence="))
+        if (proc.stderr.count(b"audit truncated") != 1 or trace_bytes > 65536
+                or len(proc.stderr) - config_bytes > 68000):
+            raise RuntimeError(f"audit output was not bounded: trace={trace_bytes}, total={len(proc.stderr)}")
         # The budget drops whole records: the notice is a line of its own and
         # every syscall record before it is complete.
         lines = proc.stderr.splitlines()

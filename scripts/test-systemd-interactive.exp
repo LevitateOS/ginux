@@ -52,23 +52,23 @@ expect {
     timeout { puts stderr "Rocky host shell prompt timed out"; exit 72 }
     eof { puts stderr "Rocky host shell exited early"; exit 73 }
 }
-send -- "test -x /usr/local/bin/ginux && test -f /etc/ginux/examples/rocky-systemd.toml && test -z \"\$(sudo find /var/lib/ginux/images -mindepth 1 -maxdepth 1 -print -quit)\" && test \"\$(ginux instance list | wc -l)\" -eq 1 && printf 'GINUX_HOST_EMPTY: PASS\\n'\r"
+send -- "test -x /usr/local/bin/ginux && test -f /etc/ginux/examples/rocky-systemd.toml && test -z \"\$(sudo find /var/lib/ginux/images -mindepth 1 -maxdepth 1 -print -quit)\" && test \"\$(ginux list | wc -l)\" -eq 1 && printf 'GINUX_HOST_EMPTY: PASS\\n'\r"
 expect {
     -re {GINUX_HOST_EMPTY: PASS} {}
     timeout { puts stderr "installed Ginux host was not empty"; exit 74 }
     eof { puts stderr "Rocky host shell exited during installation check"; exit 75 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "if ginux instance create legacy --config /etc/ginux/examples/rocky-systemd.toml; then echo GINUX_CREATE_POSITIONAL: FAIL; else echo GINUX_CREATE_POSITIONAL: PASS; fi\r"
+send -- "if ginux import legacy --config /etc/ginux/examples/rocky-systemd.toml; then echo GINUX_CREATE_POSITIONAL: FAIL; else echo GINUX_CREATE_POSITIONAL: PASS; fi\r"
 expect {
     -re {GINUX_CREATE_POSITIONAL: PASS} {}
     timeout { puts stderr "legacy --config create syntax was not rejected"; exit 166 }
     eof { puts stderr "Rocky host shell exited during positional create check"; exit 167 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "ginux instance create rocky /etc/ginux/examples/rocky-systemd.toml\r"
+send -- "ginux import rocky /etc/ginux/examples/rocky-systemd.toml\r"
 expect {
-    -re {Creating instance "rocky"} {}
+    -re {Importing instance "rocky"} {}
     timeout { puts stderr "first instance creation did not begin"; exit 159 }
     eof { puts stderr "Rocky host shell exited before image acquisition"; exit 160 }
 }
@@ -88,7 +88,7 @@ expect {
     eof { puts stderr "Rocky host shell exited during layer acquisition"; exit 164 }
 }
 expect {
-    -re {Instance "rocky" created.} {}
+    -re {Instance "rocky" imported.} {}
     timeout { puts stderr "instance creation timed out"; exit 76 }
     eof { puts stderr "Rocky host shell exited during instance creation"; exit 77 }
 }
@@ -100,14 +100,14 @@ expect {
     eof { puts stderr "Rocky host shell exited during acquisition check"; exit 130 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "sudo unshare -n /usr/local/bin/ginux instance create cache-check /etc/ginux/examples/rocky-systemd.toml\r"
+send -- "sudo unshare -n /usr/local/bin/ginux import cache-check /etc/ginux/examples/rocky-systemd.toml\r"
 expect {
     -re {  Cache: hit} {}
     timeout { puts stderr "offline create did not report an OCI cache hit"; exit 131 }
     eof { puts stderr "Rocky host shell exited during offline cache check"; exit 132 }
 }
 expect {
-    -re {Instance "cache-check" created.} {}
+    -re {Instance "cache-check" imported.} {}
     timeout { puts stderr "offline cached instance creation timed out"; exit 133 }
     eof { puts stderr "Rocky host shell exited during cached creation"; exit 134 }
 }
@@ -119,9 +119,9 @@ expect {
     eof { puts stderr "Rocky host shell exited during cached-instance cleanup"; exit 136 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "ginux instance list; ginux instance status rocky\r"
+send -- "ginux list; ginux status rocky\r"
 expect {
-    -re {rocky[[:space:]]+stopped} {}
+    -re {rocky[[:space:]]+stopped[[:space:]]+locked} {}
     timeout { puts stderr "created instance was not listed as stopped"; exit 78 }
     eof { puts stderr "Rocky host shell exited during instance inspection"; exit 79 }
 }
@@ -130,15 +130,20 @@ expect {
     timeout { puts stderr "created instance status was not stopped"; exit 80 }
     eof { puts stderr "Rocky host shell exited during status inspection"; exit 81 }
 }
-expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "if ginux instance create rocky /etc/ginux/examples/rocky-systemd.toml; then echo GINUX_DUPLICATE: FAIL; else echo GINUX_DUPLICATE: PASS; fi\r"
 expect {
-    -re {GINUX_DUPLICATE: PASS} {}
-    timeout { puts stderr "duplicate instance was not rejected"; exit 82 }
-    eof { puts stderr "Rocky host shell exited during duplicate check"; exit 83 }
+    -re {contract: locked} {}
+    timeout { puts stderr "created instance contract was not locked"; exit 203 }
+    eof { puts stderr "Rocky host shell exited during contract inspection"; exit 204 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "stty rows 37 cols 101; ginux instance start rocky --attach\r"
+send -- "ginux import rocky /etc/ginux/examples/rocky-systemd.toml && echo GINUX_REIMPORT: PASS\r"
+expect {
+    -re {GINUX_REIMPORT: PASS} {}
+    timeout { puts stderr "existing instance import did not complete"; exit 82 }
+    eof { puts stderr "Rocky host shell exited during reimport check"; exit 83 }
+}
+expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
+send -- "stty rows 37 cols 101; ginux start rocky --attach\r"
 
 expect {
     -re {rocky: started \(supervisor pid [0-9]+\); attaching console} {}
@@ -165,10 +170,28 @@ expect {
 }
 send -- "ginux\r"
 expect {
+    -re {initialize_job_control: no job control} { puts stderr "instance shell job control initialization failed"; exit 202 }
     -re {\[root@ginux [^]]+\]# } {}
     timeout { puts stderr "interactive instance shell timed out"; exit 88 }
     eof { puts stderr "instance shell exited early"; exit 89 }
 }
+send -- "sleep 30\r"
+after 1000
+send -- "\003"
+expect {
+    -re {\[root@ginux [^]]+\]# } {}
+    -re {rocky: detached} { puts stderr "Ctrl-C detached from the instance"; exit 196 }
+    -re {\[ginux@ginux-rocky [^]]+\]\$ } { puts stderr "Ctrl-C killed the attach command"; exit 197 }
+    timeout { puts stderr "Ctrl-C did not interrupt the instance foreground process"; exit 198 }
+    eof { puts stderr "Ctrl-C terminated the host session"; exit 199 }
+}
+send -- "printf 'GINUX_INTERRUPT_%s\\n' 'FORWARDED: PASS'\r"
+expect {
+    -re {GINUX_INTERRUPT_FORWARDED: PASS} {}
+    timeout { puts stderr "instance console was unusable after Ctrl-C"; exit 200 }
+    eof { puts stderr "instance exited after Ctrl-C"; exit 201 }
+}
+expect -re {\[root@ginux [^]]+\]# }
 send -- "printf 'GINUX_HUMAN_INTERACTIVE: PASS\\n'\r"
 expect {
     -re {GINUX_HUMAN_INTERACTIVE: PASS} {}
@@ -315,7 +338,7 @@ expect {
     eof { puts stderr "host session exited during detach"; exit 124 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "ginux instance status rocky | grep -Fq 'state: running' && printf 'GINUX_ATTACH_%s\\n' 'DETACH: PASS'\r"
+send -- "ginux status rocky | grep -Fq 'state: running' && printf 'GINUX_ATTACH_%s\\n' 'DETACH: PASS'\r"
 expect {
     -re {GINUX_ATTACH_DETACH: PASS} {}
     timeout { puts stderr "detached instance did not remain running"; exit 125 }
@@ -329,7 +352,7 @@ expect {
     eof { puts stderr "host session exited during host backstop check"; exit 193 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "stty rows 43 cols 109; ginux instance attach rocky\r"
+send -- "stty rows 43 cols 109; ginux attach rocky\r"
 after 1000
 send -- "test \"\$(stty size)\" = '43 109' && printf 'GINUX_ATTACH_%s\\n' 'REATTACH: PASS'\r"
 expect {
@@ -344,23 +367,109 @@ expect {
     eof { puts stderr "Rocky host shell exited before return"; exit 93 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "grep -Fq 'GINUX_NATIVE_CHECK: PASS' /var/lib/ginux/instances/rocky/audit.log && ginux instance status rocky | grep -Fq 'state: stopped' && printf 'GINUX_INTERACTIVE_SHUTDOWN: PASS\\n'\r"
+send -- "grep -Fq 'GINUX_NATIVE_CHECK: PASS' /var/lib/ginux/instances/rocky/audit.log && ! grep -Fq 'GINUX_NATIVE_AUDIT:' /var/lib/ginux/instances/rocky/audit.log && ginux status rocky | grep -Fq 'state: stopped' && printf 'GINUX_INTERACTIVE_%s\\n' 'SHUTDOWN: PASS'\r"
 expect {
     -re {GINUX_INTERACTIVE_SHUTDOWN: PASS} {}
     timeout { puts stderr "interactive shutdown evidence missing"; exit 94 }
     eof { puts stderr "Rocky host shell exited during audit check"; exit 95 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "ginux instance start rocky\r"
+send -- "ginux unlock rocky; ginux status rocky\r"
+expect {
+    -re {Instance "rocky" contract unlocked.} {}
+    timeout { puts stderr "instance contract did not unlock"; exit 205 }
+    eof { puts stderr "Rocky host shell exited while unlocking contract"; exit 206 }
+}
+expect {
+    -re {contract: unlocked} {}
+    timeout { puts stderr "unlocked contract state was not visible"; exit 207 }
+    eof { puts stderr "Rocky host shell exited during unlocked status"; exit 208 }
+}
+expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
+send -- "ginux start rocky --attach\r"
+expect {
+    -re {WARNING: rocky is starting with its contract unlocked for maintenance.} {}
+    timeout { puts stderr "unlocked start warning was not shown"; exit 209 }
+    eof { puts stderr "Ginux exited before unlocked start warning"; exit 210 }
+}
+expect {
+    -re {login:} {}
+    timeout { puts stderr "maintenance instance login timed out"; exit 211 }
+    eof { puts stderr "Ginux exited before maintenance login"; exit 212 }
+}
+send -- "root\r"
+expect -re {Password:}
+send -- "ginux\r"
+expect {
+    -re {\[root@ginux [^]]+\]# } {}
+    timeout { puts stderr "maintenance instance shell timed out"; exit 213 }
+    eof { puts stderr "maintenance instance shell exited early"; exit 214 }
+}
+send -- "printf maintenance > /ginux-demo/read-only/maintenance && test \"\$(cat /ginux-demo/read-only/maintenance)\" = maintenance && printf 'GINUX_MAINTENANCE_WRITE: PASS\\n'\r"
+expect {
+    -re {GINUX_MAINTENANCE_WRITE: PASS} {}
+    timeout { puts stderr "unlocked maintenance write remained denied"; exit 215 }
+    eof { puts stderr "instance exited during maintenance write"; exit 216 }
+}
+expect -re {\[root@ginux [^]]+\]# }
+send -- "kill -RTMIN+4 1\r"
+expect {
+    -re {rocky: stopped \(status 0\)} {}
+    timeout { puts stderr "maintenance instance shutdown timed out"; exit 217 }
+    eof { puts stderr "host exited during maintenance shutdown"; exit 218 }
+}
+expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
+send -- "ginux lock rocky; ginux status rocky\r"
+expect {
+    -re {Instance "rocky" contract locked.} {}
+    timeout { puts stderr "instance contract did not relock"; exit 219 }
+    eof { puts stderr "Rocky host shell exited while relocking contract"; exit 220 }
+}
+expect {
+    -re {contract: locked} {}
+    timeout { puts stderr "relocked contract state was not visible"; exit 221 }
+    eof { puts stderr "Rocky host shell exited during relocked status"; exit 222 }
+}
+expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
+send -- "ginux start rocky --attach\r"
+expect {
+    -re {login:} {}
+    timeout { puts stderr "relocked instance login timed out"; exit 223 }
+    eof { puts stderr "Ginux exited before relocked login"; exit 224 }
+}
+send -- "root\r"
+expect -re {Password:}
+send -- "ginux\r"
+expect {
+    -re {\[root@ginux [^]]+\]# } {}
+    timeout { puts stderr "relocked instance shell timed out"; exit 225 }
+    eof { puts stderr "relocked instance shell exited early"; exit 226 }
+}
+send -- "if printf denied > /ginux-demo/read-only/maintenance 2>/dev/null; then printf 'GINUX_RELOCK_DENY: FAIL\\n'; else printf 'GINUX_RELOCK_DENY: PASS\\n'; fi\r"
+expect {
+    -re {GINUX_RELOCK_DENY: PASS} {}
+    -re {GINUX_RELOCK_DENY: FAIL} { puts stderr "relocked contract allowed protected write"; exit 227 }
+    timeout { puts stderr "relocked contract denial timed out"; exit 228 }
+    eof { puts stderr "instance exited during relocked contract denial"; exit 229 }
+}
+expect -re {\[root@ginux [^]]+\]# }
+send -- "kill -RTMIN+4 1\r"
+expect {
+    -re {rocky: stopped \(status 0\)} {}
+    timeout { puts stderr "relocked instance shutdown timed out"; exit 230 }
+    eof { puts stderr "host exited during relocked shutdown"; exit 231 }
+}
+expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
+send -- "ginux start rocky --audit\r"
 expect {
     -re {rocky: started detached} {}
     timeout { puts stderr "detached instance start timed out"; exit 96 }
     eof { puts stderr "Rocky host shell exited during detached start"; exit 97 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "ginux instance list; ginux instance status rocky\r"
+send -- "ginux list; ginux status rocky\r"
 expect {
-    -re {rocky[[:space:]]+running[[:space:]]+[0-9]+} {}
+    -re {rocky[[:space:]]+running[[:space:]]+locked[[:space:]]+[0-9]+} {}
     timeout { puts stderr "detached instance was not listed as running"; exit 98 }
     eof { puts stderr "Rocky host shell exited during detached inspection"; exit 99 }
 }
@@ -370,6 +479,13 @@ expect {
     eof { puts stderr "Rocky host shell exited during detached status"; exit 101 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
+send -- "sudo sh -c 'i=0; while test \$i -lt 60; do grep -Fq \"GINUX_NATIVE_AUDIT:\" /var/lib/ginux/instances/rocky/audit.log && exit 0; i=\$((i+1)); sleep 1; done; exit 1' && printf 'GINUX_AUDIT_%s\\n' 'OPT_IN: PASS'\r"
+expect {
+    -re {GINUX_AUDIT_OPT_IN: PASS} {}
+    timeout { puts stderr "--audit did not enable native syscall records"; exit 194 }
+    eof { puts stderr "Rocky host shell exited during audit opt-in check"; exit 195 }
+}
+expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
 send -- "runtime=\$(sudo awk '{print \$1}' /var/lib/ginux/instances/rocky/runtime.pid); args=\$(ps -o args= -p \"\$runtime\"); case \"\$args\" in *' systemd') exit 1;; esac; sudo grep -Fq 'init = \"/sbin/init\"' /var/lib/ginux/instances/rocky/config.toml && sudo grep -Fq 'args = \[\"--system\", \"--unit=multi-user.target\"\]' /var/lib/ginux/instances/rocky/config.toml && printf 'GINUX_RUNTIME_%s\\n' 'CONFIG: PASS'\r"
 expect {
     -re {GINUX_RUNTIME_CONFIG: PASS} {}
@@ -377,14 +493,14 @@ expect {
     eof { puts stderr "Rocky host shell exited during runtime argument check"; exit 138 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "ginux instance stop rocky\r"
+send -- "ginux stop rocky\r"
 expect {
     -re {rocky: stopped} {}
     timeout { puts stderr "detached instance stop timed out"; exit 102 }
     eof { puts stderr "Rocky host shell exited during detached stop"; exit 103 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "sudo sh -c 'printf \"999999 1\\n\" > /var/lib/ginux/instances/rocky/supervisor.pid'; ginux instance list; ginux instance stop rocky\r"
+send -- "sudo sh -c 'printf \"999999 1\\n\" > /var/lib/ginux/instances/rocky/supervisor.pid'; ginux list; ginux stop rocky\r"
 expect {
     -re {rocky[[:space:]]+stopped} {}
     timeout { puts stderr "stale supervisor state was not reported stopped"; exit 104 }
@@ -416,14 +532,14 @@ expect {
     eof { puts stderr "second host exited before login"; exit 168 }
 }
 expect -re {\[ginux@ginux-rocky [^]]+\]\$ }
-send -- "test -n \"\$(sudo find /var/lib/ginux/images -mindepth 1 -maxdepth 1 -print -quit)\" && ginux instance status rocky | grep -Fq 'state: stopped' && sudo unshare -n /usr/local/bin/ginux instance create restart-cache /etc/ginux/examples/rocky-systemd.toml\r"
+send -- "test -n \"\$(sudo find /var/lib/ginux/images -mindepth 1 -maxdepth 1 -print -quit)\" && ginux status rocky | grep -Fq 'state: stopped' && sudo unshare -n /usr/local/bin/ginux import restart-cache /etc/ginux/examples/rocky-systemd.toml\r"
 expect {
     -re {  Cache: hit} {}
     timeout { puts stderr "OCI cache or instance state did not persist across Rocky host sessions"; exit 169 }
     eof { puts stderr "second host exited during persistent state check"; exit 170 }
 }
 expect {
-    -re {Instance "restart-cache" created.} {}
+    -re {Instance "restart-cache" imported.} {}
     timeout { puts stderr "cached instance creation on the second host timed out"; exit 171 }
     eof { puts stderr "second host exited during cached instance creation"; exit 172 }
 }

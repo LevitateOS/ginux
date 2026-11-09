@@ -26,7 +26,7 @@ def main():
             config = template
             if mode == "deny":
                 config = config.replace('args = []', 'args = ["deny"]')
-                config = config.replace('[contract]', '[contract]\ndeny = ["filesystem.path.read"]')
+                config = config.replace('deny = ["device.mmio.direct"', 'deny = ["filesystem.path.read", "device.mmio.direct"', 1)
             path, result = work / (mode + ".toml"), work / (mode + ".json")
             path.write_text(config)
             run = subprocess.run([binary, "launch", str(path), str(root), "--result-file", str(result)], capture_output=True, timeout=20)

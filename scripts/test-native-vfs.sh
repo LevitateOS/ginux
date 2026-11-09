@@ -19,7 +19,7 @@ rocky_scp "$rootfs" \
 rocky_ssh "set -eu; sudo rm -rf /var/lib/ginux/instances/gate5; sudo mkdir -p '$instance_root'; sudo tar -xf /var/tmp/ginux-oci-rootfs.tar -C '$instance_root'; sudo chmod -R a-w /var/lib/ginux/instances/gate5; test -x '$instance_root/usr/bin/bash'; test -x '$instance_root/usr/lib64/ld-linux-x86-64.so.2'; sha256sum '$instance_root/usr/bin/bash'" > build/gate5-bash-before.sha256
 
 rocky_ssh "sudo /var/tmp/ginux native /var/tmp/gate5.toml '$instance_root'" > "$native_log" 2>&1
-grep -Fqx 'GINUX_NATIVE: backend=ptrace-native profile=balanced elf-loader=host contract=gate5-balanced-v1' "$native_log"
+grep -Fqx 'GINUX_NATIVE: backend=ptrace-native profile=balanced elf-loader=host contract=self-contained-v1' "$native_log"
 grep -Fqx 'GINUX_NATIVE: tracee-uid=1000 tracee-gid=1000 root=oci-read-only' "$native_log"
 grep -Fqx 'GINUX_NATIVE_SHELL: PASS' "$native_log"
 grep -Fqx 'GINUX_NATIVE: supervisor=attached dispatch=paranoid direct-safe-syscalls=0' "$native_log"

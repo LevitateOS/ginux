@@ -566,6 +566,29 @@ fn close_undeclared_inherited_descriptors(control: Option<usize>) -> Result<(), 
 fn launch_validate(config: &InstanceConfig) {
     // These are accepted instance fields, but their owners are the systemd
     // backend. Never silently launch with a requested restriction or hook ignored.
+    // Hierarchical native policies have separate enforcement owners. The
+    // configured lane must reject requested controls it cannot implement.
+    if !config.filesystem_read.as_slice().is_empty()
+        || !config.filesystem_write.as_slice().is_empty()
+        || !config.filesystem_create.as_slice().is_empty()
+        || !config.privilege_setuid.as_slice().is_empty()
+        || !config.privilege_setgid.as_slice().is_empty()
+        || !config.device_read.as_slice().is_empty()
+        || !config.device_write.as_slice().is_empty()
+        || !config.device_create.as_slice().is_empty()
+        || config.process_max_processes != 4096
+        || config.process_max_threads != 4096
+        || !config.process_signals.as_slice().is_empty()
+        || config.process_ptrace
+        || !config.process_namespace_create.as_slice().is_empty()
+        || !config.process_namespace_join.as_slice().is_empty()
+        || !config.kernel_proc_read.as_slice().is_empty()
+        || !config.kernel_proc_write.as_slice().is_empty()
+        || !config.kernel_sys_read.as_slice().is_empty()
+        || !config.kernel_sys_write.as_slice().is_empty()
+    {
+        launch_startup_fail(b"launch does not implement native hierarchical resource policy");
+    }
     if !config.filesystem_write_deny.as_slice().is_empty()
         || !config.pre_boot_hooks.as_slice().is_empty()
     {

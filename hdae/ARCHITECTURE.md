@@ -167,7 +167,11 @@ tests require no network access.
 ### Virtual kernel filesystems
 
 - `/dev` resolves names to Ginux device objects.
-- `/proc` describes Ginux-managed processes and instance state.
+- `/proc` and `/sys` are Ginux-owned, in-memory object models. Lookups,
+  directory entries, metadata, links, and file contents are generated on
+  demand from current instance state; no virtual kernel nodes are staged in
+  the instance root or persisted between starts.
+- `/proc` describes only live Ginux-managed processes and instance state.
 - `/sys` describes only contract-visible virtual devices and attributes.
 - `/sys/fs/cgroup` provides the cgroup v2 behavior required by the validated
   systemd baseline.
@@ -257,6 +261,35 @@ workload path restrictions activate only after all hooks complete, allowing the
 recipe to prepare the state that it subsequently makes read-only. One denied
 absolute directory path covers that directory and its descendants using
 component-boundary matching and confined path resolution.
+
+Gate 12 separates portable policy from deployment-specific network state. The
+instance recipe owns a hierarchical `[contract]` describing syscall,
+filesystem, network, device, privilege, process, and synthetic-kernel-view
+authority. Host interface selection and external-to-instance port translation
+are not recipe fields; repeatable top-level `create`, `import`, and `set` flags
+persist them as operational instance state. The instance remains the managed
+object, but the CLI does not add a redundant `instance` command group. With no
+explicit attachment, the instance uses the host default network. `/proc` and
+`/sys` remain synthetic and Ginux-owned regardless of policy; policy controls
+visibility and operations, not passthrough to host kernel trees.
+
+Gate 12.1 makes that synthetic boundary concrete in the native runtime. The
+instance root contains only empty `proc` and `sys` mountpoint directories.
+Every visible directory entry, link, metadata record, descriptor, offset, and
+file payload is a Ginux-owned in-memory object generated from current virtual
+instance state when accessed. No host procfs or sysfs path is opened to satisfy
+an instance operation, and unsupported nodes fail closed. Host procfs may be
+sampled internally only for statistics about a managed host tracee; raw host
+paths and host identities are never projected into the instance.
+
+Gate 12.5 separates the portable contract from an operational maintenance
+lock. Instances default to `locked`; a stopped instance may be explicitly
+`unlocked` so Ginux materializes a temporary broad contract for supported
+maintenance operations without changing the recipe. Unlocking never removes
+Ginux virtualization, promotes unsupported catalog operations, exposes host
+kernel trees, grants host credentials, or removes `NoNewPrivs`. Lock state is
+persisted beside host network deployment state, shown in lifecycle output, and
+must be restored before normal operation.
 
 ### Observability and benchmarking
 

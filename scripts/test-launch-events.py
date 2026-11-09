@@ -52,7 +52,7 @@ def main():
                     thread = threading.Thread(target=peer, daemon=True)
                     thread.start()
                 if mode == "deny":
-                    text = text.replace('[contract]', '[contract]\ndeny = ["syscall.eventfd2", "syscall.epoll_create1", "syscall.epoll_ctl", "syscall.epoll_wait", "syscall.epoll_pwait"]')
+                    text = text.replace('deny = ["device.mmio.direct"', 'deny = ["syscall.eventfd2", "syscall.epoll_create1", "syscall.epoll_ctl", "syscall.epoll_wait", "syscall.epoll_pwait", "device.mmio.direct"', 1)
                 config, result = work / (mode + ".toml"), work / (mode + ".json")
                 config.write_text(text)
                 start = time.monotonic()

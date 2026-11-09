@@ -25,8 +25,13 @@ def main():
         work.chmod(0o755)
         # The systemd profile supervises fork; derive it from the same instance.
         systemd_config = work / "systemd.toml"
+        (root / "sbin").mkdir()
+        shutil.copyfile(root / "usr/bin/bash", root / "sbin/init")
+        (root / "sbin/init").chmod(0o755)
         systemd_config.write_text(config.read_text().replace(
-            'profile = "gate5-balanced-v1"', 'profile = "gate9-systemd-v1"'))
+            'init = "/bin/bash"', 'init = "/sbin/init"') +
+            '\n[contract.filesystem]\nread = ["/"]\nwrite = ["/"]\ncreate = ["/"]\n'
+            '[contract.kernel]\nproc_read = ["/"]\nsys_read = ["/"]\n')
 
         def run(scenario, instance=config, stdin=None, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **options):
             (root / "scenario").write_text(scenario)
@@ -44,11 +49,10 @@ def main():
         for dispatch in ("selective", "paranoid"):
             for denied in (False, True):
                 instance = work / f"yield-{dispatch}-{denied}.toml"
-                text = config.read_text().replace('dispatch = "paranoid"',
-                                                  f'dispatch = "{dispatch}"')
+                text = config.read_text().replace('control = "paranoid"',
+                                                  f'control = "{dispatch}"')
                 if denied:
-                    text = text.replace('profile = "gate5-balanced-v1"',
-                                        'profile = "gate5-balanced-v1"\ndeny = ["syscall.sched_yield"]')
+                    text = text.replace('deny = []', 'deny = ["sched_yield"]')
                 instance.write_text(text)
                 code, out = run("yield", instance)
                 expected = -1 if denied else 0

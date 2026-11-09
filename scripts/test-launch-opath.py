@@ -38,7 +38,7 @@ def main():
                 config = config.replace('args = []', 'args = ' + json.dumps([mode]))
                 config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
                 if mode == "deny":
-                    config = config.replace('[contract]', '[contract]\ndeny = ["syscall.open"]')
+                    config = config.replace('deny = ["device.mmio.direct"', 'deny = ["syscall.open", "device.mmio.direct"', 1)
                 path, result = work / (mode + ".toml"), work / (mode + ".json")
                 path.write_text(config)
                 def lower():
