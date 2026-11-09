@@ -391,11 +391,24 @@ fn child_name<'a>(directory: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
     (!name.is_empty() && !name.contains(&b'/')).then_some(name)
 }
 
+/// What an overlay slot currently holds. A whiteout hides a base entry and
+/// keeps an unlinked file's bytes alive until its last descriptor closes; a
+/// link is another name for the object a different slot stores.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Slot {
+    Free,
+    File,
+    Whiteout,
+    Directory,
+    Symlink,
+    Link,
+}
+
 #[derive(Clone, Copy)]
 pub struct OverlayFile {
     accessed: Timestamp,
     modified: Timestamp,
-    state: u8,
+    state: Slot,
     path: Path,
     mode: u32,
     len: usize,
@@ -410,7 +423,7 @@ impl OverlayFile {
         Self {
             accessed: Timestamp::ZERO,
             modified: Timestamp::ZERO,
-            state: 0,
+            state: Slot::Free,
             path: Path::new(),
             mode: 0,
             len: 0,
@@ -661,15 +674,19 @@ impl<
         let object: usize;
         let overlay: bool;
         match overlay_index {
-            Some(index) if self.overlay[index].state == 2 => {
+            Some(index) if self.overlay[index].state == Slot::Whiteout => {
                 if flags & O_CREATE == 0 {
                     return Err(VfsError::NotFound);
                 }
                 object = self.create_overlay(path, 0o600)?;
                 overlay = true;
             }
-            Some(index) if self.overlay[index].state == 3 => return Err(VfsError::IsDirectory),
-            Some(index) if self.overlay[index].state == 4 => return Err(VfsError::SymlinkLoop),
+            Some(index) if self.overlay[index].state == Slot::Directory => {
+                return Err(VfsError::IsDirectory)
+            }
+            Some(index) if self.overlay[index].state == Slot::Symlink => {
+                return Err(VfsError::SymlinkLoop)
+            }
             Some(index) => {
                 let index = self.object(index);
                 if writable && self.overlay[index].executions != 0 {
@@ -833,7 +850,7 @@ impl<
         }
         if state.overlay {
             let file = &self.overlay[state.object];
-            if file.state == 2 {
+            if file.state == Slot::Whiteout {
                 return Err(VfsError::NotFound);
             }
             Ok(file.path.as_bytes())
@@ -851,7 +868,7 @@ impl<
         }
         let path = if state.overlay {
             let file = &self.overlay[state.object];
-            if file.state == 2 {
+            if file.state == Slot::Whiteout {
                 return Err(VfsError::NotFound);
             }
             file.path.as_bytes()
@@ -875,7 +892,7 @@ impl<
         if !state.directory {
             return Err(VfsError::NotDirectory);
         }
-        if state.overlay && self.overlay[state.object].state == 2 {
+        if state.overlay && self.overlay[state.object].state == Slot::Whiteout {
             return Ok(None);
         }
         let path = self.directory_path(descriptor)?;
@@ -912,7 +929,10 @@ impl<
             } else {
                 let object = ordinal - self.index.len();
                 let entry = &self.overlay[object];
-                if !matches!(entry.state, 1 | 3 | 4 | 5) {
+                if !matches!(
+                    entry.state,
+                    Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+                ) {
                     continue;
                 }
                 if let Some(name) = child_name(path, entry.path.as_bytes()) {
@@ -920,8 +940,8 @@ impl<
                         name,
                         inode: (self.index.len() + self.object(object) + 1) as u64,
                         kind: match entry.state {
-                            3 => NodeKind::Directory,
-                            4 => NodeKind::Symlink,
+                            Slot::Directory => NodeKind::Directory,
+                            Slot::Symlink => NodeKind::Symlink,
                             _ => NodeKind::File,
                         },
                         next: ordinal as u64 + 3,
@@ -1046,20 +1066,20 @@ impl<
             .links
             .checked_sub(1)
             .expect("live inode link count");
-        self.overlay[slot].state = 2;
+        self.overlay[slot].state = Slot::Whiteout;
         self.release_unlinked(slot);
     }
 
     fn release_unlinked(&mut self, slot: usize) {
         let object = self.object(slot);
         if object != slot
-            && self.overlay[slot].state == 2
+            && self.overlay[slot].state == Slot::Whiteout
             && self.overlay[slot].name_pins == 0
             && !self.referenced(slot)
         {
             self.overlay[slot].object = None;
         }
-        if self.overlay[object].state == 2
+        if self.overlay[object].state == Slot::Whiteout
             && self.overlay[object].links == 0
             && self.overlay[object].executions == 0
             && !self.referenced(object)
@@ -1087,10 +1107,10 @@ impl<
     pub fn unlink(&mut self, path: &[u8]) -> Result<(), VfsError> {
         let path = self.namespace_path(path, false)?;
         if let Some(index) = self.find_overlay(path.as_bytes()) {
-            if self.overlay[index].state == 2 {
+            if self.overlay[index].state == Slot::Whiteout {
                 return Err(VfsError::NotFound);
             }
-            if self.overlay[index].state == 3 {
+            if self.overlay[index].state == Slot::Directory {
                 return Err(VfsError::IsDirectory);
             }
             self.remove_name(index);
@@ -1103,7 +1123,7 @@ impl<
         }
         let index = self.allocate_overlay()?;
         self.overlay[index] = OverlayFile {
-            state: 2,
+            state: Slot::Whiteout,
             path,
             ..OverlayFile::empty()
         };
@@ -1256,7 +1276,7 @@ impl<
         if entry.name_pins == 0 || self.object(image.entry) != image.object {
             return Err(VfsError::InvalidDescriptor);
         }
-        Ok((entry.path.as_bytes(), entry.state == 2))
+        Ok((entry.path.as_bytes(), entry.state == Slot::Whiteout))
     }
 
     pub fn executable_pins(&self) -> usize {
@@ -1275,14 +1295,17 @@ impl<
     /// never follows a symlink or resolves an alternate name for the caller.
     pub fn named_overlay_slot(&self, path: &[u8]) -> Option<usize> {
         self.find_overlay(path)
-            .filter(|slot| self.overlay[*slot].state != 2)
+            .filter(|slot| self.overlay[*slot].state != Slot::Whiteout)
     }
 
     /// Enumerate live writable entries while the caller has quiesced mutation.
     /// Slots are opaque and stable only until the next filesystem mutation.
     pub fn overlay_entry(&self, slot: usize) -> Option<(&[u8], FileMetadata)> {
         let entry = self.overlay.get(slot)?;
-        if !matches!(entry.state, 1 | 3 | 4 | 5) {
+        if !matches!(
+            entry.state,
+            Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+        ) {
             return None;
         }
         Some((entry.path.as_bytes(), self.overlay_metadata(slot)))
@@ -1296,7 +1319,7 @@ impl<
         output: &mut [u8],
     ) -> Result<(), VfsError> {
         let entry = self.overlay.get(slot).ok_or(VfsError::NotFound)?;
-        if !matches!(entry.state, 1 | 4 | 5) {
+        if !matches!(entry.state, Slot::File | Slot::Symlink | Slot::Link) {
             return Err(VfsError::NotFound);
         }
         let object = self.object(slot);
@@ -1313,7 +1336,7 @@ impl<
     pub fn overlay_files(&self) -> usize {
         self.overlay
             .iter()
-            .filter(|entry| matches!(entry.state, 1 | 5))
+            .filter(|entry| matches!(entry.state, Slot::File | Slot::Link))
             .count()
     }
 
@@ -1373,7 +1396,7 @@ impl<
         self.overlay[slot] = OverlayFile {
             accessed: Timestamp::ZERO,
             modified: Timestamp::ZERO,
-            state: 4,
+            state: Slot::Symlink,
             path,
             mode: 0o777,
             len: target.len(),
@@ -1389,10 +1412,10 @@ impl<
         let path = self.resolved_path(name, false, false)?;
         if let Some(slot) = self.find_overlay(path.as_bytes()) {
             let entry = &self.overlay[slot];
-            if entry.state == 2 {
+            if entry.state == Slot::Whiteout {
                 return Err(VfsError::NotFound);
             }
-            if entry.state != 4 {
+            if entry.state != Slot::Symlink {
                 return Err(VfsError::InvalidPath);
             }
             let count = entry.len.min(output.len());
@@ -1416,8 +1439,8 @@ impl<
             modified: entry.modified,
             inode: (self.index.len() + object + 1) as u64,
             kind: match self.overlay[slot].state {
-                3 => NodeKind::Directory,
-                4 => NodeKind::Symlink,
+                Slot::Directory => NodeKind::Directory,
+                Slot::Symlink => NodeKind::Symlink,
                 _ => NodeKind::File,
             },
             mode: entry.mode,
@@ -1458,7 +1481,7 @@ impl<
         self.storage.clear(slot);
         self.overlay[object].links = links;
         self.overlay[slot] = OverlayFile {
-            state: 5,
+            state: Slot::Link,
             path: destination,
             object: Some(object),
             ..OverlayFile::empty()
@@ -1480,7 +1503,7 @@ impl<
     fn metadata_at(&self, path: &[u8]) -> Result<FileMetadata, VfsError> {
         if let Some(index) = self.find_overlay(path) {
             let file = &self.overlay[index];
-            if file.state == 2 {
+            if file.state == Slot::Whiteout {
                 return Err(VfsError::NotFound);
             }
             return Ok(self.overlay_metadata(index));
@@ -1544,14 +1567,16 @@ impl<
         }
         self.require_parent(path.as_bytes())?;
         let slot = self.create_overlay(path, mode & 0o777)?;
-        self.overlay[slot].state = 3;
+        self.overlay[slot].state = Slot::Directory;
         Ok(())
     }
 
     fn has_children(&self, path: &[u8]) -> Result<bool, VfsError> {
         if self.overlay.iter().any(|entry| {
-            matches!(entry.state, 1 | 3 | 4 | 5)
-                && child_name(path, entry.path.as_bytes()).is_some()
+            matches!(
+                entry.state,
+                Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+            ) && child_name(path, entry.path.as_bytes()).is_some()
         }) {
             return Ok(true);
         }
@@ -1658,8 +1683,10 @@ impl<
         }
         // Check every new descendant path before changing any namespace entry.
         for entry in self.overlay.iter() {
-            if matches!(entry.state, 1 | 3 | 4 | 5)
-                && beneath(entry.path.as_bytes(), source.as_bytes())
+            if matches!(
+                entry.state,
+                Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+            ) && beneath(entry.path.as_bytes(), source.as_bytes())
             {
                 let suffix = entry.path.len - source.len;
                 if destination
@@ -1675,8 +1702,10 @@ impl<
             self.remove_name(target);
         }
         for entry in self.overlay.iter_mut() {
-            if matches!(entry.state, 1 | 3 | 4 | 5)
-                && beneath(entry.path.as_bytes(), source.as_bytes())
+            if matches!(
+                entry.state,
+                Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+            ) && beneath(entry.path.as_bytes(), source.as_bytes())
             {
                 let mut path = destination;
                 path.extend(&entry.path.as_bytes()[source.len..])?; // Preflight above guarantees capacity.
@@ -1717,7 +1746,7 @@ impl<
         let slot = self
             .find_overlay(path.as_bytes())
             .ok_or(VfsError::PermissionDenied)?;
-        if self.overlay[slot].state == 2 {
+        if self.overlay[slot].state == Slot::Whiteout {
             return Err(VfsError::NotFound);
         }
         self.set_object_times(self.object(slot), accessed, modified)
@@ -1818,21 +1847,26 @@ impl<
     fn find_overlay(&self, path: &[u8]) -> Option<usize> {
         self.overlay
             .iter()
-            .position(|entry| matches!(entry.state, 1 | 3 | 4 | 5) && entry.path.as_bytes() == path)
+            .position(|entry| {
+                matches!(
+                    entry.state,
+                    Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+                ) && entry.path.as_bytes() == path
+            })
             .or_else(|| {
-                self.overlay
-                    .iter()
-                    .position(|entry| entry.state == 2 && entry.path.as_bytes() == path)
+                self.overlay.iter().position(|entry| {
+                    entry.state == Slot::Whiteout && entry.path.as_bytes() == path
+                })
             })
     }
 
     fn allocate_overlay(&self) -> Result<usize, VfsError> {
         self.overlay
             .iter()
-            .position(|entry| entry.state == 0)
+            .position(|entry| entry.state == Slot::Free)
             .or_else(|| {
                 self.overlay.iter().enumerate().position(|(slot, entry)| {
-                    entry.state == 2
+                    entry.state == Slot::Whiteout
                         && entry.executions == 0
                         && entry.name_pins == 0
                         && entry.links == 0
@@ -1841,7 +1875,7 @@ impl<
                             == Err(VfsError::NotFound)
                             || self.overlay.iter().enumerate().any(|(other, candidate)| {
                                 other != slot
-                                    && candidate.state != 0
+                                    && candidate.state != Slot::Free
                                     && candidate.path.as_bytes() == entry.path.as_bytes()
                             }))
                 })
@@ -1852,7 +1886,7 @@ impl<
     fn name_slot(&self, path: &[u8]) -> Result<usize, VfsError> {
         match self.find_overlay(path) {
             Some(slot)
-                if self.overlay[slot].state == 2
+                if self.overlay[slot].state == Slot::Whiteout
                     && self.overlay[slot].executions == 0
                     && self.overlay[slot].name_pins == 0
                     && self.overlay[slot].links == 0
@@ -1868,7 +1902,7 @@ impl<
         let index = self.name_slot(path.as_bytes())?;
         self.storage.clear(index);
         self.overlay[index] = OverlayFile {
-            state: 1,
+            state: Slot::File,
             path,
             mode,
             links: 1,
@@ -1931,9 +1965,9 @@ impl<
             if let Some(slot) = self.find_overlay(name) {
                 let entry = &self.overlay[slot];
                 return match entry.state {
-                    2 => Err(VfsError::NotFound),
-                    3 => Ok((NodeKind::Directory, 0)),
-                    4 => {
+                    Slot::Whiteout => Err(VfsError::NotFound),
+                    Slot::Directory => Ok((NodeKind::Directory, 0)),
+                    Slot::Symlink => {
                         if entry.len > target.len() {
                             return Err(VfsError::InvalidPath);
                         }
