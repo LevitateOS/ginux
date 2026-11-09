@@ -592,8 +592,11 @@ remain copy-on-write, and unlink/recreation preserves existing mapping identity.
 Writable shared mappings are unsupported. A temporary read-only descriptor
 transfer requires host pidfd_open/pidfd_getfd and ptrace access. Temporary native
 descriptors and stack scratch retire before the original mmap returns. Fixed
-maps cannot replace the replay instruction or scratch region. Transfer failure,
-signal interruption or death stops the instance if cleanup cannot complete safely.
+maps cannot replace the replay instruction or scratch region. Signals stay
+blocked in the calling task while supervisor-chosen syscalls replace its own, for
+this transaction and for exec descriptor setup; they are delivered when the
+original call returns. Transfer failure or death stops the instance if cleanup
+cannot complete safely.
 Threads remain unsupported in configured launch; nonleader mapping integration
 is not provided here. File capacity charging remains unchanged, but guest mappings,
 private COW pages and mappings retained after unlink are not aggregate RAM-accounted.
@@ -628,8 +631,15 @@ per descriptor. No native pipe or host descriptor is given to the workload.
 Nonblocking empty/full operations return `EAGAIN`. Blocking operations stay
 stopped at entry until another task changes pipe state. Forked peers can exchange
 data and wake blocked reads/writes; a self-pipe without a runnable peer still
-waits indefinitely. SIGKILL termination and reaping are supported. Signal-driven restart of emulated blocking operations remains unsupported;
-configured descriptor readiness is described below.
+waits indefinitely. SIGKILL termination and reaping are supported. A blocked
+owned read, write, lock, wait, poll or epoll wait ends early for a signal that
+runs a handler or terminates the task. The call is handed back to the kernel,
+which applies the handler's own flags: EINTR, or a restart of the same call with
+SA_RESTART; poll and epoll waits always report EINTR. A partly completed
+blocking write returns its count. Ignored signals leave the call blocked. The
+supervisor looks for such signals when it reaps a task, which is when a child's
+SIGCHLD is queued; a signal sent from outside the instance is not noticed while
+a call stays blocked. Configured descriptor readiness is described below.
 
 Configured processes start with a creation mask of `022`. `umask` updates the
 process group's mask used by owned file and directory creation; fork copies it,
@@ -645,7 +655,11 @@ sets the ignored DETACHED bit); other clone forms remain unsupported. Threads
 share the process descriptor table, cwd and executable pin. Pending syscall
 results and readiness snapshots remain per task. A blocked owned IO call keeps
 its original handle until completion, even if another thread replaces its fd. New children remain stopped until their virtual identity
-and descriptor snapshot are installed. Init is PID 1; PID/TID/parent queries,
+and descriptor snapshot are installed. A creation is a reservation until the
+parent's birth event publishes the child: a failed clone, or a parent that dies
+first, withdraws the reserved identity and descriptor snapshot together, and a
+native child that parent can no longer claim is killed without ever running.
+Init is PID 1; PID/TID/parent queries,
 child-TID writes and forwarded signal senders use virtual identities. Actual
 credentials remain UID/GID 1000. `wait4` supports a positive child PID or -1,
 optional `WNOHANG`, and a null rusage pointer. A faulty status destination still
@@ -743,8 +757,9 @@ unsupported for this operation. Error/hangup bits are reported independently of
 the requested mask. Zero through 300000 ms and negative infinite waits are
 supported. Queries park and wake on object progress; finite/console waits also
 use a 1 ms supervisor tick.
-General nonfatal signal interruption/restart remains unfinished. The shared
-native syscall contract is unchanged; this is configured-launch readiness.
+A handled signal ends a parked query with EINTR as described for blocked pipe
+operations. The shared native syscall contract is unchanged; this is
+configured-launch readiness.
 
 Configured launch permits `clock_gettime` and `clock_getres` for host
 `CLOCK_REALTIME` and `CLOCK_MONOTONIC` only. These are global host clocks,
@@ -753,8 +768,9 @@ not virtual instance time; CPU clocks and dynamic/fd clocks return EPERM.
 on those two clocks, at most 300 seconds into the future. Requests are copied
 once. Scalar kernel poll waits of at most 100 ms preserve peer progress and
 recheck absolute realtime deadlines. Millisecond rounding can delay completion.
-Relative waits use monotonic time; interrupted waits return EINTR even with
-SA_RESTART, with remaining time for relative requests only. A realtime clock
+Relative waits use monotonic time; a wait interrupted by a signal handler
+returns EINTR even with SA_RESTART, with remaining time for relative requests
+only. Ignored signals and the supervisor's own stops do not end it. A realtime clock
 adjustment cannot extend a request beyond 300 seconds of monotonic time;
 that limit returns ETIMEDOUT. Invalid times or unsupported flags return EINVAL.
 This does not change native execution's clock policy or virtualize vDSO time.
@@ -863,8 +879,9 @@ connecting and connected sockets. Receive bytes that cannot be copied out remain
 with the shared socket until delivered or closed. SO_ERROR consumption does not
 turn a failed connection into a successful one. Socket names require a started
 connection; ppoll accepts a null signal mask and rounds positive timeouts up to
-milliseconds without modifying the supplied timespec. General signal interruption
-and restart behavior is not implemented. Live sockets are never exported or restored.
+milliseconds without modifying the supplied timespec. Blocked socket calls
+follow the signal rule described for blocked pipe operations. Live sockets are
+never exported or restored.
 The focused scenario is `make build-launch-network-fixture` followed by
 `sudo make test-launch-network`.
 

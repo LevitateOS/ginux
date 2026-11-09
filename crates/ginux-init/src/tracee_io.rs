@@ -138,6 +138,82 @@ pub fn image_link(pid: usize, member: &[u8]) -> Result<Path, i64> {
     Path::from_bytes(relative).map_err(|_| -36)
 }
 
+/// Thread-group and parent identity of a host task the supervisor traces,
+/// as the kernel reports them. `None` once the task is gone.
+pub fn native_identity(pid: usize) -> Option<(usize, usize)> {
+    let mut text = [0u8; 4096];
+    let length = read_status(pid, &mut text)?;
+    let field = |name: &[u8]| -> Option<usize> {
+        let line = text[..length]
+            .split(|byte| *byte == b'\n')
+            .find(|line| line.starts_with(name))?;
+        let mut value = 0usize;
+        for digit in line[name.len()..].trim_ascii() {
+            value = value
+                .checked_mul(10)?
+                .checked_add((*digit as char).to_digit(10)? as usize)?;
+        }
+        Some(value)
+    };
+    Some((field(b"Tgid:")?, field(b"PPid:")?))
+}
+
+/// Reads `/proc/<pid>/status`. The name is built only from a host identity
+/// the supervisor obtained from its own wait or ptrace results.
+pub fn read_status(pid: usize, text: &mut [u8]) -> Option<usize> {
+    let mut name = [0u8; 40];
+    name[..6].copy_from_slice(b"/proc/");
+    let mut digits = [0u8; 20];
+    let mut number = pid;
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (number % 10) as u8;
+        count += 1;
+        number /= 10;
+        if number == 0 {
+            break;
+        }
+    }
+    for n in 0..count {
+        name[6 + n] = digits[count - n - 1];
+    }
+    name[6 + count..6 + count + 7].copy_from_slice(b"/status");
+    let fd = unsafe {
+        syscall4(
+            257,
+            (-100isize) as usize,
+            name.as_ptr() as usize,
+            0x80000,
+            0,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let mut length = 0;
+    while length < text.len() {
+        let read = unsafe {
+            crate::supervisor::syscall3(
+                0,
+                fd as usize,
+                text[length..].as_mut_ptr() as usize,
+                text.len() - length,
+            )
+        };
+        if read == -4 {
+            continue;
+        }
+        if read <= 0 {
+            break;
+        }
+        length += read as usize;
+    }
+    unsafe {
+        crate::supervisor::syscall1(3, fd as usize);
+    }
+    Some(length)
+}
+
 /// Linux file type bits are part of mode; identities belong to the instance.
 pub struct Stat {
     pub accessed: ginux_vfs::Timestamp,

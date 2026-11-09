@@ -86,8 +86,8 @@ Waits support zero, finite timeouts up to 300000 ms and negative infinite waits.
 wait pins its epoll object; copyout failure does not consume pending delivery.
 `epoll_pwait` accepts a null signal-mask pointer or an 8-byte kernel mask equal
 to the calling task's current mask (ignoring unmaskable KILL/STOP bits). Other
-temporary masks return EOPNOTSUPP: general signal interruption/restart semantics
-are not promised. An interrupted admitted futex exposing the kernel's internal
+temporary masks return EOPNOTSUPP. A parked wait ends with EINTR for a signal
+that runs a handler; ignored signals leave it parked. An interrupted admitted futex exposing the kernel's internal
 ERESTART_RESTARTBLOCK returns EINTR for userspace retry; `restart_syscall` is
 not granted. Native policy, catalog membership and explicit-deny precedence
 are unchanged. These are configured facilities, not a general Linux ABI claim.

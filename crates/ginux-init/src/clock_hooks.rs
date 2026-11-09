@@ -128,28 +128,34 @@ impl Sleep {
     }
 
     /// True requests another kernel poll; false completes the original sleep.
-    pub fn finish(&self, pid: usize, r: &mut UserRegs) -> Result<bool, i64> {
+    /// An interrupted quantum is not an interrupted sleep: a supervisor stop
+    /// or an ignored signal ends the poll early too. The sleep continues
+    /// until its deadline; a handled signal ends it through `interrupt`.
+    pub fn finish(&self, r: &mut UserRegs) -> Result<bool, i64> {
         let remaining = self.deadline.saturating_sub(now(self.clock)?);
-        let result = r.rax as i64;
-        if result == 0 && remaining != 0 && now(1)? < self.limit {
-            r.rip = r.rip.checked_sub(2).ok_or(-5)?;
-            r.rax = 7;
-            return Ok(true);
+        let mut result = r.rax as i64;
+        if result == 0 || matches!(result, -514..=-512 | -516 | -4) {
+            if remaining != 0 && now(1)? < self.limit {
+                r.rip = r.rip.checked_sub(2).ok_or(-5)?;
+                r.rax = 7;
+                return Ok(true);
+            }
+            result = if remaining != 0 { -110 } else { 0 };
         }
-        let result = if matches!(result, -514..=-512 | -516) {
-            -4
-        } else if result == 0 && remaining != 0 {
-            -110
-        } else {
-            result
-        };
         self.restore(r, result);
-        if result == -4 && self.remaining != 0 {
+        Ok(false)
+    }
+
+    /// Complete the sleep for a signal whose handler is about to run.
+    pub fn interrupt(&self, pid: usize, r: &mut UserRegs) -> Result<(), i64> {
+        let remaining = self.deadline.saturating_sub(now(self.clock)?);
+        self.restore(r, -4);
+        if self.remaining != 0 {
             let mut bytes = [0u8; 16];
             bytes[..8].copy_from_slice(&(remaining / SECOND).to_ne_bytes());
             bytes[8..].copy_from_slice(&(remaining % SECOND).to_ne_bytes());
             write_tracee_bytes_strict(pid, self.remaining as usize, &bytes)?;
         }
-        Ok(false)
+        Ok(())
     }
 }

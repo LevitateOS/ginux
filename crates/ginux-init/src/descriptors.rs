@@ -244,6 +244,13 @@ impl DescriptorCall {
         self.poll_tick
     }
 
+    /// Bytes a parked blocking write already published. A signal handler
+    /// ends that write with this count rather than a restart, as Linux does.
+    pub fn interrupted_result(&self) -> Option<i64> {
+        let written = self.channel_write.written();
+        (written != 0).then_some(written as i64)
+    }
+
     fn save(&mut self, r: &UserRegs) {
         self.saved_args = Some([r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9, r.orig_rax]);
     }

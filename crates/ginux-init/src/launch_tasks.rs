@@ -90,6 +90,54 @@ struct Task {
     path_rewrite: Option<crate::path_hooks::Rewrite>,
     waiter: Option<usize>,
     sleep: Option<crate::clock_hooks::Sleep>,
+    /// Restart result of a parked object wait; `None` while the park is only
+    /// a short ordering gate that no signal may end.
+    interruptible: Option<i64>,
+    /// A parked call handed back to the kernel so a queued signal can arrive.
+    unpark: Option<Unpark>,
+    /// The tracee's own signal mask while an injected transaction blocks it.
+    signal_hold: Option<u64>,
+    /// Native reaps the supervisor had completed when this task last resumed.
+    reaps_seen: u64,
+}
+
+/// A parked syscall being returned to its own instruction. The skipped entry
+/// exits first; the replayed entry is then an ordinary retry of the call.
+#[derive(Clone, Copy)]
+struct Unpark {
+    original: UserRegs,
+    restart: i64,
+    replaying: bool,
+}
+
+impl Task {
+    fn new(id: TaskId, host: usize, group: usize) -> Self {
+        Self {
+            id,
+            host,
+            alive: true,
+            running: false,
+            held_status: None,
+            adopted_reaped: false,
+            wait_status: None,
+            group,
+            call: DescriptorCall::new(),
+            image_chdir: None,
+            pending: Pending::None,
+            override_result: None,
+            blocked: None,
+            sequence: 0,
+            exec: None,
+            mapping: None,
+            path_rewrite: None,
+            waiter: None,
+            sleep: None,
+            interruptible: None,
+            unpark: None,
+            signal_hold: None,
+            reaps_seen: 0,
+        }
+    }
 }
 
 struct DescriptorGroup {
@@ -128,6 +176,9 @@ struct Supervisor<'a> {
     root_status: Option<i32>,
     creation_failure_reported: bool,
     argument_guard: Option<usize>,
+    /// Terminal statuses collected so far. Each native reap can queue SIGCHLD
+    /// for a task the supervisor is holding in a stop.
+    reaps: u64,
 }
 
 fn birth_stop(status: i32) -> bool {
@@ -315,6 +366,7 @@ pub fn supervise(
         root_status: None,
         creation_failure_reported: false,
         argument_guard: None,
+        reaps: 0,
     };
     s.groups[0] = Some(DescriptorGroup {
         table: descriptors,
@@ -326,27 +378,7 @@ pub fn supervise(
         cwd: None,
         creation_mask: 0o022,
     });
-    s.tasks[0] = Some(Task {
-        id,
-        host: root,
-        alive: true,
-        running: false,
-        held_status: None,
-        adopted_reaped: false,
-        wait_status: None,
-        group: 0,
-        call: DescriptorCall::new(),
-        image_chdir: None,
-        pending: Pending::None,
-        override_result: None,
-        blocked: None,
-        sequence: 0,
-        exec: None,
-        mapping: None,
-        path_rewrite: None,
-        waiter: None,
-        sleep: None,
-    });
+    s.tasks[0] = Some(Task::new(id, root, 0));
     if ptrace(PTRACE_SETOPTIONS, root, 0, OPTIONS) < 0 {
         s.fail(instance, b"launch ptrace setup failed");
     }
@@ -413,22 +445,38 @@ pub fn supervise(
             s.fail(instance, b"launch task wait failed")
         }
         let host = host as usize;
+        if held.is_none() && (exited(status) || signaled(status)) {
+            s.reaps += 1;
+        }
         let index = s
             .tasks
             .iter()
             .position(|t| t.as_ref().is_some_and(|t| t.host == host && host != 0));
         let Some(index) = index else {
-            // Auto-attached children can report their birth stop before the
-            // parent's event. Hold them; GETEVENTMSG must confirm ownership.
-            if birth_stop(status) {
-                let slot = s
-                    .unknown_stops
-                    .iter()
-                    .position(|p| *p == 0)
-                    .unwrap_or_else(|| s.fail(instance, b"unregistered task bound exceeded"));
-                s.unknown_stops[slot] = host;
+            if exited(status) || signaled(status) {
+                // A newborn that died before its parent could publish it, or
+                // a task already retired from the table. It is reaped and
+                // holds nothing; only its ledger entry remains to clear.
+                for unknown in s.unknown_stops.iter_mut().filter(|p| **p == host) {
+                    *unknown = 0;
+                }
                 continue;
             }
+            // This stop has been consumed: nothing else would report the
+            // task again, so it must not outlive a failure unrecorded.
+            if birth_stop(status) {
+                // Auto-attached children can report their birth stop before
+                // the parent's event. Hold them; GETEVENTMSG must confirm
+                // ownership.
+                let Some(slot) = s.unknown_stops.iter().position(|p| *p == 0) else {
+                    let _ = unsafe { syscall2(SYS_KILL, host, SIGKILL) };
+                    s.fail(instance, b"unregistered task bound exceeded")
+                };
+                s.unknown_stops[slot] = host;
+                s.settle_newborns();
+                continue;
+            }
+            let _ = unsafe { syscall2(SYS_KILL, host, SIGKILL) };
             s.fail(instance, b"event from unregistered task");
         };
         s.task_mut(index).running = false;
@@ -493,19 +541,9 @@ pub fn supervise(
         }
         let signal = ((status >> 8) & 255) as usize;
         if signal != 133 {
-            // A signal can arrive between two bounded sleep quanta, before
-            // the replay enters the kernel. Complete the original syscall
-            // before allowing the guest's handler to issue its own calls.
-            if let Some(sleep) = s.task_mut(index).sleep.take() {
-                let mut registers = s.registers(index, instance);
-                registers.rax = (-4i64) as u64;
-                if let Err(result) = sleep.finish(host, &mut registers) {
-                    sleep.restore(&mut registers, result);
-                }
-                if ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize) < 0 {
-                    s.fail(instance, b"sleep interruption register update failed");
-                }
-            }
+            s.signal_reaches_held_call(index, signal, instance);
+            // Injected transactions block signals for their whole duration,
+            // so this stop cannot belong to one.
             if s.task(index).mapping.is_some()
                 || s.task(index).exec.is_some_and(|e| {
                     matches!(
@@ -648,6 +686,93 @@ impl Supervisor<'_> {
         Some((state.leader, state.status))
     }
 
+    /// Withdraw a creation whose child was never published: the reserved
+    /// virtual identity, its descriptor group reference and the gate on the
+    /// parent's group all go together. Returns whether a reservation was
+    /// withdrawn; a published child is a task of its own and stays.
+    fn cancel_creation(&mut self, parent: usize, instance: &mut Instance) -> bool {
+        let Pending::Fork {
+            child, parent_tid, ..
+        } = self.task(parent).pending
+        else {
+            return false;
+        };
+        if self.task(child).host != 0 {
+            return false;
+        }
+        self.task_mut(parent).pending = Pending::None;
+        self.release_group(child, instance);
+        let (id, reserved) = (self.task(parent).id, self.task(child).id);
+        let rollback = if parent_tid.is_some() {
+            self.processes.cancel_thread(id, reserved)
+        } else {
+            self.processes.cancel_fork(id, reserved)
+        };
+        if self.group(parent).creating == Some(parent) {
+            self.group_mut(parent).creating = None;
+            self.wake_needed = true;
+        }
+        if rollback.is_err() {
+            self.fail(instance, b"task creation rollback failed");
+        }
+        self.tasks[child] = None;
+        true
+    }
+
+    /// Host identity of the thread group a task belongs to.
+    fn host_tgid(&self, index: usize) -> Option<usize> {
+        let leader = self.group(index).leader;
+        self.tasks
+            .iter()
+            .flatten()
+            .find(|task| task.id == leader)
+            .map(|task| task.host)
+            .filter(|host| *host != 0)
+    }
+
+    /// An auto-attached newborn stays stopped until its parent's birth event
+    /// claims it. Only a live task with an unpublished creation can do that:
+    /// the newborn is a thread of that task's group or a child of its
+    /// process. Any other newborn lost its parent before publication. It
+    /// never ran and no virtual task names it, so it is killed; its terminal
+    /// event is consumed like that of any task the table no longer holds.
+    fn settle_newborns(&mut self) {
+        for slot in 0..TASKS {
+            let host = self.unknown_stops[slot];
+            if host == 0 {
+                continue;
+            }
+            let identity = crate::tracee_io::native_identity(host);
+            let claimable = identity.is_some_and(|(tgid, parent)| {
+                (0..TASKS).any(|index| {
+                    let Some(task) = self.tasks[index].as_ref() else {
+                        return false;
+                    };
+                    let Pending::Fork {
+                        child, parent_tid, ..
+                    } = task.pending
+                    else {
+                        return false;
+                    };
+                    task.alive
+                        && self.task(child).host == 0
+                        && self.host_tgid(index).is_some_and(|group| {
+                            if parent_tid.is_some() {
+                                group == tgid
+                            } else {
+                                group == parent
+                            }
+                        })
+                })
+            });
+            if !claimable {
+                let _ = unsafe { syscall2(SYS_KILL, host, SIGKILL) };
+                self.unknown_stops[slot] = 0;
+                audit_write(b"ginux: unclaimed newborn retired\n");
+            }
+        }
+    }
+
     fn report_creation_failure(&mut self, reason: &[u8]) {
         // Keep the first concrete resource failure visible after ordinary audit
         // truncation, without permitting a failed-clone loop to flood stderr.
@@ -702,6 +827,8 @@ impl Supervisor<'_> {
                 self.fail(instance, reason);
             }
         }
+        self.settle_signal_hold(index, instance);
+        self.task_mut(index).reaps_seen = self.reaps;
         let result = ptrace(PTRACE_SYSCALL, self.task(index).host, 0, signal);
         if result == -3 {
             // SIGKILL can end a ptrace stop between an object retry and
@@ -714,6 +841,149 @@ impl Supervisor<'_> {
             self.task_mut(index).running = true;
         }
     }
+    fn injecting(&self, index: usize) -> bool {
+        let task = self.task(index);
+        task.mapping.is_some()
+            || task.exec.is_some_and(|e| {
+                matches!(
+                    e.stage,
+                    ExecStage::Sync
+                        | ExecStage::Reenter
+                        | ExecStage::Create
+                        | ExecStage::Close
+                        | ExecStage::Retire
+                        | ExecStage::RetireReenter
+                )
+            })
+    }
+
+    /// Every stop ends by resuming the task or parking its call, and both
+    /// pass through here: signals are blocked exactly while supervisor-chosen
+    /// syscalls replace the task's own, so none can be delivered in between.
+    fn settle_signal_hold(&mut self, index: usize, instance: &mut Instance) {
+        let host = self.task(index).host;
+        let result = match (self.injecting(index), self.task(index).signal_hold) {
+            (true, None) => crate::task_signals::hold(host).map(Some),
+            (false, Some(saved)) => crate::task_signals::release(host, saved).map(|_| None),
+            _ => return,
+        };
+        match result {
+            Ok(hold) => self.task_mut(index).signal_hold = hold,
+            // SIGKILL ended the stop; wait4 supplies the actual death.
+            Err(-3) => {}
+            Err(_) => self.fail(instance, b"signal hold update failed"),
+        }
+    }
+
+    /// Hold a syscall at its entry stop. `restart` marks an object wait that
+    /// a signal may end; an ordering gate passes `None` and is released only
+    /// by the transition it waits for.
+    fn park(
+        &mut self,
+        index: usize,
+        original: UserRegs,
+        restart: Option<i64>,
+        instance: &mut Instance,
+    ) {
+        self.settle_signal_hold(index, instance);
+        let reaps = self.reaps;
+        let task = self.task_mut(index);
+        task.blocked = Some(original);
+        task.interruptible = restart;
+        // A child reaped since this task last resumed can have queued SIGCHLD
+        // after the kernel last looked. The next wake pass examines it.
+        if restart.is_some() && task.reaps_seen != reaps {
+            self.wake_needed = true;
+        }
+    }
+
+    /// Hand a parked object wait back to the kernel when a queued signal
+    /// would run a handler or end the task. The call skips this entry and is
+    /// replayed from its own instruction: the kernel delivers the signal on
+    /// the way, and a replay nobody claimed is an ordinary retry.
+    fn interrupt_parked(&mut self, index: usize, instance: &mut Instance) {
+        let reaps = self.reaps;
+        let task = self.task_mut(index);
+        let (Some(original), Some(restart)) = (task.blocked, task.interruptible) else {
+            return;
+        };
+        if task.reaps_seen == reaps {
+            return;
+        }
+        task.reaps_seen = reaps;
+        let host = task.host;
+        let mut instruction = [0u8; 2];
+        if !crate::task_signals::Signals::read(host)
+            .is_some_and(|signals| signals.interrupt_held_call())
+            || original.rip < 2
+            || copy_memory(host, original.rip - 2, &mut instruction, false) != Ok(2)
+            || instruction != [0x0f, 0x05]
+        {
+            return;
+        }
+        let task = self.task_mut(index);
+        task.blocked = None;
+        task.interruptible = None;
+        task.unpark = Some(Unpark {
+            original,
+            restart,
+            replaying: false,
+        });
+        audit_write(b"ginux: park interrupted surface=pending-signal virtual-pid=");
+        audit_u64(self.task(index).id.pid as u64);
+        audit_write(b"\n");
+        let mut skipped = original;
+        skipped.orig_rax = u64::MAX;
+        self.run(index, &skipped, instance);
+    }
+
+    /// A signal-delivery stop for a task whose call the supervisor still
+    /// holds. Only a handler ends the call; an ignored signal leaves it held
+    /// and a fatal one needs no result.
+    fn signal_reaches_held_call(&mut self, index: usize, signal: usize, instance: &mut Instance) {
+        if self.task(index).sleep.is_none() && self.task(index).unpark.is_none() {
+            return;
+        }
+        let host = self.task(index).host;
+        // An unreadable signal view keeps the conservative result.
+        if !crate::task_signals::Signals::read(host).is_none_or(|signals| signals.handled(signal)) {
+            return;
+        }
+        if let Some(sleep) = self.task_mut(index).sleep.take() {
+            let mut registers = self.registers(index, instance);
+            if let Err(result) = sleep.interrupt(host, &mut registers) {
+                sleep.restore(&mut registers, result);
+            }
+            if ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize) < 0 {
+                self.fail(instance, b"sleep interruption register update failed");
+            }
+        }
+        if let Some(unpark) = self.task_mut(index).unpark.take() {
+            // The kernel resolves the restart result against this handler's
+            // flags: EINTR, or a transparent restart of the same call.
+            let mut registers = unpark.original;
+            let group = self.task(index).group;
+            let task = self.tasks[index].as_mut().unwrap();
+            let progress = task.call.interrupted_result();
+            if let Err(reason) = task.call.finish(
+                &mut self.groups[group].as_mut().unwrap().table,
+                &mut registers,
+                &mut self.objects,
+            ) {
+                self.fail(instance, reason);
+            }
+            self.wake_needed = true;
+            registers.rax = progress.unwrap_or(unpark.restart) as u64;
+            let result = ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize);
+            if result < 0 && result != -3 {
+                self.fail(instance, b"interrupted call register update failed");
+            }
+            audit_write(b"ginux: audit sequence=");
+            audit_u64(self.task(index).sequence);
+            audit_write(b" phase=exit result=interrupted\n");
+        }
+    }
+
     fn begin_argument_guard(&mut self, owner: usize, instance: &mut Instance) {
         if self.argument_guard.is_some() {
             return;
@@ -772,6 +1042,9 @@ impl Supervisor<'_> {
                 let peer = self.task_mut(index);
                 peer.running = false;
                 peer.held_status = Some(status);
+                if exited(status) || signaled(status) {
+                    self.reaps += 1;
+                }
                 break;
             }
         }
@@ -821,6 +1094,14 @@ impl Supervisor<'_> {
         self.run(index, r, instance);
     }
     fn entry(&mut self, index: usize, r: &mut UserRegs, instance: &mut Instance) {
+        if let Some(unpark) = self.task_mut(index).unpark.take() {
+            if !unpark.replaying
+                || r.orig_rax != unpark.original.orig_rax
+                || r.rip != unpark.original.rip
+            {
+                self.fail(instance, b"interrupted park left its syscall instruction");
+            }
+        }
         if let Some(sleep) = self.task(index).sleep {
             match sleep.enter(r) {
                 Ok(()) => self.run(index, r, instance),
@@ -942,7 +1223,7 @@ impl Supervisor<'_> {
             .is_some_and(|owner| owner != index)
             && !matches!(r.orig_rax, 60 | 231 | 62)
         {
-            self.task_mut(index).blocked = Some(original);
+            self.park(index, original, None, instance);
             audit_write(b"park surface=descriptor-snapshot\n");
             return;
         }
@@ -1384,7 +1665,7 @@ impl Supervisor<'_> {
                         .flatten()
                         .any(|t| t.group == parent_group && t.call.native_mutation())
                 {
-                    self.task_mut(index).blocked = Some(original);
+                    self.park(index, original, None, instance);
                     audit_write(b"park surface=descriptor-snapshot\n");
                     return;
                 }
@@ -1450,30 +1731,6 @@ impl Supervisor<'_> {
                             self.fail(instance, b"fork executable retain failed");
                         }
                     }
-                    let cwd = match self.group(index).cwd {
-                        Some(fd) => match self.objects.filesystem.copy_cwd(fd) {
-                            Ok(fd) => Some(fd),
-                            Err(error) => {
-                                if let Some(image) = image {
-                                    if self.objects.filesystem.release_executable(image).is_err() {
-                                        self.fail(
-                                            instance,
-                                            b"cwd-limited fork image rollback failed",
-                                        );
-                                    }
-                                }
-                                if let Err(reason) = table.release_exited(&mut self.objects) {
-                                    self.fail(instance, reason);
-                                }
-                                if self.processes.cancel_fork(id, child).is_err() {
-                                    self.fail(instance, b"cwd-limited fork rollback failed");
-                                }
-                                self.emulate(index, r, error, instance);
-                                return;
-                            }
-                        },
-                        None => None,
-                    };
                     self.groups[group] = Some(DescriptorGroup {
                         table,
                         owners: 1,
@@ -1481,39 +1738,34 @@ impl Supervisor<'_> {
                         status: None,
                         creating: None,
                         image,
-                        cwd,
+                        cwd: None,
                         creation_mask: self.group(index).creation_mask,
                     });
                     self.group_mut(index).creating = Some(index);
                     group
                 };
-                self.tasks[slot] = Some(Task {
-                    id: child,
-                    host: 0,
-                    alive: true,
-                    running: false,
-                    held_status: None,
-                    adopted_reaped: false,
-                    wait_status: None,
-                    group,
-                    call: DescriptorCall::new(),
-                    image_chdir: None,
-                    pending: Pending::None,
-                    override_result: None,
-                    blocked: None,
-                    sleep: None,
-                    sequence: 0,
-                    exec: None,
-                    mapping: None,
-                    path_rewrite: None,
-                    waiter: None,
-                });
+                // The reservation is complete from here: the syscall result,
+                // the birth event or the parent's death settles it, and every
+                // failure below leaves through `cancel_creation`.
+                self.tasks[slot] = Some(Task::new(child, 0, group));
                 self.task_mut(index).pending = Pending::Fork {
                     child: slot,
                     flags,
                     child_tid: libc_fork.then_some(r.r10),
                     parent_tid: thread.then_some(r.rdx),
                 };
+                if !thread {
+                    if let Some(fd) = self.group(index).cwd {
+                        match self.objects.filesystem.copy_cwd(fd) {
+                            Ok(fd) => self.groups[group].as_mut().unwrap().cwd = Some(fd),
+                            Err(error) => {
+                                self.cancel_creation(index, instance);
+                                self.emulate(index, r, error, instance);
+                                return;
+                            }
+                        }
+                    }
+                }
                 if libc_fork {
                     r.rdi &= !0x1000000;
                 }
@@ -1602,14 +1854,24 @@ impl Supervisor<'_> {
         };
         match decision {
             NativeDecision::ParkPoll => {
-                self.task_mut(index).blocked = Some(original);
+                self.park(
+                    index,
+                    original,
+                    Some(crate::task_signals::RESTART_WITHOUT_HANDLER),
+                    instance,
+                );
                 audit_write(b"park surface=owned-poll");
                 self.objects.devices.network.audit_attempt();
                 audit_write(b"\n");
             }
             NativeDecision::Park { fd, progressed } => {
                 self.wake_needed |= progressed;
-                self.task_mut(index).blocked = Some(original);
+                self.park(
+                    index,
+                    original,
+                    Some(crate::task_signals::RESTART_SYSCALL),
+                    instance,
+                );
                 audit_write(b"park");
                 self.objects.devices.network.audit_attempt();
                 audit_write(b"\nginux: park surface=lane-channel fd=");
@@ -1969,6 +2231,10 @@ impl Supervisor<'_> {
         self.resume(index, 0, instance);
     }
 
+    /// Publish a reserved child: bind its native identity, then finish the
+    /// identity copyouts both tasks observe. Until `host` is bound the
+    /// reservation can still be cancelled; afterwards the child is a task of
+    /// its own and its death is an ordinary death.
     fn birth(&mut self, parent: usize, instance: &mut Instance) {
         let Pending::Fork {
             child: slot,
@@ -1979,54 +2245,79 @@ impl Supervisor<'_> {
         else {
             self.fail(instance, b"unreserved child event")
         };
+        let parent_host = self.task(parent).host;
         let mut host = 0usize;
-        if ptrace(
+        let identity = ptrace(
             PTRACE_GETEVENTMSG,
-            self.task(parent).host,
+            parent_host,
             0,
             &mut host as *mut _ as usize,
-        ) < 0
-            || host == 0
-        {
+        );
+        if identity == -3 {
+            // The parent was killed out of this event stop. Its death cancels
+            // the reservation and retires the newborn it cannot claim.
+            return;
+        }
+        if identity < 0 || host == 0 {
             self.fail(instance, b"child event identity missing")
         }
-        self.task_mut(slot).host = host;
         let early = self.unknown_stops.iter().position(|p| *p == host);
         if let Some(i) = early {
             self.unknown_stops[i] = 0;
         } else {
             let mut status = 0;
-            if unsafe { syscall4(SYS_WAIT4, host, &mut status as *mut _ as usize, WALL, 0) } < 0
-                || !stopped(status)
-                || !birth_stop(status)
+            let waited =
+                unsafe { syscall4(SYS_WAIT4, host, &mut status as *mut _ as usize, WALL, 0) };
+            if waited == host as isize
+                && (exited(status) || signaled(status))
+                && parent_tid.is_some()
             {
+                // A thread born into a group that is being killed never
+                // reached its birth stop. Nothing was published; the caller
+                // sees a failed creation if it outlives the group at all.
+                self.reaps += 1;
+                self.cancel_creation(parent, instance);
+                self.task_mut(parent).override_result = Some(-11);
+                self.resume(parent, 0, instance);
+                return;
+            }
+            if waited < 0 || !birth_stop(status) {
                 self.fail(instance, b"child birth stop missing")
             }
         }
-        if ptrace(PTRACE_SETOPTIONS, host, 0, OPTIONS) < 0 {
-            self.fail(instance, b"child supervision setup failed")
-        }
-        if let Some(address) = child_tid {
-            match crate::tracee_io::store_u32(host, address, self.task(slot).id.pid) {
-                Ok(()) | Err(-14) => {}
-                Err(_) => self.fail(instance, b"child tid rollback failed"),
+        self.task_mut(slot).host = host;
+        let virtual_id = self.task(slot).id.pid;
+        let setup = (|| -> Result<(), &'static [u8]> {
+            if ptrace(PTRACE_SETOPTIONS, host, 0, OPTIONS) < 0 {
+                return Err(b"child supervision setup failed");
             }
-            let mut registers = self.registers(slot, instance);
-            registers.rdi = flags;
-            if ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize) < 0 {
-                self.fail(instance, b"child clone argument restoration failed");
+            if let Some(address) = child_tid {
+                match crate::tracee_io::store_u32(host, address, virtual_id) {
+                    Ok(()) | Err(-14) => {}
+                    Err(_) => return Err(b"child tid rollback failed"),
+                }
             }
-        }
-        if let Some(address) = parent_tid {
-            if crate::tracee_io::store_u32(self.task(parent).host, address, self.task(slot).id.pid)
-                .is_err()
-            {
-                self.fail(instance, b"thread identity copyout failed");
+            if let Some(address) = parent_tid {
+                if crate::tracee_io::store_u32(parent_host, address, virtual_id).is_err() {
+                    return Err(b"thread identity copyout failed");
+                }
             }
-            let mut registers = self.registers(slot, instance);
-            registers.rdi = flags;
-            if ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize) < 0 {
-                self.fail(instance, b"thread birth register update failed");
+            if child_tid.is_some() || parent_tid.is_some() {
+                let mut registers = self
+                    .read_registers(slot)
+                    .map_err(|_| b"child birth register read failed".as_slice())?;
+                registers.rdi = flags;
+                if ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize) < 0 {
+                    return Err(b"child birth register update failed");
+                }
+            }
+            Ok(())
+        })();
+        if let Err(reason) = setup {
+            // SIGKILL can reach either task inside its stop. The published
+            // child and its parent then die through their own wait events.
+            if !crate::tracee_killed(host) && !crate::tracee_killed(parent_host) {
+                self.fail(instance, reason);
             }
         }
         if self.group(parent).creating == Some(parent) {
@@ -2034,14 +2325,25 @@ impl Supervisor<'_> {
             self.wake_needed = true;
         }
         audit_write(b"ginux: task registered virtual-pid=");
-        audit_u64(self.task(slot).id.pid as u64);
+        audit_u64(virtual_id as u64);
         audit_write(b"\n");
         self.resume(slot, 0, instance);
         self.resume(parent, 0, instance);
     }
     fn syscall_exit(&mut self, index: usize, r: &mut UserRegs, instance: &mut Instance) {
+        if let Some(unpark) = self.task(index).unpark {
+            if unpark.replaying {
+                self.fail(instance, b"interrupted park exited before its replay");
+            }
+            let mut replay = unpark.original;
+            replay.rip -= 2;
+            replay.rax = replay.orig_rax;
+            self.task_mut(index).unpark.as_mut().unwrap().replaying = true;
+            self.run(index, &replay, instance);
+            return;
+        }
         if let Some(sleep) = self.task(index).sleep {
-            match sleep.finish(self.task(index).host, r) {
+            match sleep.finish(r) {
                 Ok(true) => {
                     self.run(index, r, instance);
                     return;
@@ -2195,12 +2497,7 @@ impl Supervisor<'_> {
         }
         let pending = self.task(index).pending;
         match pending {
-            Pending::Fork {
-                child,
-                flags,
-                parent_tid,
-                ..
-            } => {
+            Pending::Fork { child, flags, .. } => {
                 r.rdi = flags;
                 if r.rax as i64 == -513 {
                     // A peer stop can expose the kernel's internal fork restart.
@@ -2214,21 +2511,7 @@ impl Supervisor<'_> {
                             b"ginux: native task creation returned EAGAIN",
                         );
                     }
-                    self.release_group(child, instance);
-                    let child_id = self.task(child).id;
-                    let rollback = if parent_tid.is_some() {
-                        self.processes.cancel_thread(self.task(index).id, child_id)
-                    } else {
-                        self.processes.cancel_fork(self.task(index).id, child_id)
-                    };
-                    if self.group(index).creating == Some(index) {
-                        self.group_mut(index).creating = None;
-                        self.wake_needed = true;
-                    }
-                    if rollback.is_err() {
-                        self.fail(instance, b"fork rollback failed");
-                    }
-                    self.tasks[child] = None;
+                    self.cancel_creation(index, instance);
                 } else {
                     if self.task(child).host == 0 || r.rax as usize != self.task(child).host {
                         self.fail(instance, b"unregistered fork result");
@@ -2350,7 +2633,12 @@ impl Supervisor<'_> {
                     if r.rdx & 1 != 0 {
                         self.emulate(index, r, 0, instance);
                     } else {
-                        self.task_mut(index).blocked = Some(*r);
+                        self.park(
+                            index,
+                            *r,
+                            Some(crate::task_signals::RESTART_SYSCALL),
+                            instance,
+                        );
                         audit_write(b"park surface=owned-child-wait\n");
                     }
                     return;
@@ -2384,7 +2672,12 @@ impl Supervisor<'_> {
                 } else if r.rdx & 1 != 0 {
                     self.emulate(index, r, 0, instance)
                 } else {
-                    self.task_mut(index).blocked = Some(*r);
+                    self.park(
+                        index,
+                        *r,
+                        Some(crate::task_signals::RESTART_SYSCALL),
+                        instance,
+                    );
                     audit_write(b"park surface=owned-child-wait\n");
                 }
             }
@@ -2403,6 +2696,7 @@ impl Supervisor<'_> {
             let Some(mut r) = self.tasks[index].as_mut().and_then(|t| t.blocked.take()) else {
                 continue;
             };
+            self.task_mut(index).interruptible = None;
             if self.needs_argument_guard(index, &r) {
                 self.begin_argument_guard(index, instance);
             }
@@ -2410,6 +2704,7 @@ impl Supervisor<'_> {
             if self.argument_guard == Some(index) && self.task(index).blocked.is_some() {
                 self.release_argument_guard(instance);
             }
+            self.interrupt_parked(index, instance);
         }
     }
     fn release_task_images(&mut self, index: usize, instance: &mut Instance) {
@@ -2479,23 +2774,10 @@ impl Supervisor<'_> {
         }
         let id = self.task(index).id;
         let group = self.task(index).group;
-        if let Pending::Fork {
-            child, parent_tid, ..
-        } = self.task(index).pending
-        {
-            if self.task(child).host == 0 {
-                self.release_group(child, instance);
-                let reserved = self.task(child).id;
-                let rollback = if parent_tid.is_some() {
-                    self.processes.cancel_thread(id, reserved)
-                } else {
-                    self.processes.cancel_fork(id, reserved)
-                };
-                if rollback.is_err() {
-                    self.fail(instance, b"unpublished task rollback failed");
-                }
-                self.tasks[child] = None;
-            }
+        if self.cancel_creation(index, instance) {
+            // The kernel may already have created the child this parent can
+            // no longer claim.
+            self.settle_newborns();
         }
         if self.group(index).creating == Some(index) {
             self.group_mut(index).creating = None;

@@ -433,6 +433,14 @@ build-launch-thread-fixture:
 test-launch-threads:
 	python3 scripts/test-launch-threads.py $(GINUX) .artifacts/launch/launch-thread-fixture
 
+.PHONY: build-launch-signal-fixture test-launch-signals
+build-launch-signal-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-signal-fixture.c -o .artifacts/launch/launch-signal-fixture
+
+test-launch-signals:
+	python3 scripts/test-launch-signals.py $(GINUX) .artifacts/launch/launch-signal-fixture
+
 .PHONY: build-launch-image-io-fixture test-launch-image-io
 build-launch-image-io-fixture:
 	mkdir -p .artifacts/launch

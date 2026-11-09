@@ -85,6 +85,10 @@ impl WriteProgress {
             event_nonblock: None,
         }
     }
+
+    pub fn written(&self) -> usize {
+        self.written
+    }
 }
 
 pub enum ChannelResult {

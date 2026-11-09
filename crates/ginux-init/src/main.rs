@@ -35,6 +35,7 @@ mod storage_export;
 mod storage_memory;
 mod storage_restore;
 mod supervisor;
+mod task_signals;
 mod tracee_io;
 
 use crate::dispatch::{balanced_surface_name, decide_native, process_entry, Lane, NativeDecision};
