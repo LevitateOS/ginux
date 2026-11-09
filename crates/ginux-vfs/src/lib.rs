@@ -41,7 +41,17 @@ pub enum VfsError {
     OverlayLimit,
     FileTooLarge,
     AlreadyExists,
+    /// A value that names no path is out of range or malformed.
+    InvalidArgument,
     Io,
+}
+
+/// Where `seek` measures its offset from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Whence {
+    Start,
+    Current,
+    End,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -759,7 +769,7 @@ impl<
     /// description. The caller supplies authority through an existing handle.
     pub fn reopen_readonly(&mut self, descriptor: i32, flags: u32) -> Result<i32, VfsError> {
         if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
-            return Err(VfsError::InvalidPath);
+            return Err(VfsError::InvalidArgument);
         }
         let source = self.descriptors[self.descriptor(descriptor)?];
         if !source.readable {
@@ -799,7 +809,7 @@ impl<
     /// through the launcher's aliases, just like ordinary file offsets.
     pub fn open_directory(&mut self, path: &[u8], flags: u32) -> Result<i32, VfsError> {
         if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
-            return Err(VfsError::InvalidPath);
+            return Err(VfsError::InvalidArgument);
         }
         let path = self.resolved_path(path, true, false)?;
         let metadata = self.metadata_at(path.as_bytes())?;
@@ -911,7 +921,7 @@ impl<
                 next: cookie + 1,
             }));
         }
-        let start = usize::try_from(cookie - 2).map_err(|_| VfsError::InvalidPath)?;
+        let start = usize::try_from(cookie - 2).map_err(|_| VfsError::InvalidArgument)?;
         for ordinal in start..self.index.len() + self.overlay.len() {
             if ordinal < self.index.len() {
                 let entry = self.index.entry(ordinal)?;
@@ -1416,7 +1426,7 @@ impl<
                 return Err(VfsError::NotFound);
             }
             if entry.state != Slot::Symlink {
-                return Err(VfsError::InvalidPath);
+                return Err(VfsError::InvalidArgument);
             }
             let count = entry.len.min(output.len());
             self.storage.read(slot, 0, &mut output[..count])?;
@@ -1424,7 +1434,7 @@ impl<
         }
         let entry = self.index.lookup_exact(path.as_bytes())?;
         if entry.kind != NodeKind::Symlink {
-            return Err(VfsError::InvalidPath);
+            return Err(VfsError::InvalidArgument);
         }
         let count = entry.link.len().min(output.len());
         output[..count].copy_from_slice(&entry.link[..count]);
@@ -1774,7 +1784,7 @@ impl<
             .flatten()
             .any(|time| time.nanoseconds >= 1_000_000_000)
         {
-            return Err(VfsError::InvalidPath);
+            return Err(VfsError::InvalidArgument);
         }
         if let Some(time) = accessed {
             self.overlay[object].accessed = time;
@@ -1796,21 +1806,22 @@ impl<
     }
 
     /// Seek the shared open-file position; seeking past EOF does not grow data.
-    pub fn seek(&mut self, descriptor: i32, offset: i64, whence: u32) -> Result<u64, VfsError> {
+    /// A position that is negative or does not fit is an invalid argument,
+    /// not a file that grew too large.
+    pub fn seek(&mut self, descriptor: i32, offset: i64, whence: Whence) -> Result<u64, VfsError> {
         let slot = self.descriptor(descriptor)?;
         let base = match whence {
-            0 => 0,
-            1 => self.positions[self.descriptors[slot].position] as u64,
-            2 => self.fstat(descriptor)?.size,
-            _ => return Err(VfsError::InvalidPath),
+            Whence::Start => 0,
+            Whence::Current => self.positions[self.descriptors[slot].position] as u64,
+            Whence::End => self.fstat(descriptor)?.size,
         };
-        let base = i64::try_from(base).map_err(|_| VfsError::FileTooLarge)?;
-        let position = base
-            .checked_add(offset)
-            .filter(|p| *p >= 0)
-            .ok_or(VfsError::InvalidPath)?;
-        self.positions[self.descriptors[slot].position] =
-            usize::try_from(position).map_err(|_| VfsError::FileTooLarge)?;
+        let position = i64::try_from(base)
+            .ok()
+            .and_then(|base| base.checked_add(offset))
+            .filter(|position| *position >= 0)
+            .and_then(|position| usize::try_from(position).ok())
+            .ok_or(VfsError::InvalidArgument)?;
+        self.positions[self.descriptors[slot].position] = position;
         Ok(position as u64)
     }
 
@@ -2568,7 +2579,7 @@ mod tests {
         fs.unlink(b"/moved").unwrap();
         assert_eq!(fs.fstat(fd).unwrap().links, 0);
         let mut output = [0; 6];
-        fs.seek(fd, 0, 0).unwrap();
+        fs.seek(fd, 0, Whence::Start).unwrap();
         assert_eq!(fs.read(fd, &mut output), Ok(6));
         assert_eq!(&output, b"Shared");
         fs.close(alias).unwrap();
@@ -2597,7 +2608,7 @@ mod tests {
         assert_eq!(&bytes[..2], b"ar");
         fs.read(reopen, &mut bytes[..2]).unwrap();
         assert_eq!(&bytes[..2], b"sh");
-        assert_eq!(fs.seek(fd, 0, 1), Ok(4));
+        assert_eq!(fs.seek(fd, 0, Whence::Current), Ok(4));
         let old = fs.pin_executable_fd(fd).unwrap();
         assert_eq!(fs.executable_name(old), Ok((b"/two".as_slice(), false)));
         fs.retain_executable(old).unwrap();
@@ -2888,25 +2899,25 @@ mod tests {
         let fd = vfs
             .open(b"/work/build/data", O_READ | O_WRITE | O_CREATE)
             .unwrap();
-        vfs.seek(fd, 3, 0).unwrap();
+        vfs.seek(fd, 3, Whence::Start).unwrap();
         vfs.write(fd, b"x").unwrap();
         vfs.fchmod(fd, 0o640).unwrap();
         assert_eq!(vfs.fstat(fd).unwrap().mode, 0o640);
         assert_eq!(vfs.fstat(fd).unwrap().size, 4);
-        vfs.seek(fd, 0, 0).unwrap();
+        vfs.seek(fd, 0, Whence::Start).unwrap();
         let mut output = [0xff; 8];
         assert_eq!(vfs.read(fd, &mut output), Ok(4));
         assert_eq!(&output[..4], b"\0\0\0x");
-        vfs.seek(fd, 100, 0).unwrap();
+        vfs.seek(fd, 100, Whence::Start).unwrap();
         assert_eq!(vfs.read(fd, &mut output), Ok(0));
         assert_eq!(vfs.write(fd, b""), Ok(0));
         assert_eq!(vfs.fstat(fd).unwrap().size, 4);
         let append = vfs
             .open(b"/work/build/data", O_WRITE | O_APPEND | O_CLOEXEC)
             .unwrap();
-        vfs.seek(append, 0, 0).unwrap();
+        vfs.seek(append, 0, Whence::Start).unwrap();
         vfs.write(append, b"y").unwrap();
-        assert_eq!(vfs.seek(append, 0, 1), Ok(5));
+        assert_eq!(vfs.seek(append, 0, Whence::Current), Ok(5));
         assert_eq!(vfs.descriptor_flags(append), Ok((0o2001, true)));
         assert_eq!(
             vfs.open(b"/work/build/data", O_READ | O_TRUNC),
@@ -2929,7 +2940,7 @@ mod tests {
             .unwrap();
         vfs.write(new, b"new").unwrap();
         let mut output = [0; 3];
-        vfs.seek(old, 0, 0).unwrap();
+        vfs.seek(old, 0, Whence::Start).unwrap();
         vfs.read(old, &mut output).unwrap();
         assert_eq!(&output, b"old");
         assert_eq!(
@@ -3026,20 +3037,29 @@ mod tests {
         let fd = fs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
         fs.write(fd, b"abc").unwrap();
         let alias = fs.duplicate(fd, false).unwrap();
-        fs.seek(alias, 0, 0).unwrap();
+        fs.seek(alias, 0, Whence::Start).unwrap();
         let mut byte = [0];
         assert_eq!(fs.read(fd, &mut byte), Ok(1));
         assert_eq!(&byte, b"a");
-        assert_eq!(fs.seek(alias, i64::MAX, 0), Ok(i64::MAX as u64));
-        assert_eq!(fs.seek(fd, 1, 1), Err(VfsError::InvalidPath));
-        assert_eq!(fs.seek(fd, -1, 0), Err(VfsError::InvalidPath));
-        assert_eq!(fs.seek(fd, 0, 99), Err(VfsError::InvalidPath));
-        assert_eq!(fs.seek(fd, 0, 1), Ok(i64::MAX as u64));
+        assert_eq!(fs.seek(alias, i64::MAX, Whence::Start), Ok(i64::MAX as u64));
+        assert_eq!(
+            fs.seek(fd, 1, Whence::Current),
+            Err(VfsError::InvalidArgument)
+        );
+        assert_eq!(
+            fs.seek(fd, -1, Whence::Start),
+            Err(VfsError::InvalidArgument)
+        );
+        assert_eq!(
+            fs.seek(fd, i64::MIN, Whence::End),
+            Err(VfsError::InvalidArgument)
+        );
+        assert_eq!(fs.seek(fd, 0, Whence::Current), Ok(i64::MAX as u64));
         assert_eq!(fs.read(fd, &mut byte), Ok(0));
         assert_eq!(fs.write(fd, b""), Ok(0));
         assert_eq!(fs.write(alias, b"x"), Err(VfsError::FileTooLarge));
         assert_eq!(fs.fstat(fd).unwrap().size, 3);
-        assert_eq!(fs.seek(fd, -2, 2), Ok(1));
+        assert_eq!(fs.seek(fd, -2, Whence::End), Ok(1));
         assert_eq!(fs.read(alias, &mut byte), Ok(1));
         assert_eq!(&byte, b"b");
     }
@@ -3105,9 +3125,9 @@ mod tests {
         fs.write(fd, b"secret").unwrap();
         let trunc = fs.open(b"/new", O_WRITE | O_TRUNC).unwrap();
         fs.close(trunc).unwrap();
-        fs.seek(fd, 3, 0).unwrap();
+        fs.seek(fd, 3, Whence::Start).unwrap();
         fs.write(fd, b"x").unwrap();
-        fs.seek(fd, 0, 0).unwrap();
+        fs.seek(fd, 0, Whence::Start).unwrap();
         let mut contents = [0xff; 4];
         assert_eq!(fs.read(fd, &mut contents), Ok(4));
         assert_eq!(&contents, b"\0\0\0x");
@@ -3127,16 +3147,16 @@ mod tests {
         assert_eq!(vfs.write(fd, &payload), Ok(5000));
         assert_eq!(vfs.truncate(fd, 9000), Err(VfsError::FileTooLarge));
         assert_eq!(vfs.fstat(fd).unwrap().size, 5000);
-        assert_eq!(vfs.seek(fd, 0, 1), Ok(5000));
-        vfs.seek(fd, 0, 0).unwrap();
+        assert_eq!(vfs.seek(fd, 0, Whence::Current), Ok(5000));
+        vfs.seek(fd, 0, Whence::Start).unwrap();
         let mut output = [0; 5000];
         assert_eq!(vfs.read(fd, &mut output), Ok(5000));
         assert_eq!(output, payload);
         vfs.truncate(fd, 3).unwrap();
-        assert_eq!(vfs.seek(fd, 0, 1), Ok(5000));
+        assert_eq!(vfs.seek(fd, 0, Whence::Current), Ok(5000));
         vfs.truncate(fd, 8192).unwrap();
-        assert_eq!(vfs.seek(fd, 0, 1), Ok(5000));
-        vfs.seek(fd, 0, 0).unwrap();
+        assert_eq!(vfs.seek(fd, 0, Whence::Current), Ok(5000));
+        vfs.seek(fd, 0, Whence::Start).unwrap();
         output.fill(0xff);
         assert_eq!(vfs.read(fd, &mut output), Ok(5000));
         assert_eq!(&output[..3], b"xxx");
@@ -3147,7 +3167,7 @@ mod tests {
         vfs.close(readonly).unwrap();
         let truncating = vfs.open(b"/large", O_WRITE | O_TRUNC).unwrap();
         assert_eq!(vfs.fstat(fd).unwrap().size, 0);
-        assert_eq!(vfs.seek(fd, 0, 1), Ok(5000));
+        assert_eq!(vfs.seek(fd, 0, Whence::Current), Ok(5000));
         vfs.close(truncating).unwrap();
     }
 
@@ -3163,7 +3183,7 @@ mod tests {
         let mut original = [0; 4];
         assert_eq!(fs.read(image, &mut original), Ok(4));
         assert_eq!(&original, b"BASE");
-        fs.seek(owned, 0, 0).unwrap();
+        fs.seek(owned, 0, Whence::Start).unwrap();
         assert_eq!(fs.read(owned, &mut original), Ok(2));
         assert_eq!(&original[..2], b"ok");
     }
@@ -3184,7 +3204,7 @@ mod tests {
         let alias = fs.duplicate(owned, true).unwrap();
         fs.unlink(b"/new").unwrap();
         fs.close(owned).unwrap();
-        fs.seek(alias, 0, 0).unwrap();
+        fs.seek(alias, 0, Whence::Start).unwrap();
         assert_eq!(fs.read(alias, &mut data), Ok(2));
         assert_eq!(&data[..2], b"ok");
         fs.close_on_exec();
@@ -3252,13 +3272,13 @@ mod tests {
                 assert_eq!(opened, Err(VfsError::Io));
                 assert_eq!(fs.overlay_files(), 0);
                 assert_eq!(fs.fstat(image), Ok(original));
-                assert_eq!(fs.seek(image, 0, 1), Ok(3));
+                assert_eq!(fs.seek(image, 0, Whence::Current), Ok(3));
                 let mut untouched = [0; 2];
                 assert_eq!(fs.read(image, &mut untouched), Ok(2));
                 assert_eq!(untouched, [3, 4]);
                 let new = fs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
                 assert_eq!(fs.write(new, b"ok"), Ok(2));
-                fs.seek(new, 0, 0).unwrap();
+                fs.seek(new, 0, Whence::Start).unwrap();
                 let mut output = [0; 2];
                 assert_eq!(fs.read(new, &mut output), Ok(2));
                 assert_eq!(&output, b"ok");
@@ -3306,8 +3326,8 @@ mod tests {
                 b"nested".to_vec()
             ]
         );
-        assert_eq!(vfs.seek(dir, 0, 1), Ok(0)); // Peeking did not consume anything.
-        vfs.seek(dir, cookie as i64, 0).unwrap();
+        assert_eq!(vfs.seek(dir, 0, Whence::Current), Ok(0)); // Peeking did not consume anything.
+        vfs.seek(dir, cookie as i64, Whence::Start).unwrap();
         assert!(vfs.directory_entry(dir, cookie).unwrap().is_none());
         assert_eq!(vfs.directory_path(dir), Ok(b"/work".as_slice()));
         vfs.close_on_exec();
@@ -3342,10 +3362,10 @@ mod tests {
         assert_eq!(vfs.metadata(b"/work/a"), Err(VfsError::NotFound));
         assert_eq!(vfs.metadata(b"/work/b").unwrap().inode, inode);
         let mut output = [0; 3];
-        vfs.seek(b, 0, 0).unwrap();
+        vfs.seek(b, 0, Whence::Start).unwrap();
         vfs.read(b, &mut output).unwrap();
         assert_eq!(&output, b"old");
-        vfs.seek(a, 0, 0).unwrap();
+        vfs.seek(a, 0, Whence::Start).unwrap();
         vfs.read(a, &mut output).unwrap();
         assert_eq!(&output, b"new");
         vfs.close(a).unwrap();
@@ -3402,19 +3422,19 @@ mod tests {
         fs.write(file, b"data").unwrap();
         let dir = fs.open_directory(b"/work", 0).unwrap();
         let alias = fs.duplicate(dir, false).unwrap();
-        fs.seek(alias, 2, 0).unwrap();
-        assert_eq!(fs.seek(dir, 0, 1), Ok(2));
+        fs.seek(alias, 2, Whence::Start).unwrap();
+        assert_eq!(fs.seek(dir, 0, Whence::Current), Ok(2));
         assert_eq!(fs.directory_entry(dir, 2).unwrap().unwrap().name, b"file");
-        assert_eq!(fs.seek(file, 0, 1), Ok(4));
+        assert_eq!(fs.seek(file, 0, Whence::Current), Ok(4));
         fs.close(dir).unwrap();
         let image = fs.open_directory(b"/bin", 0).unwrap();
         assert_eq!(fs.directory_path(image), Ok(b"/usr/bin".as_slice()));
         let parent = fs.open_directory(b"/bin/..", 0).unwrap();
         assert_eq!(fs.directory_path(parent), Ok(b"/usr".as_slice()));
         fs.close(parent).unwrap();
-        fs.seek(image, 1, 0).unwrap();
-        assert_eq!(fs.seek(alias, 0, 1), Ok(2));
-        assert_eq!(fs.seek(file, 0, 1), Ok(4));
+        fs.seek(image, 1, Whence::Start).unwrap();
+        assert_eq!(fs.seek(alias, 0, Whence::Current), Ok(2));
+        assert_eq!(fs.seek(file, 0, Whence::Current), Ok(4));
         fs.rename(b"/work", b"/moved", false).unwrap();
         assert_eq!(fs.directory_path(alias), Ok(b"/moved".as_slice()));
         fs.chmod(b"/moved", 0o40750).unwrap();
@@ -3461,11 +3481,11 @@ mod tests {
             .reopen_readonly(original, O_CLOEXEC | O_NONBLOCK)
             .unwrap();
         let inode = vfs.fstat(reopened).unwrap().inode;
-        assert_eq!(vfs.seek(original, 0, 1), Ok(9));
+        assert_eq!(vfs.seek(original, 0, Whence::Current), Ok(9));
         let mut output = [0u8; 9];
         assert_eq!(vfs.read(reopened, &mut output[..3]), Ok(3));
         assert_eq!(&output[..3], b"old");
-        assert_eq!(vfs.seek(original, 0, 1), Ok(9));
+        assert_eq!(vfs.seek(original, 0, Whence::Current), Ok(9));
         assert_eq!(vfs.write(reopened, b"no"), Err(VfsError::PermissionDenied));
         assert_eq!(vfs.truncate(reopened, 0), Err(VfsError::PermissionDenied));
         vfs.unlink(b"/program").unwrap();
@@ -3485,8 +3505,8 @@ mod tests {
         );
         let directory = vfs.open_directory(b"/", 0).unwrap();
         let other = vfs.reopen_readonly(directory, 0).unwrap();
-        vfs.seek(directory, 1, 0).unwrap();
-        assert_eq!(vfs.seek(other, 0, 1), Ok(0));
+        vfs.seek(directory, 1, Whence::Start).unwrap();
+        assert_eq!(vfs.seek(other, 0, Whence::Current), Ok(0));
         vfs.close(directory).unwrap();
         vfs.close(other).unwrap();
     }
@@ -3509,7 +3529,7 @@ mod tests {
         ));
         vfs.close(writer).unwrap();
         let reader = vfs.open(b"/program", O_READ).unwrap();
-        vfs.seek(reader, 4, 0).unwrap();
+        vfs.seek(reader, 4, Whence::Start).unwrap();
         let image = vfs.pin_executable_fd(reader).unwrap();
         assert_eq!(vfs.executable_pins(), 1);
         assert_eq!(
@@ -3519,7 +3539,7 @@ mod tests {
         let mut output = [0u8; 32];
         assert_eq!(vfs.read_executable(image, 0, &mut output), Ok(16));
         assert_eq!(&output[..16], b"executable-bytes");
-        assert_eq!(vfs.seek(reader, 0, 1), Ok(4));
+        assert_eq!(vfs.seek(reader, 0, Whence::Current), Ok(4));
         vfs.retain_executable(image).unwrap(); // A forked process owns another reference.
         vfs.rename(b"/program", b"/moved", false).unwrap();
         vfs.unlink(b"/moved").unwrap();
@@ -3554,7 +3574,7 @@ mod tests {
         fs.fchmod(writer, 0o755).unwrap();
         fs.close(writer).unwrap();
         let reader = fs.open(b"/program", O_READ).unwrap();
-        fs.seek(reader, 1, 0).unwrap();
+        fs.seek(reader, 1, Whence::Start).unwrap();
         let image = fs.pin_executable_fd(reader).unwrap();
         assert_eq!(
             fs.executable_name(image),

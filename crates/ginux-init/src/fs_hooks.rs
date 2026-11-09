@@ -1537,11 +1537,12 @@ impl LaunchFs {
                 .fstat(fd)
                 .map_err(errno)
                 .and_then(|m| copy_metadata(pid, r.rsi, m, false)),
-            8 => self
-                .fs
-                .seek(fd, r.rsi as i64, r.rdx as u32)
-                .map(|n| n as i64)
-                .map_err(errno),
+            8 => seek_origin(r.rdx).and_then(|whence| {
+                self.fs
+                    .seek(fd, r.rsi as i64, whence)
+                    .map(|n| n as i64)
+                    .map_err(errno)
+            }),
             91 => self.fs.fchmod(fd, r.rsi as u32).map(|_| 0).map_err(errno),
             74 | 75 => self.fs.fstat(fd).map_err(errno).and_then(|metadata| {
                 if metadata.kind == NodeKind::Directory {
@@ -1668,7 +1669,10 @@ impl LaunchFs {
         }
         let base = match whence {
             0 => 0,
-            1 => self.fs.seek(fd, 0, 1).map_err(errno)?,
+            1 => self
+                .fs
+                .seek(fd, 0, ginux_vfs::Whence::Current)
+                .map_err(errno)?,
             2 => metadata.size,
             _ => return Err(-22),
         };
@@ -1764,11 +1768,19 @@ impl LaunchFs {
         length: u64,
         offset: Option<i64>,
     ) -> Result<i64, i64> {
-        let previous = self.fs.seek(fd, 0, 1).map_err(errno)?;
+        let previous = self
+            .fs
+            .seek(fd, 0, ginux_vfs::Whence::Current)
+            .map_err(errno)?;
         if let Some(offset) = offset {
-            self.fs.seek(fd, offset, 0).map_err(errno)?;
+            self.fs
+                .seek(fd, offset, ginux_vfs::Whence::Start)
+                .map_err(errno)?;
         }
-        let start = self.fs.seek(fd, 0, 1).map_err(errno)?;
+        let start = self
+            .fs
+            .seek(fd, 0, ginux_vfs::Whence::Current)
+            .map_err(errno)?;
         let mut buffer = [0u8; IO_SIZE];
         let read = self
             .fs
@@ -1780,7 +1792,9 @@ impl LaunchFs {
         } else {
             start + result.unwrap_or(0) as u64
         };
-        self.fs.seek(fd, next as i64, 0).map_err(errno)?;
+        self.fs
+            .seek(fd, next as i64, ginux_vfs::Whence::Start)
+            .map_err(errno)?;
         result
     }
 
@@ -1795,14 +1809,17 @@ impl LaunchFs {
                 .map(|n| n as i64)
                 .map_err(errno)
         } else {
-            let offset = self.fs.seek(fd, 0, 1).map_err(errno)?;
+            let offset = self
+                .fs
+                .seek(fd, 0, ginux_vfs::Whence::Current)
+                .map_err(errno)?;
             let read = self.fs.read(fd, &mut bytes[..count]).map_err(errno)?;
             let result = vectors.copy(pid, &mut bytes[..read], true);
             self.fs
                 .seek(
                     fd,
                     (offset + result.as_ref().copied().unwrap_or(0) as u64) as i64,
-                    0,
+                    ginux_vfs::Whence::Start,
                 )
                 .map_err(errno)?;
             result.map(|n| n as i64)
@@ -1818,9 +1835,14 @@ impl LaunchFs {
         offset: Option<i64>,
     ) -> Result<i64, i64> {
         self.fs.fstat(fd).map_err(errno)?;
-        let previous = self.fs.seek(fd, 0, 1).map_err(errno)?;
+        let previous = self
+            .fs
+            .seek(fd, 0, ginux_vfs::Whence::Current)
+            .map_err(errno)?;
         if let Some(offset) = offset {
-            self.fs.seek(fd, offset, 0).map_err(errno)?;
+            self.fs
+                .seek(fd, offset, ginux_vfs::Whence::Start)
+                .map_err(errno)?;
         }
         let result = (|| {
             let mut buffer = [0u8; IO_SIZE];
@@ -1854,7 +1876,9 @@ impl LaunchFs {
             Ok(written as i64)
         })();
         if offset.is_some() {
-            self.fs.seek(fd, previous as i64, 0).map_err(errno)?;
+            self.fs
+                .seek(fd, previous as i64, ginux_vfs::Whence::Start)
+                .map_err(errno)?;
         }
         result
     }
@@ -1863,7 +1887,10 @@ impl LaunchFs {
         if self.fs.fstat(fd).map_err(errno)?.kind != NodeKind::Directory {
             return Err(-20);
         }
-        let mut cookie = self.fs.seek(fd, 0, 1).map_err(errno)?;
+        let mut cookie = self
+            .fs
+            .seek(fd, 0, ginux_vfs::Whence::Current)
+            .map_err(errno)?;
         let mut buffer = [0u8; IO_SIZE];
         let capacity = length.min(IO_SIZE as u64) as usize;
         let mut used = 0;
@@ -1891,7 +1918,9 @@ impl LaunchFs {
         if copy_memory(pid, address, &mut buffer[..used], true)? != used as i64 {
             return Err(-14);
         }
-        self.fs.seek(fd, cookie as i64, 0).map_err(errno)?;
+        self.fs
+            .seek(fd, cookie as i64, ginux_vfs::Whence::Start)
+            .map_err(errno)?;
         Ok(used as i64)
     }
 }
@@ -1967,6 +1996,16 @@ fn copy_metadata(
     )
 }
 
+/// Linux lseek origins; the data/hole origins are not offered.
+fn seek_origin(whence: u64) -> Result<ginux_vfs::Whence, i64> {
+    match whence as u32 {
+        0 => Ok(ginux_vfs::Whence::Start),
+        1 => Ok(ginux_vfs::Whence::Current),
+        2 => Ok(ginux_vfs::Whence::End),
+        _ => Err(-22),
+    }
+}
+
 fn errno(error: VfsError) -> i64 {
     match error {
         VfsError::NotFound => -2,
@@ -1980,7 +2019,7 @@ fn errno(error: VfsError) -> i64 {
         VfsError::DescriptorLimit => -24,
         VfsError::OverlayLimit => -28,
         VfsError::FileTooLarge => -27,
-        VfsError::InvalidPath => -22,
+        VfsError::InvalidPath | VfsError::InvalidArgument => -22,
         VfsError::SymlinkLoop => -40,
         VfsError::InvalidIndex | VfsError::Io => -5,
     }
