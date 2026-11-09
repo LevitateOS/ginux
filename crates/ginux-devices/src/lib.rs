@@ -657,11 +657,12 @@ impl<B: TcpBackend, const ENDPOINTS: usize, const SOCKETS: usize>
             .iter()
             .position(Option::is_none)
             .ok_or(NetworkError::DescriptorLimit)?;
+        let socket = u32::try_from(index).map_err(|_| NetworkError::DescriptorLimit)?;
         self.sockets[index] = Some(TcpSocket {
             family,
             handle: None,
         });
-        Ok(index as u32)
+        Ok(socket)
     }
 
     pub fn connect(&mut self, socket: u32, endpoint: TcpEndpoint) -> Result<(), NetworkError> {
@@ -1430,6 +1431,52 @@ mod tests {
             network.close(socket).unwrap();
             peer.join().unwrap();
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn tcp_refused_connect_preserves_budget_and_releases_the_slot() {
+        use std::os::fd::FromRawFd;
+        use std::time::{Duration, Instant};
+
+        // Keep a port bound without listening, so another process cannot
+        // acquire the test destination between selecting it and connecting.
+        let fd = unsafe { LinuxTcpBackend::call(41, [2, 1 | 0x80000, 6, 0, 0, 0]) };
+        assert!(fd >= 0);
+        let _bound = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+        let mut address = [0u8; 16];
+        address[..2].copy_from_slice(&2u16.to_ne_bytes());
+        address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        assert_eq!(
+            unsafe {
+                LinuxTcpBackend::call(49, [fd as usize, address.as_ptr() as usize, 16, 0, 0, 0])
+            },
+            0
+        );
+        let endpoint = LinuxTcpBackend
+            .endpoint(LinuxTcpHandle(fd as i32), false)
+            .unwrap();
+        let mut network: BoundedTcp<_, 1, 1> =
+            BoundedTcp::new(LinuxTcpBackend, &[endpoint], 1, 17).unwrap();
+        let socket = network.open(TcpFamily::Ipv4).unwrap();
+        match network.connect(socket, endpoint) {
+            Ok(()) => {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    let ready = network.readiness(socket).unwrap();
+                    if ready.writable || ready.error || ready.hangup {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(network.socket_error(socket), Ok(111));
+            }
+            Err(error) => assert_eq!(error, NetworkError::Backend(111)),
+        }
+        assert_eq!(network.remaining_bytes(), 17);
+        network.close(socket).unwrap();
+        assert_eq!(network.open(TcpFamily::Ipv4), Ok(socket));
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
