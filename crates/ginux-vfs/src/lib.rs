@@ -16,6 +16,8 @@ pub const O_CLOEXEC: u32 = 16;
 pub const O_APPEND: u32 = 32;
 pub const O_EXCLUSIVE: u32 = 64;
 pub const O_NONBLOCK: u32 = 128;
+/// `open` must name a directory and returns a directory description.
+pub const O_DIRECTORY: u32 = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -43,6 +45,8 @@ pub enum VfsError {
     AlreadyExists,
     /// A value that names no path is out of range or malformed.
     InvalidArgument,
+    /// The image is immutable; only instance objects can change.
+    ReadOnly,
     Io,
 }
 
@@ -69,6 +73,50 @@ pub struct Entry<'a> {
 pub struct Index<'a> {
     bytes: &'a [u8],
     count: usize,
+}
+
+static ROOT_ONLY: [u8; HEADER_SIZE + RECORD_SIZE] = root_only_bytes();
+
+// The encoding encode_header and encode_record give a lone "/" directory.
+const fn root_only_bytes() -> [u8; HEADER_SIZE + RECORD_SIZE] {
+    let mut bytes = [0u8; HEADER_SIZE + RECORD_SIZE];
+    let mut i = 0;
+    while i < 8 {
+        bytes[i] = INDEX_MAGIC[i];
+        i += 1;
+    }
+    let fields = [
+        (8, INDEX_VERSION),
+        (12, RECORD_SIZE as u32),
+        (16, 1),
+        (HEADER_SIZE, 1),
+        (HEADER_SIZE + 4, 0o755),
+    ];
+    let mut field = 0;
+    while field < fields.len() {
+        let (at, value) = fields[field];
+        let value = value.to_le_bytes();
+        let mut j = 0;
+        while j < 4 {
+            bytes[at + j] = value[j];
+            j += 1;
+        }
+        field += 1;
+    }
+    bytes[HEADER_SIZE + 2] = NodeKind::Directory as u8;
+    bytes[HEADER_SIZE + 40] = b'/';
+    bytes
+}
+
+impl Index<'static> {
+    /// An index holding only the root directory, for a filesystem whose
+    /// whole namespace lives in its overlay.
+    pub const fn root_only() -> Self {
+        Index {
+            bytes: &ROOT_ONLY,
+            count: 1,
+        }
+    }
 }
 
 impl<'a> Index<'a> {
@@ -666,6 +714,17 @@ impl<
     }
 
     pub fn open(&mut self, path: &[u8], flags: u32) -> Result<i32, VfsError> {
+        if flags & O_DIRECTORY != 0 {
+            // A directory is opened for reading only and is never created,
+            // truncated or appended to through `open`.
+            if flags & (O_WRITE | O_CREATE | O_TRUNC | O_APPEND | O_EXCLUSIVE) != 0 {
+                return Err(VfsError::InvalidArgument);
+            }
+            return self.open_directory(path, flags & (O_CLOEXEC | O_NONBLOCK));
+        }
+        if flags & O_CREATE != 0 && path.ends_with(b"/") {
+            return Err(VfsError::IsDirectory);
+        }
         let exclusive = flags & (O_CREATE | O_EXCLUSIVE) == (O_CREATE | O_EXCLUSIVE);
         let path = self.resolved_path(path, !exclusive, flags & O_CREATE != 0)?;
         let writable = flags & O_WRITE != 0;
@@ -981,6 +1040,30 @@ impl<
 
     pub fn read(&mut self, descriptor: i32, output: &mut [u8]) -> Result<usize, VfsError> {
         let slot = self.descriptor(descriptor)?;
+        let description = self.descriptors[slot].description;
+        let length = self.read_from(slot, self.descriptions[description].offset, output)?;
+        self.descriptions[description].offset += length;
+        Ok(length)
+    }
+
+    /// Read at `offset` without moving the shared file offset.
+    pub fn pread(
+        &mut self,
+        descriptor: i32,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, VfsError> {
+        let slot = self.descriptor(descriptor)?;
+        let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidArgument)?;
+        self.read_from(slot, offset, output)
+    }
+
+    fn read_from(
+        &mut self,
+        slot: usize,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<usize, VfsError> {
         if !self.descriptors[slot].readable {
             return Err(VfsError::PermissionDenied);
         }
@@ -988,7 +1071,6 @@ impl<
         if state.directory {
             return Err(VfsError::IsDirectory);
         }
-        let offset = self.descriptions[state.description].offset;
         let available = if state.overlay {
             self.overlay[state.object].len.saturating_sub(offset)
         } else {
@@ -1009,12 +1091,51 @@ impl<
             self.reader
                 .read_at(entry.data_offset + offset as u64, &mut output[..length])?;
         }
-        self.descriptions[state.description].offset += length;
         Ok(length)
     }
 
     pub fn write(&mut self, descriptor: i32, input: &[u8]) -> Result<usize, VfsError> {
         let slot = self.descriptor(descriptor)?;
+        let state = self.descriptors[slot];
+        let description = self.descriptions[state.description];
+        let offset = if description.append && state.overlay {
+            self.overlay[state.object].len
+        } else {
+            description.offset
+        };
+        if let Some(end) = self.write_to(slot, offset, input)? {
+            self.descriptions[state.description].offset = end;
+        }
+        Ok(input.len())
+    }
+
+    /// Write at `offset` without moving the shared file offset. As on Linux,
+    /// an append open still writes at the end.
+    pub fn pwrite(
+        &mut self,
+        descriptor: i32,
+        offset: u64,
+        input: &[u8],
+    ) -> Result<usize, VfsError> {
+        let slot = self.descriptor(descriptor)?;
+        let state = self.descriptors[slot];
+        let offset = if self.descriptions[state.description].append && state.overlay {
+            self.overlay[state.object].len
+        } else {
+            usize::try_from(offset).map_err(|_| VfsError::InvalidArgument)?
+        };
+        self.write_to(slot, offset, input)?;
+        Ok(input.len())
+    }
+
+    /// The end of the written range, or `None` for an empty write, which
+    /// checks access and changes nothing.
+    fn write_to(
+        &mut self,
+        slot: usize,
+        offset: usize,
+        input: &[u8],
+    ) -> Result<Option<usize>, VfsError> {
         let state = self.descriptors[slot];
         if !state.writable || !state.overlay {
             return Err(VfsError::PermissionDenied);
@@ -1023,13 +1144,8 @@ impl<
             return Err(VfsError::TextBusy);
         }
         if input.is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
-        let offset = if self.descriptions[state.description].append {
-            self.overlay[state.object].len
-        } else {
-            self.descriptions[state.description].offset
-        };
         let end = offset
             .checked_add(input.len())
             .ok_or(VfsError::FileTooLarge)?;
@@ -1038,8 +1154,7 @@ impl<
             .resize(state.object, previous, previous.max(end))?;
         self.storage.write(state.object, offset, input)?;
         self.overlay[state.object].len = previous.max(end);
-        self.descriptions[state.description].offset = end;
-        Ok(input.len())
+        Ok(Some(end))
     }
 
     /// Share the open-file offset while keeping close-on-exec descriptor-local.
@@ -1118,8 +1233,9 @@ impl<
 
     pub fn truncate(&mut self, descriptor: i32, length: u64) -> Result<(), VfsError> {
         let state = self.descriptors[self.descriptor(descriptor)?];
+        // Linux reports a descriptor not open for writing as EINVAL here.
         if !state.overlay || !state.writable {
-            return Err(VfsError::PermissionDenied);
+            return Err(VfsError::InvalidArgument);
         }
         if self.overlay[state.object].executions != 0 {
             return Err(VfsError::TextBusy);
@@ -1365,6 +1481,20 @@ impl<
             .iter()
             .filter(|entry| matches!(entry.state, Slot::File | Slot::Link))
             .count()
+    }
+
+    /// Namespace slots in use, including whiteouts kept to hide image names.
+    pub fn overlay_objects(&self) -> usize {
+        self.overlay
+            .iter()
+            .filter(|entry| entry.state != Slot::Free)
+            .count()
+    }
+
+    /// Payload bytes the instance holds: file contents, link targets and an
+    /// unlinked file while an open retains it. Directories hold none.
+    pub fn overlay_bytes(&self) -> usize {
+        self.overlay.iter().map(|entry| entry.len).sum()
     }
 
     pub fn canonical_path(
@@ -1752,9 +1882,16 @@ impl<
         // ignore them, while retaining the existing denial of special bits.
         let mode = mode & 0o7777;
         let path = self.resolved_path(path, true, false)?;
-        let slot = self
-            .find_overlay(path.as_bytes())
-            .ok_or(VfsError::PermissionDenied)?;
+        let slot = match self.find_overlay(path.as_bytes()) {
+            Some(slot) if self.overlay[slot].state == Slot::Whiteout => {
+                return Err(VfsError::NotFound)
+            }
+            Some(slot) => slot,
+            None => {
+                self.index.lookup_exact(path.as_bytes())?;
+                return Err(VfsError::ReadOnly);
+            }
+        };
         if mode & !0o777 != 0 {
             return Err(VfsError::PermissionDenied);
         }
@@ -1816,7 +1953,10 @@ impl<
     pub fn fchmod(&mut self, descriptor: i32, mode: u32) -> Result<(), VfsError> {
         let mode = mode & 0o7777;
         let state = self.descriptors[self.descriptor(descriptor)?];
-        if !state.overlay || mode & !0o777 != 0 {
+        if !state.overlay {
+            return Err(VfsError::ReadOnly);
+        }
+        if mode & !0o777 != 0 {
             return Err(VfsError::PermissionDenied);
         }
         self.overlay[state.object].mode = mode;
@@ -3178,8 +3318,9 @@ mod tests {
         assert_eq!(fs.fstat(alias), Err(VfsError::InvalidDescriptor));
         assert!(fs.fstat(fd).is_ok());
         let image = fs.open(b"/base", O_READ).unwrap();
-        assert_eq!(fs.fchmod(image, 0o600), Err(VfsError::PermissionDenied));
-        assert_eq!(fs.chmod(b"/usr", 0o700), Err(VfsError::PermissionDenied));
+        assert_eq!(fs.fchmod(image, 0o600), Err(VfsError::ReadOnly));
+        assert_eq!(fs.chmod(b"/usr", 0o700), Err(VfsError::ReadOnly));
+        assert_eq!(fs.chmod(b"/absent", 0o700), Err(VfsError::NotFound));
     }
 
     #[test]
@@ -3254,7 +3395,7 @@ mod tests {
         assert_eq!(&output[..3], b"xxx");
         assert!(output[3..].iter().all(|byte| *byte == 0));
         let readonly = vfs.open(b"/large", O_READ).unwrap();
-        assert_eq!(vfs.truncate(readonly, 0), Err(VfsError::PermissionDenied));
+        assert_eq!(vfs.truncate(readonly, 0), Err(VfsError::InvalidArgument));
         assert_eq!(vfs.fstat(fd).unwrap().size, 8192);
         vfs.close(readonly).unwrap();
         let truncating = vfs.open(b"/large", O_WRITE | O_TRUNC).unwrap();
@@ -3583,7 +3724,7 @@ mod tests {
         assert_eq!(&output[..3], b"old");
         assert_eq!(vfs.seek(original, 0, Whence::Current), Ok(9));
         assert_eq!(vfs.write(reopened, b"no"), Err(VfsError::PermissionDenied));
-        assert_eq!(vfs.truncate(reopened, 0), Err(VfsError::PermissionDenied));
+        assert_eq!(vfs.truncate(reopened, 0), Err(VfsError::InvalidArgument));
         vfs.unlink(b"/program").unwrap();
         vfs.close(original).unwrap();
         let replacement = vfs.open(b"/program", O_CREATE | O_WRITE).unwrap();
@@ -3690,5 +3831,539 @@ mod tests {
         fs.release_executable(image).unwrap();
         assert_eq!(fs.executable_name(image), Err(VfsError::InvalidDescriptor));
         assert_eq!(fs.executable_pins(), 0);
+    }
+
+    // The redesigned foundation's contract, ported from the configured
+    // storage candidate.
+    type TestFs<'a> = VirtualFs<'a, Reader, 4, 32, 4>;
+    fn test_fs(bytes: &[u8]) -> TestFs<'_> {
+        VirtualFs::new(Index::new(bytes).unwrap(), Reader(*b"BASETOOL"))
+    }
+
+    #[test]
+    fn mkdir_creates_openable_directories_but_unlink_requires_rmdir() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        assert_eq!(vfs.mkdir(b"/work", 0o755), Ok(()));
+        assert_eq!(vfs.mkdir(b"/work/build", 0o700), Ok(()));
+        let metadata = vfs.metadata(b"/work/build").unwrap();
+        assert_eq!(metadata.kind, NodeKind::Directory);
+        assert_eq!(metadata.mode, 0o700);
+        let directory = vfs.open(b"/work/build", O_READ | O_DIRECTORY).unwrap();
+        assert_eq!(vfs.fstat(directory).unwrap().kind, NodeKind::Directory);
+        assert_eq!(vfs.read(directory, &mut [0; 1]), Err(VfsError::IsDirectory));
+        assert_eq!(vfs.unlink(b"/work/build"), Err(VfsError::IsDirectory));
+    }
+
+    #[test]
+    fn mkdir_rejects_existing_names_and_invalid_parents() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        assert_eq!(vfs.mkdir(b"/", 0o755), Err(VfsError::AlreadyExists));
+        assert_eq!(vfs.mkdir(b"/base", 0o755), Err(VfsError::AlreadyExists));
+        assert_eq!(vfs.mkdir(b"/loop", 0o755), Err(VfsError::AlreadyExists));
+        assert_eq!(vfs.mkdir(b"/missing/dir", 0o755), Err(VfsError::NotFound));
+        assert_eq!(vfs.mkdir(b"/base/dir", 0o755), Err(VfsError::NotDirectory));
+        assert_eq!(vfs.mkdir(b"", 0o755), Err(VfsError::InvalidPath));
+        assert_eq!(vfs.overlay_files(), 0);
+    }
+
+    #[test]
+    fn mkdir_resolves_parent_links_before_dot_dot() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        assert_eq!(vfs.mkdir(b"/bin/../created", 0o750), Ok(()));
+        assert_eq!(
+            vfs.metadata(b"/usr/created").unwrap().kind,
+            NodeKind::Directory
+        );
+        assert_eq!(vfs.metadata(b"/created"), Err(VfsError::NotFound));
+    }
+
+    #[test]
+    fn directories_use_overlay_slots() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 2, 32, 4> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        assert_eq!(vfs.mkdir(b"/a", 0o755), Ok(()));
+        assert_eq!(vfs.mkdir(b"/b", 0o755), Ok(()));
+        assert_eq!(vfs.overlay_files(), 0);
+        assert_eq!(
+            vfs.open(b"/a/file", O_WRITE | O_CREATE),
+            Err(VfsError::OverlayLimit)
+        );
+    }
+
+    #[test]
+    fn paths_through_a_file_are_not_directories() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        vfs.mkdir(b"/work", 0o755).unwrap();
+        let fd = vfs.open(b"/work/file", O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.write(fd, b"kept"), Ok(4));
+        assert_eq!(
+            vfs.metadata(b"/work/file/../file"),
+            Err(VfsError::NotDirectory)
+        );
+        assert_eq!(vfs.metadata(b"/work/file/."), Err(VfsError::NotDirectory));
+        assert_eq!(
+            vfs.chmod(b"/work/missing/../file", 0o777),
+            Err(VfsError::NotFound)
+        );
+        assert_eq!(vfs.fstat(fd).unwrap().mode, 0o600);
+    }
+
+    #[test]
+    fn seek_moves_the_shared_offset() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.write(fd, b"abc"), Ok(3));
+        let alias = vfs.duplicate(fd, false).unwrap();
+        assert_eq!(vfs.seek(alias, 1, Whence::Start), Ok(1));
+        let mut byte = [0];
+        assert_eq!(vfs.read(fd, &mut byte), Ok(1));
+        assert_eq!(&byte, b"b");
+        assert_eq!(vfs.seek(fd, -1, Whence::Current), Ok(1));
+        assert_eq!(vfs.seek(alias, 0, Whence::End), Ok(3));
+    }
+
+    #[test]
+    fn seek_rejects_negative_and_overflowing_targets_without_moving() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.write(fd, b"abc"), Ok(3));
+        assert_eq!(
+            vfs.seek(fd, -4, Whence::Current),
+            Err(VfsError::InvalidArgument)
+        );
+        assert_eq!(
+            vfs.seek(fd, i64::MAX, Whence::End),
+            Err(VfsError::InvalidArgument)
+        );
+        assert_eq!(vfs.seek(fd, 0, Whence::Current), Ok(3));
+        assert_eq!(
+            vfs.seek(2, 0, Whence::Start),
+            Err(VfsError::InvalidDescriptor)
+        );
+    }
+
+    #[test]
+    fn seek_to_the_end_of_an_image_file_uses_its_size() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/base", O_READ).unwrap();
+        assert_eq!(vfs.seek(fd, 0, Whence::End), Ok(4));
+        let mut byte = [0];
+        assert_eq!(vfs.read(fd, &mut byte), Ok(0));
+    }
+
+    #[test]
+    fn writes_past_the_end_fill_the_gap_with_zeros() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.write(fd, b"abcdef"), Ok(6));
+        // Truncation keeps the old bytes in the slot; they must not reappear.
+        let truncated = vfs.open(b"/new", O_WRITE | O_TRUNC).unwrap();
+        assert_eq!(vfs.seek(truncated, 3, Whence::Start), Ok(3));
+        assert_eq!(vfs.write(truncated, b"x"), Ok(1));
+        let mut contents = [0xff; 8];
+        assert_eq!(vfs.pread(fd, 0, &mut contents), Ok(4));
+        assert_eq!(&contents[..4], b"\0\0\0x");
+    }
+
+    #[test]
+    fn io_beyond_the_end_or_capacity_is_bounded() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.seek(fd, 1000, Whence::Start), Ok(1000));
+        let mut byte = [0];
+        assert_eq!(vfs.read(fd, &mut byte), Ok(0));
+        assert_eq!(vfs.write(fd, b"x"), Err(VfsError::FileTooLarge));
+        assert_eq!(vfs.fstat(fd).unwrap().size, 0);
+    }
+
+    #[test]
+    fn zero_length_io_checks_access_and_changes_nothing() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.write(fd, b""), Ok(0));
+        assert_eq!(vfs.fstat(fd).unwrap().size, 0);
+        let reader = vfs.open(b"/base", O_READ).unwrap();
+        assert_eq!(vfs.write(reader, b""), Err(VfsError::PermissionDenied));
+    }
+
+    #[test]
+    fn pread_leaves_the_shared_offset_alone() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/base", O_READ).unwrap();
+        let mut pair = [0; 2];
+        assert_eq!(vfs.pread(fd, 2, &mut pair), Ok(2));
+        assert_eq!(&pair, b"SE");
+        assert_eq!(vfs.read(fd, &mut pair), Ok(2));
+        assert_eq!(&pair, b"BA");
+        assert_eq!(vfs.pread(fd, 9, &mut pair), Ok(0));
+        let writer = vfs.open(b"/new", O_WRITE | O_CREATE).unwrap();
+        assert_eq!(
+            vfs.pread(writer, 0, &mut pair),
+            Err(VfsError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn append_writes_go_to_the_end_through_every_description() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let first = vfs.open(b"/log", O_WRITE | O_CREATE | O_APPEND).unwrap();
+        let second = vfs.open(b"/log", O_WRITE | O_APPEND).unwrap();
+        assert_eq!(vfs.write(first, b"1"), Ok(1));
+        assert_eq!(vfs.write(second, b"2"), Ok(1));
+        assert_eq!(vfs.seek(first, 0, Whence::Start), Ok(0));
+        assert_eq!(vfs.write(first, b"3"), Ok(1));
+        assert_eq!(vfs.seek(first, 0, Whence::Current), Ok(3));
+        let reader = vfs.open(b"/log", O_READ).unwrap();
+        let mut contents = [0; 4];
+        assert_eq!(vfs.read(reader, &mut contents), Ok(3));
+        assert_eq!(&contents[..3], b"123");
+    }
+
+    #[test]
+    fn status_flags_use_this_crates_values_and_follow_duplicates() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/log", O_WRITE | O_CREATE | O_APPEND).unwrap();
+        assert_eq!(vfs.status_flags(fd), Ok(O_WRITE | O_APPEND));
+        let alias = vfs.duplicate(fd, false).unwrap();
+        assert_eq!(vfs.status_flags(alias), Ok(O_WRITE | O_APPEND));
+        let reader = vfs.open(b"/base", O_READ).unwrap();
+        assert_eq!(vfs.status_flags(reader), Ok(O_READ));
+        assert_eq!(vfs.status_flags(99), Err(VfsError::InvalidDescriptor));
+    }
+
+    #[test]
+    fn close_on_exec_is_per_descriptor() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/base", O_READ | O_CLOEXEC).unwrap();
+        let alias = vfs.duplicate(fd, false).unwrap();
+        assert_eq!(vfs.is_close_on_exec(fd), Ok(true));
+        assert_eq!(vfs.is_close_on_exec(alias), Ok(false));
+        assert_eq!(vfs.set_close_on_exec(fd, false), Ok(()));
+        assert_eq!(vfs.set_close_on_exec(alias, true), Ok(()));
+        vfs.close_on_exec();
+        assert_eq!(vfs.status_flags(fd), Ok(O_READ));
+        assert_eq!(vfs.status_flags(alias), Err(VfsError::InvalidDescriptor));
+        assert_eq!(vfs.is_close_on_exec(99), Err(VfsError::InvalidDescriptor));
+        assert_eq!(
+            vfs.set_close_on_exec(99, true),
+            Err(VfsError::InvalidDescriptor)
+        );
+    }
+
+    #[test]
+    fn exclusive_create_refuses_any_existing_name_without_following_links() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let exclusive = O_WRITE | O_CREATE | O_EXCLUSIVE;
+        assert!(vfs.open(b"/new", exclusive).is_ok());
+        assert_eq!(vfs.open(b"/new", exclusive), Err(VfsError::AlreadyExists));
+        vfs.mkdir(b"/dir", 0o755).unwrap();
+        assert_eq!(vfs.open(b"/dir", exclusive), Err(VfsError::AlreadyExists));
+        assert_eq!(vfs.open(b"/loop", exclusive), Err(VfsError::AlreadyExists));
+        assert_eq!(
+            vfs.open(b"/bin/sh", exclusive),
+            Err(VfsError::AlreadyExists)
+        );
+        assert_eq!(vfs.overlay_files(), 1);
+    }
+
+    #[test]
+    fn exclusive_without_create_is_ignored() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/base", O_READ | O_EXCLUSIVE).unwrap();
+        let mut contents = [0; 4];
+        assert_eq!(vfs.read(fd, &mut contents), Ok(4));
+        assert_eq!(&contents, b"BASE");
+    }
+
+    #[test]
+    fn unlinked_names_can_be_created_exclusively_again() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let old = vfs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.write(old, b"old"), Ok(3));
+        assert_eq!(vfs.unlink(b"/new"), Ok(()));
+        let new = vfs
+            .open(b"/new", O_READ | O_WRITE | O_CREATE | O_EXCLUSIVE)
+            .unwrap();
+        assert_eq!(vfs.write(new, b"new"), Ok(3));
+        let mut contents = [0; 3];
+        assert_eq!(vfs.pread(old, 0, &mut contents), Ok(3));
+        assert_eq!(&contents, b"old");
+    }
+
+    #[test]
+    fn inodes_match_between_paths_and_descriptors() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let image = vfs.open(b"/base", O_READ).unwrap();
+        assert_eq!(vfs.fstat(image).unwrap().inode, 2);
+        assert_eq!(vfs.metadata(b"/base").unwrap().inode, 2);
+        let created = vfs.open(b"/new", O_WRITE | O_CREATE).unwrap();
+        let inode = vfs.metadata(b"/new").unwrap().inode;
+        assert_eq!(vfs.fstat(created).unwrap().inode, inode);
+        assert!(inode > 8);
+    }
+
+    #[test]
+    fn copy_up_keeps_the_image_inode() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let reader = vfs.open(b"/base", O_READ).unwrap();
+        let writer = vfs.open(b"/base", O_READ | O_WRITE).unwrap();
+        assert_eq!(vfs.write(writer, b"EDITED"), Ok(6));
+        assert_eq!(vfs.metadata(b"/base").unwrap().inode, 2);
+        assert_eq!(vfs.fstat(writer).unwrap().inode, 2);
+        assert_eq!(vfs.fstat(reader).unwrap().inode, 2);
+        // Earlier opens follow the copied inode, including its new size.
+        assert_eq!(vfs.fstat(reader).unwrap().size, 6);
+        assert_eq!(vfs.metadata(b"/base").unwrap().size, 6);
+    }
+
+    #[test]
+    fn image_entries_keep_their_modes() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        assert_eq!(vfs.chmod(b"/usr/bin/tool", 0o700), Err(VfsError::ReadOnly));
+        assert_eq!(vfs.chmod(b"/missing", 0o700), Err(VfsError::NotFound));
+        let fd = vfs.open(b"/base", O_READ).unwrap();
+        assert_eq!(vfs.fchmod(fd, 0o600), Err(VfsError::ReadOnly));
+        assert_eq!(vfs.metadata(b"/base").unwrap().mode, 0o644);
+    }
+
+    #[test]
+    fn closing_every_alias_releases_its_description() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 4, 32, 4> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        for _ in 0..8 {
+            let original = vfs.open(b"/base", O_READ).unwrap();
+            let alias = vfs.duplicate(original, false).unwrap();
+            let mut byte = [0];
+            assert_eq!(vfs.read(alias, &mut byte), Ok(1));
+            vfs.close(original).unwrap();
+            vfs.close(alias).unwrap();
+            let separate = vfs.open(b"/base", O_READ).unwrap();
+            assert_eq!(vfs.read(separate, &mut byte), Ok(1));
+            assert_eq!(&byte, b"B");
+            vfs.close(separate).unwrap();
+        }
+    }
+
+    #[test]
+    fn root_only_index_holds_just_the_root_directory() {
+        let index = Index::root_only();
+        assert_eq!(index.len(), 1);
+        let root = index.lookup_exact(b"/").unwrap();
+        assert_eq!((root.kind, root.mode), (NodeKind::Directory, 0o755));
+        assert!(Index::new(&ROOT_ONLY).is_ok());
+        let mut vfs: VirtualFs<'_, Reader, 2, 8, 2> =
+            VirtualFs::new(Index::root_only(), Reader(*b"BASETOOL"));
+        assert_eq!(vfs.mkdir(b"/work", 0o755), Ok(()));
+        assert_eq!(vfs.metadata(b"/").unwrap().kind, NodeKind::Directory);
+    }
+
+    #[test]
+    fn pwrite_leaves_the_shared_offset_alone() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.write(fd, b"abc"), Ok(3));
+        assert_eq!(vfs.pwrite(fd, 5, b"z"), Ok(1));
+        assert_eq!(vfs.seek(fd, 0, Whence::Current), Ok(3));
+        let mut contents = [0xff; 6];
+        assert_eq!(vfs.pread(fd, 0, &mut contents), Ok(6));
+        assert_eq!(&contents, b"abc\0\0z");
+        let reader = vfs.open(b"/base", O_READ).unwrap();
+        assert_eq!(vfs.pwrite(reader, 0, b"x"), Err(VfsError::PermissionDenied));
+    }
+
+    #[test]
+    fn pwrite_on_an_append_open_writes_at_the_end() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs
+            .open(b"/log", O_READ | O_WRITE | O_CREATE | O_APPEND)
+            .unwrap();
+        assert_eq!(vfs.write(fd, b"ab"), Ok(2));
+        assert_eq!(vfs.pwrite(fd, 0, b"c"), Ok(1));
+        let mut contents = [0; 3];
+        assert_eq!(vfs.pread(fd, 0, &mut contents), Ok(3));
+        assert_eq!(&contents, b"abc");
+    }
+
+    #[test]
+    fn truncate_shrinks_and_grows_with_zeros() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let fd = vfs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.write(fd, b"abcdef"), Ok(6));
+        assert_eq!(vfs.truncate(fd, 2), Ok(()));
+        assert_eq!(vfs.truncate(fd, 4), Ok(()));
+        let mut contents = [0xff; 6];
+        assert_eq!(vfs.pread(fd, 0, &mut contents), Ok(4));
+        assert_eq!(&contents[..4], b"ab\0\0");
+        assert_eq!(vfs.truncate(fd, 33), Err(VfsError::FileTooLarge));
+        let reader = vfs.open(b"/new", O_READ).unwrap();
+        assert_eq!(vfs.truncate(reader, 0), Err(VfsError::InvalidArgument));
+    }
+
+    #[test]
+    fn writes_past_a_truncated_end_read_back_zeros() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 4, 32, 4> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        let writer = vfs.open(b"/new", O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.write(writer, b"secret"), Ok(6));
+        let truncated = vfs.open(b"/new", O_WRITE | O_TRUNC).unwrap();
+        vfs.close(truncated).unwrap();
+        assert_eq!(vfs.write(writer, b"x"), Ok(1));
+        let reader = vfs.open(b"/new", O_READ).unwrap();
+        let mut contents = [0xff; 8];
+        assert_eq!(vfs.read(reader, &mut contents), Ok(7));
+        assert_eq!(&contents[..7], b"\0\0\0\0\0\0x");
+    }
+
+    #[test]
+    fn copy_up_updates_already_open_readers_and_metadata() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 4, 32, 4> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        let reader = vfs.open(b"/base", O_READ).unwrap();
+        let writer = vfs.open(b"/base", O_WRITE | O_TRUNC).unwrap();
+        assert_eq!(vfs.write(writer, b"new"), Ok(3));
+        assert_eq!(vfs.fstat(reader), vfs.metadata(b"/base"));
+        let mut data = [0; 4];
+        assert_eq!(vfs.read(reader, &mut data), Ok(3));
+        assert_eq!(&data[..3], b"new");
+    }
+
+    #[test]
+    fn directories_count_as_objects_without_allocating_payloads() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        assert_eq!(vfs.mkdir(b"/dir/", 0o755), Ok(()));
+        assert_eq!(vfs.overlay_objects(), 1);
+        assert_eq!(vfs.overlay_files(), 0);
+        assert_eq!(vfs.overlay_bytes(), 0);
+        let fd = vfs.open(b"/dir/file", O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.write(fd, b"data"), Ok(4));
+        assert_eq!(vfs.overlay_objects(), 2);
+        assert_eq!(vfs.overlay_files(), 1);
+        assert_eq!(vfs.overlay_bytes(), 4);
+    }
+
+    #[test]
+    fn directory_entries_merge_image_and_overlay_without_duplicates() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let root = vfs.open(b"/", O_READ | O_DIRECTORY).unwrap();
+        let copied = vfs.open(b"/base", O_WRITE).unwrap();
+        assert_eq!(vfs.write(copied, b"edit"), Ok(4));
+        assert_eq!(vfs.mkdir(b"/newdir", 0o755), Ok(()));
+        let mut names = std::vec::Vec::new();
+        let mut cookie = 0;
+        while let Some(entry) = vfs.directory_entry(root, cookie).unwrap() {
+            names.push(entry.name.to_vec());
+            if entry.name == b"base" {
+                assert_eq!(entry.inode, 2);
+            }
+            cookie = entry.next;
+        }
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_slice() == b"base")
+                .count(),
+            1
+        );
+        assert!(names.iter().any(|name| name.as_slice() == b"newdir"));
+        assert_eq!(&names[..2], &[b".".to_vec(), b"..".to_vec()]);
+    }
+
+    #[test]
+    fn removed_directory_descriptors_keep_identity_and_do_not_rebind() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        assert_eq!(vfs.mkdir(b"/dir", 0o755), Ok(()));
+        let directory = vfs.open(b"/dir", O_READ | O_DIRECTORY).unwrap();
+        let inode = vfs.fstat(directory).unwrap().inode;
+        let file = vfs.open(b"/dir/file", O_WRITE | O_CREATE).unwrap();
+        assert_eq!(vfs.close(file), Ok(()));
+        assert_eq!(
+            vfs.remove_directory(b"/dir"),
+            Err(VfsError::DirectoryNotEmpty)
+        );
+        assert_eq!(vfs.unlink(b"/dir/file"), Ok(()));
+        assert_eq!(vfs.remove_directory(b"/dir"), Ok(()));
+        assert_eq!(vfs.fstat(directory).unwrap().kind, NodeKind::Directory);
+        assert_eq!(vfs.fstat(directory).unwrap().inode, inode);
+        assert_eq!(vfs.directory_path(directory), Err(VfsError::NotFound));
+        assert_eq!(vfs.mkdir(b"/dir", 0o755), Ok(()));
+        assert_ne!(vfs.metadata(b"/dir").unwrap().inode, inode);
+        assert_eq!(vfs.close(directory), Ok(()));
+    }
+
+    #[test]
+    fn toggling_append_is_shared_by_aliases_but_not_independent_opens() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        let original = vfs.open(b"/new", O_READ | O_WRITE | O_CREATE).unwrap();
+        let alias = vfs.duplicate(original, false).unwrap();
+        let separate = vfs.open(b"/new", O_READ | O_WRITE).unwrap();
+        assert_eq!(vfs.write(original, b"ab"), Ok(2));
+        assert_eq!(vfs.seek(alias, 0, Whence::Start), Ok(0));
+        assert_eq!(vfs.set_append(alias, true), Ok(()));
+        assert_ne!(vfs.status_flags(original).unwrap() & O_APPEND, 0);
+        assert_eq!(vfs.status_flags(separate).unwrap() & O_APPEND, 0);
+        assert_eq!(vfs.write(original, b"c"), Ok(1));
+        assert_eq!(vfs.seek(alias, 0, Whence::Current), Ok(3));
+        assert_eq!(vfs.set_append(original, false), Ok(()));
+        assert_eq!(vfs.status_flags(alias).unwrap() & O_APPEND, 0);
+        let mut bytes = [0; 3];
+        assert_eq!(vfs.read(separate, &mut bytes), Ok(3));
+        assert_eq!(&bytes, b"abc");
+        assert_eq!(vfs.set_append(-1, true), Err(VfsError::InvalidDescriptor));
+    }
+
+    #[test]
+    fn trailing_slash_create_and_exclusive_directory_errors_have_no_effects() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        assert_eq!(
+            vfs.open(b"/new/", O_WRITE | O_CREATE),
+            Err(VfsError::IsDirectory)
+        );
+        assert_eq!(vfs.metadata(b"/new"), Err(VfsError::NotFound));
+        assert_eq!(vfs.mkdir(b"/dir/", 0o755), Ok(()));
+        assert_eq!(
+            vfs.open(b"/dir", O_READ | O_CREATE | O_EXCLUSIVE),
+            Err(VfsError::AlreadyExists)
+        );
+        assert_eq!(
+            vfs.open(b"/dir", O_READ | O_CREATE),
+            Err(VfsError::IsDirectory)
+        );
+        assert_eq!(
+            vfs.open(b"/base", O_READ | O_DIRECTORY),
+            Err(VfsError::NotDirectory)
+        );
+        assert_eq!(vfs.overlay_objects(), 1);
     }
 }

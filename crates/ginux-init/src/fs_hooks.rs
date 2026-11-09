@@ -2053,6 +2053,7 @@ fn errno(error: VfsError) -> i64 {
         VfsError::OverlayLimit => -28,
         VfsError::FileTooLarge => -27,
         VfsError::InvalidPath | VfsError::InvalidArgument => -22,
+        VfsError::ReadOnly => -30,
         VfsError::SymlinkLoop => -40,
         VfsError::InvalidIndex | VfsError::Io => -5,
     }
