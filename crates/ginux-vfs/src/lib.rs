@@ -451,13 +451,30 @@ struct Descriptor {
     overlay: bool,
     object: usize,
     entry: usize,
-    position: usize,
+    description: usize,
     readable: bool,
     writable: bool,
     close_on_exec: bool,
-    append: bool,
     directory: bool,
+}
+
+/// State shared by every descriptor duplicated from one open: Linux keeps
+/// the offset and the status flags on the open file description.
+#[derive(Clone, Copy)]
+struct Description {
+    offset: usize,
+    append: bool,
     nonblocking: bool,
+}
+
+impl Description {
+    const fn new(flags: u32) -> Self {
+        Self {
+            offset: 0,
+            append: flags & O_APPEND != 0,
+            nonblocking: flags & O_NONBLOCK != 0,
+        }
+    }
 }
 
 impl Descriptor {
@@ -467,13 +484,11 @@ impl Descriptor {
             overlay: false,
             object: 0,
             entry: 0,
-            position: 0,
+            description: 0,
             readable: false,
             writable: false,
             close_on_exec: false,
-            append: false,
             directory: false,
-            nonblocking: false,
         }
     }
 }
@@ -566,7 +581,7 @@ pub struct VirtualFs<
     overlay: N,
     storage: S,
     descriptors: [Descriptor; FDS],
-    positions: [usize; FDS],
+    descriptions: [Description; FDS],
 }
 
 impl<'a, R: BaseReader, const FILES: usize, const FILE_SIZE: usize, const FDS: usize>
@@ -593,7 +608,7 @@ impl<
             storage,
             overlay: InlineNamespace([OverlayFile::empty(); FILES]),
             descriptors: [Descriptor::empty(); FDS],
-            positions: [0; FDS],
+            descriptions: [Description::new(0); FDS],
         }
     }
 }
@@ -616,7 +631,7 @@ impl<
             storage,
             overlay: namespace,
             descriptors: [Descriptor::empty(); FDS],
-            positions: [0; FDS],
+            descriptions: [Description::new(0); FDS],
         }
     }
     pub fn namespace_capacity(&self) -> usize {
@@ -670,14 +685,14 @@ impl<
             .iter()
             .position(|descriptor| !descriptor.open)
             .ok_or(VfsError::DescriptorLimit)?;
-        // Duplicates share a position until their last close. A free descriptor
-        // implies a position unreferenced by every live descriptor.
-        let position = (0..FDS)
-            .find(|position| {
+        // Duplicates share a description until their last close. A free
+        // descriptor implies a description no live descriptor references.
+        let description = (0..FDS)
+            .find(|description| {
                 !self
                     .descriptors
                     .iter()
-                    .any(|fd| fd.open && fd.position == *position)
+                    .any(|fd| fd.open && fd.description == *description)
             })
             .ok_or(VfsError::DescriptorLimit)?;
         let overlay_index = self.find_overlay(path.as_bytes());
@@ -747,19 +762,17 @@ impl<
         } else {
             object
         };
-        self.positions[position] = 0;
+        self.descriptions[description] = Description::new(flags);
         self.descriptors[slot] = Descriptor {
             open: true,
             overlay,
             object,
             entry,
-            position,
+            description,
             readable,
             writable,
             close_on_exec: flags & O_CLOEXEC != 0,
-            append: flags & O_APPEND != 0,
             directory: false,
-            nonblocking: flags & O_NONBLOCK != 0,
         };
         Ok(slot as i32 + 3)
     }
@@ -780,27 +793,25 @@ impl<
             .iter()
             .position(|fd| !fd.open)
             .ok_or(VfsError::DescriptorLimit)?;
-        let position = (0..FDS)
-            .find(|position| {
+        let description = (0..FDS)
+            .find(|description| {
                 !self
                     .descriptors
                     .iter()
-                    .any(|fd| fd.open && fd.position == *position)
+                    .any(|fd| fd.open && fd.description == *description)
             })
             .ok_or(VfsError::DescriptorLimit)?;
-        self.positions[position] = 0;
+        self.descriptions[description] = Description::new(flags & O_NONBLOCK);
         self.descriptors[slot] = Descriptor {
             open: true,
             overlay: source.overlay,
             object: source.object,
             entry: source.entry,
-            position,
+            description,
             readable: true,
             writable: false,
             close_on_exec: flags & O_CLOEXEC != 0,
-            append: false,
             directory: source.directory,
-            nonblocking: flags & O_NONBLOCK != 0,
         };
         Ok(slot as i32 + 3)
     }
@@ -828,27 +839,25 @@ impl<
                 .find_base_record(self.index.resolve(path.as_bytes())?.path)
                 .ok_or(VfsError::InvalidIndex)?,
         };
-        let position = (0..FDS)
-            .find(|position| {
+        let description = (0..FDS)
+            .find(|description| {
                 !self
                     .descriptors
                     .iter()
-                    .any(|fd| fd.open && fd.position == *position)
+                    .any(|fd| fd.open && fd.description == *description)
             })
             .ok_or(VfsError::DescriptorLimit)?;
-        self.positions[position] = 0;
+        self.descriptions[description] = Description::new(flags & O_NONBLOCK);
         self.descriptors[slot] = Descriptor {
             open: true,
             overlay: overlay.is_some(),
             object,
             entry: object,
-            position,
+            description,
             readable: true,
             writable: false,
             close_on_exec: flags & O_CLOEXEC != 0,
-            append: false,
             directory: true,
-            nonblocking: flags & O_NONBLOCK != 0,
         };
         Ok(slot as i32 + 3)
     }
@@ -971,7 +980,7 @@ impl<
         if state.directory {
             return Err(VfsError::IsDirectory);
         }
-        let offset = self.positions[state.position];
+        let offset = self.descriptions[state.description].offset;
         let available = if state.overlay {
             self.overlay[state.object].len.saturating_sub(offset)
         } else {
@@ -992,7 +1001,7 @@ impl<
             self.reader
                 .read_at(entry.data_offset + offset as u64, &mut output[..length])?;
         }
-        self.positions[state.position] += length;
+        self.descriptions[state.description].offset += length;
         Ok(length)
     }
 
@@ -1008,10 +1017,10 @@ impl<
         if input.is_empty() {
             return Ok(0);
         }
-        let offset = if state.append {
+        let offset = if self.descriptions[state.description].append {
             self.overlay[state.object].len
         } else {
-            self.positions[state.position]
+            self.descriptions[state.description].offset
         };
         let end = offset
             .checked_add(input.len())
@@ -1021,7 +1030,7 @@ impl<
             .resize(state.object, previous, previous.max(end))?;
         self.storage.write(state.object, offset, input)?;
         self.overlay[state.object].len = previous.max(end);
-        self.positions[state.position] = end;
+        self.descriptions[state.description].offset = end;
         Ok(input.len())
     }
 
@@ -1812,7 +1821,7 @@ impl<
         let slot = self.descriptor(descriptor)?;
         let base = match whence {
             Whence::Start => 0,
-            Whence::Current => self.positions[self.descriptors[slot].position] as u64,
+            Whence::Current => self.descriptions[self.descriptors[slot].description].offset as u64,
             Whence::End => self.fstat(descriptor)?.size,
         };
         let position = i64::try_from(base)
@@ -1821,22 +1830,40 @@ impl<
             .filter(|position| *position >= 0)
             .and_then(|position| usize::try_from(position).ok())
             .ok_or(VfsError::InvalidArgument)?;
-        self.positions[self.descriptors[slot].position] = position;
+        self.descriptions[self.descriptors[slot].description].offset = position;
         Ok(position as u64)
     }
 
-    pub fn descriptor_flags(&self, descriptor: i32) -> Result<(u32, bool), VfsError> {
+    /// The open's status flags, as this crate's `O_READ`, `O_WRITE`,
+    /// `O_APPEND` and `O_NONBLOCK`. Callers translate them to their own ABI.
+    pub fn status_flags(&self, descriptor: i32) -> Result<u32, VfsError> {
         let state = self.descriptors[self.descriptor(descriptor)?];
-        let mode = match (state.readable, state.writable) {
-            (true, false) => 0,
-            (false, true) => 1,
-            _ => 2,
-        };
-        Ok((
-            mode | if state.append { 0o2000 } else { 0 }
-                | if state.nonblocking { 0o4000 } else { 0 },
-            state.close_on_exec,
-        ))
+        let description = self.descriptions[state.description];
+        let mut flags = 0;
+        if state.readable {
+            flags |= O_READ;
+        }
+        if state.writable {
+            flags |= O_WRITE;
+        }
+        if description.append {
+            flags |= O_APPEND;
+        }
+        if description.nonblocking {
+            flags |= O_NONBLOCK;
+        }
+        Ok(flags)
+    }
+
+    /// Changes the open's append mode for every descriptor that shares it.
+    pub fn set_append(&mut self, descriptor: i32, append: bool) -> Result<(), VfsError> {
+        let state = self.descriptors[self.descriptor(descriptor)?];
+        self.descriptions[state.description].append = append;
+        Ok(())
+    }
+
+    pub fn is_close_on_exec(&self, descriptor: i32) -> Result<bool, VfsError> {
+        Ok(self.descriptors[self.descriptor(descriptor)?].close_on_exec)
     }
 
     pub fn set_close_on_exec(&mut self, descriptor: i32, enabled: bool) -> Result<(), VfsError> {
@@ -2918,7 +2945,8 @@ mod tests {
         vfs.seek(append, 0, Whence::Start).unwrap();
         vfs.write(append, b"y").unwrap();
         assert_eq!(vfs.seek(append, 0, Whence::Current), Ok(5));
-        assert_eq!(vfs.descriptor_flags(append), Ok((0o2001, true)));
+        assert_eq!(vfs.status_flags(append), Ok(O_WRITE | O_APPEND));
+        assert_eq!(vfs.is_close_on_exec(append), Ok(true));
         assert_eq!(
             vfs.open(b"/work/build/data", O_READ | O_TRUNC),
             Err(VfsError::PermissionDenied)
@@ -3078,8 +3106,15 @@ mod tests {
         assert_eq!(fs.fstat(alias).unwrap().mode, 0o750);
         assert_eq!(fs.fchmod(alias, 0o4755), Err(VfsError::PermissionDenied));
         assert_eq!(fs.fstat(fd).unwrap().mode, 0o750);
-        assert_eq!(fs.descriptor_flags(fd), Ok((0o2002, true)));
-        assert_eq!(fs.descriptor_flags(alias), Ok((0o2002, false)));
+        assert_eq!(fs.status_flags(fd), Ok(O_READ | O_WRITE | O_APPEND));
+        assert_eq!(fs.status_flags(alias), Ok(O_READ | O_WRITE | O_APPEND));
+        assert_eq!(fs.is_close_on_exec(fd), Ok(true));
+        assert_eq!(fs.is_close_on_exec(alias), Ok(false));
+        // Append is a status flag of the open, so the duplicate follows it.
+        fs.set_append(alias, false).unwrap();
+        assert_eq!(fs.status_flags(fd), Ok(O_READ | O_WRITE));
+        fs.set_append(fd, true).unwrap();
+        assert_eq!(fs.status_flags(alias), Ok(O_READ | O_WRITE | O_APPEND));
         fs.set_close_on_exec(alias, true).unwrap();
         fs.set_close_on_exec(fd, false).unwrap();
         fs.close_on_exec();
@@ -3308,7 +3343,8 @@ mod tests {
             .open_directory(b"/work", O_CLOEXEC | O_NONBLOCK)
             .unwrap();
         assert_eq!(vfs.fstat(dir).unwrap().kind, NodeKind::Directory);
-        assert_eq!(vfs.descriptor_flags(dir), Ok((0o4000, true)));
+        assert_eq!(vfs.status_flags(dir), Ok(O_READ | O_NONBLOCK));
+        assert_eq!(vfs.is_close_on_exec(dir), Ok(true));
         assert_eq!(vfs.read(dir, &mut [0; 4]), Err(VfsError::IsDirectory));
         let mut names = Vec::new();
         let mut cookie = 0;

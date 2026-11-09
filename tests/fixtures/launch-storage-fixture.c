@@ -43,6 +43,9 @@ static long ordinary_mapping(int unlink_mode) {
     CHECK(DO(8,fd,0,0)==0 && DO(0,fd,output,3)==3 && output[0]=='n',156);
     /* An unknown origin and a negative position are refused in place. */
     CHECK(DO(8,fd,0,99)==-22 && DO(8,fd,-1,0)==-22 && DO(8,fd,0,1)==3,156);
+    /* F_SETFL changes only append, a status flag of the open. */
+    CHECK(DO(72,fd,3,0)==2 && DO(72,fd,4,02000)==0 && DO(72,fd,3,0)==02002,156);
+    CHECK(DO(72,fd,4,0)==0 && DO(72,fd,3,0)==2,156);
     long child=DO(57,0,0,0); CHECK(child>=0,157);
     if(!child) {
         CHECK(DO(8,fd,4096,0)==4096 && DO(1,fd,"fresh",5)==5,158);

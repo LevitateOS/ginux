@@ -1588,20 +1588,27 @@ impl LaunchFs {
                     .map_err(errno)
             }),
             280 => Err(-22),
-            72 => self
-                .fs
-                .descriptor_flags(fd)
-                .map_err(errno)
-                .and_then(|(flags, cloexec)| match r.rsi {
-                    1 => Ok(cloexec as i64),
-                    2 if r.rdx & !1 == 0 => self
-                        .fs
-                        .set_close_on_exec(fd, r.rdx != 0)
-                        .map(|_| 0)
-                        .map_err(errno),
-                    3 => Ok(flags as i64),
-                    _ => Err(-95),
-                }),
+            72 => match r.rsi {
+                1 => self.fs.is_close_on_exec(fd).map(i64::from).map_err(errno),
+                2 if r.rdx & !1 == 0 => self
+                    .fs
+                    .set_close_on_exec(fd, r.rdx != 0)
+                    .map(|_| 0)
+                    .map_err(errno),
+                3 => self
+                    .fs
+                    .status_flags(fd)
+                    .map(linux_status_flags)
+                    .map_err(errno),
+                // Only append can change on an owned file; Linux ignores the
+                // access mode and creation flags in F_SETFL.
+                4 => self
+                    .fs
+                    .set_append(fd, r.rdx & 0o2000 != 0)
+                    .map(|_| 0)
+                    .map_err(errno),
+                _ => self.fs.status_flags(fd).map_err(errno).and(Err(-95)),
+            },
             262 | 332 => {
                 let flags = if r.orig_rax == 262 { r.r10 } else { r.rdx };
                 let valid = if r.orig_rax == 262 {
@@ -1676,8 +1683,11 @@ impl LaunchFs {
             2 => metadata.size,
             _ => return Err(-22),
         };
-        let (flags, _) = self.fs.descriptor_flags(fd).map_err(errno)?;
-        if command != 5 && ((kind == 0 && flags & 3 == 1) || (kind == 1 && flags & 3 == 0)) {
+        let flags = self.fs.status_flags(fd).map_err(errno)?;
+        if command != 5
+            && ((kind == 0 && flags & ginux_vfs::O_READ == 0)
+                || (kind == 1 && flags & ginux_vfs::O_WRITE == 0))
+        {
             return Err(-9);
         }
         let lock = crate::file_locks::Lock {
@@ -1994,6 +2004,29 @@ fn copy_metadata(
         },
         statx,
     )
+}
+
+/// F_GETFL's view of the VFS's own status flags.
+fn linux_status_flags(flags: u32) -> i64 {
+    let access = match (
+        flags & ginux_vfs::O_READ != 0,
+        flags & ginux_vfs::O_WRITE != 0,
+    ) {
+        (true, false) => 0,
+        (false, true) => 1,
+        _ => 2,
+    };
+    access
+        | if flags & ginux_vfs::O_APPEND != 0 {
+            0o2000
+        } else {
+            0
+        }
+        | if flags & ginux_vfs::O_NONBLOCK != 0 {
+            0o4000
+        } else {
+            0
+        }
 }
 
 /// Linux lseek origins; the data/hole origins are not offered.
