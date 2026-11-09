@@ -426,6 +426,9 @@ pub struct OverlayFile {
     links: u64,
     object: Option<usize>,
     name_pins: usize,
+    /// The image record this object replaced, as its inode; zero for an
+    /// object created in the instance, whose inode follows from its slot.
+    inode: u64,
 }
 
 impl OverlayFile {
@@ -441,6 +444,7 @@ impl OverlayFile {
             links: 0,
             object: None,
             name_pins: 0,
+            inode: 0,
         }
     }
 }
@@ -729,6 +733,9 @@ impl<
                         if entry.mode & 0o222 == 0 {
                             return Err(VfsError::PermissionDenied);
                         }
+                        let record = self
+                            .find_base_record(entry.path)
+                            .ok_or(VfsError::InvalidIndex)?;
                         object = if flags & O_TRUNC != 0 {
                             // Truncation discards image bytes; copying them first
                             // can incorrectly exhaust a smaller owned backing.
@@ -736,6 +743,7 @@ impl<
                         } else {
                             self.copy_to_overlay(path, entry)?
                         };
+                        self.replace_image_file(record, object);
                         overlay = true;
                     } else {
                         object = self
@@ -957,7 +965,7 @@ impl<
                 if let Some(name) = child_name(path, entry.path.as_bytes()) {
                     return Ok(Some(DirectoryEntry {
                         name,
-                        inode: (self.index.len() + self.object(object) + 1) as u64,
+                        inode: self.overlay_inode(self.object(object)),
                         kind: match entry.state {
                             Slot::Directory => NodeKind::Directory,
                             Slot::Symlink => NodeKind::Symlink,
@@ -1423,6 +1431,7 @@ impl<
             links: 1,
             object: None,
             name_pins: 0,
+            inode: 0,
         };
         Ok(())
     }
@@ -1456,7 +1465,7 @@ impl<
         FileMetadata {
             accessed: entry.accessed,
             modified: entry.modified,
-            inode: (self.index.len() + object + 1) as u64,
+            inode: self.overlay_inode(object),
             kind: match self.overlay[slot].state {
                 Slot::Directory => NodeKind::Directory,
                 Slot::Symlink => NodeKind::Symlink,
@@ -1554,7 +1563,7 @@ impl<
                 accessed: file.accessed,
                 modified: file.modified,
                 links: self.link_count(state.object),
-                inode: (self.index.len() + state.object + 1) as u64,
+                inode: self.overlay_inode(state.object),
                 kind: if state.directory {
                     NodeKind::Directory
                 } else {
@@ -1933,6 +1942,34 @@ impl<
                 Ok(slot)
             }
             _ => self.allocate_overlay(),
+        }
+    }
+
+    /// Image records are inodes 1..=N in index order and objects created in
+    /// the instance follow them. An object that replaced an image file is
+    /// still that file and keeps its record's inode.
+    fn overlay_inode(&self, object: usize) -> u64 {
+        match self.overlay[object].inode {
+            0 => (self.index.len() + object + 1) as u64,
+            inode => inode,
+        }
+    }
+
+    /// A writable open turned an image file into an instance object. Every
+    /// descriptor already open on the image follows the same live bytes and
+    /// metadata, as it would for one inode.
+    fn replace_image_file(&mut self, record: usize, object: usize) {
+        self.overlay[object].inode = record as u64 + 1;
+        for descriptor in &mut self.descriptors {
+            if descriptor.open
+                && !descriptor.overlay
+                && !descriptor.directory
+                && descriptor.object == record
+            {
+                descriptor.overlay = true;
+                descriptor.object = object;
+                descriptor.entry = object;
+            }
         }
     }
 
@@ -2502,6 +2539,26 @@ mod tests {
         assert_eq!(vfs.close(duplicate), Err(VfsError::InvalidDescriptor));
         vfs.teardown();
         assert_eq!(vfs.overlay_files(), 0);
+    }
+
+    #[test]
+    fn copy_up_keeps_the_image_file_identity() {
+        let bytes = index_bytes();
+        let mut vfs: VirtualFs<'_, Reader, 4, 32, 4> =
+            VirtualFs::new(Index::new(&bytes).unwrap(), Reader(*b"BASETOOL"));
+        let before = vfs.metadata(b"/base").unwrap().inode;
+        let reader = vfs.open(b"/base", O_READ).unwrap();
+        assert_eq!(vfs.fstat(reader).unwrap().inode, before);
+        let writer = vfs.open(b"/base", O_READ | O_WRITE).unwrap();
+        vfs.write(writer, b"x").unwrap();
+        // A write through one descriptor must not change which file the
+        // path, the writer and an earlier reader all name.
+        assert_eq!(vfs.metadata(b"/base").unwrap().inode, before);
+        assert_eq!(vfs.fstat(writer).unwrap().inode, before);
+        assert_eq!(vfs.fstat(reader).unwrap().inode, before);
+        let mut byte = [0];
+        assert_eq!(vfs.read(reader, &mut byte), Ok(1));
+        assert_eq!(&byte, b"x");
     }
 
     #[test]
@@ -3215,9 +3272,12 @@ mod tests {
         let owned = fs.open(b"/base", O_READ | O_WRITE | O_TRUNC).unwrap();
         assert_eq!(fs.fstat(owned).unwrap().size, 0);
         assert_eq!(fs.write(owned, b"ok"), Ok(2));
+        // The earlier reader names the same file, so it reads what the
+        // truncating writer left, not the image bytes it replaced.
         let mut original = [0; 4];
-        assert_eq!(fs.read(image, &mut original), Ok(4));
-        assert_eq!(&original, b"BASE");
+        assert_eq!(fs.read(image, &mut original), Ok(2));
+        assert_eq!(&original[..2], b"ok");
+        assert_eq!(fs.fstat(image), fs.fstat(owned));
         fs.seek(owned, 0, Whence::Start).unwrap();
         assert_eq!(fs.read(owned, &mut original), Ok(2));
         assert_eq!(&original[..2], b"ok");
