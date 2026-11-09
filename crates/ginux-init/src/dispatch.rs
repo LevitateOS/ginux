@@ -91,7 +91,7 @@ pub fn decide_objects(
     pid: usize,
     signal_tgid: usize,
     registers: &UserRegs,
-    filesystem: &mut crate::fs_hooks::LaunchFs,
+    filesystem: &mut crate::launch_storage::LaunchFs,
     devices: &mut crate::device_hooks::LaunchDevices,
     channels: &mut crate::channel_hooks::LaunchChannels,
     progress: &mut crate::channel_hooks::WriteProgress,

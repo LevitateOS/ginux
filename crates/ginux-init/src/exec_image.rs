@@ -4,7 +4,7 @@
 //! is created. The tracee cannot run until this backing is sealed and the host
 //! fd is closed. Script backings retire before the interpreter's first syscall.
 
-use crate::fs_hooks::LaunchFs;
+use crate::launch_storage::LaunchFs;
 use crate::supervisor::{syscall1, syscall2, syscall3, syscall4};
 use ginux_vfs::Executable;
 

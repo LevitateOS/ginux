@@ -1,6 +1,6 @@
 //! Restore the instance script name after kernel binfmt dispatch. Only the new
 //! exec stack is changed: fork/vfork's old address space is never used as scratch.
-use crate::fs_hooks::LaunchFs;
+use crate::launch_storage::LaunchFs;
 use crate::supervisor::UserRegs;
 use crate::tracee_io::{copy_memory, read_path};
 use ginux_instance::Text;

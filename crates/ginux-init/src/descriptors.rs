@@ -5,7 +5,7 @@ use crate::channel_hooks::LaunchChannels;
 use crate::device_hooks::LaunchDevices;
 use crate::dispatch::{decide_objects, Lane, NativeDecision};
 use crate::event_hooks::{Event, Key, ALLOWED_EVENTS, WATCHES};
-use crate::fs_hooks::LaunchFs;
+use crate::launch_storage::LaunchFs;
 use crate::supervisor::{syscall2, syscall3, syscall4, UserRegs};
 use crate::tracee_io::{copy_memory, read_path};
 use ginux_core::decide_balanced;
@@ -755,7 +755,7 @@ impl DescriptorTable {
             }
             Handle::Native { fd, .. } if path.is_empty() => Ok(fd as u64),
             Handle::Owned(_) => Err(-20),
-            Handle::Native { fd, .. } => Ok(crate::fs_hooks::IMAGE_DIR_BASE + fd as u64),
+            Handle::Native { fd, .. } => Ok(crate::launch_storage::IMAGE_DIR_BASE + fd as u64),
             Handle::Reserved => Err(-9),
         }
     }

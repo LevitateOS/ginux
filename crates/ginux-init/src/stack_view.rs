@@ -45,7 +45,7 @@ pub fn metadata(pid: usize, r: &crate::supervisor::UserRegs) -> Option<Result<i6
             return if mode & 3 != 0 { Err(-13) } else { Ok(0) };
         }
         if r.orig_rax == 262 && r.r10 & !0x1900 != 0
-            || r.orig_rax == 332 && !crate::fs_hooks::valid_statx(r.rdx, r.r10)
+            || r.orig_rax == 332 && !crate::launch_storage::valid_statx(r.rdx, r.r10)
         {
             return Err(-22);
         }

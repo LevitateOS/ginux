@@ -3,7 +3,7 @@
 //! Replies: GXA1, matching u64 sequence, u64 zero status. A reply follows file
 //! fsync/close; the coordinator must sync its directory and matching state before
 //! acknowledging the workload. Invalid requests or storage failures stop launch.
-use crate::fs_hooks::LaunchFs;
+use crate::launch_storage::LaunchFs;
 use crate::supervisor::{syscall3, syscall5, syscall6};
 
 type Error = &'static [u8];

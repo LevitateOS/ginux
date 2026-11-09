@@ -4173,6 +4173,25 @@ mod tests {
         let root = index.lookup_exact(b"/").unwrap();
         assert_eq!((root.kind, root.mode), (NodeKind::Directory, 0o755));
         assert!(Index::new(&ROOT_ONLY).is_ok());
+        // The constant is exactly what the encoders produce for a lone root.
+        let mut encoded = [0u8; HEADER_SIZE + RECORD_SIZE];
+        let (header, record) = encoded.split_at_mut(HEADER_SIZE);
+        encode_header(1, header.try_into().unwrap());
+        encode_record(
+            Entry {
+                path: b"/",
+                kind: NodeKind::Directory,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                data_offset: 0,
+                link: b"",
+            },
+            record.try_into().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(encoded, ROOT_ONLY);
         let mut vfs: VirtualFs<'_, Reader, 2, 8, 2> =
             VirtualFs::new(Index::root_only(), Reader(*b"BASETOOL"));
         assert_eq!(vfs.mkdir(b"/work", 0o755), Ok(()));

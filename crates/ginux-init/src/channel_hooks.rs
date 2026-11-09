@@ -245,7 +245,7 @@ impl LaunchChannels {
                 let valid = if r.orig_rax == 262 {
                     flags & !0x1900 == 0
                 } else {
-                    crate::fs_hooks::valid_statx(flags, r.r10)
+                    crate::launch_storage::valid_statx(flags, r.r10)
                 };
                 if flags & 0x1000 == 0 || !valid {
                     Err(-22)

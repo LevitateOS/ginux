@@ -350,7 +350,7 @@ pub struct Rewrite {
 }
 impl Rewrite {
     pub fn prepare(
-        fs: &crate::fs_hooks::LaunchFs,
+        fs: &crate::launch_storage::LaunchFs,
         pid: usize,
         r: &mut UserRegs,
     ) -> Result<Option<Self>, i64> {

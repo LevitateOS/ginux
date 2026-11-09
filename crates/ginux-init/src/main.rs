@@ -26,6 +26,7 @@ mod file_locks;
 mod file_mapping;
 mod fs_hooks;
 mod launch;
+mod launch_storage;
 mod launch_tasks;
 mod network_hooks;
 mod path_hooks;

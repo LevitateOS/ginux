@@ -445,7 +445,7 @@ pub fn launch_main(
     // Capture the public operator limit before reserving private backing FDs.
     let descriptors = crate::descriptors::DescriptorTable::new()
         .unwrap_or_else(|reason| launch_startup_fail(reason));
-    let mut filesystem = crate::fs_hooks::LaunchFs::prepare(&config)
+    let mut filesystem = crate::launch_storage::LaunchFs::prepare(&config)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
     filesystem
         .check_image(root_path)
@@ -1296,7 +1296,7 @@ fn tracee_setup_fail(message: &[u8], code: usize) -> ! {
 fn supervise_launch(
     pid: usize,
     instance: &mut Instance,
-    filesystem: &mut crate::fs_hooks::LaunchFs,
+    filesystem: &mut crate::launch_storage::LaunchFs,
     devices: &mut crate::device_hooks::LaunchDevices,
     channels: &mut crate::channel_hooks::LaunchChannels,
     descriptors: crate::descriptors::DescriptorTable,

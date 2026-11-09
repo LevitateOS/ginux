@@ -1,6 +1,6 @@
 //! Bounded startup import of an owned-filesystem snapshot. All entries are
 //! validated before a workload starts; failures discard this new memory view.
-use crate::fs_hooks::{LaunchFs, RestoreEntry};
+use crate::launch_storage::{LaunchFs, RestoreEntry};
 use crate::storage_memory::MappedArray;
 use crate::supervisor::{syscall1, syscall2, syscall3, syscall4};
 use ginux_vfs::NodeKind;

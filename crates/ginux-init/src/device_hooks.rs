@@ -1,7 +1,7 @@
 //! Explicitly assigned character devices for configured native launch.
 //! All IO uses ginux-devices objects; no host device node or descriptor is used.
 
-use crate::fs_hooks::LaunchFs;
+use crate::launch_storage::LaunchFs;
 use crate::supervisor::UserRegs;
 use crate::tracee_io::{read_path, write_stat, Stat};
 use ginux_devices::{DeviceError, DeviceKind, DeviceName, DeviceRegistry};
@@ -111,7 +111,7 @@ impl LaunchDevices {
                 }
             }
             332 => {
-                if !crate::fs_hooks::valid_statx(r.rdx, r.r10) {
+                if !crate::launch_storage::valid_statx(r.rdx, r.r10) {
                     Err(-22)
                 } else {
                     Self::stat(pid, r.r8, true, dir)
@@ -215,7 +215,7 @@ impl LaunchDevices {
                 let valid = if r.orig_rax == 262 {
                     flags & !0x1900 == 0
                 } else {
-                    crate::fs_hooks::valid_statx(flags, r.r10)
+                    crate::launch_storage::valid_statx(flags, r.r10)
                 };
                 if flags & 0x1000 == 0 || !valid {
                     Err(-22)
