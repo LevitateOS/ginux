@@ -1770,6 +1770,8 @@ impl LaunchFs {
         Ok(times)
     }
 
+    /// An ordinary read advances the shared offset only by the bytes the
+    /// caller received; a positional read never touches it.
     fn read(
         &mut self,
         pid: usize,
@@ -1778,34 +1780,30 @@ impl LaunchFs {
         length: u64,
         offset: Option<i64>,
     ) -> Result<i64, i64> {
-        let previous = self
+        let current = self
             .fs
             .seek(fd, 0, ginux_vfs::Whence::Current)
             .map_err(errno)?;
-        if let Some(offset) = offset {
+        let start = match offset {
+            Some(offset) => u64::try_from(offset).map_err(|_| -22)?,
+            None => current,
+        };
+        let mut buffer = [0u8; IO_SIZE];
+        let count = self
+            .fs
+            .pread(
+                fd,
+                start,
+                &mut buffer[..length.min(IO_SIZE as u64) as usize],
+            )
+            .map_err(errno)?;
+        let copied = copy_memory(pid, address, &mut buffer[..count], true)?;
+        if offset.is_none() {
             self.fs
-                .seek(fd, offset, ginux_vfs::Whence::Start)
+                .seek(fd, (start + copied as u64) as i64, ginux_vfs::Whence::Start)
                 .map_err(errno)?;
         }
-        let start = self
-            .fs
-            .seek(fd, 0, ginux_vfs::Whence::Current)
-            .map_err(errno)?;
-        let mut buffer = [0u8; IO_SIZE];
-        let read = self
-            .fs
-            .read(fd, &mut buffer[..length.min(IO_SIZE as u64) as usize])
-            .map_err(errno);
-        let result = read.and_then(|count| copy_memory(pid, address, &mut buffer[..count], true));
-        let next = if offset.is_some() {
-            previous
-        } else {
-            start + result.unwrap_or(0) as u64
-        };
-        self.fs
-            .seek(fd, next as i64, ginux_vfs::Whence::Start)
-            .map_err(errno)?;
-        result
+        Ok(copied)
     }
 
     fn vector_io(&mut self, pid: usize, fd: i32, r: &UserRegs) -> Result<i64, i64> {
@@ -1823,19 +1821,25 @@ impl LaunchFs {
                 .fs
                 .seek(fd, 0, ginux_vfs::Whence::Current)
                 .map_err(errno)?;
-            let read = self.fs.read(fd, &mut bytes[..count]).map_err(errno)?;
-            let result = vectors.copy(pid, &mut bytes[..read], true);
+            let read = self
+                .fs
+                .pread(fd, offset, &mut bytes[..count])
+                .map_err(errno)?;
+            let copied = vectors.copy(pid, &mut bytes[..read], true)?;
             self.fs
                 .seek(
                     fd,
-                    (offset + result.as_ref().copied().unwrap_or(0) as u64) as i64,
+                    (offset + copied as u64) as i64,
                     ginux_vfs::Whence::Start,
                 )
                 .map_err(errno)?;
-            result.map(|n| n as i64)
+            Ok(copied as i64)
         }
     }
 
+    /// Copies the caller's bytes in bounded chunks. A positional write goes
+    /// through the VFS's own pwrite, so the shared offset is never moved and
+    /// needs no restoring.
     fn write(
         &mut self,
         pid: usize,
@@ -1845,52 +1849,46 @@ impl LaunchFs {
         offset: Option<i64>,
     ) -> Result<i64, i64> {
         self.fs.fstat(fd).map_err(errno)?;
-        let previous = self
-            .fs
-            .seek(fd, 0, ginux_vfs::Whence::Current)
-            .map_err(errno)?;
-        if let Some(offset) = offset {
-            self.fs
-                .seek(fd, offset, ginux_vfs::Whence::Start)
-                .map_err(errno)?;
-        }
-        let result = (|| {
-            let mut buffer = [0u8; IO_SIZE];
-            let limit = length.min(1024 * 1024) as usize;
-            if limit == 0 {
-                return self.fs.write(fd, &[]).map(|n| n as i64).map_err(errno);
-            }
-            let mut written = 0usize;
-            while written < limit {
-                let count = (limit - written).min(IO_SIZE);
+        let position = match offset {
+            Some(offset) => Some(u64::try_from(offset).map_err(|_| -22)?),
+            None => None,
+        };
+        let mut buffer = [0u8; IO_SIZE];
+        let limit = length.min(1024 * 1024) as usize;
+        let mut written = 0usize;
+        loop {
+            let count = (limit - written).min(IO_SIZE);
+            let copied = if count == 0 {
+                0
+            } else {
                 let copy = address
                     .checked_add(written as u64)
                     .ok_or(-14)
                     .and_then(|address| copy_memory(pid, address, &mut buffer[..count], false));
-                let copied = match copy {
+                match copy {
                     Ok(n) => n as usize,
                     Err(_) if written != 0 => break,
                     Err(error) => return Err(error),
-                };
-                match self.fs.write(fd, &buffer[..copied]).map_err(errno) {
-                    Ok(n) => {
-                        written += n;
-                        if n != copied || copied != count {
-                            break;
-                        }
-                    }
-                    Err(_) if written != 0 => break,
-                    Err(error) => return Err(error),
                 }
+            };
+            let stored = match position {
+                Some(start) => self
+                    .fs
+                    .pwrite(fd, start + written as u64, &buffer[..copied]),
+                None => self.fs.write(fd, &buffer[..copied]),
+            };
+            match stored.map_err(errno) {
+                Ok(n) => {
+                    written += n;
+                    if n != copied || copied != count || written == limit {
+                        break;
+                    }
+                }
+                Err(_) if written != 0 => break,
+                Err(error) => return Err(error),
             }
-            Ok(written as i64)
-        })();
-        if offset.is_some() {
-            self.fs
-                .seek(fd, previous as i64, ginux_vfs::Whence::Start)
-                .map_err(errno)?;
         }
-        result
+        Ok(written as i64)
     }
 
     fn getdents(&mut self, pid: usize, fd: i32, address: u64, length: u64) -> Result<i64, i64> {
