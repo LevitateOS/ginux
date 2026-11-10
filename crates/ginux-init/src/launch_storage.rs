@@ -1814,8 +1814,9 @@ impl LaunchFs {
         Ok(times)
     }
 
-    /// An ordinary read advances the shared offset only by the bytes the
-    /// caller received; a positional read never touches it.
+    /// Transfer regular-file data in bounded buffers without exposing the
+    /// buffer size as an artificial short read. An ordinary read advances the
+    /// shared offset only by delivered bytes; a positional read leaves it alone.
     fn read(
         &mut self,
         pid: usize,
@@ -1833,21 +1834,49 @@ impl LaunchFs {
             None => current,
         };
         let mut buffer = [0u8; IO_SIZE];
-        let count = self
-            .fs
-            .pread(
-                fd,
-                start,
-                &mut buffer[..length.min(IO_SIZE as u64) as usize],
-            )
-            .map_err(errno)?;
-        let copied = copy_memory(pid, address, &mut buffer[..count], true)?;
+        // Linux's x86-64 MAX_RW_COUNT. Storage quotas still bound the file;
+        // reads stop at EOF and never allocate the requested transfer size.
+        let limit = length.min(0x7fff_f000) as usize;
+        let mut copied = 0usize;
+        loop {
+            let count = (limit - copied).min(IO_SIZE);
+            let read = start
+                .checked_add(copied as u64)
+                .ok_or(-22)
+                .and_then(|position| {
+                    self.fs
+                        .pread(fd, position, &mut buffer[..count])
+                        .map_err(errno)
+                });
+            let read = match read {
+                Ok(read) => read,
+                Err(_) if copied != 0 => break,
+                Err(error) => return Err(error),
+            };
+            if read == 0 {
+                break;
+            }
+            let delivered = address
+                .checked_add(copied as u64)
+                .ok_or(-14)
+                .and_then(|address| copy_memory(pid, address, &mut buffer[..read], true));
+            match delivered {
+                Ok(n) => {
+                    copied += n as usize;
+                    if n as usize != read || read != count || copied == limit {
+                        break;
+                    }
+                }
+                Err(_) if copied != 0 => break,
+                Err(error) => return Err(error),
+            }
+        }
         if offset.is_none() {
             self.fs
                 .seek(fd, (start + copied as u64) as i64, ginux_vfs::Whence::Start)
                 .map_err(errno)?;
         }
-        Ok(copied)
+        Ok(copied as i64)
     }
 
     fn vector_io(&mut self, pid: usize, fd: i32, r: &UserRegs) -> Result<i64, i64> {

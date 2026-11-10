@@ -15,6 +15,7 @@ static long call(long n, word a, word b, word c, word d, word e, word f)
 struct pollfd { int fd; unsigned short events, revents; };
 static const struct pollfd readonly_poll = {123,0,0};
 static char buffer[4096];
+static char console_data[10003];
 static long query(int fd, unsigned short events, unsigned short expected)
 {
     struct pollfd entry={fd,events,0xffff};
@@ -25,7 +26,21 @@ long poll_main(word *stack)
     char **argv=(char **)(stack+1);
     char mode=*stack>1 ? argv[1][0] : 'a';
     int pipe[2]; CHECK(DO(293,pipe,04000,0)==0,10);
-    if (mode=='s') {
+    if (mode=='L') {
+        for(word i=0;i<sizeof console_data;++i)console_data[i]='A'+i%26;
+        long alias=DO(32,1,0,0);CHECK(alias>=3,102);
+        long written=DO(1,1,console_data,sizeof console_data);CHECK(written==4096,103);
+        while((word)written<sizeof console_data) {
+            long n=DO(1,alias,console_data+written,sizeof console_data-written);
+            CHECK(n>0 && n<=4096,104);written+=n;
+        }
+        CHECK(DO(3,alias,0,0)==0,105);
+    } else if (mode=='C') {
+        CHECK(DO(1,1,console_data,sizeof console_data)==-1,106);
+        long alias=DO(32,1,0,0);CHECK(alias>=3,107);
+        CHECK(DO(1,alias,console_data,sizeof console_data)==-1 && DO(3,alias,0,0)==0,108);
+        return 0;
+    } else if (mode=='s') {
         word read[4]={1UL<<pipe[0]}, write[4]={1UL<<pipe[1]}, except[4]={1UL<<pipe[0]};
         long timeout[2]={0,0};
         CHECK(call(270,64,(word)read,(word)write,(word)except,(word)timeout,0)==1,80);

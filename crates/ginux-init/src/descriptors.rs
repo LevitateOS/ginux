@@ -1121,6 +1121,12 @@ impl DescriptorTable {
                 if !console && matches!(r.orig_rax, 1 | 20 | 18 | 77 | 91) {
                     return Err(-9);
                 }
+                if console && r.orig_rax == 1 {
+                    // Preserve the native console transfer bound as an ordinary
+                    // short write. Callers retry the remaining bytes, and finish
+                    // restores their original arguments and public descriptor.
+                    r.rdx = r.rdx.min(4096);
+                }
                 r.rdi = fd as u64;
             }
             Handle::Owned(handle) => r.rdi = handle as u64,

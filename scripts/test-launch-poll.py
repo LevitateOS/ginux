@@ -24,15 +24,17 @@ def main():
         shutil.copyfile(fixture, root / 'bin/fixture')
         (root / 'bin/fixture').chmod(0o755)
         selected = sys.argv[3:]
-        if selected and any(mode not in ('ordinary', 'read', 'write', 'hup', 'ordinary-timer', 'select', 'Splice', 'Denied') for mode in selected):
+        if selected and any(mode not in ('ordinary', 'read', 'write', 'hup', 'ordinary-timer', 'select', 'Splice', 'Denied', 'LargeConsole', 'ConsoleDenied') for mode in selected):
             sys.exit('unknown selected poll scenario')
-        for mode in selected or ('all', 'read', 'write', 'hup', 'deadline', 'timer', 'console', 'kill', 'infinite-kill', 'all-again', 'ordinary', 'ordinary-timer', 'select', 'Splice', 'Denied'):
+        for mode in selected or ('all', 'read', 'write', 'hup', 'deadline', 'timer', 'console', 'kill', 'infinite-kill', 'all-again', 'ordinary', 'ordinary-timer', 'select', 'Splice', 'Denied', 'LargeConsole', 'ConsoleDenied'):
             config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
             config = config.replace('args = []', 'args = ' + json.dumps([mode]))
             config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
             config = config.replace('[devices]\nassignments = []', '[devices]\nassignments = ["null"]')
             if mode == 'Denied':
                 config = config.replace('deny = ["device.mmio.direct"', 'deny = ["syscall.pselect6", "syscall.splice", "device.mmio.direct"', 1)
+            if mode == 'ConsoleDenied':
+                config = config.replace('deny = ["device.mmio.direct"', 'deny = ["device.console.write", "device.mmio.direct"', 1)
             path, result, audit_path = [work / (mode + suffix) for suffix in ('.toml', '.json', '.audit')]
             path.write_text(config)
             start = time.monotonic()
@@ -75,7 +77,12 @@ def main():
                 assert stdout == b'', stdout
             else:
                 assert proc.returncode == 0 and record['outcome'] == 'exited' and record['code'] == 0, (mode, proc.returncode, record, audit)
-                assert stdout == b'owned-poll: PASS\n', stdout
+                expected = b'owned-poll: PASS\n'
+                if mode == 'LargeConsole':
+                    expected = bytes(65 + i % 26 for i in range(10003)) + expected
+                elif mode == 'ConsoleDenied':
+                    expected = b''
+                assert stdout == expected, stdout
             if mode in ('timer', 'ordinary-timer', 'select'):
                 assert elapsed >= 0.055, ('finite wait returned early', elapsed)
             assert elapsed < 5, ('readiness/deadline stalled', mode, elapsed)

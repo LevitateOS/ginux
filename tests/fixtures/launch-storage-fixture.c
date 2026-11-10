@@ -369,18 +369,25 @@ static long ordinary_large_io(void) {
     CHECK(DO(1,fd,large_io+2*mib,37)==37 && DO(5,fd,meta,0)==0,199);
     CHECK(*(word *)(meta+48)==sizeof large_io && DO(8,fd,0,0)==0,200);
     for(word i=0;i<sizeof large_io;++i) large_io[i]=0;
-    word done=0;
-    while(done<sizeof large_io) {
-        long n=DO(0,fd,large_io+done,sizeof large_io-done);
-        CHECK(n>0 && n<=4096,201);
-        for(long i=0;i<n;++i) CHECK(large_io[done+i]==(char)((done+i)%251),202);
-        done+=(word)n;
-    }
+    /* One read must fill a regular file request beyond internal transfer bounds. */
+    CHECK(DO(0,fd,large_io,sizeof large_io)==sizeof large_io,201);
+    for(word i=0;i<sizeof large_io;++i) CHECK(large_io[i]==(char)(i%251),202);
     CHECK(DO(0,fd,output,sizeof output)==0,203);
     long alias=DO(32,fd,0,0);CHECK(alias>=3 && DO(8,fd,17,0)==17,204);
     CHECK(call(18,alias,(word)large_io,sizeof large_io,3*mib,0,0)==mib && DO(8,fd,0,1)==17,205);
     CHECK(call(17,fd,(word)output,4096,4*mib-4096,0,0)==4096 && DO(8,alias,0,1)==17,206);
     for(word i=0;i<4096;++i) CHECK(output[i]==large_io[mib-4096+i],207);
+    CHECK(call(17,fd,(word)large_io,sizeof large_io,0,0,0)==sizeof large_io && DO(8,alias,0,1)==17,209);
+    for(word i=0;i<sizeof large_io;++i) CHECK(large_io[i]==(char)(i%251),210);
+    long pages=call(9,0,12288,3,0x22,-1,0);CHECK(pages>0,211);
+    CHECK(DO(10,pages+8192,4096,0)==0,212);
+    CHECK(DO(8,fd,0,0)==0 && DO(0,fd,pages+100,12288)==8092,213);
+    CHECK(DO(8,alias,0,1)==8092,214);
+    for(word i=0;i<8092;++i) CHECK(((char *)pages)[100+i]==(char)(i%251),215);
+    CHECK(call(17,fd,pages+100,12288,31,0,0)==8092 && DO(8,alias,0,1)==8092,216);
+    for(word i=0;i<8092;++i) CHECK(((char *)pages)[100+i]==(char)((31+i)%251),217);
+    CHECK(DO(0,fd,pages+8192,1)==-14 && DO(8,alias,0,1)==8092,218);
+    CHECK(DO(11,pages,12288,0)==0,219);
     CHECK(DO(3,fd,0,0)==0 && DO(3,alias,0,0)==0,208);
     return 0;
 }

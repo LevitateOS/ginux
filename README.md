@@ -504,12 +504,16 @@ use a temporary canonical path below the stopped workload's stack; an unavailabl
 scratch area or overlapping output buffer returns EFAULT. This is a bounded
 storage adapter, not a complete unified image/overlay filesystem. Regular writes
 and pwrites process at most 1 MiB per call in 4 KiB scratch chunks, returning
-only committed bytes after a short transfer or error. Reads and readv/writev
-remain bounded to 4096 bytes per call; callers must handle short transfers.
+only committed bytes after a short transfer or error. Scalar reads and preads
+fill the available requested range up to Linux's 2,147,479,552-byte transfer limit,
+using 4096-byte internal buffers; EOF or copy faults can return a shorter count.
+Readv/writev remain bounded to 4096 bytes per call.
 Owned files and pipes accept at most 16 iovecs, including empty entries, with a
 combined length no greater than the signed transfer-result range. Pipe writes
 use the combined vector length for atomicity and retain their existing bounds.
-Native image/console transfer policy is unchanged. Metadata defaults to 32 objects (including seeded directories) and 64 independently
+Native image transfer policy is unchanged. Configured scalar console writes
+return a partial count for requests over 4096 bytes, retaining that host transfer
+bound while allowing callers to write the remainder. Metadata defaults to 32 objects (including seeded directories) and 64 independently
 opened files. `[storage].max_objects` permits 1–1000000 namespace slots. Bounded
 supervisor allocations hold namespace and backing metadata. Before workload
 startup, assigned storage reserves `max_objects + 128` private descriptors by raising
