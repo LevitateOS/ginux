@@ -1474,11 +1474,13 @@ pub(crate) fn launch_semantic_operation(
         | 90..=94
         | 132
         | 258
+        | 259
         | 260
         | 263..=266
         | 268
         | 280
-        | 316 => Some("filesystem.path.write"),
+        | 316
+        | 452 => Some("filesystem.path.write"),
         n => syscall_semantic_operation(n, r.rsi),
     }
 }

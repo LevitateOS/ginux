@@ -38,6 +38,16 @@ long opath_main(word *stack)
         DO(1,1,"opath: PASS\n",12);return 0;
     }
     if(mode=='d') { for(unsigned i=0;i<260;++i)CHECK(DO(2,"/image/item",PATH,0)==-1,3);DO(1,1,"opath: PASS\n",12);return 0; }
+    if(mode=='w') {
+        long directory=DO(2,"/work",PATH|0200000,0);CHECK(directory>=3,57);
+        CHECK(call(257,(word)directory,(word)"new",0101,0600,0,0)==-1,58);
+        CHECK(call(258,(word)directory,(word)"new",0755,0,0,0)==-1,59);
+        CHECK(call(268,(word)directory,(word)".",0700,0,0,0)==-1,60);
+        CHECK(call(452,(word)directory,(word)"",0700,0x1000,0,0)==-1,61);
+        CHECK(DO(5,directory,meta,0)==0 && (*(unsigned *)(meta+24)&0777)==0755,62);
+        CHECK(DO(3,directory,0,0)==0,63);
+        DO(1,1,"opath: PASS\n",12);return 0;
+    }
     if(mode=='l') {
         for(word i=3;i<8;++i)CHECK(DO(2,"/image/item",PATH,0)==(long)i,4);
         CHECK(DO(2,"/image/item",PATH,0)==-24,5);
@@ -71,16 +81,23 @@ long opath_main(word *stack)
     CHECK(name((word)owned,"/work/directory/item") && name((word)image,"/image/sealed"),23);
     long alias=DO(32,owned,0,0);CHECK(alias>=3 && DO(72,alias,1,0)==0,24);
     CHECK(DO(33,owned,alias,0)==alias && DO(3,owned,0,0)==0 && data_denied((word)alias),25);
+    /* O_PATH directories are usable dirfds, including for mutations. */
+    long relative=call(257,(word)directory,(word)"item",0,0,0,0);CHECK(relative>=3,26);
+    CHECK(DO(0,relative,bytes,7)==7 && DO(3,relative,0,0)==0,51);
+    CHECK(call(258,(word)directory,(word)"new",0755,0,0,0)==0,27);
+    CHECK(call(268,(word)directory,(word)"item",0600,0,0,0)==0,29);
+    CHECK(call(262,(word)directory,(word)"item",(word)meta,0,0,0)==0 && (*(unsigned *)(meta+24)&0777)==0600,52);
+    relative=call(257,(word)directory,(word)"new/copy",0101,0644,0,0);CHECK(relative>=3,53);
+    CHECK(DO(1,relative,"copy",4)==4 && DO(3,relative,0,0)==0,54);
+    CHECK(call(263,(word)directory,(word)"new/copy",0,0,0,0)==0,28);
+    CHECK(call(263,(word)directory,(word)"new",0x200,0,0,0)==0,55);
+    CHECK(call(257,(word)alias,(word)"child",0,0,0,0)==-20,56);
     if(mode!='n') {
-        CHECK(call(257,(word)directory,(word)"item",0,0,0,0)==-9,26);
-        CHECK(call(258,(word)directory,(word)"new",0755,0,0,0)==-9,27);
-        CHECK(call(263,(word)directory,(word)"item",0,0,0,0)==-9,28);
-        CHECK(call(268,(word)directory,(word)"item",0600,0,0,0)==-38,29); /* catalog denial precedes FD handling */
         CHECK(DO(81,directory,0,0)==-9,30);
         char p[64]="/dev/fd/";number(p+8,(word)alias);CHECK(DO(2,p,0,0)==-9,31);
         char *av[]={"fixture",0},*ev[]={0};
         CHECK(call(322,(word)image,(word)"",(word)av,(word)ev,0x1000,0)==-9,32);
-        CHECK(call(322,(word)directory,(word)"item",(word)av,(word)ev,0,0)==-9,33);
+        CHECK(call(322,(word)directory,(word)"item",(word)av,(word)ev,0,0)==-13,33);
         CHECK(DO(2,"/work/directory/item",PATH|01000,0)==-95,34);
         CHECK(DO(2,"/work/link",PATH|0400000,0)==-95,35);
         CHECK(DO(5,alias,meta,0)==0 && *(word *)(meta+48)==7,36);

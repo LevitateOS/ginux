@@ -9,8 +9,8 @@ use crate::tracee_io::{copy_memory, read_path};
 use core::sync::atomic::{AtomicBool, Ordering};
 use ginux_instance::{InstanceConfig, Text};
 use ginux_vfs::{
-    BaseReader, Executable, FileMetadata, Index, NodeKind, VfsError, VirtualFs, MAX_PATH, O_APPEND,
-    O_CLOEXEC, O_CREATE, O_EXCLUSIVE, O_NONBLOCK, O_READ, O_TRUNC, O_WRITE,
+    BaseReader, Executable, FileMetadata, Index, NodeKind, Timestamp, VfsError, VirtualFs,
+    MAX_PATH, O_APPEND, O_CLOEXEC, O_CREATE, O_EXCLUSIVE, O_NONBLOCK, O_READ, O_TRUNC, O_WRITE,
 };
 
 pub const FD_BASE: usize = 1 << 20;
@@ -642,6 +642,21 @@ impl LaunchFs {
     }
 
     pub(crate) fn request_path(&self, pid: usize, r: &UserRegs) -> Result<Option<(u8, Path)>, i64> {
+        if r.orig_rax == 452 {
+            if r.r10 & !0x1100 != 0 {
+                return Err(-22);
+            }
+            if read_path(pid, r.rsi)?.is_empty() {
+                if r.r10 & 0x1000 == 0 {
+                    return Err(-2);
+                }
+                return if r.rdi as i32 == -100 {
+                    self.cwd_path(pid).map(|path| Some((1, path)))
+                } else {
+                    Ok(None)
+                };
+            }
+        }
         // Descriptor futimens has no pathname; its public descriptor owner
         // validates/translates the handle before the filesystem claim.
         // Empty-path ownership likewise belongs to the descriptor owner.
@@ -679,6 +694,7 @@ impl LaunchFs {
             262 | 280 => (1, r.rsi, r.rdi, r.r10 & 0x100 == 0, false),
             263 | 267 => (1, r.rsi, r.rdi, false, false),
             268 | 269 => (1, r.rsi, r.rdi, true, false),
+            452 => (1, r.rsi, r.rdi, r.r10 & 0x100 == 0, false),
             332 => (1, r.rsi, r.rdi, r.rdx & 0x100 == 0, false),
             439 => (1, r.rsi, r.rdi, r.r10 & 0x100 == 0, false),
             _ => return Ok(None),
@@ -1099,6 +1115,9 @@ impl LaunchFs {
 
     /// Configured-launch dispatch only; demo paths keep their existing contract.
     pub fn claim(&mut self, pid: usize, r: &UserRegs) -> Option<i64> {
+        if r.orig_rax == 452 && r.r10 & !0x1100 != 0 {
+            return Some(-22);
+        }
         if matches!(r.orig_rax, 86 | 265) {
             return Some(self.hard_link(pid, r).unwrap_or_else(|error| error));
         }
@@ -1139,12 +1158,12 @@ impl LaunchFs {
         {
             return Some(self.descriptor_call(pid, r, fd - FD_BASE as i32 + 3));
         }
-        if matches!(r.orig_rax, 260 | 262 | 332 | 439) {
+        if matches!(r.orig_rax, 260 | 262 | 332 | 439 | 452) {
             match read_path(pid, r.rsi) {
                 Ok(p) if p.is_empty() && fd >= FD_BASE as i32 => {
                     return Some(self.descriptor_call(pid, r, fd - FD_BASE as i32 + 3))
                 }
-                Ok(p) if p.is_empty() => return None,
+                Ok(p) if p.is_empty() && !(r.orig_rax == 452 && fd == -100) => return None,
                 Err(error) => return Some(error),
                 _ => {}
             }
@@ -1184,10 +1203,11 @@ impl LaunchFs {
                 .map_err(errno)
                 .and_then(|metadata| access(metadata, r)),
             88 | 266 => read_path(pid, r.rdi).and_then(|target| {
+                let now = realtime()?;
                 self.fs
                     .symlink(target.as_bytes(), path.as_bytes())
-                    .map(|_| 0)
-                    .map_err(errno)
+                    .map_err(errno)?;
+                self.created(path.as_bytes(), now)
             }),
             89 | 267 => {
                 let (address, length) = if r.orig_rax == 89 {
@@ -1225,16 +1245,10 @@ impl LaunchFs {
                     self.stat(pid, path.as_bytes(), r.r8, true)
                 }
             }
-            83 => self
-                .fs
-                .mkdir(path.as_bytes(), r.rsi as u32 & 0o777 & !self.creation_mask)
-                .map(|_| 0)
-                .map_err(errno),
-            258 => self
-                .fs
-                .mkdir(path.as_bytes(), r.rdx as u32 & 0o777 & !self.creation_mask)
-                .map(|_| 0)
-                .map_err(errno),
+            83 | 258 => self.mkdir(
+                path.as_bytes(),
+                if r.orig_rax == 83 { r.rsi } else { r.rdx } as u32,
+            ),
             87 => self.fs.unlink(path.as_bytes()).map(|_| 0).map_err(errno),
             84 => self.remove_directory(path.as_bytes()),
             263 => {
@@ -1256,9 +1270,47 @@ impl LaunchFs {
                 .chmod(path.as_bytes(), r.rdx as u32)
                 .map(|_| 0)
                 .map_err(errno),
+            452 => self.chmod_at(path.as_bytes(), r.rdx as u32, r.r10),
             _ => Err(-95),
         };
         Some(result.unwrap_or_else(|error| error))
+    }
+
+    fn chmod_at(&mut self, path: &[u8], mode: u32, flags: u64) -> Result<i64, i64> {
+        if flags & 0x100 != 0
+            && self.fs.metadata_no_follow(path).map_err(errno)?.kind == NodeKind::Symlink
+        {
+            // Linux does not support changing the permissions of a symlink.
+            return Err(-95);
+        }
+        self.fs.chmod(path, mode).map(|_| 0).map_err(errno)
+    }
+
+    fn mkdir(&mut self, path: &[u8], mode: u32) -> Result<i64, i64> {
+        let now = realtime()?;
+        self.fs
+            .mkdir(path, mode & 0o777 & !self.creation_mask)
+            .map_err(errno)?;
+        self.created(path, now)
+    }
+
+    fn created(&mut self, path: &[u8], now: Timestamp) -> Result<i64, i64> {
+        self.fs
+            .set_times(path, false, Some(now), Some(now))
+            .map_err(errno)?;
+        self.parent_modified(path, now)?;
+        Ok(0)
+    }
+
+    fn parent_modified(&mut self, path: &[u8], now: Timestamp) -> Result<(), i64> {
+        let end = path.iter().rposition(|byte| *byte == b'/').ok_or(-22)?;
+        let parent = &path[..end.max(1)];
+        if self.owns_path(parent) {
+            self.fs
+                .set_times(parent, false, None, Some(now))
+                .map_err(errno)?;
+        }
+        Ok(())
     }
 
     /// A read-only anonymous snapshot consumes existing filesystem object,
@@ -1363,13 +1415,26 @@ impl LaunchFs {
                 translated |= internal;
             }
         }
-        let existed = self.fs.metadata(path).is_ok();
+        let existed = metadata.is_ok();
+        let now = if !existed || flags & 0o1000 != 0 {
+            Some(realtime()?)
+        } else {
+            None
+        };
         let fd = self.fs.open(path, translated).map_err(errno)?;
         self.stack_snapshots[(fd - 3) as usize] = false;
         if !existed && flags & 0o100 != 0 {
             self.fs
                 .fchmod(fd, mode as u32 & 0o777 & !self.creation_mask)
                 .map_err(errno)?;
+        }
+        if let Some(now) = now {
+            self.fs
+                .fset_times(fd, (!existed).then_some(now), Some(now))
+                .map_err(errno)?;
+            if !existed {
+                self.parent_modified(path, now)?;
+            }
         }
         Ok(FD_BASE as i64 + fd as i64 - 3)
     }
@@ -1482,7 +1547,7 @@ impl LaunchFs {
 
     fn descriptor_call(&mut self, pid: usize, r: &UserRegs, fd: i32) -> i64 {
         if fd >= 3 && self.stack_snapshots.get((fd - 3) as usize) == Some(&true) {
-            if matches!(r.orig_rax, 77 | 91 | 93 | 260 | 280) {
+            if matches!(r.orig_rax, 77 | 91 | 93 | 260 | 280 | 452) {
                 return -30;
             }
             let metadata = match r.orig_rax {
@@ -1525,6 +1590,8 @@ impl LaunchFs {
                     .map_err(errno)
             }),
             91 => self.fs.fchmod(fd, r.rsi as u32).map(|_| 0).map_err(errno),
+            452 if r.r10 & 0x1000 == 0 => Err(-2),
+            452 => self.fs.fchmod(fd, r.rdx as u32).map(|_| 0).map_err(errno),
             74 | 75 => self.fs.fstat(fd).map_err(errno).and_then(|metadata| {
                 if metadata.kind == NodeKind::Directory {
                     return Ok(0);
@@ -1547,7 +1614,13 @@ impl LaunchFs {
                 .fstat(fd)
                 .map_err(errno)
                 .and_then(|_| preserve_owner(r.rdx, r.r10)),
-            77 if r.rsi as i64 >= 0 => self.fs.truncate(fd, r.rsi).map(|_| 0).map_err(errno),
+            77 if r.rsi as i64 >= 0 => realtime().and_then(|now| {
+                self.fs.truncate(fd, r.rsi).map_err(errno)?;
+                self.fs
+                    .fset_times(fd, None, Some(now))
+                    .map(|_| 0)
+                    .map_err(errno)
+            }),
             77 => Err(-22),
             217 => self.getdents(pid, fd, r.rsi, r.rdx),
             439 => {
@@ -1727,17 +1800,7 @@ impl LaunchFs {
                 1_073_741_822 => None,
                 1_073_741_823 => {
                     if now.is_none() {
-                        let mut clock = [0i64; 2];
-                        if unsafe {
-                            crate::supervisor::syscall2(228, 0, clock.as_mut_ptr() as usize)
-                        } != 0
-                        {
-                            return Err(-5);
-                        }
-                        now = Some(ginux_vfs::Timestamp {
-                            seconds: clock[0],
-                            nanoseconds: clock[1] as u32,
-                        });
+                        now = Some(realtime()?);
                     }
                     now
                 }
@@ -1793,10 +1856,12 @@ impl LaunchFs {
         let count = vectors.length.min(IO_SIZE);
         if r.orig_rax == 20 {
             let copied = vectors.copy(pid, &mut bytes[..count], false)?;
-            self.fs
-                .write(fd, &bytes[..copied])
-                .map(|n| n as i64)
-                .map_err(errno)
+            let now = realtime()?;
+            let written = self.fs.write(fd, &bytes[..copied]).map_err(errno)?;
+            if written != 0 {
+                self.fs.fset_times(fd, None, Some(now)).map_err(errno)?;
+            }
+            Ok(written as i64)
         } else {
             let offset = self
                 .fs
@@ -1836,6 +1901,7 @@ impl LaunchFs {
         };
         let mut buffer = [0u8; IO_SIZE];
         let limit = length.min(1024 * 1024) as usize;
+        let now = realtime()?;
         let mut written = 0usize;
         loop {
             let count = (limit - written).min(IO_SIZE);
@@ -1868,6 +1934,9 @@ impl LaunchFs {
                 Err(_) if written != 0 => break,
                 Err(error) => return Err(error),
             }
+        }
+        if written != 0 {
+            self.fs.fset_times(fd, None, Some(now)).map_err(errno)?;
         }
         Ok(written as i64)
     }
@@ -1912,6 +1981,19 @@ impl LaunchFs {
             .map_err(errno)?;
         Ok(used as i64)
     }
+}
+
+// Live files use the same realtime clock as clock_gettime and UTIME_NOW.
+// Archive restoration sets its recorded times explicitly after writing bytes.
+fn realtime() -> Result<Timestamp, i64> {
+    let mut value = [0i64; 2];
+    if unsafe { crate::supervisor::syscall2(228, 0, value.as_mut_ptr() as usize) } != 0 {
+        return Err(-5);
+    }
+    Ok(Timestamp {
+        seconds: value[0],
+        nanoseconds: value[1] as u32,
+    })
 }
 
 pub(crate) fn valid_statx(flags: u64, mask: u64) -> bool {

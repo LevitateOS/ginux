@@ -171,7 +171,7 @@ def main():
                     invoke(['disk0'], ['export'], expected=2, export=True)
                     print('PASS launch storage: bad-export-config')
                     continue
-                if mode not in ('growth', 'bounds', 'quota', 'view-probes', 'mapping', 'ordinary-mapping', 'ordinary-unlinked-mapping', 'symlinks', 'ordinary-symlinks', 'namespace', 'positioned', 'ownership', 'ordinary-ownership', 'ordinary-vectors', 'ordinary-large-io', 'timestamps', 'ordinary-times', 'flush', 'export', 'export-wait', 'failed-export', 'child-export', 'bad-export-config', 'invalid-export-config'):
+                if mode not in ('growth', 'bounds', 'quota', 'view-probes', 'mapping', 'ordinary-mapping', 'ordinary-unlinked-mapping', 'symlinks', 'ordinary-symlinks', 'namespace', 'positioned', 'ownership', 'ordinary-ownership', 'ordinary-vectors', 'ordinary-large-io', 'timestamps', 'ordinary-times', 'build-metadata', 'flush', 'export', 'export-wait', 'failed-export', 'child-export', 'bad-export-config', 'invalid-export-config'):
                     sys.exit('unknown selected storage scenario')
                 invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], [mode],
                        expected=2 if mode == 'invalid-export-config' else (7 if mode == 'failed-export' else 0),
@@ -180,6 +180,7 @@ def main():
                 print(f'PASS launch storage: {mode}')
             return
         invoke(['memory:/work'], ['view-probes'])
+        invoke(['memory:/work'], ['build-metadata'])
         invoke(['memory:/work', 'memory:/work/build', 'memory:/out'], ['growth'])
         for mode in ['path-owned', 'missing-owned', 'image-parent', 'alias-shadow']:
             invoke(['memory:/work'], [mode])

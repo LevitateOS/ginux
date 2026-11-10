@@ -219,6 +219,7 @@ fn path_call(syscall: u64) -> bool {
             | 322
             | 332
             | 439
+            | 452
     )
 }
 

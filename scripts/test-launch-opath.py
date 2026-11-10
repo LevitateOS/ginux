@@ -17,7 +17,7 @@ def main():
     template = (Path(__file__).resolve().parent.parent / "config/instance-configured.toml").read_text()
     with tempfile.TemporaryDirectory(prefix="ginux-opath-") as directory:
         work = Path(directory)
-        for mode in ("native", "configured", "deny", "lower"):
+        for mode in ("native", "configured", "deny", "write-deny", "lower"):
             root = work / mode
             (root / "bin").mkdir(parents=True)
             (root / "image").mkdir()
@@ -39,6 +39,8 @@ def main():
                 config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
                 if mode == "deny":
                     config = config.replace('deny = ["device.mmio.direct"', 'deny = ["syscall.open", "device.mmio.direct"', 1)
+                if mode == "write-deny":
+                    config = config.replace('deny = ["device.mmio.direct"', 'deny = ["filesystem.path.write", "device.mmio.direct"', 1)
                 path, result = work / (mode + ".toml"), work / (mode + ".json")
                 path.write_text(config)
                 def lower():

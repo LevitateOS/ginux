@@ -831,8 +831,12 @@ and no checkpoint control socket is required.
 
 Owned inode access and modification timestamps can be set explicitly through
 `utimensat` and descriptor `futimens`, including no-follow, nanoseconds and
-`UTIME_OMIT`/`UTIME_NOW`. Aliases share times; stat/statx return them. New owned objects
-and VFS index metadata start at zero; reads/writes do not update times automatically.
+`UTIME_OMIT`/`UTIME_NOW`. Aliases share times; stat/statx return them. VFS index
+metadata starts at zero. Configured-launch file creation, directory
+creation and symlink creation stamp access and modification times from realtime;
+nonempty writes, positional writes, vectored writes and truncation update the
+modified time. Reads leave access times unchanged. Explicit timestamp updates and
+archive restoration retain their supplied times until a later write or truncation.
 `UTIME_NOW` uses the supervisor's native realtime clock.
 These operations require existing owned objects.
 Archives retain only whole-second nonnegative USTAR mtime. Access time and runtime

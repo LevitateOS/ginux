@@ -48,9 +48,12 @@ the public descriptor table. Supported accompanying flags are `O_DIRECTORY`,
 the owned FD-name view, duplication, descriptor flags, close and fork/exec
 lifetime are supported. `F_GETFL` reports `O_PATH` and requested `O_DIRECTORY`.
 Data I/O, directory enumeration, seek, mapping, descriptor execution, fchdir,
-status/metadata mutation and descriptor-path reopen are denied. A metadata
-directory cannot supply authority for relative open, exec or mutation; absolute
-pathnames retain their ordinary independent checks. Poll reports POLLNVAL and
+status mutation and descriptor-path reopen are denied. An `O_PATH` directory
+can be the base of a relative open, exec or pathname mutation, subject to the same
+contract and storage checks as an absolute pathname. `fchmodat` and `fchmodat2`
+change modes in writable storage; the latter also accepts `AT_EMPTY_PATH`
+on an owned reference. Direct `fchmod` on `O_PATH` still returns EBADF.
+Poll reports POLLNVAL and
 epoll does not watch filesystem references. References consume the existing
 public and filesystem descriptor quotas, including lower operator limits.
 Explicit contract denial precedes allocation and metadata effects. This is a

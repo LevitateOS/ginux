@@ -293,6 +293,43 @@ static long timestamp_data(int ordinary) {
     CHECK(call(280,fd,0,(word)times,0,0,0)==0 && DO(4,"/work/time-alias",meta,0)==0 && *(long *)(meta+72)==13,83);
     CHECK(DO(3,fd,0,0)==0,84); return 0;
 }
+/* Build tools compare live mtimes and use each chmod ABI, including dirfds. */
+static long build_metadata(void) {
+    long before[2],after[2],old[4]={11,12,13,14};
+    CHECK(DO(228,0,before,0)==0,1);
+    long fd=DO(2,"/work/live",0102,0600);CHECK(fd>=3,2);
+    CHECK(DO(5,fd,meta,0)==0 && DO(228,0,after,0)==0,3);
+    CHECK(*(long *)(meta+88)>=before[0] && *(long *)(meta+88)<=after[0],4);
+    CHECK(*(long *)(meta+72)==*(long *)(meta+88) && *(long *)(meta+80)==*(long *)(meta+96),5);
+    CHECK(call(280,fd,0,(word)old,0,0,0)==0,6);
+    CHECK(DO(1,fd,"",0)==0 && DO(5,fd,meta,0)==0 && *(long *)(meta+88)==13,7);
+    CHECK(DO(1,fd,"data",4)==4 && DO(5,fd,meta,0)==0 && *(long *)(meta+88)>=before[0],8);
+    CHECK(*(long *)(meta+72)==11,9);
+    CHECK(call(280,fd,0,(word)old,0,0,0)==0,10);
+    CHECK(call(18,fd,(word)"x",1,1,0,0)==1 && DO(8,fd,0,1)==4,11);
+    CHECK(DO(5,fd,meta,0)==0 && *(long *)(meta+88)>=before[0],12);
+    word vector[2]={(word)"v",1};
+    CHECK(call(280,fd,0,(word)old,0,0,0)==0 && DO(20,fd,vector,1)==1,13);
+    CHECK(DO(5,fd,meta,0)==0 && *(long *)(meta+88)>=before[0],14);
+    CHECK(call(280,fd,0,(word)old,0,0,0)==0 && DO(77,fd,1,0)==0,15);
+    CHECK(DO(5,fd,meta,0)==0 && *(long *)(meta+88)>=before[0],16);
+    CHECK(call(280,fd,0,(word)old,0,0,0)==0,17);
+    long trunc=DO(2,"/work/live",01001,0);CHECK(trunc>=3 && DO(3,trunc,0,0)==0,18);
+    CHECK(DO(5,fd,meta,0)==0 && *(long *)(meta+88)>=before[0],19);
+    CHECK(DO(83,"/work/live-dir",0755,0)==0 && DO(4,"/work/live-dir",meta,0)==0 && *(long *)(meta+88)>=before[0],20);
+    CHECK(DO(88,"live","/work/live-link",0)==0 && DO(6,"/work/live-link",meta,0)==0 && *(long *)(meta+88)>=before[0],21);
+    CHECK(DO(90,"/work/live",0755,0)==0 && DO(5,fd,meta,0)==0 && (*(unsigned *)(meta+24)&0777)==0755,22);
+    CHECK(DO(91,fd,0640,0)==0 && DO(5,fd,meta,0)==0 && (*(unsigned *)(meta+24)&0777)==0640,23);
+    long dir=DO(2,"/work",0200000,0);CHECK(dir>=3,24);
+    CHECK(call(268,dir,(word)"live",0600,0,0,0)==0 && DO(5,fd,meta,0)==0 && (*(unsigned *)(meta+24)&0777)==0600,25);
+    CHECK(call(452,dir,(word)"live",0750,0,0,0)==0 && DO(5,fd,meta,0)==0 && (*(unsigned *)(meta+24)&0777)==0750,26);
+    CHECK(call(452,dir,(word)"live-link",0700,0x100,0,0)==-95,27);
+    CHECK(call(452,dir,(word)"live",0700,0x800,0,0)==-22,28);
+    CHECK(call(452,fd,(word)"",0644,0x1000,0,0)==0 && DO(5,fd,meta,0)==0 && (*(unsigned *)(meta+24)&0777)==0644,29);
+    CHECK(call(452,fd,(word)"",0600,0,0,0)==-2,30);
+    CHECK(DO(3,dir,0,0)==0 && DO(3,fd,0,0)==0,31);
+    return 0;
+}
 /* Valid, stable buffers exercise owned I/O without relying on native transfers. */
 static char large_io[2*1024*1024+37];
 static long ordinary_vectors(void) {
@@ -378,6 +415,7 @@ long storage_main(word *stack)
     char **argv = (char **)(stack + 1);
     if(argc>1 && equal(argv[1],"timestamps")) return timestamp_data(0);
     if(argc>1 && equal(argv[1],"ordinary-times")) return timestamp_data(1);
+    if(argc>1 && equal(argv[1],"build-metadata")) return build_metadata();
     if(argc>1 && equal(argv[1],"archive-create")) return archive_links(0);
     if(argc>1 && equal(argv[1],"restore-links")) return archive_links(1);
     if(argc>1 && equal(argv[1],"restore-namespace")) return restore_namespace();

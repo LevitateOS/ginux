@@ -3,7 +3,7 @@
 use core::fmt;
 
 pub const CATALOG_VERSION: u32 = 2;
-pub const MAX_OPERATIONS: usize = 193;
+pub const MAX_OPERATIONS: usize = 195;
 pub const DIGEST_HEX_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,12 +246,28 @@ pub static CONFIGURED_OPERATIONS: &[Operation] = &[
         "test-launch"
     ),
     syscall!(
+        "fchmodat",
+        268,
+        Partial,
+        Action::Mediate,
+        "instance path and bounded mode",
+        "test-launch-opath"
+    ),
+    syscall!(
         "faccessat",
         269,
         Partial,
         Action::Mediate,
         "instance path and access mode",
         "test-launch-storage"
+    ),
+    syscall!(
+        "splice",
+        275,
+        Partial,
+        Action::Mediate,
+        "unsupported transfers return EINVAL without consuming input",
+        "test-launch-poll"
     ),
     syscall!(
         "renameat2",
@@ -2599,6 +2615,39 @@ mod tests {
         let rule = write.runtime_rule(1, Some("device.console.write")).unwrap();
         assert_eq!(rule.action, Action::Deny(1));
         assert_eq!(rule.operation.id, "syscall.write");
+    }
+
+    #[test]
+    fn configured_build_calls_keep_explicit_denials() {
+        let denied = resolve(
+            b"configured-balanced-v2",
+            &[],
+            &[],
+            &[b"filesystem.path.write", b"syscall.splice"],
+        )
+        .unwrap();
+        for number in [90, 91, 268, 452] {
+            let rule = denied
+                .runtime_rule(number, Some("filesystem.path.write"))
+                .unwrap();
+            assert_eq!(rule.action, Action::Deny(1), "syscall {number}");
+            assert_eq!(rule.provenance, Provenance::InstanceDeny);
+        }
+        assert_eq!(denied.syscall_action(275), Action::Deny(1));
+        let exact = resolve(
+            b"configured-balanced-v2",
+            &[],
+            &[],
+            &[b"syscall.fchmodat"],
+        )
+        .unwrap();
+        assert_eq!(
+            exact
+                .runtime_rule(268, Some("filesystem.path.write"))
+                .unwrap()
+                .action,
+            Action::Deny(1)
+        );
     }
 
     #[test]

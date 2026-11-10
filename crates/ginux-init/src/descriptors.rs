@@ -682,11 +682,25 @@ impl DescriptorTable {
                     backends.claim(pid, r)
                 })
             }
-            258 | 260 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 => {
+            258 | 260 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 | 452 => {
                 call.save(r);
                 self.path_descriptor(pid, r, backends)
             }
             7 | 271 => self.poll(pid, r, backends, call),
+            275 => {
+                // Owned storage/devices do not offer splice. Linux uses EINVAL
+                // for an unsupported endpoint so callers can retry with read/write.
+                // Validate public handles first; never submit them to the host.
+                self.get(r.rdi).and_then(|input| {
+                    self.get(r.rdx).and_then(|output| {
+                        if input.path_flags != 0 || output.path_flags != 0 {
+                            Err(-9)
+                        } else {
+                            Err(-22)
+                        }
+                    })
+                })
+            }
             _ => Ok(backends.claim(pid, r)),
         };
         result.unwrap_or_else(ready)
@@ -722,7 +736,7 @@ impl DescriptorTable {
             pid,
             r.rdi,
             r.rsi,
-            matches!(r.orig_rax, 262 | 267 | 269 | 332 | 439),
+            matches!(r.orig_rax, 262 | 267 | 269 | 332 | 439 | 452),
         )?;
         Ok(backends.claim(pid, r))
     }
@@ -746,7 +760,9 @@ impl DescriptorTable {
             return Ok(dirfd);
         }
         let entry = self.get(dirfd)?;
-        if entry.path_flags != 0 && !metadata {
+        // O_PATH forbids direct data access, but a directory reference remains
+        // valid as the starting point for relative *at operations.
+        if entry.path_flags != 0 && path.is_empty() && !metadata {
             return Err(-9);
         }
         match entry.handle {
