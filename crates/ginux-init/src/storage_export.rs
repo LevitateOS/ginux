@@ -387,6 +387,7 @@ impl Archive {
                 NodeKind::File => (b'0', metadata.size),
                 NodeKind::Directory => (b'5', 0),
                 NodeKind::Symlink => (b'2', 0),
+                NodeKind::Fifo => (b'6', 0),
             }
         };
         if name.len() > 100 {

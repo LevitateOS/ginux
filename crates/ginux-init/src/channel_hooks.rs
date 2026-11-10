@@ -41,8 +41,9 @@ struct Pipe {
     len: usize,
     readers: u16,
     writers: u16,
-    read_flags: u32,
-    write_flags: u32,
+    fifo: Option<u64>,
+    reader_generation: u64,
+    writer_generation: u64,
 }
 
 impl Pipe {
@@ -56,8 +57,9 @@ impl Pipe {
             len: 0,
             readers: 0,
             writers: 0,
-            read_flags: 0,
-            write_flags: 1,
+            fifo: None,
+            reader_generation: 0,
+            writer_generation: 0,
         }
     }
 }
@@ -65,8 +67,26 @@ impl Pipe {
 #[derive(Clone, Copy)]
 struct PipeFd {
     pipe: usize,
-    write: bool,
+    flags: u32,
     peer: Option<usize>,
+    fifo: Option<FifoFd>,
+}
+
+#[derive(Clone, Copy)]
+struct FifoFd {
+    reference: u32,
+    reader_generation: u64,
+    writer_generation: u64,
+}
+
+impl PipeFd {
+    fn readable(self) -> bool {
+        self.flags & 3 != 1
+    }
+
+    fn writable(self) -> bool {
+        self.flags & 3 != 0
+    }
 }
 
 /// Progress belongs to the task's current syscall, not its shared endpoint.
@@ -204,7 +224,7 @@ impl LaunchChannels {
                     Ok(4) => {
                         let flags = self.flags(entry);
                         self.set_flags(
-                            entry,
+                            slot,
                             if i32::from_ne_bytes(value) == 0 {
                                 flags & !NONBLOCK
                             } else {
@@ -213,6 +233,16 @@ impl LaunchChannels {
                         );
                         Ok(0)
                     }
+                    _ => Err(-14),
+                }
+            }
+            16 if r.rsi == 0x541b
+                && matches!(self.pipes[entry.pipe].event, Event::None)
+                && !self.pipes[entry.pipe].packet =>
+            {
+                let mut bytes = (self.pipes[entry.pipe].len as i32).to_ne_bytes();
+                match copy_memory(pid, r.rdx, &mut bytes, true) {
+                    Ok(4) => Ok(0),
                     _ => Err(-14),
                 }
             }
@@ -225,15 +255,8 @@ impl LaunchChannels {
                     Err(-22)
                 }
                 4 if r.rdx & !((NONBLOCK | APPEND | 3) as u64) == 0 => {
-                    let flags = (r.rdx as u32 & (NONBLOCK | APPEND))
-                        | if entry.peer.is_some()
-                            || !matches!(self.pipes[entry.pipe].event, Event::None)
-                        {
-                            2
-                        } else {
-                            u32::from(entry.write)
-                        };
-                    self.set_flags(entry, flags);
+                    let flags = (r.rdx as u32 & (NONBLOCK | APPEND)) | (entry.flags & 3);
+                    self.set_flags(slot, flags);
                     Ok(0)
                 }
                 1032 if !matches!(self.pipes[entry.pipe].event, Event::None) => Err(-9),
@@ -289,17 +312,20 @@ impl LaunchChannels {
         p.len = 0;
         p.readers = 1;
         p.writers = 1;
-        p.read_flags = flags as u32 & NONBLOCK;
-        p.write_flags = 1 | p.read_flags;
+        p.fifo = None;
+        p.reader_generation = 0;
+        p.writer_generation = 0;
         self.descriptors[first] = Some(PipeFd {
             pipe,
-            write: false,
+            flags: flags as u32 & NONBLOCK,
             peer: None,
+            fifo: None,
         });
         self.descriptors[second] = Some(PipeFd {
             pipe,
-            write: true,
+            flags: 1 | (flags as u32 & NONBLOCK),
             peer: None,
+            fifo: None,
         });
         Ok([PIPE_FD_BASE + first as u32, PIPE_FD_BASE + second as u32])
     }
@@ -322,18 +348,112 @@ impl LaunchChannels {
         let pb = self.descriptors[b].unwrap().pipe;
         self.descriptors[a].as_mut().unwrap().peer = Some(pb);
         self.descriptors[b].as_mut().unwrap().peer = Some(pa);
+        self.descriptors[a].as_mut().unwrap().flags |= 2;
+        self.descriptors[b].as_mut().unwrap().flags |= 2;
         // Transfer writer ownership into the opposite duplex endpoint.
         self.descriptors[(first[1] - PIPE_FD_BASE) as usize] = None;
         self.descriptors[(second[1] - PIPE_FD_BASE) as usize] = None;
         for index in [pa, pb] {
             self.pipes[index].packet = true;
-            self.pipes[index].read_flags |= 2;
         }
         Ok([first[0], second[0]])
     }
 
     pub fn release(&mut self, handle: u32) {
         self.close((handle - PIPE_FD_BASE) as usize);
+    }
+
+    /// Open the pipe belonging to a VFS inode. The private storage reference
+    /// pins that inode across unlink; the descriptor owner releases it when
+    /// this endpoint's last public alias closes. Failed opens do not consume it.
+    pub fn open_fifo(&mut self, inode: u64, reference: u32, flags: u32) -> Result<u32, i64> {
+        let access = flags & 3;
+        if access == 3 {
+            return Err(-22);
+        }
+        let existing = self
+            .pipes
+            .iter()
+            .position(|pipe| pipe.live && pipe.fifo == Some(inode));
+        if access == 1
+            && flags & NONBLOCK != 0
+            && existing.is_none_or(|index| self.pipes[index].readers == 0)
+        {
+            return Err(-6);
+        }
+        let slot = self
+            .descriptors
+            .iter()
+            .position(Option::is_none)
+            .ok_or(-24)?;
+        let index = existing
+            .or_else(|| self.pipes.iter().position(|pipe| !pipe.live))
+            .ok_or(-24)?;
+        let pipe = &mut self.pipes[index];
+        if existing.is_none() {
+            pipe.live = true;
+            pipe.event = Event::None;
+            pipe.packet = false;
+            pipe.head = 0;
+            pipe.len = 0;
+            pipe.readers = 0;
+            pipe.writers = 0;
+            pipe.fifo = Some(inode);
+            pipe.reader_generation = 0;
+            pipe.writer_generation = 0;
+        }
+        // Remember a peer that is already present, or one that opens and
+        // closes before a parked open is retried. A reader opened before the
+        // first writer has EOF but no POLLHUP until a writer has appeared.
+        let fifo = FifoFd {
+            reference,
+            reader_generation: pipe
+                .reader_generation
+                .wrapping_sub(u64::from(pipe.readers != 0)),
+            writer_generation: pipe
+                .writer_generation
+                .wrapping_sub(u64::from(pipe.writers != 0)),
+        };
+        if access != 1 {
+            pipe.readers += 1;
+            pipe.reader_generation = pipe.reader_generation.wrapping_add(1);
+        }
+        if access != 0 {
+            pipe.writers += 1;
+            pipe.writer_generation = pipe.writer_generation.wrapping_add(1);
+        }
+        self.descriptors[slot] = Some(PipeFd {
+            pipe: index,
+            flags: flags & (3 | NONBLOCK | APPEND),
+            peer: None,
+            fifo: Some(fifo),
+        });
+        Ok(PIPE_FD_BASE + slot as u32)
+    }
+
+    pub fn fifo_open_ready(&self, handle: u32) -> bool {
+        let Some(slot) = handle.checked_sub(PIPE_FD_BASE) else {
+            return false;
+        };
+        let Ok(entry) = self.entry(slot as usize) else {
+            return false;
+        };
+        let Some(fifo) = entry.fifo else {
+            return false;
+        };
+        let pipe = &self.pipes[entry.pipe];
+        match entry.flags & 3 {
+            0 => entry.flags & NONBLOCK != 0 || pipe.writer_generation != fifo.writer_generation,
+            1 => pipe.reader_generation != fifo.reader_generation,
+            _ => true,
+        }
+    }
+
+    pub fn fifo_reference(&self, handle: u32) -> Option<u32> {
+        self.entry(handle.checked_sub(PIPE_FD_BASE)? as usize)
+            .ok()?
+            .fifo
+            .map(|fifo| fifo.reference)
     }
 
     /// Event objects share the existing bounded pipe/object pool. They add no
@@ -353,16 +473,18 @@ impl LaunchChannels {
         object.len = 0;
         object.readers = 1;
         object.writers = 1;
-        object.read_flags = 2 | (flags & NONBLOCK);
-        object.write_flags = object.read_flags;
+        object.fifo = None;
+        object.reader_generation = 0;
+        object.writer_generation = 0;
         if matches!(event, Event::Epoll) {
             self.epolls[pipe] = crate::event_hooks::Epoll::new();
             self.epoll_count += 1;
         }
         self.descriptors[slot] = Some(PipeFd {
             pipe,
-            write: false,
+            flags: 2 | (flags & NONBLOCK),
             peer: None,
+            fifo: None,
         });
         Ok(PIPE_FD_BASE + slot as u32)
     }
@@ -454,11 +576,19 @@ impl LaunchChannels {
                     | (if output.readers == 0 { 8 } else { 0 }),
             );
         }
-        Some(if entry.write {
-            (if pipe.len < CAPACITY { 0x104 } else { 0 }) | (if pipe.readers == 0 { 8 } else { 0 })
-        } else {
-            (if pipe.len != 0 { 0x41 } else { 0 }) | (if pipe.writers == 0 { 16 } else { 0 })
-        })
+        let mut events = 0;
+        if entry.writable() {
+            events |= (if pipe.len < CAPACITY { 0x104 } else { 0 })
+                | (if pipe.readers == 0 { 8 } else { 0 });
+        }
+        if entry.readable() {
+            let hung_up = pipe.writers == 0
+                && entry
+                    .fifo
+                    .is_none_or(|fifo| fifo.writer_generation != pipe.writer_generation);
+            events |= (if pipe.len != 0 { 0x41 } else { 0 }) | (if hung_up { 16 } else { 0 });
+        }
+        Some(events)
     }
 
     pub fn is_socket(&self, handle: u32) -> bool {
@@ -474,19 +604,11 @@ impl LaunchChannels {
     }
 
     fn flags(&self, entry: PipeFd) -> u32 {
-        if entry.write {
-            self.pipes[entry.pipe].write_flags
-        } else {
-            self.pipes[entry.pipe].read_flags
-        }
+        entry.flags
     }
 
-    fn set_flags(&mut self, entry: PipeFd, flags: u32) {
-        if entry.write {
-            self.pipes[entry.pipe].write_flags = flags;
-        } else {
-            self.pipes[entry.pipe].read_flags = flags;
-        }
+    fn set_flags(&mut self, slot: usize, flags: u32) {
+        self.descriptors[slot].as_mut().unwrap().flags = flags;
     }
 
     fn close(&mut self, slot: usize) {
@@ -504,9 +626,13 @@ impl LaunchChannels {
                 object.head = 0;
                 return;
             }
-            self.close_direction(entry.pipe, entry.write);
+            if entry.readable() {
+                self.close_direction(entry.pipe, false);
+            }
             if let Some(peer) = entry.peer {
                 self.close_direction(peer, true);
+            } else if entry.writable() {
+                self.close_direction(entry.pipe, true);
             }
         }
     }
@@ -626,7 +752,7 @@ impl LaunchChannels {
             &vectors
         };
         let requested = vectors.length;
-        if entry.peer.is_none() && writing != entry.write {
+        if (writing && !entry.writable()) || (!writing && !entry.readable()) {
             return Err(-9);
         }
         if requested == 0 && entry.peer.is_none() {

@@ -343,6 +343,14 @@ build-launch-pipe-fixture:
 test-launch-pipes:
 	python3 scripts/test-launch-pipes.py $(GINUX) .artifacts/launch/launch-pipe-fixture
 
+.PHONY: build-launch-fifo-fixture test-launch-fifos
+build-launch-fifo-fixture:
+	mkdir -p .artifacts/launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fifo-fixture.c -o .artifacts/launch/launch-fifo-fixture
+
+test-launch-fifos:
+	python3 scripts/test-launch-fifos.py $(GINUX) .artifacts/launch/launch-fifo-fixture
+
 .PHONY: build-launch-fd-fixture test-launch-fds
 build-launch-fd-fixture:
 	mkdir -p .artifacts/launch

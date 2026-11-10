@@ -1473,6 +1473,7 @@ pub(crate) fn launch_semantic_operation(
         | 82..=88
         | 90..=94
         | 132
+        | 133
         | 258
         | 259
         | 260

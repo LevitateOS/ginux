@@ -73,8 +73,17 @@ zero-descriptor, zero-timeout native `pselect6` solely for Linux to deliver a
 pending signal and restore the original mask, including after the handler's
 `sigreturn`; no workload file descriptor is passed to the host. Exact contract
 denials still precede these effects. This supports ordinary parallel make's
-pipe jobserver. Named FIFO creation remains unsupported, so make uses its
-existing unnamed-pipe fallback.
+pipe and named FIFO jobservers.
+
+Configured `mknod`/`mknodat` create FIFOs in assigned writable storage, with
+normal umask, permissions, inode metadata, links, rename and unlink behavior.
+FIFO opens join the existing bounded channel owner: blocking readers and
+writers rendezvous, nonblocking writers without a reader return ENXIO, and
+`O_RDWR` opens both directions. Each open has independent status flags; aliases
+share them. `O_PATH` opens only an inode reference. Open endpoints retain their
+inode across unlink, and the final close discards buffered bytes. Export/restore
+preserves FIFO names and hardlinks, without saving live channels or their data.
+Character and block device creation remains denied.
 
 Configured `splice` validates the public descriptors and returns EINVAL for
 unsupported transfer endpoints without consuming input. Programs can use their

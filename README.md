@@ -632,6 +632,14 @@ flags, pipe-size queries and aliases across owners are supported.
 Alias status flags and endpoint lifetimes are shared; close-on-exec flags are
 per descriptor. No native pipe or host descriptor is given to the workload.
 
+Named FIFOs in assigned writable storage use the same channel buffers.
+`mknod`/`mknodat` accept FIFO creation, apply umask, and retain ordinary inode
+permissions and namespace operations. Blocking opens wait for the opposite
+endpoint; `O_NONBLOCK` and Linux `O_RDWR` behavior are supported. Separate opens
+have separate status flags. Unlinking a FIFO preserves existing endpoints;
+recreating its name creates a distinct channel. Export/restore preserves FIFO
+metadata and hardlinks, with no buffered data or open endpoints.
+
 Nonblocking empty/full operations return `EAGAIN`. Blocking operations stay
 stopped at entry until another task changes pipe state. Forked peers can exchange
 data and wake blocked reads/writes; a self-pipe without a runnable peer still

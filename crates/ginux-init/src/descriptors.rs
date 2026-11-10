@@ -21,6 +21,8 @@ const PATH_ONLY: u64 = 0o10000000;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Handle {
     Reserved,
+    // A blocked FIFO open owns the number, but exposes no public descriptor.
+    OpeningFifo(u32),
     Native { fd: u32, console: bool },
     Owned(u32),
 }
@@ -102,6 +104,22 @@ pub struct Backends<'a> {
     pub refs: &'a mut ObjectReferences,
 }
 impl Backends<'_> {
+    fn fifo_endpoint(&mut self, reference: u32, flags: u64) -> Result<u32, i64> {
+        let opened = self
+            .filesystem
+            .fifo_identity(reference)
+            .and_then(|inode| self.channels.open_fifo(inode, reference, flags as u32));
+        if opened.is_err() {
+            let mut close = empty_regs();
+            close.orig_rax = 3;
+            close.rdi = reference as u64;
+            if self.filesystem.claim(0, &close) != Some(0) {
+                return Err(-5);
+            }
+        }
+        opened
+    }
+
     fn readiness(&mut self, handle: u32) -> Option<u16> {
         self.channels
             .readiness(handle)
@@ -154,6 +172,22 @@ impl Backends<'_> {
         r: &UserRegs,
         progress: &mut crate::channel_hooks::WriteProgress,
     ) -> NativeDecision {
+        if let Some(reference) = self.channels.fifo_reference(r.rdi as u32) {
+            if r.orig_rax == 3 {
+                self.channels.release(r.rdi as u32);
+                let mut close = *r;
+                close.rdi = reference as u64;
+                return ready(self.filesystem.claim(pid, &close).unwrap_or(-9));
+            }
+            if matches!(
+                r.orig_rax,
+                5 | 91 | 93 | 260 | 262 | 267 | 269 | 280 | 332 | 439 | 452
+            ) {
+                let mut metadata = *r;
+                metadata.rdi = reference as u64;
+                return ready(self.filesystem.claim(pid, &metadata).unwrap_or(-9));
+            }
+        }
         let counter = matches!(r.orig_rax, 0 | 1)
             && matches!(
                 self.channels.event(r.rdi as u32),
@@ -202,6 +236,9 @@ pub struct DescriptorTable {
 /// the descriptor table it uses.
 pub struct DescriptorCall {
     pending: Option<Pending>,
+    // A blocking FIFO open owns its endpoint before a public FD is returned.
+    // Keep it with the syscall so signals and task exit release both pins.
+    fifo_open: Option<(u32, usize)>,
     saved_args: Option<[u64; 7]>,
     pinned: Option<Descriptor>,
     poll_wait: bool,
@@ -226,6 +263,7 @@ impl DescriptorCall {
     pub const fn new() -> Self {
         Self {
             pending: None,
+            fifo_open: None,
             saved_args: None,
             pinned: None,
             poll_wait: false,
@@ -241,7 +279,20 @@ impl DescriptorCall {
     pub fn native_mutation(&self) -> bool {
         self.pending.is_some()
     }
-    pub fn reset(&mut self, backends: &mut Backends) -> Result<(), &'static [u8]> {
+    pub fn reset(
+        &mut self,
+        table: Option<&mut DescriptorTable>,
+        backends: &mut Backends,
+    ) -> Result<(), &'static [u8]> {
+        if let Some((handle, slot)) = self.fifo_open.take() {
+            let table = table.ok_or(b"FIFO reservation lost descriptor table".as_slice())?;
+            if !table.entries[slot].is_some_and(|entry| entry.handle == Handle::OpeningFifo(handle))
+            {
+                return Err(b"FIFO reservation lost descriptor slot");
+            }
+            table.entries[slot] = None;
+            backends.release(handle)?;
+        }
         if let Some(Descriptor {
             handle: Handle::Owned(handle),
             ..
@@ -402,8 +453,8 @@ impl DescriptorCall {
             r.orig_rax = args[6];
             changed = true;
         }
-        if self.pinned.is_some() {
-            self.reset(backends)?;
+        if self.pinned.is_some() || self.fifo_open.is_some() {
+            self.reset(Some(table), backends)?;
             changed = true;
         }
         Ok(changed)
@@ -461,13 +512,18 @@ impl DescriptorTable {
         {
             return Err(b"cannot inherit unfinished descriptor syscall");
         }
-        for entry in self.entries.iter().flatten() {
-            if let Handle::Owned(handle) = entry.handle {
-                refs.retain(handle);
+        let mut entries = self.entries;
+        for slot in &mut entries {
+            match slot.map(|entry| entry.handle) {
+                Some(Handle::Owned(handle)) => refs.retain(handle),
+                // Linux fork copies installed descriptors, not another
+                // thread's reserved number while its open is still blocked.
+                Some(Handle::OpeningFifo(_)) => *slot = None,
+                _ => {}
             }
         }
         Ok(Self {
-            entries: self.entries,
+            entries,
             capacity: self.capacity,
         })
     }
@@ -537,6 +593,7 @@ impl DescriptorTable {
         pid: usize,
         path: &[u8],
         filesystem: &LaunchFs,
+        channels: &LaunchChannels,
     ) -> Option<Result<ginux_instance::Text<{ ginux_vfs::MAX_PATH }>, i64>> {
         let digits = path.strip_prefix(b"/proc/self/fd/")?;
         Some((|| {
@@ -559,6 +616,10 @@ impl DescriptorTable {
                 Handle::Owned(handle) if (1048576..1048640).contains(&handle) => {
                     filesystem.descriptor_path(handle)
                 }
+                Handle::Owned(handle) => channels
+                    .fifo_reference(handle)
+                    .ok_or(-2)
+                    .and_then(|reference| filesystem.descriptor_path(reference)),
                 _ => Err(-2),
             }
         })())
@@ -573,7 +634,7 @@ impl DescriptorTable {
             .entries
             .iter()
             .flatten()
-            .any(|d| d.handle == Handle::Reserved)
+            .any(|d| matches!(d.handle, Handle::Reserved | Handle::OpeningFifo(_)))
         {
             return Err(b"exec overlapped unfinished descriptor syscall");
         }
@@ -613,7 +674,7 @@ impl DescriptorTable {
             .get(fd as usize)
             .copied()
             .flatten()
-            .filter(|d| d.handle != Handle::Reserved)
+            .filter(|d| !matches!(d.handle, Handle::Reserved | Handle::OpeningFifo(_)))
             .ok_or(-9)
     }
 
@@ -778,7 +839,7 @@ impl DescriptorTable {
                     backends.claim(pid, r)
                 })
             }
-            258 | 260 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 | 452 => {
+            258 | 259 | 260 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 | 452 => {
                 call.save(r);
                 self.path_descriptor(pid, r, backends)
             }
@@ -869,7 +930,7 @@ impl DescriptorTable {
             Handle::Native { fd, .. } if path.is_empty() => Ok(fd as u64),
             Handle::Owned(_) => Err(-20),
             Handle::Native { fd, .. } => Ok(crate::launch_storage::IMAGE_DIR_BASE + fd as u64),
-            Handle::Reserved => Err(-9),
+            Handle::Reserved | Handle::OpeningFifo(_) => Err(-9),
         }
     }
 
@@ -892,6 +953,21 @@ impl DescriptorTable {
         call: &mut DescriptorCall,
     ) -> Result<NativeDecision, i64> {
         let flags = if r.orig_rax == 2 { r.rsi } else { r.rdx };
+        if let Some((handle, slot)) = call.fifo_open {
+            if !backends.channels.fifo_open_ready(handle) {
+                return Ok(NativeDecision::Park {
+                    fd: slot as u32,
+                    progressed: false,
+                });
+            }
+            if !self.entries[slot].is_some_and(|entry| entry.handle == Handle::OpeningFifo(handle))
+            {
+                return Err(-5);
+            }
+            call.fifo_open = None;
+            self.entries[slot].as_mut().unwrap().handle = Handle::Owned(handle);
+            return Ok(ready(slot as i64));
+        }
         if flags & PATH_ONLY != 0
             && flags & !(PATH_ONLY | CLOEXEC | 0o100000 | 0o400 | 0o200000) != 0
         {
@@ -918,15 +994,34 @@ impl DescriptorTable {
                 .map(ready)
         } else if let Some(decision) = self.open_descriptor_path(pid, r, backends) {
             decision
-        } else if r.orig_rax == 257 {
-            self.path_descriptor(pid, r, backends)
         } else {
-            Ok(backends.claim(pid, r))
+            (|| {
+                if r.orig_rax == 257 {
+                    r.rdi = self.path_handle(pid, r.rdi, r.rsi)?;
+                }
+                let Some(reference) = backends.filesystem.open_fifo(pid, r)? else {
+                    return Ok(backends.claim(pid, r));
+                };
+                backends
+                    .fifo_endpoint(reference, flags & !CLOEXEC)
+                    .map(|handle| ready(handle as i64))
+            })()
         };
         match decision {
             Ok(NativeDecision::Hooked { lane, result }) => {
                 if result >= 0 {
                     backends.refs.retain(result as u32);
+                    if backends.channels.fifo_reference(result as u32).is_some()
+                        && !backends.channels.fifo_open_ready(result as u32)
+                    {
+                        self.entries[slot].as_mut().unwrap().handle =
+                            Handle::OpeningFifo(result as u32);
+                        call.fifo_open = Some((result as u32, slot));
+                        return Ok(NativeDecision::Park {
+                            fd: slot as u32,
+                            progressed: true,
+                        });
+                    }
                     self.entries[slot].as_mut().unwrap().handle = Handle::Owned(result as u32);
                 } else {
                     self.entries[slot] = None;
@@ -986,16 +1081,37 @@ impl DescriptorTable {
             if entry.path_flags != 0 {
                 return Err(-9);
             }
+            let flags = if r.orig_rax == 2 { r.rsi } else { r.rdx };
+            if let Handle::Owned(handle) = entry.handle {
+                if let Some(reference) = backends.channels.fifo_reference(handle) {
+                    if end != suffix.len() {
+                        return Err(-20);
+                    }
+                    let reference = backends.filesystem.clone_fifo_reference(reference, flags)?;
+                    return if flags & PATH_ONLY != 0 {
+                        Ok(ready(reference as i64))
+                    } else {
+                        backends
+                            .fifo_endpoint(reference, flags)
+                            .map(|handle| ready(handle as i64))
+                    };
+                }
+            }
             let handle = match entry.handle {
                 Handle::Owned(handle) if (1048576..1048640).contains(&handle) => handle,
                 _ => return Err(-95),
             };
-            let flags = if r.orig_rax == 2 { r.rsi } else { r.rdx };
             let tail = &suffix[end..];
             let handle = backends
                 .filesystem
                 .open_descriptor(pid, handle, tail, flags)?;
-            Ok(ready(handle))
+            if flags & PATH_ONLY == 0 && backends.filesystem.fifo_identity(handle as u32).is_ok() {
+                backends
+                    .fifo_endpoint(handle as u32, flags)
+                    .map(|handle| ready(handle as i64))
+            } else {
+                Ok(ready(handle))
+            }
         })())
     }
 
@@ -1130,7 +1246,7 @@ impl DescriptorTable {
                 r.rdi = fd as u64;
             }
             Handle::Owned(handle) => r.rdi = handle as u64,
-            Handle::Reserved => return Err(-9),
+            Handle::Reserved | Handle::OpeningFifo(_) => return Err(-9),
         }
         let decision = match backends.claim_with_write(pid, signal_tgid, r, &mut call.channel_write)
         {
@@ -1214,7 +1330,7 @@ impl DescriptorTable {
                     _ => Err(-5),
                 }
             }
-            Handle::Reserved => Err(-9),
+            Handle::Reserved | Handle::OpeningFifo(_) => Err(-9),
         }
     }
 
@@ -1245,7 +1361,9 @@ impl DescriptorTable {
             }
             _ => return Err(-22),
         };
-        if self.entries[target].is_some_and(|entry| entry.handle == Handle::Reserved) {
+        if self.entries[target]
+            .is_some_and(|entry| matches!(entry.handle, Handle::Reserved | Handle::OpeningFifo(_)))
+        {
             return Err(-16);
         }
         entry.cloexec = cloexec;
@@ -1522,7 +1640,7 @@ impl DescriptorTable {
                     external = true;
                 }
                 Handle::Native { .. } => return Err(-95),
-                Handle::Reserved => return Err(-9),
+                Handle::Reserved | Handle::OpeningFifo(_) => return Err(-9),
             }
         }
         let result = unsafe { syscall3(7, consoles.as_mut_ptr() as usize, count, 0) };

@@ -203,8 +203,10 @@ fn path_call(syscall: u64) -> bool {
             | 90
             | 92
             | 94
+            | 133
             | 257
             | 258
+            | 259
             | 260
             | 262
             | 263
@@ -1437,6 +1439,7 @@ impl Supervisor<'_> {
                         host,
                         path.as_bytes(),
                         self.objects.filesystem,
+                        self.objects.channels,
                     ) {
                         let result = name
                             .and_then(|name| {
@@ -2825,12 +2828,10 @@ impl Supervisor<'_> {
         }
         self.task_mut(index).wait_status = Some(status);
         self.task_mut(index).blocked = None;
-        if let Err(reason) = self.tasks[index]
-            .as_mut()
-            .unwrap()
-            .call
-            .reset(&mut self.objects)
-        {
+        if let Err(reason) = self.tasks[index].as_mut().unwrap().call.reset(
+            Some(&mut self.groups[group].as_mut().unwrap().table),
+            &mut self.objects,
+        ) {
             self.fail(instance, reason);
         }
         if id == self.groups[group].as_ref().unwrap().leader {
@@ -2905,7 +2906,12 @@ impl Supervisor<'_> {
             }
         }
         for task in self.tasks.iter_mut().flatten() {
-            if let Err(reason) = task.call.reset(&mut self.objects) {
+            if let Err(reason) = task.call.reset(
+                self.groups[task.group]
+                    .as_mut()
+                    .map(|group| &mut group.table),
+                &mut self.objects,
+            ) {
                 supervision_error(instance, reason);
             }
         }

@@ -222,6 +222,7 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
             b'5' => NodeKind::Directory,
             b'0' | 0 | b'1' => NodeKind::File,
             b'2' => NodeKind::Symlink,
+            b'6' => NodeKind::Fifo,
             _ => return Err(b"unsupported restore entry kind"),
         };
         let directory = kind == NodeKind::Directory;

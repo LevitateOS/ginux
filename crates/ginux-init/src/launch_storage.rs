@@ -17,6 +17,17 @@ pub const FD_BASE: usize = 1 << 20;
 // Internal tag for a registered native image directory, never a public FD.
 pub const IMAGE_DIR_BASE: u64 = 0x0800_0000;
 const IO_SIZE: usize = 4096;
+const OPEN_FLAGS: u64 = 3
+    | 0o100
+    | 0o200
+    | 0o400
+    | 0o1000
+    | 0o2000
+    | 0o4000
+    | 0o100000
+    | 0o200000
+    | 0o400000
+    | 0o2000000;
 type Path = Text<MAX_PATH>;
 type ExecutableName = Text<{ MAX_PATH + 10 }>;
 type MemoryFs =
@@ -266,8 +277,11 @@ impl LaunchFs {
         if slot >= 64 {
             return None;
         }
-        // This owner contains only regular memory files and directories.
-        self.fs.fstat(slot as i32 + 3).ok().map(|_| 0x145)
+        self.fs
+            .fstat(slot as i32 + 3)
+            .ok()
+            .filter(|metadata| metadata.kind != NodeKind::Fifo)
+            .map(|_| 0x145)
     }
 
     pub fn byte_limit(&self) -> u64 {
@@ -364,7 +378,7 @@ impl LaunchFs {
                 .overlay_entry(slot)
                 .ok_or(b"restore hardlink target missing".as_slice())?;
             if !seen[slot]
-                || metadata.kind != NodeKind::File
+                || !matches!(metadata.kind, NodeKind::File | NodeKind::Fifo)
                 || metadata.mode != mode
                 || metadata.modified.seconds != modified as i64
                 || !self.owns_path(target)
@@ -374,6 +388,10 @@ impl LaunchFs {
             self.fs
                 .hard_link(target, path, false)
                 .map_err(|_| b"restore hardlink creation failed".as_slice())?;
+        } else if kind == NodeKind::Fifo {
+            self.fs
+                .mkfifo(path, mode)
+                .map_err(|_| b"restore FIFO creation failed".as_slice())?;
         } else if kind == NodeKind::Symlink {
             self.fs
                 .symlink(link, path)
@@ -449,11 +467,13 @@ impl LaunchFs {
     ) -> Result<(), &'static [u8]> {
         for slot in 0..self.fs.namespace_capacity() {
             if let Some((path, metadata)) = self.fs.overlay_entry(slot) {
-                let prior = if metadata.kind == NodeKind::File && metadata.links > 1 {
+                let prior = if matches!(metadata.kind, NodeKind::File | NodeKind::Fifo)
+                    && metadata.links > 1
+                {
                     (0..slot)
                         .filter_map(|slot| self.fs.overlay_entry(slot))
                         .find(|(_, prior)| {
-                            prior.kind == NodeKind::File && prior.inode == metadata.inode
+                            prior.kind == metadata.kind && prior.inode == metadata.inode
                         })
                         .map(|(path, _)| path)
                 } else {
@@ -685,10 +705,10 @@ impl LaunchFs {
             322 => (1, r.rsi, r.rdi, r.r8 & 0x100 == 0, false),
             4 | 21 | 90 | 92 => (0, r.rdi, (-100i64) as u64, true, false),
             6 | 84 | 87 | 89 | 94 => (0, r.rdi, (-100i64) as u64, false, false),
-            83 => (0, r.rdi, (-100i64) as u64, false, true),
+            83 | 133 => (0, r.rdi, (-100i64) as u64, false, true),
             88 => (1, r.rsi, (-100i64) as u64, false, true),
             266 => (2, r.rdx, r.rsi, false, true),
-            258 => (1, r.rsi, r.rdi, false, true),
+            258 | 259 => (1, r.rsi, r.rdi, false, true),
             260 if r.r8 & !0x1100 != 0 => return Err(-22),
             260 => (1, r.rsi, r.rdi, r.r8 & 0x100 == 0, false),
             262 | 280 => (1, r.rsi, r.rdi, r.r10 & 0x100 == 0, false),
@@ -709,7 +729,7 @@ impl LaunchFs {
         if (r.orig_rax == 84 || r.orig_rax == 263 && r.rdx == 0x200) && dot_entry(path.as_bytes()) {
             return Err(-22);
         }
-        if matches!(r.orig_rax, 88 | 266) && path.as_bytes().ends_with(b"/") {
+        if matches!(r.orig_rax, 88 | 133 | 259 | 266) && path.as_bytes().ends_with(b"/") {
             return Err(-2);
         }
         let path = if matches!(r.orig_rax, 83 | 84 | 87 | 258 | 263) {
@@ -1115,6 +1135,13 @@ impl LaunchFs {
 
     /// Configured-launch dispatch only; demo paths keep their existing contract.
     pub fn claim(&mut self, pid: usize, r: &UserRegs) -> Option<i64> {
+        if matches!(r.orig_rax, 133 | 259) {
+            let mode = if r.orig_rax == 133 { r.rsi } else { r.rdx };
+            if mode & 0o170000 != 0o10000 {
+                // Device nodes and other mknod types grant no native authority.
+                return Some(-1);
+            }
+        }
         if r.orig_rax == 452 && r.r10 & !0x1100 != 0 {
             return Some(-22);
         }
@@ -1249,6 +1276,16 @@ impl LaunchFs {
                 path.as_bytes(),
                 if r.orig_rax == 83 { r.rsi } else { r.rdx } as u32,
             ),
+            133 | 259 => {
+                let mode = if r.orig_rax == 133 { r.rsi } else { r.rdx } as u32;
+                let now = realtime();
+                now.and_then(|now| {
+                    self.fs
+                        .mkfifo(path.as_bytes(), mode & 0o777 & !self.creation_mask)
+                        .map_err(errno)?;
+                    self.created(path.as_bytes(), now)
+                })
+            }
             87 => self.fs.unlink(path.as_bytes()).map(|_| 0).map_err(errno),
             84 => self.remove_directory(path.as_bytes()),
             263 => {
@@ -1355,23 +1392,85 @@ impl LaunchFs {
         Ok(FD_BASE as i64 + readonly as i64 - 3)
     }
 
+    /// Reserve the FIFO inode for a channel open. O_PATH references stay
+    /// with the ordinary descriptor owner and never join the channel.
+    pub fn open_fifo(&mut self, pid: usize, r: &UserRegs) -> Result<Option<u32>, i64> {
+        let flags = match r.orig_rax {
+            2 => r.rsi,
+            257 => r.rdx,
+            _ => return Ok(None),
+        };
+        if flags & 0o10000000 != 0 {
+            return Ok(None);
+        }
+        let Some((_, path)) = self.request_path(pid, r)? else {
+            return Ok(None);
+        };
+        if !self.owns_path(path.as_bytes())
+            || !self
+                .fs
+                .metadata_no_follow(path.as_bytes())
+                .is_ok_and(|metadata| metadata.kind == NodeKind::Fifo)
+        {
+            return Ok(None);
+        }
+        self.open(path.as_bytes(), flags, 0)
+            .map(|handle| Some(handle as u32))
+    }
+
+    pub fn fifo_identity(&self, handle: u32) -> Result<u64, i64> {
+        let slot = handle
+            .checked_sub(FD_BASE as u32)
+            .filter(|slot| *slot < 64)
+            .ok_or(-9)?;
+        let metadata = self.fs.fstat(slot as i32 + 3).map_err(errno)?;
+        if metadata.kind != NodeKind::Fifo {
+            return Err(-22);
+        }
+        Ok(metadata.inode)
+    }
+
+    /// A fresh channel open through /dev/fd retains the same inode even when
+    /// its last name was unlinked. The copied reference conveys metadata only.
+    pub fn clone_fifo_reference(&mut self, handle: u32, flags: u64) -> Result<u32, i64> {
+        let slot = handle
+            .checked_sub(FD_BASE as u32)
+            .filter(|slot| *slot < 64)
+            .ok_or(-9)?;
+        let fd = slot as i32 + 3;
+        let metadata = self.fs.fstat(fd).map_err(errno)?;
+        if metadata.kind != NodeKind::Fifo {
+            return Err(-22);
+        }
+        let ordinary = flags & !0o10000000;
+        if ordinary & !OPEN_FLAGS != 0 || ordinary & 3 == 3 {
+            return Err(-95);
+        }
+        if ordinary & (0o200000 | 0o100) == (0o200000 | 0o100) {
+            return Err(-22);
+        }
+        if ordinary & 0o200000 != 0 {
+            return Err(-20);
+        }
+        if ordinary & 0o300 == 0o300 {
+            return Err(-17);
+        }
+        fifo_access(metadata, flags)?;
+        let copied = self
+            .fs
+            .duplicate(fd, flags & 0o2000000 != 0)
+            .map_err(errno)?;
+        self.stack_snapshots[(copied - 3) as usize] = false;
+        Ok(FD_BASE as u32 + copied as u32 - 3)
+    }
+
     fn open(&mut self, path: &[u8], flags: u64, mode: u64) -> Result<i64, i64> {
         // Public descriptors retain O_PATH as an immutable metadata-only kind.
         // The VFS reference supplies stat/name/lifetime, never data authority.
+        let path_only = flags & 0o10000000 != 0;
         let flags = flags & !0o10000000;
         // Unsupported flag combinations never fall through to native storage.
-        const ALLOWED: u64 = 3
-            | 0o100
-            | 0o200
-            | 0o400
-            | 0o1000
-            | 0o2000
-            | 0o4000
-            | 0o100000
-            | 0o200000
-            | 0o400000
-            | 0o2000000;
-        if flags & !ALLOWED != 0 || flags & 3 == 3 {
+        if flags & !OPEN_FLAGS != 0 || flags & 3 == 3 {
             return Err(-95);
         }
         if flags & (0o200000 | 0o100) == (0o200000 | 0o100) {
@@ -1397,6 +1496,14 @@ impl LaunchFs {
         }
         if flags & 0o200000 != 0 {
             return Err(metadata.err().map(errno).unwrap_or(-20));
+        }
+        if metadata.is_ok_and(|metadata| metadata.kind == NodeKind::Fifo) {
+            let metadata = metadata.map_err(errno)?;
+            fifo_access(metadata, flags | if path_only { 0o10000000 } else { 0 })?;
+            let status = if flags & 0o2000000 != 0 { O_CLOEXEC } else { 0 };
+            let fd = self.fs.open_fifo_reference(path, status).map_err(errno)?;
+            self.stack_snapshots[(fd - 3) as usize] = false;
+            return Ok(FD_BASE as i64 + fd as i64 - 3);
         }
         let mut translated = match flags & 3 {
             0 => O_READ,
@@ -1997,6 +2104,7 @@ impl LaunchFs {
                 NodeKind::File => 8,
                 NodeKind::Directory => 4,
                 NodeKind::Symlink => 10,
+                NodeKind::Fifo => 1,
             };
             record[19..19 + entry.name.len()].copy_from_slice(entry.name);
             used += size;
@@ -2043,6 +2151,16 @@ fn preserve_owner(uid: u64, gid: u64) -> Result<i64, i64> {
     }
 }
 
+fn fifo_access(metadata: FileMetadata, flags: u64) -> Result<(), i64> {
+    if flags & 0o10000000 == 0
+        && ((flags & 3 != 1 && metadata.mode & 0o444 == 0)
+            || (flags & 3 != 0 && metadata.mode & 0o222 == 0))
+    {
+        return Err(-13);
+    }
+    Ok(())
+}
+
 fn access(metadata: FileMetadata, r: &UserRegs) -> Result<i64, i64> {
     let mode = if r.orig_rax == 21 { r.rsi } else { r.rdx };
     let flags = if r.orig_rax == 439 { r.r10 } else { 0 };
@@ -2086,6 +2204,7 @@ fn copy_metadata(
                 | match metadata.kind {
                     NodeKind::Directory => 0o40000,
                     NodeKind::Symlink => 0o120000,
+                    NodeKind::Fifo => 0o10000,
                     _ => 0o100000,
                 },
             size: metadata.size,

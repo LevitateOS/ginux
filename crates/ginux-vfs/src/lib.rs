@@ -25,6 +25,7 @@ pub enum NodeKind {
     File = 1,
     Directory = 2,
     Symlink = 3,
+    Fifo = 4,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -207,6 +208,7 @@ fn decode_record(bytes: &[u8]) -> Result<Entry<'_>, VfsError> {
         1 => NodeKind::File,
         2 => NodeKind::Directory,
         3 => NodeKind::Symlink,
+        4 => NodeKind::Fifo,
         _ => return Err(VfsError::InvalidIndex),
     };
     let link_len = read_u16(bytes, 32)? as usize;
@@ -459,6 +461,7 @@ enum Slot {
     Whiteout,
     Directory,
     Symlink,
+    Fifo,
     Link,
 }
 
@@ -467,6 +470,7 @@ pub struct OverlayFile {
     accessed: Timestamp,
     modified: Timestamp,
     state: Slot,
+    kind: NodeKind,
     path: Path,
     mode: u32,
     len: usize,
@@ -485,6 +489,7 @@ impl OverlayFile {
             accessed: Timestamp::ZERO,
             modified: Timestamp::ZERO,
             state: Slot::Free,
+            kind: NodeKind::File,
             path: Path::new(),
             mode: 0,
             len: 0,
@@ -694,7 +699,7 @@ impl<
     /// regular file, including write-only descriptions.
     pub fn descriptor_storage(&mut self, descriptor: i32) -> Result<(&mut S, usize), VfsError> {
         let fd = self.descriptors[self.descriptor(descriptor)?];
-        if !fd.overlay || fd.directory {
+        if !fd.overlay || self.overlay[fd.object].kind != NodeKind::File {
             return Err(VfsError::InvalidDescriptor);
         }
         Ok((&mut self.storage, fd.object))
@@ -703,7 +708,7 @@ impl<
     /// Readable regular-file backing for an adapter-owned mapping reference.
     pub fn readable_storage(&mut self, descriptor: i32) -> Result<(&mut S, usize), VfsError> {
         let fd = self.descriptors[self.descriptor(descriptor)?];
-        if !fd.overlay || fd.directory || !fd.readable {
+        if !fd.overlay || self.overlay[fd.object].kind != NodeKind::File || !fd.readable {
             return Err(VfsError::PermissionDenied);
         }
         Ok((&mut self.storage, fd.object))
@@ -741,6 +746,13 @@ impl<
                 Err(VfsError::NotFound) => {}
                 Err(error) => return Err(error),
             }
+        }
+        if self
+            .metadata_at(path.as_bytes())
+            .is_ok_and(|m| m.kind == NodeKind::Fifo)
+        {
+            // FIFO data belongs to the channel owner, never regular-file storage.
+            return Err(VfsError::InvalidArgument);
         }
         // Reserve capacity before any operation can create, copy up or truncate.
         let slot = self
@@ -883,6 +895,47 @@ impl<
         Ok(slot as i32 + 3)
     }
 
+    /// Pin a named FIFO inode for its channel owner without granting byte,
+    /// executable or mapping access to the filesystem backing.
+    pub fn open_fifo_reference(&mut self, path: &[u8], flags: u32) -> Result<i32, VfsError> {
+        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+            return Err(VfsError::InvalidArgument);
+        }
+        let path = self.resolved_path(path, true, false)?;
+        if self.metadata_at(path.as_bytes())?.kind != NodeKind::Fifo {
+            return Err(VfsError::InvalidArgument);
+        }
+        let slot = self
+            .descriptors
+            .iter()
+            .position(|fd| !fd.open)
+            .ok_or(VfsError::DescriptorLimit)?;
+        let description = (0..FDS)
+            .find(|description| {
+                !self
+                    .descriptors
+                    .iter()
+                    .any(|fd| fd.open && fd.description == *description)
+            })
+            .ok_or(VfsError::DescriptorLimit)?;
+        let entry = self
+            .find_overlay(path.as_bytes())
+            .ok_or(VfsError::ReadOnly)?;
+        self.descriptions[description] = Description::new(flags);
+        self.descriptors[slot] = Descriptor {
+            open: true,
+            overlay: true,
+            object: self.object(entry),
+            entry,
+            description,
+            readable: false,
+            writable: false,
+            close_on_exec: flags & O_CLOEXEC != 0,
+            directory: false,
+        };
+        Ok(slot as i32 + 3)
+    }
+
     /// Open a directory description. Enumeration cookies share this object
     /// through the launcher's aliases, just like ordinary file offsets.
     pub fn open_directory(&mut self, path: &[u8], flags: u32) -> Result<i32, VfsError> {
@@ -1017,7 +1070,7 @@ impl<
                 let entry = &self.overlay[object];
                 if !matches!(
                     entry.state,
-                    Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+                    Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
                 ) {
                     continue;
                 }
@@ -1025,11 +1078,7 @@ impl<
                     return Ok(Some(DirectoryEntry {
                         name,
                         inode: self.overlay_inode(self.object(object)),
-                        kind: match entry.state {
-                            Slot::Directory => NodeKind::Directory,
-                            Slot::Symlink => NodeKind::Symlink,
-                            _ => NodeKind::File,
-                        },
+                        kind: self.overlay[self.object(object)].kind,
                         next: ordinal as u64 + 3,
                     }));
                 }
@@ -1287,7 +1336,7 @@ impl<
 
     pub fn pin_executable_fd(&mut self, descriptor: i32) -> Result<Executable, VfsError> {
         let state = self.descriptors[self.descriptor(descriptor)?];
-        if !state.overlay || state.directory {
+        if !state.overlay || self.overlay[state.object].kind != NodeKind::File {
             return Err(VfsError::PermissionDenied);
         }
         self.pin_object(state.entry)
@@ -1447,7 +1496,7 @@ impl<
         let entry = self.overlay.get(slot)?;
         if !matches!(
             entry.state,
-            Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+            Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
         ) {
             return None;
         }
@@ -1466,6 +1515,9 @@ impl<
             return Err(VfsError::NotFound);
         }
         let object = self.object(slot);
+        if self.overlay[object].kind == NodeKind::Fifo {
+            return Err(VfsError::InvalidArgument);
+        }
         if offset
             .checked_add(output.len())
             .filter(|end| *end <= self.overlay[object].len)
@@ -1554,6 +1606,7 @@ impl<
             accessed: Timestamp::ZERO,
             modified: Timestamp::ZERO,
             state: Slot::Symlink,
+            kind: NodeKind::Symlink,
             path,
             mode: 0o777,
             len: target.len(),
@@ -1596,11 +1649,7 @@ impl<
             accessed: entry.accessed,
             modified: entry.modified,
             inode: self.overlay_inode(object),
-            kind: match self.overlay[slot].state {
-                Slot::Directory => NodeKind::Directory,
-                Slot::Symlink => NodeKind::Symlink,
-                _ => NodeKind::File,
-            },
+            kind: entry.kind,
             mode: entry.mode,
             size: entry.len as u64,
             links: self.link_count(object),
@@ -1615,7 +1664,7 @@ impl<
     ) -> Result<(), VfsError> {
         let source = self.resolved_path(source, follow, false)?;
         let metadata = self.metadata_no_follow(source.as_bytes())?;
-        if metadata.kind != NodeKind::File {
+        if !matches!(metadata.kind, NodeKind::File | NodeKind::Fifo) {
             return Err(VfsError::PermissionDenied);
         }
         let object = self
@@ -1694,11 +1743,7 @@ impl<
                 modified: file.modified,
                 links: self.link_count(state.object),
                 inode: self.overlay_inode(state.object),
-                kind: if state.directory {
-                    NodeKind::Directory
-                } else {
-                    NodeKind::File
-                },
+                kind: file.kind,
                 mode: file.mode,
                 size: file.len as u64,
             })
@@ -1726,6 +1771,26 @@ impl<
         self.require_parent(path.as_bytes())?;
         let slot = self.create_overlay(path, mode & 0o777)?;
         self.overlay[slot].state = Slot::Directory;
+        self.overlay[slot].kind = NodeKind::Directory;
+        Ok(())
+    }
+
+    /// Create a FIFO namespace object. Its live channel is owned by the
+    /// launcher and never represented by regular-file bytes.
+    pub fn mkfifo(&mut self, path: &[u8], mode: u32) -> Result<(), VfsError> {
+        if path.ends_with(b"/") {
+            return Err(VfsError::NotFound);
+        }
+        let path = self.namespace_path(path, true)?;
+        match self.metadata_at(path.as_bytes()) {
+            Ok(_) => return Err(VfsError::AlreadyExists),
+            Err(VfsError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        self.require_parent(path.as_bytes())?;
+        let slot = self.create_overlay(path, mode & 0o777)?;
+        self.overlay[slot].state = Slot::Fifo;
+        self.overlay[slot].kind = NodeKind::Fifo;
         Ok(())
     }
 
@@ -1733,7 +1798,7 @@ impl<
         if self.overlay.iter().any(|entry| {
             matches!(
                 entry.state,
-                Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+                Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
             ) && child_name(path, entry.path.as_bytes()).is_some()
         }) {
             return Ok(true);
@@ -1843,7 +1908,7 @@ impl<
         for entry in self.overlay.iter() {
             if matches!(
                 entry.state,
-                Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+                Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
             ) && beneath(entry.path.as_bytes(), source.as_bytes())
             {
                 let suffix = entry.path.len - source.len;
@@ -1862,7 +1927,7 @@ impl<
         for entry in self.overlay.iter_mut() {
             if matches!(
                 entry.state,
-                Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+                Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
             ) && beneath(entry.path.as_bytes(), source.as_bytes())
             {
                 let mut path = destination;
@@ -2037,7 +2102,7 @@ impl<
             .position(|entry| {
                 matches!(
                     entry.state,
-                    Slot::File | Slot::Directory | Slot::Symlink | Slot::Link
+                    Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
                 ) && entry.path.as_bytes() == path
             })
             .or_else(|| {
@@ -2189,7 +2254,7 @@ impl<
                         self.storage.read(slot, 0, &mut target[..entry.len])?;
                         Ok((NodeKind::Symlink, entry.len))
                     }
-                    _ => Ok((NodeKind::File, 0)),
+                    _ => Ok((self.overlay[self.object(slot)].kind, 0)),
                 };
             }
             let entry = self.index.lookup_exact(name)?;
@@ -3838,6 +3903,88 @@ mod tests {
     type TestFs<'a> = VirtualFs<'a, Reader, 4, 32, 4>;
     fn test_fs(bytes: &[u8]) -> TestFs<'_> {
         VirtualFs::new(Index::new(bytes).unwrap(), Reader(*b"BASETOOL"))
+    }
+
+    #[test]
+    fn fifo_names_aliases_and_directory_entries_share_the_inode() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        vfs.mkfifo(b"/fifo", 0o640).unwrap();
+        vfs.hard_link(b"/fifo", b"/alias", false).unwrap();
+        vfs.symlink(b"fifo", b"/link").unwrap();
+        let metadata = vfs.metadata(b"/fifo").unwrap();
+        assert_eq!(
+            (metadata.kind, metadata.mode, metadata.size, metadata.links),
+            (NodeKind::Fifo, 0o640, 0, 2)
+        );
+        assert_eq!(vfs.metadata(b"/alias"), Ok(metadata));
+        assert_eq!(vfs.metadata(b"/link"), Ok(metadata));
+        assert_eq!(vfs.mkfifo(b"/link", 0o600), Err(VfsError::AlreadyExists));
+        let directory = vfs.open_directory(b"/", 0).unwrap();
+        let mut cookie = 0;
+        let mut fifos = 0;
+        while let Some(entry) = vfs.directory_entry(directory, cookie).unwrap() {
+            if entry.kind == NodeKind::Fifo {
+                assert_eq!(entry.inode, metadata.inode);
+                fifos += 1;
+            }
+            cookie = entry.next;
+        }
+        assert_eq!(fifos, 2);
+        vfs.rename(b"/fifo", b"/moved", false).unwrap();
+        vfs.unlink(b"/moved").unwrap();
+        assert_eq!(vfs.metadata(b"/alias").unwrap().kind, NodeKind::Fifo);
+        assert_eq!(vfs.metadata(b"/alias").unwrap().links, 1);
+        let fd = vfs.open_fifo_reference(b"/alias", 0).unwrap();
+        assert_eq!(vfs.fstat(fd).unwrap().inode, metadata.inode);
+    }
+
+    #[test]
+    fn fifo_references_keep_unlinked_identity_and_metadata_without_byte_authority() {
+        let bytes = index_bytes();
+        let mut vfs = test_fs(&bytes);
+        vfs.mkfifo(b"/fifo", 0o777).unwrap();
+        let fd = vfs.open_fifo_reference(b"/fifo", 0).unwrap();
+        let old_inode = vfs.fstat(fd).unwrap().inode;
+        assert_eq!(
+            vfs.open(b"/fifo", O_READ | O_WRITE),
+            Err(VfsError::InvalidArgument)
+        );
+        assert_eq!(vfs.read(fd, &mut [0]), Err(VfsError::PermissionDenied));
+        assert_eq!(vfs.write(fd, b"x"), Err(VfsError::PermissionDenied));
+        assert_eq!(vfs.truncate(fd, 1), Err(VfsError::InvalidArgument));
+        assert!(matches!(
+            vfs.descriptor_storage(fd),
+            Err(VfsError::InvalidDescriptor)
+        ));
+        assert!(matches!(
+            vfs.readable_storage(fd),
+            Err(VfsError::PermissionDenied)
+        ));
+        assert!(matches!(
+            vfs.pin_executable_fd(fd),
+            Err(VfsError::PermissionDenied)
+        ));
+        vfs.unlink(b"/fifo").unwrap();
+        vfs.mkfifo(b"/fifo", 0o600).unwrap();
+        let new_inode = vfs.metadata(b"/fifo").unwrap().inode;
+        assert_ne!(new_inode, old_inode);
+        vfs.fchmod(fd, 0o644).unwrap();
+        let old = vfs.fstat(fd).unwrap();
+        assert_eq!(
+            (old.inode, old.kind, old.links, old.mode),
+            (old_inode, NodeKind::Fifo, 0, 0o644)
+        );
+        assert_eq!(vfs.metadata(b"/fifo").unwrap().mode, 0o600);
+        assert_eq!(vfs.overlay_bytes(), 0);
+        let copied = vfs.duplicate(fd, false).unwrap();
+        vfs.close(fd).unwrap();
+        assert_eq!(vfs.fstat(copied), Ok(old));
+        assert!(matches!(
+            vfs.readable_storage(copied),
+            Err(VfsError::PermissionDenied)
+        ));
+        vfs.close(copied).unwrap();
     }
 
     #[test]
