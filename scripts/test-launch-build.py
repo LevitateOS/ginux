@@ -2,7 +2,8 @@
 """Build ncurses and htop using supplied sources and a compiler rootfs archive.
 
 This test downloads nothing and never invokes a package manager. The root must
-contain a C compiler, development headers, make, and ordinary shell build tools.
+contain a C compiler, development headers, make, cmp, pkg-config, and ordinary
+shell build tools.
 All source/build/install files live in the launcher's assigned memory storage.
 """
 import copy
@@ -34,7 +35,7 @@ report_failure() {
     exit "$status"
 }
 trap report_failure EXIT
-for tool in sh gcc make install sed awk grep; do command -v "$tool"; done
+for tool in sh gcc make install sed awk grep cmp pkg-config; do command -v "$tool"; done
 cd /work/ncurses
 ./configure --prefix=/usr --enable-widec --with-normal --without-shared \
     --without-debug --without-cxx --without-cxx-binding --without-ada \
@@ -164,8 +165,13 @@ def main():
     stdout = (output/'stdout.log').read_text(errors='replace')
     assert 'htop ' in stdout and 'GINUX HTOP BUILD: PASS' in stdout, 'missing htop execution evidence'
     assert 'checking for uid_t in sys/types.h... yes' in stdout, 'uid_t configure probe failed'
-    assert 'here-document at line' not in (output/'stderr.log').read_text(errors='replace'), \
+    stderr = (output/'stderr.log').read_text(errors='replace')
+    assert 'here-document at line' not in stderr, \
         'generated configure script lost a here-document'
+    assert 'jobserver mkfifo' not in stderr and '--jobserver-style=pipe' not in stderr, \
+        'make could not use its named FIFO jobserver'
+    assert not re.search(r'(?:cmp|pkg-config): (?:command )?not found', stdout + stderr), \
+        'build image is missing a required tool'
     assert manifest['completion']['outcome'] == 'exited' and manifest['completion']['code'] == 0
     (output/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
     print('test-launch-build: PASS (configure, parallel make, make install, installed htop execution)')
