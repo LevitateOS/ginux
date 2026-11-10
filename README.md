@@ -722,6 +722,20 @@ make build-launch-thread-fixture
 sudo make test-launch-threads
 ```
 
+The source-build check uses an existing compiler rootfs and local ncurses/htop
+release archives. It runs configure, parallel make and make install in assigned
+storage, then executes the installed htop. It downloads nothing; the rootfs must
+contain the C toolchain, development headers and standard shell build tools.
+
+```sh
+sudo python3 scripts/test-launch-build.py \
+  target/x86_64-unknown-linux-gnu/release/ginux \
+  compiler-rootfs.tar ncurses.tar.gz htop.tar.xz .artifacts/htop-build
+```
+
+Use a fresh output directory. It retains build logs, source/binary checksums,
+the completion result and an archive of the source, build and installed files.
+
 ## Native process scenarios
 
 The separate `process-native <config> <executable>` command exercises native
