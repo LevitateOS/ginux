@@ -82,6 +82,39 @@ long signal_main(word *stack)
         if (restart) { CHECK(result==1 && byte=='x',23); }
         else { CHECK(result==-4 && DO(0,wake_pipe[0],&byte,1)==1 && byte=='x',24); }
         CHECK(call(61,child,(word)&status,0,0,0,0)==child && status==0,25);
+    } else if (same(mode,"pending-pselect") || same(mode,"pending-zero-pselect") || same(mode,"ready-pselect")) {
+        word original=1UL<<(17-1), temporary=0, current=0, read[4]={1UL<<wake_pipe[0]};
+        word mask_argument[2]={(word)&temporary,8};
+        long zero[2]={0,0};
+        CHECK(install(17,0x10000000UL)==0,140);
+        CHECK(call(14,0,(word)&original,0,8,0,0)==0,141);
+        long child=fork_();CHECK(child>=0,142);
+        if(child==0)return 0;
+        CHECK(call(61,child,(word)&status,0,0,0,0)==child && status==0 && handled==0,143);
+        if(same(mode,"ready-pselect")) {
+            CHECK(DO(1,wake_pipe[1],"R",1)==1,144);
+            CHECK(call(270,64,(word)read,0,0,(word)zero,(word)mask_argument)==1 && handled==0,145);
+            CHECK(call(14,2,0,(word)&current,8,0,0)==0 && current==original,146);
+            CHECK(DO(0,wake_pipe[0],&byte,1)==1 && byte=='R',147);
+        }
+        CHECK(call(270,0,0,0,0,same(mode,"pending-pselect")?0:(word)zero,(word)mask_argument)==-4,148);
+        CHECK(handled==1 && handled_signal==17,149);
+        CHECK(call(14,2,0,(word)&current,8,0,0)==0 && current==original,150);
+        CHECK(DO(0,wake_pipe[0],&byte,1)==1 && byte=='x',151);
+    } else if (same(mode,"park-pselect") || same(mode,"park-pselect-timed")) {
+        int timed=same(mode,"park-pselect-timed");
+        long timeout[2]={1,0};
+        word original=1UL<<(17-1), temporary=0, current=0, read[4]={1UL<<wake_pipe[0]};
+        word mask_argument[2]={(word)&temporary,8};
+        CHECK(install(17,0x10000000UL)==0,130);
+        CHECK(call(14,0,(word)&original,0,8,0,0)==0,131);
+        long child=released_child();CHECK(child>0,132);
+        CHECK(call(270,64,(word)read,0,0,timed?(word)timeout:0,(word)mask_argument)==-4,133);
+        CHECK(!timed || (timeout[0]==0 && timeout[1]>0 && timeout[1]<1000000000),138);
+        CHECK(handled==1 && handled_signal==17,134);
+        CHECK(call(14,2,0,(word)&current,8,0,0)==0 && current==original,135);
+        CHECK(DO(0,wake_pipe[0],&byte,1)==1 && byte=='x',136);
+        CHECK(call(61,child,(word)&status,0,0,0,0)==child && status==0,137);
     } else if (same(mode,"park-poll")) {
         struct poll_fd item={wake_pipe[0],1,0};
         CHECK(install(17,0x10000000UL)==0,30);

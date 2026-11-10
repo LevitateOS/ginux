@@ -39,6 +39,8 @@ pub enum NativeDecision {
     Park { fd: u32, progressed: bool },
     /// A public-descriptor query waits for object readiness or a deadline.
     ParkPoll,
+    /// Kernel signal-mask arbitration with zero FDs and a zero timeout.
+    SignalWait { retry: bool },
     /// A lane hook claimed the entry; emulate it with this result.
     Hooked { lane: Lane, result: i64 },
     /// No hook claimed the entry; apply the shared contract decision.

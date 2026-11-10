@@ -908,7 +908,9 @@ impl Supervisor<'_> {
         let (Some(original), Some(restart)) = (task.blocked, task.interruptible) else {
             return;
         };
-        if task.reaps_seen == reaps {
+        // pselect arbitrates its snapshotted temporary mask in its descriptor
+        // owner and the kernel's zero-FD completion call.
+        if original.orig_rax == 270 || task.reaps_seen == reaps {
             return;
         }
         task.reaps_seen = reaps;
@@ -1854,6 +1856,24 @@ impl Supervisor<'_> {
             decision => decision,
         };
         match decision {
+            NativeDecision::SignalWait { retry } => {
+                // Only the native completion borrows scratch; parked readiness
+                // queries must not acquire/release a guard and wake themselves.
+                self.begin_argument_guard(index, instance);
+                let host = self.task(index).host;
+                match self
+                    .task_mut(index)
+                    .call
+                    .prepare_signal_wait(host, r, retry)
+                {
+                    Ok(()) => {
+                        audit_write(b"mediate surface=pselect-signal-mask\n");
+                        self.run(index, r, instance);
+                    }
+                    Err(-5) => self.fail(instance, b"pselect scratch rollback failed"),
+                    Err(error) => self.emulate(index, r, error, instance),
+                }
+            }
             NativeDecision::ParkPoll => {
                 self.park(
                     index,
@@ -2332,6 +2352,15 @@ impl Supervisor<'_> {
         self.resume(parent, 0, instance);
     }
     fn syscall_exit(&mut self, index: usize, r: &mut UserRegs, instance: &mut Instance) {
+        let host = self.task(index).host;
+        match self.task_mut(index).call.finish_signal_wait(host, r) {
+            Ok(true) => {
+                self.run(index, r, instance);
+                return;
+            }
+            Ok(false) => {}
+            Err(reason) => self.fail(instance, reason),
+        }
         if let Some(unpark) = self.task(index).unpark {
             if unpark.replaying {
                 self.fail(instance, b"interrupted park exited before its replay");

@@ -208,7 +208,18 @@ pub struct DescriptorCall {
     poll_tick: bool,
     poll_deadline: Option<u64>,
     poll_input: [u8; 128],
+    wait_signal_mask: Option<u64>,
+    signal_wait: Option<SignalWait>,
     channel_write: crate::channel_hooks::WriteProgress,
+}
+
+/// A bounded native pselect only arbitrates signal delivery, never file IO.
+/// Its zero timeout and optional mask are snapshotted in stopped-task scratch.
+struct SignalWait {
+    address: u64,
+    saved: [u8; 40],
+    original: UserRegs,
+    retry: bool,
 }
 
 impl DescriptorCall {
@@ -221,6 +232,8 @@ impl DescriptorCall {
             poll_tick: false,
             poll_deadline: None,
             poll_input: [0; 128],
+            wait_signal_mask: None,
+            signal_wait: None,
             channel_write: crate::channel_hooks::WriteProgress::new(),
         }
     }
@@ -244,6 +257,88 @@ impl DescriptorCall {
         self.poll_tick
     }
 
+    pub fn prepare_signal_wait(
+        &mut self,
+        pid: usize,
+        r: &mut UserRegs,
+        retry: bool,
+    ) -> Result<(), i64> {
+        if retry {
+            let mut instruction = [0u8; 2];
+            if r.rip < 2
+                || copy_memory(pid, r.rip - 2, &mut instruction, false) != Ok(2)
+                || instruction != [0x0f, 0x05]
+            {
+                return Err(-95);
+            }
+        }
+        // The supervisor's argument guard stops peers while these bytes are
+        // borrowed. Native pselect sees no FD and cannot access a host object.
+        let address = r.rsp.checked_sub(128).ok_or(-14)?;
+        let mut saved = [0u8; 40];
+        if copy_memory(pid, address, &mut saved, false)? != 40 {
+            return Err(-14);
+        }
+        let mut bytes = [0u8; 40]; // zero timespec, then mask and its wrapper
+        if let Some(mask) = self.wait_signal_mask {
+            bytes[16..24].copy_from_slice(&mask.to_ne_bytes());
+            bytes[24..32].copy_from_slice(&(address + 16).to_ne_bytes());
+            bytes[32..40].copy_from_slice(&8u64.to_ne_bytes());
+        }
+        let written = copy_memory(pid, address, &mut bytes, true)? as usize;
+        if written != bytes.len() {
+            if copy_memory(pid, address, &mut saved[..written], true) != Ok(written as i64) {
+                return Err(-5);
+            }
+            return Err(-14);
+        }
+        self.signal_wait = Some(SignalWait {
+            address,
+            saved,
+            original: *r,
+            retry,
+        });
+        r.rdi = 0;
+        r.rsi = 0;
+        r.rdx = 0;
+        r.r10 = 0;
+        r.r8 = address;
+        r.r9 = if self.wait_signal_mask.is_some() {
+            address + 24
+        } else {
+            0
+        };
+        Ok(())
+    }
+
+    /// Complete a zero-FD native pselect. Linux owns signal-frame mask
+    /// restoration; only our argument scratch and public registers are restored.
+    /// A signal that became ignored before delivery retries the owned wait.
+    pub fn finish_signal_wait(
+        &mut self,
+        pid: usize,
+        r: &mut UserRegs,
+    ) -> Result<bool, &'static [u8]> {
+        let Some(mut wait) = self.signal_wait.take() else {
+            return Ok(false);
+        };
+        if copy_memory(pid, wait.address, &mut wait.saved, true) != Ok(wait.saved.len() as i64) {
+            return Err(b"pselect scratch restoration failed");
+        }
+        let result = r.rax as i64;
+        *r = wait.original;
+        let retry = wait.retry && result == 0;
+        r.rax = result as u64;
+        if retry {
+            r.rip = r
+                .rip
+                .checked_sub(2)
+                .ok_or(b"pselect replay instruction missing".as_slice())?;
+            r.rax = r.orig_rax;
+        }
+        Ok(retry)
+    }
+
     /// Bytes a parked blocking write already published. A signal handler
     /// ends that write with this count rather than a restart, as Linux does.
     pub fn interrupted_result(&self) -> Option<i64> {
@@ -255,14 +350,15 @@ impl DescriptorCall {
         self.saved_args = Some([r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9, r.orig_rax]);
     }
 
-    /// Called at the matching syscall exit, including emulated exits. Never
-    /// restore memory/TLS or signal state: only the arguments we translated.
+    /// Called at the matching syscall exit, including emulated exits.
+    /// Signal-wait scratch has already been restored at the native exit.
     pub fn finish(
         &mut self,
         table: &mut DescriptorTable,
         r: &mut UserRegs,
         backends: &mut Backends,
     ) -> Result<bool, &'static [u8]> {
+        self.wait_signal_mask = None;
         self.channel_write = crate::channel_hooks::WriteProgress::new();
         self.poll_wait = false;
         self.poll_tick = false;
@@ -687,6 +783,7 @@ impl DescriptorTable {
                 self.path_descriptor(pid, r, backends)
             }
             7 | 271 => self.poll(pid, r, backends, call),
+            270 => self.select(pid, r, backends, call),
             275 => {
                 // Owned storage/devices do not offer splice. Linux uses EINVAL
                 // for an unsupported endpoint so callers can retry with read/write.
@@ -1307,6 +1404,180 @@ impl DescriptorTable {
         }
         call.poll_wait = true;
         call.poll_tick = network || call.poll_deadline.is_some();
+        Ok(NativeDecision::ParkPoll)
+    }
+
+    fn select(
+        &mut self,
+        pid: usize,
+        r: &mut UserRegs,
+        backends: &mut Backends,
+        call: &mut DescriptorCall,
+    ) -> Result<NativeDecision, i64> {
+        let count = r.rdi as i32;
+        if count < 0 || count as usize > LIMIT {
+            return Err(-22);
+        }
+        let count = count as usize;
+        const SET_SIZE: usize = LIMIT / 8;
+        let length = count.div_ceil(64) * 8;
+        let addresses = [r.rsi, r.rdx, r.r10];
+        let now = monotonic_nanoseconds()?;
+        if !call.poll_wait {
+            call.poll_input.fill(0);
+            for (set, address) in addresses.into_iter().enumerate() {
+                if address != 0
+                    && length != 0
+                    && copy_memory(
+                        pid,
+                        address,
+                        &mut call.poll_input[set * SET_SIZE..set * SET_SIZE + length],
+                        false,
+                    )? != length as i64
+                {
+                    return Err(-14);
+                }
+            }
+            if r.r8 != 0 {
+                let mut time = [0u8; 16];
+                if copy_memory(pid, r.r8, &mut time, false)? != 16 {
+                    return Err(-14);
+                }
+                let seconds = i64::from_ne_bytes(time[..8].try_into().unwrap());
+                let fraction = i64::from_ne_bytes(time[8..].try_into().unwrap());
+                let units = 1_000_000_000;
+                if seconds < 0 || seconds > 300 || !(0..units).contains(&fraction) {
+                    return Err(-22);
+                }
+                let duration = (seconds as u64)
+                    .checked_mul(1_000_000_000)
+                    .and_then(|n| n.checked_add(fraction as u64 * (1_000_000_000 / units as u64)))
+                    .ok_or(-22)?;
+                if duration > 300_000_000_000 {
+                    return Err(-22);
+                }
+                call.poll_deadline = Some(now.checked_add(duration).ok_or(-22)?);
+            }
+            if r.r9 != 0 {
+                let mut argument = [0u8; 16];
+                if copy_memory(pid, r.r9, &mut argument, false)? != 16 {
+                    return Err(-14);
+                }
+                let pointer = u64::from_ne_bytes(argument[..8].try_into().unwrap());
+                let size = u64::from_ne_bytes(argument[8..].try_into().unwrap());
+                if pointer != 0 {
+                    if size != 8 {
+                        return Err(-22);
+                    }
+                    let mut mask = [0u8; 8];
+                    if copy_memory(pid, pointer, &mut mask, false)? != 8 {
+                        return Err(-14);
+                    }
+                    call.wait_signal_mask = Some(u64::from_ne_bytes(mask));
+                }
+            }
+        }
+        let mut output = [0u8; SET_SIZE * 3];
+        let mut consoles = [PollFd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        }; LIMIT];
+        let mut available = [0u16; LIMIT];
+        let mut external = false;
+        for fd in 0..count {
+            let requested =
+                |set: usize| call.poll_input[set * SET_SIZE + fd / 8] & (1 << (fd % 8)) != 0;
+            let events = if requested(0) { 1 } else { 0 }
+                | if requested(1) { 4 } else { 0 }
+                | if requested(2) { 2 } else { 0 };
+            if events == 0 {
+                continue;
+            }
+            let descriptor = self.get(fd as u64)?;
+            if descriptor.path_flags != 0 {
+                return Err(-9);
+            }
+            match descriptor.handle {
+                Handle::Owned(handle) => {
+                    external |= crate::network_hooks::LaunchNetwork::owns(handle);
+                    available[fd] = backends.readiness(handle).ok_or(-95)?;
+                }
+                Handle::Native {
+                    fd: native,
+                    console: true,
+                } => {
+                    assert!(native < 3);
+                    consoles[fd] = PollFd {
+                        fd: native as i32,
+                        events,
+                        revents: 0,
+                    };
+                    external = true;
+                }
+                Handle::Native { .. } => return Err(-95),
+                Handle::Reserved => return Err(-9),
+            }
+        }
+        let result = unsafe { syscall3(7, consoles.as_mut_ptr() as usize, count, 0) };
+        if result < 0 {
+            return Err(result as i64);
+        }
+        let mut ready_count = 0;
+        for fd in 0..count {
+            let events = available[fd] | consoles[fd].revents;
+            for (set, mask) in [1 | 8 | 16, 4 | 8, 2].into_iter().enumerate() {
+                let offset = set * SET_SIZE + fd / 8;
+                let bit = 1 << (fd % 8);
+                if call.poll_input[offset] & bit != 0 && events & mask != 0 {
+                    output[offset] |= bit;
+                    ready_count += 1;
+                }
+            }
+        }
+        let interrupted = crate::task_signals::Signals::read(pid)
+            .is_some_and(|signals| signals.interrupt_with_mask(call.wait_signal_mask));
+        let complete = ready_count != 0 || call.poll_deadline.is_some_and(|end| now >= end);
+        if complete {
+            for (set, address) in addresses.into_iter().enumerate() {
+                if address != 0
+                    && length != 0
+                    && copy_memory(
+                        pid,
+                        address,
+                        &mut output[set * SET_SIZE..set * SET_SIZE + length],
+                        true,
+                    )? != length as i64
+                {
+                    return Err(-14);
+                }
+            }
+        }
+        if complete || interrupted {
+            if let Some(end) = call.poll_deadline {
+                let remaining = end.saturating_sub(monotonic_nanoseconds()?);
+                let mut time = [0u8; 16];
+                time[..8].copy_from_slice(&(remaining / 1_000_000_000).to_ne_bytes());
+                let fraction = remaining % 1_000_000_000;
+                time[8..].copy_from_slice(&fraction.to_ne_bytes());
+                if copy_memory(pid, r.r8, &mut time, true)? != 16 {
+                    return Err(-14);
+                }
+            }
+        }
+        if complete {
+            // Linux returns ready descriptors before handling a pending
+            // signal. The temporary mask has no effect on this immediate path.
+            if ready_count != 0 || call.wait_signal_mask.is_none() && !interrupted {
+                return Ok(ready(ready_count));
+            }
+        }
+        call.poll_wait = true;
+        if complete || interrupted {
+            return Ok(NativeDecision::SignalWait { retry: !complete });
+        }
+        call.poll_tick =
+            external || call.poll_deadline.is_some() || call.wait_signal_mask.is_some();
         Ok(NativeDecision::ParkPoll)
     }
 

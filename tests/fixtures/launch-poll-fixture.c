@@ -25,7 +25,42 @@ long poll_main(word *stack)
     char **argv=(char **)(stack+1);
     char mode=*stack>1 ? argv[1][0] : 'a';
     int pipe[2]; CHECK(DO(293,pipe,04000,0)==0,10);
-    if (mode=='o') {
+    if (mode=='s') {
+        word read[4]={1UL<<pipe[0]}, write[4]={1UL<<pipe[1]}, except[4]={1UL<<pipe[0]};
+        long timeout[2]={0,0};
+        CHECK(call(270,64,(word)read,(word)write,(word)except,(word)timeout,0)==1,80);
+        CHECK(read[0]==0 && write[0]==(1UL<<pipe[1]) && except[0]==0,81);
+        CHECK(DO(1,pipe[1],"S",1)==1,82);
+        read[0]=1UL<<pipe[0]; write[0]=1UL<<pipe[1];
+        CHECK(call(270,64,(word)read,(word)write,0,(word)timeout,0)==2,83);
+        CHECK(read[0]==(1UL<<pipe[0]) && write[0]==(1UL<<pipe[1]),84);
+        read[0]=1UL<<63;
+        CHECK(call(270,64,(word)read,0,0,(word)timeout,0)==-9,85);
+        CHECK(call(270,64,1,0,0,(word)timeout,0)==-14,86);
+        CHECK(call(270,257,0,0,0,(word)timeout,0)==-22,87);
+        word mask_argument[2]={1,8};
+        CHECK(call(270,0,0,0,0,(word)timeout,(word)mask_argument)==-14,88);
+        read[0]=1UL<<pipe[0];
+        CHECK(call(270,64,(word)read,0,0,(word)timeout,0)==1 && read[0]==(1UL<<pipe[0]),89);
+        timeout[0]=300;timeout[1]=1;
+        CHECK(call(270,0,0,0,0,(word)timeout,0)==-22,100);
+        timeout[0]=0;timeout[1]=1000000000;
+        CHECK(call(270,0,0,0,0,(word)timeout,0)==-22,101);
+        timeout[1]=60000000;
+        CHECK(call(270,0,0,0,0,(word)timeout,0)==0 && timeout[0]==0 && timeout[1]==0,90);
+    } else if (mode=='S') {
+        long null=DO(2,"/dev/null",2,0);CHECK(null>=3,91);
+        CHECK(DO(1,pipe[1],"S",1)==1,92);
+        CHECK(call(275,pipe[0],0,null,0,1,0)==-22,93);
+        CHECK(DO(0,pipe[0],buffer,1)==1 && buffer[0]=='S',94);
+        CHECK(call(275,123,0,null,0,1,0)==-9,95);
+        CHECK(call(275,pipe[0],0,123,0,1,0)==-9,96);
+        CHECK(DO(3,null,0,0)==0,97);
+    } else if (mode=='D') {
+        long timeout[2]={0,0};
+        CHECK(call(270,0,0,0,0,(word)timeout,0)==-1,98);
+        CHECK(call(275,pipe[0],0,pipe[1],0,1,0)==-1,99);
+    } else if (mode=='o') {
         if(argv[1][8]=='-') {
             CHECK(DO(7,0,0,60)==0,70);
         } else {

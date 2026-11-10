@@ -111,7 +111,14 @@ impl Signals {
     /// task. A call held for such a signal must be handed back to the kernel;
     /// one the task ignores leaves the call held, as it would natively.
     pub fn interrupt_held_call(&self) -> bool {
-        let deliverable = self.pending & !self.blocked;
+        self.interrupt_with_mask(None)
+    }
+
+    /// pselect's snapshotted mask applies while its owned readiness query waits.
+    pub fn interrupt_with_mask(&self, mask: Option<u64>) -> bool {
+        let unmaskable = (1u64 << (9 - 1)) | (1u64 << (19 - 1));
+        let blocked = mask.unwrap_or(self.blocked) & !unmaskable;
+        let deliverable = self.pending & !blocked;
         (1..=64u8).any(|signal| {
             let bit = 1u64 << (signal - 1);
             deliverable & bit != 0

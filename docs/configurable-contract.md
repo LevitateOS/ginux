@@ -59,6 +59,28 @@ public and filesystem descriptor quotas, including lower operator limits.
 Explicit contract denial precedes allocation and metadata effects. This is a
 configured subset, with native policy and catalog membership unchanged.
 
+Configured `pselect6` snapshots up to 256 public descriptor bits per set and
+accepts zero, finite timeouts up to 300 seconds, or an infinite wait. Owned
+files, devices and channels supply readiness; inherited console descriptors
+are polled through their registered handles. Other native/image descriptors
+return EOPNOTSUPP and `O_PATH` references return EBADF. Readable EOF and writable
+error conditions follow the Linux select masks. Timeouts retain their deadline
+while parked and report the remaining time on completion or interruption.
+
+An optional 8-byte signal mask is snapshotted with the input sets. Ready
+descriptors take priority over pending signals. A no-ready completion uses a
+zero-descriptor, zero-timeout native `pselect6` solely for Linux to deliver a
+pending signal and restore the original mask, including after the handler's
+`sigreturn`; no workload file descriptor is passed to the host. Exact contract
+denials still precede these effects. This supports ordinary parallel make's
+pipe jobserver. Named FIFO creation remains unsupported, so make uses its
+existing unnamed-pipe fallback.
+
+Configured `splice` validates the public descriptors and returns EINVAL for
+unsupported transfer endpoints without consuming input. Programs can use their
+normal read/write fallback; invalid descriptors and `O_PATH` references return
+EBADF. This does not provide zero-copy transfers or expose host descriptors.
+
 Configured launch implements `eventfd2`, `epoll_create1`, `epoll_ctl`,
 `epoll_wait` and bounded `epoll_pwait` through the public descriptor table.
 Counters and epoll instances share the existing 16-object channel pool with

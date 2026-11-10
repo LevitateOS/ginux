@@ -15,6 +15,8 @@ PARKED = {
     'park-read': b'park surface=lane-channel',
     'park-read-restart': b'park surface=lane-channel',
     'park-poll': b'park surface=owned-poll',
+    'park-pselect': b'park surface=owned-poll',
+    'park-pselect-timed': b'park surface=owned-poll',
     'park-epoll': b'park surface=owned-poll',
     'park-wait': b'park surface=owned-child-wait',
     'park-ignored': b'park surface=owned-poll',
@@ -22,6 +24,7 @@ PARKED = {
 # The syscall whose entry the supervisor replaces, and the signal queued there.
 INJECTED = {'map-signal': (b'9 ', signal.SIGUSR1), 'exec-signal': (b'59 ', signal.SIGCHLD)}
 SLEEPS = ('sleep-peer', 'sleep-ignored', 'sleep-handled')
+PSELECT = ('pending-pselect', 'pending-zero-pselect', 'ready-pselect')
 CREATION = ('birth-orphan',)
 RACES = ('race-thread-exit', 'race-fork-kill')
 INTERRUPTED = b'park interrupted surface=pending-signal'
@@ -103,7 +106,7 @@ def main():
     if len(sys.argv) < 3 or os.geteuid() != 0:
         sys.exit('usage (as root): test-launch-signals.py <ginux> <signal-fixture> [scenario ...]')
     binary, fixture = [str(Path(p).resolve()) for p in sys.argv[1:3]]
-    scenarios = (*PARKED, *SLEEPS, *INJECTED, *CREATION, *RACES)
+    scenarios = (*PARKED, *PSELECT, *SLEEPS, *INJECTED, *CREATION, *RACES)
     selected = sys.argv[3:] or scenarios
     if any(mode not in scenarios for mode in selected):
         sys.exit('unknown signal scenario')
@@ -166,7 +169,8 @@ def main():
                     assert b'teardown tasks=0 owned-handles=0' in audit_bytes
                     if mode in PARKED:
                         # Only a handler hands the parked call back to the kernel.
-                        assert (INTERRUPTED in audit_bytes) == (mode != 'park-ignored'), (mode, audit_bytes[-4000:])
+                        marker = b'mediate surface=pselect-signal-mask' if mode.startswith('park-pselect') else INTERRUPTED
+                        assert (marker in audit_bytes) == (mode != 'park-ignored'), (mode, audit_bytes[-4000:])
                     if mode == 'map-signal':
                         assert b'mediate surface=owned-file-mapping' in audit_bytes, audit_bytes[-4000:]
                 finally:

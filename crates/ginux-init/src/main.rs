@@ -6395,7 +6395,9 @@ fn supervise_native(
             decide_systemd(syscall, shared_network)
         } else {
             match decide_native(syscall, registers.rdi, registers.rsi, registers.rdx) {
-                NativeDecision::Park { .. } | NativeDecision::ParkPoll => {
+                NativeDecision::Park { .. }
+                | NativeDecision::ParkPoll
+                | NativeDecision::SignalWait { .. } => {
                     native_fail(instance, pid, b"unexpected configured channel wait")
                 }
                 NativeDecision::Contract(decision) => decision,
