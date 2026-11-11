@@ -40,6 +40,19 @@ long poll_main(word *stack)
         long alias=DO(32,1,0,0);CHECK(alias>=3,107);
         CHECK(DO(1,alias,console_data,sizeof console_data)==-1 && DO(3,alias,0,0)==0,108);
         return 0;
+    } else if (mode=='p') {
+        word block=1UL<<(17-1), previous=0, current=0, empty=0;
+        CHECK(call(14,0,(word)&block,0,8,0,0)==0,110);
+        CHECK(DO(14,2,0,&previous)==-22,111);
+        CHECK(call(14,2,0,(word)&previous,8,0,0)==0 && (previous&block),112);
+        struct pollfd entry={pipe[0],1,99};
+        long timeout[2]={0,60000000};
+        CHECK(call(271,(word)&entry,1,(word)timeout,(word)&empty,4,0)==-22,113);
+        CHECK(call(271,(word)&entry,1,(word)timeout,1,8,0)==-14,114);
+        CHECK(call(271,(word)&entry,1,(word)timeout,(word)&empty,8,0)==0 && !entry.revents,115);
+        CHECK(call(14,2,0,(word)&current,8,0,0)==0 && current==previous,116);
+        CHECK(DO(1,pipe[1],"P",1)==1,117);
+        CHECK(call(271,(word)&entry,1,0,(word)&empty,8,0)==1 && entry.revents==1,118);
     } else if (mode=='s') {
         word read[4]={1UL<<pipe[0]}, write[4]={1UL<<pipe[1]}, except[4]={1UL<<pipe[0]};
         long timeout[2]={0,0};

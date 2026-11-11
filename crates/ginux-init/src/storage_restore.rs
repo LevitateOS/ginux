@@ -197,7 +197,9 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
                 }
             })
             .sum();
-        if actual != checksum || &header[257..263] != b"ustar\0" {
+        let ustar = &header[257..263] == b"ustar\0";
+        let gnu = &header[257..265] == b"ustar  \0";
+        if actual != checksum || !(ustar || gnu) {
             return Err(b"invalid restore header");
         }
         let size = octal(&header[124..136])?;
@@ -259,7 +261,8 @@ pub fn restore(path: *const u8, files: &mut LaunchFs) -> Result<(), Error> {
             append(&mut path, &mut end, &long_name[..long_len])?;
             long_len = 0;
         } else {
-            let prefix = field(&header[345..500]);
+            // GNU uses this area for timestamps, not the POSIX path prefix.
+            let prefix = if ustar { field(&header[345..500]) } else { &[] };
             if !prefix.is_empty() {
                 append(&mut path, &mut end, prefix)?;
                 append(&mut path, &mut end, b"/")?;

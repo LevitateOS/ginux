@@ -14,10 +14,10 @@ import tempfile
 
 def main():
     if len(sys.argv) not in (3, 4) or os.geteuid() != 0:
-        sys.exit('usage (as root): test-launch-restore.py <ginux> <storage-fixture> [ordinary]')
+        sys.exit('usage (as root): test-launch-restore.py <ginux> <storage-fixture> [ordinary|headers]')
     binary, fixture = [str(Path(p).resolve()) for p in sys.argv[1:3]]
     ordinary = len(sys.argv) == 4
-    if ordinary and sys.argv[3] != 'ordinary':
+    if ordinary and sys.argv[3] not in ('ordinary', 'headers'):
         sys.exit('unknown restore selection')
     template = (Path(__file__).resolve().parent.parent / 'config/instance-configured.toml').read_text()
     with tempfile.TemporaryDirectory(prefix='ginux-restore-') as folder:
@@ -107,6 +107,28 @@ def main():
         with tarfile.open(updated) as tar:
             assert tar.extractfile('out/product-alias').read() == b'changed'
             assert tar.getmember('out/product-alias').islnk()
+
+        # Rust tar emits GNU long-name/long-link headers for restored SDKs.
+        gnu = work/'gnu-links.tar'
+        with tarfile.open(linked) as source, tarfile.open(gnu, 'w', format=tarfile.GNU_FORMAT) as target:
+            for member in source.getmembers():
+                target.addfile(member, source.extractfile(member) if member.isfile() else None)
+            end = target.offset
+        gnu_bytes = bytearray(gnu.read_bytes()[:end+1024])
+        # GNU uses the POSIX prefix area for timestamps, not a path prefix.
+        gnu_bytes[345:357] = b'00000000001\0'
+        gnu_bytes[148:156] = b'        '
+        checksum = sum(gnu_bytes[:512])
+        gnu_bytes[148:156] = f'{checksum:06o}\0 '.encode()
+        gnu.write_bytes(gnu_bytes)
+        launch('restore-links', gnu, work/'gnu-updated.tar')
+        invalid = work/'gnu-invalid.tar'
+        gnu_bytes[148] ^= 1
+        invalid.write_bytes(gnu_bytes)
+        launch('restore-links', invalid, failure=True)
+        if len(sys.argv) == 4 and sys.argv[3] == 'headers':
+            print('test-launch-restore: PASS (GNU/USTAR headers, long links, checksum rejection)')
+            return
 
         namespace = work/'namespace.tar'
         launch('namespace', exported=namespace, objects=5001, memory=64)

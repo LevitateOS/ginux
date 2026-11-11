@@ -1,8 +1,7 @@
 //! Bounded configured event objects. Channels own allocation and IO; descriptor
 //! owners supply readiness. No workload pointer or FD is submitted to host epoll.
 
-// Existing owners permit 16 TCP sockets and 16 channel objects together.
-// A watch table must cover both without changing either allocation limit.
+// Registrations have their own bound, independent of socket/channel slots.
 pub const WATCHES: usize = 32;
 pub const EDGE: u32 = 1 << 31;
 pub const ONESHOT: u32 = 1 << 30;

@@ -912,7 +912,7 @@ impl Supervisor<'_> {
         };
         // pselect arbitrates its snapshotted temporary mask in its descriptor
         // owner and the kernel's zero-FD completion call.
-        if original.orig_rax == 270 || task.reaps_seen == reaps {
+        if matches!(original.orig_rax, 270 | 271) || task.reaps_seen == reaps {
             return;
         }
         task.reaps_seen = reaps;
@@ -1634,6 +1634,28 @@ impl Supervisor<'_> {
                 self.emulate(index, r, value as i64, instance);
                 return;
             }
+            127 | 131 => {
+                // Thread-local kernel state; the configured catalog and
+                // effective contract have already admitted this operation.
+                audit_write(b"mediate surface=thread-signal-state\n");
+                self.run(index, r, instance);
+                return;
+            }
+            109 => {
+                let result = if (r.rdi as i32) < 0 || (r.rsi as i32) < 0 {
+                    -22
+                } else {
+                    self.processes
+                        .set_process_group_for(id, r.rdi as u32, r.rsi as u32)
+                        .map(|_| 0)
+                        .unwrap_or_else(|error| match error {
+                            ProcessError::InvalidTask => -3,
+                            _ => -1,
+                        })
+                };
+                self.emulate(index, r, result, instance);
+                return;
+            }
             110 | 111 => {
                 let view = self.processes.view(id).unwrap();
                 self.emulate(
@@ -1659,7 +1681,8 @@ impl Supervisor<'_> {
                 }
                 let flags = r.rdi;
                 let libc_fork = r.orig_rax == 56 && flags == 0x1200011;
-                let thread = r.orig_rax == 56 && matches!(flags, 0x3d0f00 | 0x7d0f00);
+                let thread = r.orig_rax == 56 && matches!(flags, 0xd0f00 | 0x3d0f00 | 0x7d0f00);
+                let parent_tid = thread && flags & 0x100000 != 0;
                 if r.orig_rax == 56 && !thread && !matches!(flags, 17 | 0x4111 | 0x1200011) {
                     self.emulate(index, r, -38, instance);
                     return;
@@ -1675,7 +1698,7 @@ impl Supervisor<'_> {
                     audit_write(b"park surface=descriptor-snapshot\n");
                     return;
                 }
-                if thread {
+                if parent_tid {
                     let mut before = [0u8; 4];
                     if copy_memory(self.task(index).host, r.rdx, &mut before, false) != Ok(4) {
                         self.emulate(index, r, -14, instance);
@@ -1758,7 +1781,7 @@ impl Supervisor<'_> {
                     child: slot,
                     flags,
                     child_tid: libc_fork.then_some(r.r10),
-                    parent_tid: thread.then_some(r.rdx),
+                    parent_tid: parent_tid.then_some(r.rdx),
                 };
                 if !thread {
                     if let Some(fd) = self.group(index).cwd {
@@ -2294,7 +2317,7 @@ impl Supervisor<'_> {
                 unsafe { syscall4(SYS_WAIT4, host, &mut status as *mut _ as usize, WALL, 0) };
             if waited == host as isize
                 && (exited(status) || signaled(status))
-                && parent_tid.is_some()
+                && self.task(slot).group == self.task(parent).group
             {
                 // A thread born into a group that is being killed never
                 // reached its birth stop. Nothing was published; the caller

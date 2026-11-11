@@ -1672,6 +1672,7 @@ impl LaunchFs {
             }
         }
         let result = match r.orig_rax {
+            16 => self.fs.fstat(fd).map_err(errno).and(Err(-25)),
             0 => self.read(pid, fd, r.rsi, r.rdx, None),
             17 => self.read(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
             1 => self.write(pid, fd, r.rsi, r.rdx, None),

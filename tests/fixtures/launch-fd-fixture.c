@@ -102,6 +102,13 @@ long fd_main(word *stack)
     // Private backend numbers are not public authority.
     CHECK(DO(0,1048576,bytes,1)==-9 && DO(5,0x40000000,meta,0)==-9,34);
     CHECK(DO(3,(1UL<<32)|99,0,0)==-9,35);
+    long clo=DO(2,"/work/data",0,0);
+    CHECK(clo>=3 && DO(16,clo,0x5451,0)==0 && DO(72,clo,1,0)==1,60);
+    long clo_alias=DO(32,clo,0,0);
+    CHECK(clo_alias>=3 && DO(72,clo_alias,1,0)==0,61);
+    CHECK(DO(16,clo,0x5450,0)==0 && DO(72,clo,1,0)==0,62);
+    CHECK(DO(16,clo,0x5401,1)==-25,63);
+    CHECK(DO(3,clo_alias,0,0)==0 && DO(3,clo,0,0)==0,64);
     memory=DO(2,"/work/data",0,0);
     CHECK(memory==3,36);
     long aliases[252];

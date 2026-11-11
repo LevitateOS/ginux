@@ -130,6 +130,14 @@ static void join(word i)
         if (result!=0 && result!=-11 && result!=-4) { error=90; break; }
     }
 }
+static long go_thread(void) {
+    char signal_stack[16384];
+    word alt[3]={(word)signal_stack,0,sizeof signal_stack};
+    word pending=0;
+    if(DO(131,alt,0,0)!=0 || DO(127,&pending,8,0)!=0 || DO(186,0,0,0)!=2) error=210;
+    gate=1; DO(202,&gate,1,1);
+    return 0;
+}
 static long quick(void) { return 0; }
 static volatile long nested_bad, nested_good, nested_seen_tid, nested_seen_parent;
 static long nested_quick(void) {
@@ -266,7 +274,13 @@ long thread_main(word *stack)
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-1 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);
-    if (mode=='P') {
+    if (mode=='g') {
+        thread_flags=0xd0f00;
+        tid[0]=0x12345678;
+        CHECK(spawn_thread((word)(stacks[0]+sizeof stacks[0]),&tid[0],go_thread)==2,211);
+        while(!gate) { long n=DO(202,&gate,0,0); CHECK(n==0 || n==-11 || n==-4,212); }
+        CHECK(!error && tid[0]==0x12345678 && DO(39,0,0,0)==1,213);
+    } else if (mode=='P') {
         word action[4]={(word)packet_sigpipe,0x04000000,(word)packet_signal_return,0};
         CHECK(call(13,13,(word)action,0,8,0,0)==0,195);
         CHECK(call(53,1,5,0,(word)pair,0,0)==0 && pair[0]==5 && pair[1]==6,196);

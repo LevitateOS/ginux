@@ -92,9 +92,9 @@ EBADF. This does not provide zero-copy transfers or expose host descriptors.
 
 Configured launch implements `eventfd2`, `epoll_create1`, `epoll_ctl`,
 `epoll_wait` and bounded `epoll_pwait` through the public descriptor table.
-Counters and epoll instances share the existing 16-object channel pool with
+Counters and epoll instances share the bounded 32-object channel pool with
 pipes and packet channels. Each epoll instance has at most 32 registrations,
-covering the existing 16 TCP sockets and 16 channel objects together;
+independent of the 16-socket and 32-channel object limits;
 the existing public descriptor limit (including a lower operator limit) applies.
 No host eventfd or epoll descriptor is created or exposed. Counters support
 8-byte scalar transfers, semaphore/nonblocking modes, overflow backpressure,

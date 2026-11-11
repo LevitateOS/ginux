@@ -131,7 +131,7 @@ long event_main(word *stack) {
         for(int i=0;i<32;++i) { CHECK(wait_event(ep,1,0)==1,83); seen|=1UL<<events[0].data; }
         CHECK(seen==0x1fffffffeUL,84);
         CHECK(DO(3,ep,0,0)==0,85);
-        for(int i=1;i<16;++i) CHECK(DO(290,0,0,0)>=3,86);
+        for(int i=1;i<32;++i) CHECK(DO(290,0,0,0)>=3,86);
         CHECK(DO(290,0,0,0)==-24,87);
     } else if(mode=='g') {
         value=7; CHECK(DO(1,counter,&value,8)==8,109);

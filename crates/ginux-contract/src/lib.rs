@@ -3,7 +3,7 @@
 use core::fmt;
 
 pub const CATALOG_VERSION: u32 = 2;
-pub const MAX_OPERATIONS: usize = 195;
+pub const MAX_OPERATIONS: usize = 197;
 pub const DIGEST_HEX_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,6 +228,22 @@ pub static CONFIGURED_OPERATIONS: &[Operation] = &[
         Action::Mediate,
         "owned shared inode",
         "test-launch-directories"
+    ),
+    syscall!(
+        "rt_sigpending",
+        127,
+        Partial,
+        Action::Mediate,
+        "calling thread pending signal set",
+        "test-launch-signals"
+    ),
+    syscall!(
+        "sigaltstack",
+        131,
+        Partial,
+        Action::Mediate,
+        "calling thread signal stack",
+        "test-launch"
     ),
     syscall!(
         "sched_getaffinity",

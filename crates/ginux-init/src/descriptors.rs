@@ -349,6 +349,7 @@ impl DescriptorCall {
             original: *r,
             retry,
         });
+        r.orig_rax = 270; // zero-FD pselect owns temporary mask delivery
         r.rdi = 0;
         r.rsi = 0;
         r.rdx = 0;
@@ -1198,6 +1199,13 @@ impl DescriptorTable {
                 matches!(entry.handle, Handle::Owned(_)),
             )?));
         }
+        if r.orig_rax == 16 && matches!(r.rsi as u32, 0x5450 | 0x5451) {
+            self.entries[r.rdi as u32 as usize]
+                .as_mut()
+                .unwrap()
+                .cloexec = r.rsi as u32 == 0x5451;
+            return Ok(ready(0));
+        }
         let public_fd = r.rdi as u32;
         let network = matches!(entry.handle, Handle::Owned(h) if crate::network_hooks::LaunchNetwork::owns(h));
         let packet = matches!(entry.handle, Handle::Owned(h) if backends.channels.is_socket(h));
@@ -1718,7 +1726,14 @@ impl DescriptorTable {
             -1
         } else if r.orig_rax == 271 {
             if r.r10 != 0 {
-                return Err(-95);
+                if r.r8 != 8 {
+                    return Err(-22);
+                }
+                let mut mask = [0u8; 8];
+                if copy_memory(pid, r.r10, &mut mask, false)? != 8 {
+                    return Err(-14);
+                }
+                call.wait_signal_mask = Some(u64::from_ne_bytes(mask));
             }
             if r.rdx == 0 {
                 -1
@@ -1822,12 +1837,21 @@ impl DescriptorTable {
                     return Err(-14);
                 }
             }
-            return Ok(ready(ready_count));
+            if ready_count != 0 || call.wait_signal_mask.is_none() {
+                return Ok(ready(ready_count));
+            }
+            return Ok(NativeDecision::SignalWait { retry: false });
+        }
+        if crate::task_signals::Signals::read(pid)
+            .is_some_and(|signals| signals.interrupt_with_mask(call.wait_signal_mask))
+        {
+            return Ok(NativeDecision::SignalWait { retry: true });
         }
         call.poll_wait = true;
         // Infinite owned-object waits need no timer: object progress/death
         // already wakes them. External console IO needs periodic observation.
         call.poll_tick = network_wait
+            || call.wait_signal_mask.is_some()
             || call.poll_deadline.is_some()
             || consoles[..count].iter().any(|fd| fd.fd >= 0);
         Ok(NativeDecision::ParkPoll)

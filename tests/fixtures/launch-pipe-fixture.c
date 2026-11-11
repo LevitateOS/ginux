@@ -258,10 +258,10 @@ long pipe_main(word *stack)
     CHECK(DO(1,pair[0],"Q",1) == 1 && DO(0,reader,buffer,1) == 1 && buffer[0] == 'Q', 78);
     CHECK(DO(3,pair[0],0,0) == 0 && DO(0,reader,buffer,1) == 0, 79);
     CHECK(DO(3,reader,0,0) == 0, 80);
-    int all[16][2];
-    for (word i=0;i<16;++i) CHECK(DO(293,all[i],04000,0) == 0, 64);
+    int all[32][2];
+    for (word i=0;i<32;++i) CHECK(DO(293,all[i],04000,0) == 0, 64);
     CHECK(DO(293,pair,0,0) == -24, 65);
-    for (word i=0;i<16;++i) {
+    for (word i=0;i<32;++i) {
         CHECK(DO(3,all[i][0],0,0) == 0 && DO(3,all[i][1],0,0) == 0, 66);
     }
     // Exhaust descriptors via aliases without falsely closing the original end.
