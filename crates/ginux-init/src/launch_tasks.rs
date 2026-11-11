@@ -28,6 +28,7 @@ enum Pending {
     Fork {
         child: usize,
         flags: u64,
+        thread: bool,
         child_tid: Option<u64>,
         parent_tid: Option<u64>,
     },
@@ -702,7 +703,7 @@ impl Supervisor<'_> {
     /// parent's group all go together. Returns whether a reservation was
     /// withdrawn; a published child is a task of its own and stays.
     fn cancel_creation(&mut self, parent: usize, instance: &mut Instance) -> bool {
-        let Pending::Fork { child, flags, .. } = self.task(parent).pending else {
+        let Pending::Fork { child, thread, .. } = self.task(parent).pending else {
             return false;
         };
         if self.task(child).host != 0 {
@@ -711,7 +712,7 @@ impl Supervisor<'_> {
         self.task_mut(parent).pending = Pending::None;
         self.release_group(child, instance);
         let (id, reserved) = (self.task(parent).id, self.task(child).id);
-        let rollback = if flags & 0x10000 != 0 {
+        let rollback = if thread {
             self.processes.cancel_thread(id, reserved)
         } else {
             self.processes.cancel_fork(id, reserved)
@@ -756,13 +757,13 @@ impl Supervisor<'_> {
                     let Some(task) = self.tasks[index].as_ref() else {
                         return false;
                     };
-                    let Pending::Fork { child, flags, .. } = task.pending else {
+                    let Pending::Fork { child, thread, .. } = task.pending else {
                         return false;
                     };
                     task.alive
                         && self.task(child).host == 0
                         && self.host_tgid(index).is_some_and(|group| {
-                            if flags & 0x10000 != 0 {
+                            if thread {
                                 group == tgid
                             } else {
                                 group == parent
@@ -1786,6 +1787,7 @@ impl Supervisor<'_> {
                 self.task_mut(index).pending = Pending::Fork {
                     child: slot,
                     flags,
+                    thread,
                     child_tid: libc_fork.then_some(r.r10),
                     parent_tid: parent_tid.then_some(r.rdx),
                 };
@@ -2320,6 +2322,7 @@ impl Supervisor<'_> {
             flags,
             child_tid,
             parent_tid,
+            ..
         } = self.task(parent).pending
         else {
             self.fail(instance, b"unreserved child event")

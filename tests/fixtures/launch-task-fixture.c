@@ -339,6 +339,7 @@ long task_main(word *stack)
         int pipe[2]; CHECK(DO(22,pipe,0,0)==0,76);
         word limit[2]={1,1}; CHECK(DO(302,0,6,limit)==0,80);
         CHECK(DO(57,0,0,0)==-11 && DO(57,0,0,0)==-11,77);
+        CHECK(DO(57,0x10000,0,0)==-11 && DO(58,0x10000,0,0)==-11,274);
         CHECK(call(56,0x1200011,0,0,(word)&fork_tid,0,0)==-11 && fork_tid==0x1357,89);
         CHECK(DO(1,pipe[1],"K",1)==1 && DO(0,pipe[0],buffer,1)==1 && buffer[0]=='K',78);
         CHECK(DO(3,pipe[0],0,0)==0 && DO(3,pipe[1],0,0)==0,79);
