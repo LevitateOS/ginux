@@ -2577,7 +2577,8 @@ impl Supervisor<'_> {
                 // An adopted orphan is a native child of this subreaper,
                 // not of virtual init. ECHILD is expected there: the status
                 // reported status comes from its observed ptrace death.
-                if (r.rax as i64) > 0 || r.rax as i64 == -10 {
+                let usage_fault = r.rax as i64 == -14;
+                if (r.rax as i64) > 0 || usage_fault || r.rax as i64 == -10 && original[3] == 0 {
                     let id = self.task(child).id;
                     if self
                         .processes
@@ -2589,7 +2590,11 @@ impl Supervisor<'_> {
                     self.retired[self.retired_next] = (self.task(child).host, id.pid);
                     self.retired_next = (self.retired_next + 1) % TASKS;
                     self.tasks[child] = None;
-                    r.rax = id.pid as u64;
+                    r.rax = if usage_fault {
+                        (-14i64) as u64
+                    } else {
+                        id.pid as u64
+                    };
                     if original[1] != 0 {
                         match crate::tracee_io::store_u32(
                             self.task(index).host,
@@ -2601,6 +2606,11 @@ impl Supervisor<'_> {
                             Err(error) => r.rax = error as u64,
                         }
                     }
+                }
+                if r.rax as i64 == -10 && original[3] != 0 {
+                    // An adopted orphan was reaped by this subreaper. Do not
+                    // fabricate usage: leave its virtual status waitable.
+                    r.rax = (-95i64) as u64;
                 }
                 if let Some(child) = self.tasks[child].as_mut() {
                     child.waiter = None;
@@ -2662,7 +2672,7 @@ impl Supervisor<'_> {
 
     fn wait_entry(&mut self, index: usize, r: &mut UserRegs, instance: &mut Instance) {
         let selector = r.rdi as i32;
-        if selector != -1 && selector <= 0 || r.rdx & !1 != 0 || r.r10 != 0 {
+        if selector != -1 && selector <= 0 || r.rdx & !1 != 0 {
             self.emulate(index, r, -95, instance);
             return;
         }
@@ -2705,6 +2715,8 @@ impl Supervisor<'_> {
                 // caller's buffer faults. Never publish host wait status.
                 r.rsi = 0;
                 r.rdx = 0;
+                // r10 stays the caller's usage buffer. Native wait4 writes
+                // real counters for this one translated, owned child only.
                 audit_write(b"mediate surface=owned-child-wait\n");
                 self.run(index, r, instance);
             }

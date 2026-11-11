@@ -167,6 +167,19 @@ long task_main(word *stack)
     word argc=*stack;
     char **argv=(char **)(stack+1);
     char mode=argc>1 ? argv[1][0] : 'f';
+    if(mode=='W') {
+        long usage[18]; int status=-1;
+        for(int fault=0;fault<2;++fault) {
+            long child=DO(57,0,0,0); CHECK(child>=0,270);
+            if(child==0) { for(volatile word n=0;n<1000000;++n){} return 23; }
+            for(int i=0;i<18;++i)usage[i]=-1;
+            long result=call(61,child,(word)&status,0,fault?1:(word)usage,0,0);
+            CHECK(result==(fault?-14:child) && status==(23<<8),271);
+            if(!fault) CHECK(usage[0]>=0 && usage[1]>=0 && usage[2]>=0 && usage[3]>=0 && usage[4]>=0 && usage[17]>=0,272);
+            CHECK(DO(61,child,&status,1)==-10,273);
+        }
+        DO(1,1,"owned-tasks: PASS\n",18);return 0;
+    }
     if(mode=='Z') return configured_clocks();
     if(mode=='U') {
         long result=ordinary_umask(argc>1 && argv[1][5]=='E');if(result)return result;
