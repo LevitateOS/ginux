@@ -1570,7 +1570,7 @@ impl DescriptorTable {
                 let seconds = i64::from_ne_bytes(time[..8].try_into().unwrap());
                 let fraction = i64::from_ne_bytes(time[8..].try_into().unwrap());
                 let units = 1_000_000_000;
-                if seconds < 0 || seconds > 300 || !(0..units).contains(&fraction) {
+                if !(0..=300).contains(&seconds) || !(0..units).contains(&fraction) {
                     return Err(-22);
                 }
                 let duration = (seconds as u64)

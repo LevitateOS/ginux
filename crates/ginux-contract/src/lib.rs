@@ -2634,13 +2634,7 @@ mod tests {
             assert_eq!(rule.provenance, Provenance::InstanceDeny);
         }
         assert_eq!(denied.syscall_action(275), Action::Deny(1));
-        let exact = resolve(
-            b"configured-balanced-v2",
-            &[],
-            &[],
-            &[b"syscall.fchmodat"],
-        )
-        .unwrap();
+        let exact = resolve(b"configured-balanced-v2", &[], &[], &[b"syscall.fchmodat"]).unwrap();
         assert_eq!(
             exact
                 .runtime_rule(268, Some("filesystem.path.write"))

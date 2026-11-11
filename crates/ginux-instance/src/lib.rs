@@ -121,7 +121,7 @@ pub enum NetworkProtocol {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuditMode {
-    Stderr,
+    Enabled,
     Disabled,
 }
 
@@ -489,7 +489,7 @@ impl ConfigBuilder {
             hook_timeout_seconds: 30,
             hook_failure_policy: HookFailurePolicy::Stop,
             stop_timeout_seconds: 30,
-            audit_mode: AuditMode::Stderr,
+            audit_mode: AuditMode::Enabled,
             failure_policy: FailurePolicy::Stop,
         }
     }
@@ -833,12 +833,15 @@ impl InstanceConfig {
                 }
             }
             b"lifecycle.stop_timeout_seconds" => self.stop_timeout_seconds = parse_u64(value)?,
-            b"audit.mode" => {
-                self.audit_mode = match parse_string::<32>(value)?.as_bytes() {
-                    b"stderr" => AuditMode::Stderr,
-                    b"disabled" => AuditMode::Disabled,
-                    _ => return Err(ConfigError::InvalidValue),
+            b"audit.enabled" => {
+                self.audit_mode = if parse_bool(value)? {
+                    AuditMode::Enabled
+                } else {
+                    AuditMode::Disabled
                 }
+            }
+            b"audit.mode" => {
+                self.audit_mode = parse_legacy_audit_mode(value)?;
             }
             b"failure.policy" => {
                 self.failure_policy = match parse_string::<32>(value)?.as_bytes() {
@@ -1290,10 +1293,10 @@ impl InstanceConfig {
         })?;
         output.raw(b"\n\n[lifecycle]\nstop_timeout_seconds = ")?;
         output.number(self.stop_timeout_seconds)?;
-        output.raw(b"\n\n[audit]\nmode = ")?;
-        output.quoted(match self.audit_mode {
-            AuditMode::Stderr => b"stderr",
-            AuditMode::Disabled => b"disabled",
+        output.raw(b"\n\n[audit]\nenabled = ")?;
+        output.raw(match self.audit_mode {
+            AuditMode::Enabled => b"true",
+            AuditMode::Disabled => b"false",
         })?;
         output.raw(b"\n\n[failure]\npolicy = ")?;
         output.quoted(match self.failure_policy {
@@ -1877,13 +1880,17 @@ fn parse_field(
             builder.mark(1u128 << 35)?;
             builder.stop_timeout_seconds = parse_u64(value)?;
         }
+        (Section::Audit, b"enabled") => {
+            builder.mark(1 << 14)?;
+            builder.audit_mode = if parse_bool(value)? {
+                AuditMode::Enabled
+            } else {
+                AuditMode::Disabled
+            };
+        }
         (Section::Audit, b"mode") => {
             builder.mark(1 << 14)?;
-            builder.audit_mode = match parse_string::<32>(value)?.as_bytes() {
-                b"stderr" => AuditMode::Stderr,
-                b"disabled" => AuditMode::Disabled,
-                _ => return Err(ConfigError::InvalidValue),
-            };
+            builder.audit_mode = parse_legacy_audit_mode(value)?;
         }
         (Section::Failure, b"policy") => {
             builder.mark(1 << 15)?;
@@ -1923,6 +1930,22 @@ fn parse_allow_deny(value: &[u8]) -> Result<bool, ConfigError> {
     match parse_string::<32>(value)?.as_bytes() {
         b"allow" => Ok(true),
         b"deny" => Ok(false),
+        _ => Err(ConfigError::InvalidValue),
+    }
+}
+
+fn parse_bool(value: &[u8]) -> Result<bool, ConfigError> {
+    match value {
+        b"true" => Ok(true),
+        b"false" => Ok(false),
+        _ => Err(ConfigError::InvalidValue),
+    }
+}
+
+fn parse_legacy_audit_mode(value: &[u8]) -> Result<AuditMode, ConfigError> {
+    match parse_string::<32>(value)?.as_bytes() {
+        b"stderr" => Ok(AuditMode::Enabled),
+        b"disabled" => Ok(AuditMode::Disabled),
         _ => Err(ConfigError::InvalidValue),
     }
 }
@@ -2415,7 +2438,7 @@ assignments = []
 [network]
 backend = "none"
 [audit]
-mode = "stderr"
+enabled = true
 [failure]
 policy = "stop"
 "#;
@@ -2695,7 +2718,7 @@ policy = "stop"
             .replace("profile = \"security\"", "profile = \"performance\"")
             .replace("backend = \"interpreter\"", "backend = \"ptrace-native\"")
             .replace("backend = \"none\"", "backend = \"mediated\"")
-            .replace("mode = \"stderr\"", "mode = \"disabled\"");
+            .replace("enabled = true", "enabled = false");
         let config = InstanceConfig::parse(text.as_bytes()).unwrap();
         assert_eq!(config.args.as_slice().len(), ARG_ITEMS);
         assert_eq!(config.environment.as_slice().len(), ENVIRONMENT_ITEMS);
@@ -2710,6 +2733,22 @@ policy = "stop"
             InstanceConfig::parse(normalized.as_bytes()).unwrap(),
             config
         );
+    }
+
+    #[test]
+    fn normalizes_legacy_audit_destination_to_enablement() {
+        let legacy = VALID.replace("enabled = true", "mode = \"stderr\"");
+        let config = InstanceConfig::parse(legacy.as_bytes()).unwrap();
+        assert_eq!(config.audit_mode, AuditMode::Enabled);
+        let normalized = config.normalized().unwrap();
+        assert!(normalized
+            .as_bytes()
+            .windows(b"enabled = true".len())
+            .any(|window| window == b"enabled = true"));
+        assert!(!normalized
+            .as_bytes()
+            .windows(b"mode = \"stderr\"".len())
+            .any(|window| window == b"mode = \"stderr\""));
     }
 
     #[test]
