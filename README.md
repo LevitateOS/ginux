@@ -611,13 +611,16 @@ Descriptor-based scripts require a non-CLOEXEC public file or directory descript
 otherwise execveat fails with ENOENT. The interpreter can reopen /dev/fd/<public>
 (or an owned directory suffix) read-only through the virtual descriptor owner,
 with a fresh offset, including after unlink/rename. This never imports native
-or private descriptors. Other /dev/fd operations remain unsupported. Threads,
-owned ELF dynamic loaders remain unsupported.
+or private descriptors. Other /dev/fd operations and owned ELF dynamic loaders remain unsupported.
 
-Owned regular files support private mappings and read-only shared mappings.
-Mediated writes/truncation use the same anonymous file backing; private writes
-remain copy-on-write, and unlink/recreation preserves existing mapping identity.
-Writable shared mappings are unsupported. A temporary read-only descriptor
+Owned regular files support private and shared mappings. Shared write access
+requires a readable/writable public file description; executable pins reject it.
+Mediated writes/truncation and mapped writes use the same anonymous file backing;
+private writes remain copy-on-write, and unlink/recreation preserves existing
+mapping identity. Exec refuses an owned file while any registered task retains a
+shared mapping of it, including a read-only protection that could regain write
+access. Coordinated snapshots stop all tracees before reading owned bytes.
+Preallocation on owned files returns EOPNOTSUPP. A temporary backing descriptor
 transfer requires host pidfd_open/pidfd_getfd and ptrace access. Temporary native
 descriptors and stack scratch retire before the original mmap returns. Fixed
 maps cannot replace the replay instruction or scratch region. Signals stay
@@ -625,8 +628,9 @@ blocked in the calling task while supervisor-chosen syscalls replace its own, fo
 this transaction and for exec descriptor setup; they are delivered when the
 original call returns. Transfer failure or death stops the instance if cleanup
 cannot complete safely.
-Threads remain unsupported in configured launch; nonleader mapping integration
-is not provided here. File capacity charging remains unchanged, but guest mappings,
+Configured launch admits bounded glibc, musl and Go thread clone forms; private
+mapping transfers can address a registered nonleader task. File capacity charging
+remains unchanged, but guest mappings,
 private COW pages and mappings retained after unlink are not aggregate RAM-accounted.
 No retention, mapping budget or wider Linux compatibility is promised.
 

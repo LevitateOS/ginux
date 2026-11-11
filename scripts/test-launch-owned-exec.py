@@ -31,7 +31,7 @@ def main():
         (root / 'input').write_bytes(b'Q')
         config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
-        ordinary = ('ordinary-path', 'ordinary-fd', 'ordinary-unlinked', 'ordinary-relative', 'ordinary-child', 'ordinary-reexec', 'ordinary-hardlinked', 'ordinary-fd-hardlinked')
+        ordinary = ('ordinary-shared', 'ordinary-path', 'ordinary-fd', 'ordinary-unlinked', 'ordinary-relative', 'ordinary-child', 'ordinary-reexec', 'ordinary-hardlinked', 'ordinary-fd-hardlinked')
         full = ('success', 'descriptor', 'unlinked', 'relative', 'child', 'vfork', 'mixed-clone')
         for mode in (sys.argv[3:] or (*full, *ordinary)):
             if mode not in (*full, *ordinary):

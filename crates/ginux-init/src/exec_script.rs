@@ -240,6 +240,13 @@ impl Script {
         Ok(Some((end + 1, header.payload)))
     }
 
+    pub fn validate_mappings(&self, fs: &mut LaunchFs, hosts: &[usize]) -> Result<(), i64> {
+        for image in self.held.into_iter().flatten() {
+            fs.validate_exec_mappings(image, hosts)?;
+        }
+        Ok(())
+    }
+
     pub fn release_held(self, fs: &mut LaunchFs) -> Result<(), i64> {
         for image in self.held.into_iter().flatten() {
             fs.release_executable(image)?;

@@ -407,9 +407,17 @@ pub fn supervise(
             }
         }
         s.wake(instance);
-        // Only this owner mediates owned mutations; snapshot serialization
-        // cannot interleave with another owned write.
-        if let Err(reason) = crate::checkpoint_control::poll(s.objects.filesystem) {
+        if let Err(reason) = crate::checkpoint_control::poll(|path| {
+            if s.argument_guard.is_some() {
+                return Ok(false);
+            }
+            // A snapshot has no guest owner: stop every task, including
+            // userspace writers through shared owned-file mappings.
+            s.begin_argument_guard(usize::MAX, instance);
+            let result = s.objects.filesystem.snapshot(path);
+            s.release_argument_guard(instance);
+            result.map(|_| true)
+        }) {
             s.fail(instance, reason);
         }
         status = 0;
@@ -1283,7 +1291,7 @@ impl Supervisor<'_> {
         if r.orig_rax == 9 && r.r10 & 0x20 == 0 {
             match self.table(index).mapping_file(r.r8) {
                 Ok(Some(handle)) => {
-                    if r.r10 & 3 == 0 || r.r10 & 3 != 2 && r.rdx & 2 != 0 {
+                    if r.r10 & 3 == 0 || r.r10 & 3 == 3 && r.rdx & 2 != 0 {
                         self.emulate(index, r, -95, instance);
                         return;
                     }
@@ -1310,7 +1318,11 @@ impl Supervisor<'_> {
                             return;
                         }
                     }
-                    let backing = match self.objects.filesystem.mapping_reference(handle) {
+                    let backing = match self
+                        .objects
+                        .filesystem
+                        .mapping_reference(handle, r.r10 & 3 == 1 && r.rdx & 2 != 0)
+                    {
                         Ok(fd) => fd,
                         Err(error) => {
                             self.emulate(index, r, error, instance);
@@ -2053,6 +2065,32 @@ impl Supervisor<'_> {
         } else {
             None
         };
+        let hosts: [usize; TASKS] = core::array::from_fn(|i| {
+            self.tasks[i]
+                .as_ref()
+                .filter(|t| t.alive)
+                .map_or(0, |t| t.host)
+        });
+        let mappings = (|| {
+            if let Some(image) = image {
+                self.objects
+                    .filesystem
+                    .validate_exec_mappings(image, &hosts)?;
+            }
+            if let Some(script) = script {
+                script.validate_mappings(self.objects.filesystem, &hosts)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = mappings {
+            if let Some(script) = script {
+                script.release_held(self.objects.filesystem)?;
+            }
+            if let Some(image) = image {
+                self.objects.filesystem.release_executable(image)?;
+            }
+            return Err(error);
+        }
         self.task_mut(index).exec = Some(Exec {
             original: *r,
             native_dirfd,

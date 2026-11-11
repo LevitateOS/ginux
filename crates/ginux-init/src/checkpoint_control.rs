@@ -3,7 +3,6 @@
 //! Replies: GXA1, matching u64 sequence, u64 zero status. A reply follows file
 //! fsync/close; the coordinator must sync its directory and matching state before
 //! acknowledging the workload. Invalid requests or storage failures stop launch.
-use crate::launch_storage::LaunchFs;
 use crate::supervisor::{syscall3, syscall5, syscall6};
 
 type Error = &'static [u8];
@@ -83,7 +82,7 @@ pub fn readiness() -> (i32, i16) {
     )
 }
 
-pub fn poll(files: &LaunchFs) -> Result<(), Error> {
+pub fn poll(mut snapshot: impl FnMut(*const u8) -> Result<bool, Error>) -> Result<(), Error> {
     // Only the single supervisor event loop accesses this owner. The tracee
     // closes all inherited descriptors above stdio before running guest code.
     let state = unsafe { &mut *core::ptr::addr_of_mut!(CONTROL) };
@@ -103,23 +102,25 @@ pub fn poll(files: &LaunchFs) -> Result<(), Error> {
         return Ok(());
     }
     loop {
-        let count = unsafe {
-            syscall3(
-                0,
-                fd,
-                state.bytes.as_mut_ptr().add(state.used) as usize,
-                state.wanted - state.used,
-            )
-        };
-        if count == -4 || count == -11 {
-            return Ok(());
-        }
-        if count <= 0 {
-            return Err(b"checkpoint control peer closed");
-        }
-        state.used += count as usize;
         if state.used < state.wanted {
-            return Ok(());
+            let count = unsafe {
+                syscall3(
+                    0,
+                    fd,
+                    state.bytes.as_mut_ptr().add(state.used) as usize,
+                    state.wanted - state.used,
+                )
+            };
+            if count == -4 || count == -11 {
+                return Ok(());
+            }
+            if count <= 0 {
+                return Err(b"checkpoint control peer closed");
+            }
+            state.used += count as usize;
+            if state.used < state.wanted {
+                return Ok(());
+            }
         }
         if state.wanted == HEADER {
             let length = u16::from_le_bytes(state.bytes[12..14].try_into().unwrap()) as usize;
@@ -140,9 +141,11 @@ pub fn poll(files: &LaunchFs) -> Result<(), Error> {
         if path[..length].contains(&0) {
             return Err(b"invalid checkpoint destination");
         }
-        // The event loop cannot mediate another owned write during this call.
-        // Shared writable mappings and native writable backing fds are denied.
-        files.snapshot(path.as_ptr())?;
+        // The task owner quiesces mapped writers as well as mediated IO.
+        // Retain a complete request while a private transaction is in flight.
+        if !snapshot(path.as_ptr())? {
+            return Ok(());
+        }
         state.last = u64::from_le_bytes(state.bytes[4..12].try_into().unwrap());
         state.reply[..4].copy_from_slice(b"GXA1");
         state.reply[4..12].copy_from_slice(&state.last.to_le_bytes());

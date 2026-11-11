@@ -26,10 +26,11 @@ def receive(sock, count):
 
 def main():
     if len(sys.argv) not in (3,4) or os.geteuid() != 0:
-        sys.exit('usage (as root): test-launch-checkpoints.py <ginux> <storage-fixture> [ordinary]')
+        sys.exit('usage (as root): test-launch-checkpoints.py <ginux> <storage-fixture> [ordinary|shared]')
     binary, fixture = [str(Path(p).resolve()) for p in sys.argv[1:3]]
-    ordinary = len(sys.argv)==4
-    if ordinary and sys.argv[3]!='ordinary': sys.exit('unknown checkpoint selection')
+    selected = sys.argv[3] if len(sys.argv)==4 else ''
+    ordinary, shared = selected == 'ordinary', selected == 'shared'
+    if selected not in ('', 'ordinary', 'shared'): sys.exit('unknown checkpoint selection')
     template = (Path(__file__).resolve().parent.parent / 'config/instance-configured.toml').read_text()
     with tempfile.TemporaryDirectory(prefix='ginux-checkpoints-') as folder:
         work = Path(folder)
@@ -42,8 +43,10 @@ def main():
         config = config.replace('args = []', 'args = ["checkpoint"]')
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
         config_path = work / 'config.toml'
+        if shared: config = config.replace('args = ["checkpoint"]', 'args = ["checkpoint-shared"]')
         config_path.write_text(config)
-        for failure in ((None,) if ordinary else (None, 'replay', 'existing')):
+        counters = []
+        for failure in ((None,) if ordinary or shared else (None, 'replay', 'existing')):
             client, server = socket.socketpair()
             client.settimeout(5)
             result = work / f'result-{failure}.json'
@@ -82,6 +85,10 @@ def main():
                         with tarfile.open(archive) as tar:
                             assert tar.extractfile('work/checkpoint').read() == expected
                             assert tar.extractfile('work/child').read() == b'child'
+                            if shared:
+                                counter = struct.unpack('<Q', tar.extractfile('work/ticker').read())[0]
+                                assert counter > (counters[-1] if counters else 0)
+                                counters.append(counter)
                         proc.stdin.write(b'G')
                         proc.stdin.flush()
                     if failure is None:
@@ -98,6 +105,9 @@ def main():
                     if proc.poll() is None:
                         proc.kill()
                         proc.communicate(timeout=5)
+        if shared:
+            print('test-launch-checkpoints: PASS (shared data and concurrent mapped writer quiescence/resume)')
+            return
         # A normally disconnected coordinator cancels a blocked workload.
         client, server = socket.socketpair()
         result, final = work/'closed.json', work/'closed.tar'

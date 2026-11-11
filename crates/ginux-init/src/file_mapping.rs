@@ -1,5 +1,5 @@
 //! Private mapping transaction for an owned file. The existing descriptor owner
-//! validates the public fd; a readonly backing reference crosses an internal
+//! validates the public fd and mapping access; a backing reference crosses an internal
 //! socket only while the task is stopped. All three temporary native descriptors
 //! and the scratch stack bytes are retired before user code can resume.
 use crate::supervisor::{syscall1, syscall2, syscall3, syscall4, UserRegs};
@@ -38,7 +38,7 @@ impl Drop for MappingCall {
 }
 
 impl MappingCall {
-    /// Takes ownership of the supervisor's readonly backing reference.
+    /// Takes ownership of the supervisor's validated backing reference.
     pub fn new(
         host: usize,
         original: UserRegs,
@@ -278,8 +278,9 @@ fn send_backing(host: usize, socket: u32, backing: usize) -> Result<(), ()> {
     }
 }
 
-/// Obtain a readonly reference to a supervisor fd, never a guest-supplied path.
-pub fn readonly_reference(fd: i32) -> Result<usize, i64> {
+/// Obtain a reference with checked mapping access to a supervisor fd, never
+/// a guest-supplied path. The transfer transaction retires it before userspace.
+pub fn backing_reference(fd: i32, writable: bool) -> Result<usize, i64> {
     let mut path = [0u8; 64];
     path[..14].copy_from_slice(b"/proc/self/fd/");
     let mut digits = [0u8; 10];
@@ -301,7 +302,7 @@ pub fn readonly_reference(fd: i32) -> Result<usize, i64> {
             257,
             (-100isize) as usize,
             path.as_ptr() as usize,
-            0x80000,
+            0x80000 | if writable { 2 } else { 0 },
             0,
         )
     };
@@ -310,4 +311,132 @@ pub fn readonly_reference(fd: i32) -> Result<usize, i64> {
     } else {
         Ok(result as usize)
     }
+}
+
+/// Inspect only a registered stopped task's kernel mapping table. Conservatively
+/// refuse exec while any shared reference exists, including one currently
+/// protected read-only that could later regain write permission with mprotect.
+pub fn has_shared_mapping(host: usize, backing: i32) -> Result<bool, i64> {
+    let mut stat = [0u64; 18];
+    if unsafe { syscall2(5, backing as usize, stat.as_mut_ptr() as usize) } < 0 {
+        return Err(-5);
+    }
+    let device = stat[0];
+    let major = ((device >> 8) & 0xfff) | ((device >> 32) & 0xfffff000);
+    let minor = (device & 0xff) | ((device >> 12) & 0xffffff00);
+    let inode = stat[1];
+    let mut path = [0u8; 64];
+    path[..6].copy_from_slice(b"/proc/");
+    let mut digits = [0u8; 20];
+    let mut value = host;
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    for n in 0..count {
+        path[6 + n] = digits[count - n - 1];
+    }
+    path[6 + count..11 + count].copy_from_slice(b"/maps");
+    let fd = unsafe {
+        syscall4(
+            257,
+            (-100isize) as usize,
+            path.as_ptr() as usize,
+            0x80000,
+            0,
+        )
+    };
+    if fd == -2 || fd == -3 {
+        return Ok(false);
+    }
+    if fd < 0 {
+        return Err(-95);
+    }
+    let result = (|| {
+        let mut bytes = [0u8; 4096];
+        let mut line = [0u8; 128];
+        let mut used = 0;
+        let mut total = 0;
+        loop {
+            let read =
+                unsafe { syscall3(0, fd as usize, bytes.as_mut_ptr() as usize, bytes.len()) };
+            if read == -4 {
+                continue;
+            }
+            if read < 0 {
+                return Err(-95);
+            }
+            if read == 0 {
+                return Ok(false);
+            }
+            total += read as usize;
+            if total > 4 * 1024 * 1024 {
+                return Err(-95);
+            }
+            for byte in &bytes[..read as usize] {
+                if *byte == b'\n' {
+                    if shared_line(&line[..used], major, minor, inode) {
+                        return Ok(true);
+                    }
+                    used = 0;
+                } else if used < line.len() {
+                    line[used] = *byte;
+                    used += 1;
+                }
+            }
+        }
+    })();
+    let closed = unsafe { syscall1(3, fd as usize) };
+    if closed < 0 {
+        return Err(-5);
+    }
+    result
+}
+
+fn shared_line(line: &[u8], major: u64, minor: u64, inode: u64) -> bool {
+    let mut fields = line
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|f| !f.is_empty());
+    let _range = fields.next();
+    let Some(permissions) = fields.next() else {
+        return false;
+    };
+    let _offset = fields.next();
+    let Some(device) = fields.next() else {
+        return false;
+    };
+    let Some(number) = fields.next() else {
+        return false;
+    };
+    let Some(colon) = device.iter().position(|b| *b == b':') else {
+        return false;
+    };
+    permissions.get(3) == Some(&b's')
+        && parsed_number(&device[..colon], 16) == Some(major)
+        && parsed_number(&device[colon + 1..], 16) == Some(minor)
+        && parsed_number(number, 10) == Some(inode)
+}
+
+fn parsed_number(bytes: &[u8], radix: u64) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value = 0u64;
+    for byte in bytes {
+        let digit = match byte {
+            b'0'..=b'9' => u64::from(byte - b'0'),
+            b'a'..=b'f' => u64::from(byte - b'a' + 10),
+            _ => return None,
+        };
+        if digit >= radix {
+            return None;
+        }
+        value = value.checked_mul(radix)?.checked_add(digit)?;
+    }
+    Some(value)
 }

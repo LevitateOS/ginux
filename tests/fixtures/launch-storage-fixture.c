@@ -163,8 +163,16 @@ static long export_data(const char *mode) {
     }
     return equal(mode,"failed-export") ? 7 : 0;
 }
-static long checkpoint_data(void) {
+static long checkpoint_data(int shared) {
     long fd=DO(2,"/work/checkpoint",0102,0600); CHECK(fd==3 && DO(1,fd,"first",5)==5,210);
+    long mapped=0,ticker=0,writer=0;
+    if(shared) {
+        mapped=call(9,0,4096,3,1,fd,0);CHECK(mapped>0,220);
+        long count=DO(2,"/work/ticker",0102,0600);CHECK(count>=4 && DO(77,count,8,0)==0,221);
+        ticker=call(9,0,4096,3,1,count,0);CHECK(ticker>0 && DO(3,count,0,0)==0,222);
+        writer=DO(57,0,0,0);CHECK(writer>=0,223);
+        if(!writer) { for(;;) ++*(volatile word *)ticker; }
+    }
     long child=DO(57,0,0,0); CHECK(child>=0,211);
     if(!child) {
         long data=DO(2,"/work/child",0101,0600);
@@ -172,8 +180,15 @@ static long checkpoint_data(void) {
     }
     int status=-1; CHECK(DO(61,child,&status,0)==child && status==0,213);
     CHECK(DO(1,1,"checkpoint-ready\n",17)==17 && DO(0,0,output,1)==1,214);
-    CHECK(DO(8,fd,0,0)==0 && DO(1,fd,"second",6)==6,215);
+    if(shared) {
+        CHECK(DO(77,fd,6,0)==0,224);
+        for(word i=0;i<6;++i)((volatile char *)mapped)[i]="second"[i];
+    } else CHECK(DO(8,fd,0,0)==0 && DO(1,fd,"second",6)==6,215);
     CHECK(DO(1,1,"checkpoint-ready\n",17)==17 && DO(0,0,output,1)==1,216);
+    if(shared) {
+        CHECK(DO(62,writer,9,0)==0 && DO(61,writer,&status,0)==writer && status==9,225);
+        CHECK(DO(11,mapped,4096,0)==0 && DO(11,ticker,4096,0)==0,226);
+    }
     CHECK(DO(74,fd,0,0)==0 && DO(75,fd,0,0)==0 && DO(3,fd,0,0)==0,217);
     return 0;
 }
@@ -431,7 +446,8 @@ long storage_main(word *stack)
     if(argc>1 && equal(argv[1],"ordinary-vectors")) return ordinary_vectors();
     if(argc>1 && equal(argv[1],"ordinary-large-io")) return ordinary_large_io();
     if(argc>1 && equal(argv[1],"positioned")) return positioned();
-    if(argc>1 && equal(argv[1],"checkpoint")) return checkpoint_data();
+    if(argc>1 && equal(argv[1],"checkpoint")) return checkpoint_data(0);
+    if(argc>1 && equal(argv[1],"checkpoint-shared")) return checkpoint_data(1);
     if(argc>1 && equal(argv[1],"events")) return task_events_data();
     if(argc>1 && equal(argv[1],"signal-mask")) return signal_mask_data();
     if(argc>1 && equal(argv[1],"restore")) return restore_data(0);

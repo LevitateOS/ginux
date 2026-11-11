@@ -66,6 +66,19 @@ static long ordinary_exec(word *stack)
     CHECK(DO(2,"/work/drop",02000102,0600)==4,121);
     if(equal(argv[1],"ordinary-hardlinked") || equal(argv[1],"ordinary-fd-hardlinked")) CHECK(DO(86,"/work/program","/work/alias",0)==0,135);
     char *next[]={"payload","ordinary-after",argv[1],0};
+    if(equal(argv[1],"ordinary-shared")) {
+        long writer=DO(2,"/work/program",2,0);CHECK(writer>=5,140);
+        long shared=call(9,0,4096,3,1,writer,0);CHECK(shared>0 && DO(3,writer,0,0)==0,141);
+        CHECK(DO(59,"/work/program",next,empty_env)==-26,142);
+        CHECK(DO(10,shared,4096,1)==0 && DO(59,"/work/program",next,empty_env)==-26,143);
+        long child=DO(57,0,0,0);CHECK(child>=0,144);
+        if(!child) {
+            CHECK(DO(11,shared,4096,0)==0 && DO(59,"/work/program",next,empty_env)==-26,145);
+            return 0;
+        }
+        int status=-1;CHECK(DO(61,child,&status,0)==child && status==0,146);
+        CHECK(DO(11,shared,4096,0)==0,147);
+    }
     if(equal(argv[1],"ordinary-reexec")) {
         CHECK(DO(59,"/work/missing",next,empty_env)==-2 && DO(72,4,1,0)==1,129);
         CHECK(DO(8,3,0,1)==1,130);

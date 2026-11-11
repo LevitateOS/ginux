@@ -714,6 +714,31 @@ impl<
         Ok((&mut self.storage, fd.object))
     }
 
+    /// Writable shared mappings require a readable/writable regular OFD and
+    /// must not alter bytes held by an executable pin.
+    pub fn mapping_storage(
+        &mut self,
+        descriptor: i32,
+        writable: bool,
+    ) -> Result<(&mut S, usize), VfsError> {
+        let fd = self.descriptors[self.descriptor(descriptor)?];
+        if !fd.overlay
+            || self.overlay[fd.object].kind != NodeKind::File
+            || !fd.readable
+            || writable && !fd.writable
+        {
+            return Err(VfsError::PermissionDenied);
+        }
+        if writable && self.overlay[fd.object].executions != 0 {
+            return Err(VfsError::TextBusy);
+        }
+        Ok((&mut self.storage, fd.object))
+    }
+
+    pub fn executable_storage(&mut self, image: Executable) -> (&mut S, usize) {
+        (&mut self.storage, image.object)
+    }
+
     pub fn storage(&self) -> &S {
         &self.storage
     }

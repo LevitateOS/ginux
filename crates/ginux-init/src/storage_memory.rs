@@ -211,11 +211,10 @@ impl OverlayStorage for MemoryStorage {
         }
         if !output.is_empty() {
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    (file.address + offset) as *const u8,
-                    output.as_mut_ptr(),
-                    output.len(),
-                );
+                // A mapped writer in another process may change these bytes.
+                for (n, byte) in output.iter_mut().enumerate() {
+                    *byte = core::ptr::read_volatile((file.address + offset + n) as *const u8);
+                }
             }
         }
         Ok(())
@@ -231,11 +230,9 @@ impl OverlayStorage for MemoryStorage {
         }
         if !input.is_empty() {
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    input.as_ptr(),
-                    (file.address + offset) as *mut u8,
-                    input.len(),
-                );
+                for (n, byte) in input.iter().enumerate() {
+                    core::ptr::write_volatile((file.address + offset + n) as *mut u8, *byte);
+                }
             }
         }
         Ok(())

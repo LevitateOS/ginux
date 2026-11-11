@@ -1,7 +1,7 @@
 //! Configured-launch ephemeral memory storage. Bytes and descriptors belong to
 //! the supervisor; no writable host descriptor is installed in the workload.
 //! Executable references share the VFS owner. File mappings use a private
-//! read-only backing transfer; retained storage is not provided.
+//! backing transfer with validated mapping rights; retained storage is not provided.
 
 use crate::storage_memory::{MappedArray, MemoryStorage};
 use crate::supervisor::UserRegs;
@@ -1107,7 +1107,7 @@ impl LaunchFs {
         self.fs.release_executable(image).map_err(errno)
     }
 
-    pub fn mapping_reference(&mut self, handle: u32) -> Result<usize, i64> {
+    pub fn mapping_reference(&mut self, handle: u32, writable: bool) -> Result<usize, i64> {
         let slot = handle
             .checked_sub(FD_BASE as u32)
             .filter(|n| *n < 64)
@@ -1115,9 +1115,27 @@ impl LaunchFs {
         if self.stack_snapshots[slot as usize] {
             return Err(-95);
         }
-        let (storage, object) = self.fs.readable_storage(slot as i32 + 3).map_err(errno)?;
+        let (storage, object) = self
+            .fs
+            .mapping_storage(slot as i32 + 3, writable)
+            .map_err(errno)?;
         let fd = storage.backing(object).map_err(errno)?;
-        crate::file_mapping::readonly_reference(fd)
+        crate::file_mapping::backing_reference(fd, writable)
+    }
+
+    pub fn validate_exec_mappings(
+        &mut self,
+        image: Executable,
+        hosts: &[usize],
+    ) -> Result<(), i64> {
+        let (storage, object) = self.fs.executable_storage(image);
+        let fd = storage.backing(object).map_err(errno)?;
+        for host in hosts.iter().copied().filter(|host| *host != 0) {
+            if crate::file_mapping::has_shared_mapping(host, fd)? {
+                return Err(-26);
+            }
+        }
+        Ok(())
     }
 
     pub fn executable_name(&self, image: Executable) -> Result<ExecutableName, i64> {
@@ -1181,6 +1199,7 @@ impl LaunchFs {
                 | 93
                 | 217
                 | 292
+                | 285
         ) && fd >= FD_BASE as i32
         {
             return Some(self.descriptor_call(pid, r, fd - FD_BASE as i32 + 3));
@@ -1673,6 +1692,7 @@ impl LaunchFs {
         }
         let result = match r.orig_rax {
             16 => self.fs.fstat(fd).map_err(errno).and(Err(-25)),
+            285 => self.fs.fstat(fd).map_err(errno).and(Err(-95)),
             0 => self.read(pid, fd, r.rsi, r.rdx, None),
             17 => self.read(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
             1 => self.write(pid, fd, r.rsi, r.rdx, None),

@@ -88,7 +88,15 @@ long fd_main(word *stack)
     mapped=call(9,0,4096,1,2,memory,0);
     CHECK(mapped>0 && *(unsigned char *)mapped=='A',24);
     CHECK(DO(8,memory,0,1)==3 && DO(11,mapped,4096,0)==0,49);
-    CHECK(call(9,0,4096,3,1,memory,0)==-95,55); // Writable shared backing remains unsupported.
+    CHECK(call(285,memory,0,0,4096,0,0)==-95,55);
+    CHECK(DO(77,memory,4096,0)==0,65);
+    mapped=call(9,0,4096,3,1,memory,0); CHECK(mapped>0,66);
+    *(volatile char *)mapped='M';
+    CHECK(DO(8,memory,0,0)==0 && DO(0,memory,bytes,1)==1 && bytes[0]=='M',67);
+    CHECK(DO(8,memory,0,0)==0 && DO(1,memory,"A",1)==1 && *(volatile char *)mapped=='A',68);
+    CHECK(DO(11,mapped,4096,0)==0 && DO(77,memory,3,0)==0,69);
+    long reader=DO(2,"/work/data",0,0);CHECK(reader>=3,70);
+    CHECK(call(9,0,4096,3,1,reader,0)==-13 && DO(3,reader,0,0)==0,71);
     CHECK(call(9,0,4096,1,2,0,0)==-95 && DO(217,0,bytes,sizeof bytes)==-20,48);
     CHECK(DO(33,null,reopened,0)==reopened,25);
     CHECK(DO(0,reopened,bytes,1)==0,26);
