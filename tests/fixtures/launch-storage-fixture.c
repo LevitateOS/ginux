@@ -508,7 +508,11 @@ long storage_main(word *stack)
         long fd=DO(2,"/work/mapped",0102,0600);
         CHECK(fd==3 && DO(77,fd,8192,0)==0,110);
         CHECK(DO(1,fd,"old",3)==3 && DO(8,fd,4096,0)==4096 && DO(1,fd,"second",6)==6,111);
-        CHECK(call(9,0,8192,3,1,fd,0)==-95,112);
+        long writable=call(9,0,8192,3,1,fd,0);
+        CHECK(writable>0 && *(volatile char *)writable=='o',112);
+        ((volatile char *)writable)[1]='L';
+        CHECK(DO(8,fd,0,0)==0 && DO(0,fd,output,3)==3 && output[1]=='L',112);
+        CHECK(DO(11,writable,8192,0)==0 && DO(8,fd,4102,0)==4102,112);
         long shared=call(9,0,4096,1,1,fd,0);
         CHECK(shared>0 && *(volatile char *)shared=='o',132);
         CHECK(DO(10,shared,4096,3)==-13 && DO(11,shared,4096,0)==0,133);
