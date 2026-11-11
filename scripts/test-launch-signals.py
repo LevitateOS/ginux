@@ -169,7 +169,7 @@ def main():
                     assert b'teardown tasks=0 owned-handles=0' in audit_bytes
                     if mode in PARKED:
                         # Only a handler hands the parked call back to the kernel.
-                        marker = b'mediate surface=pselect-signal-mask' if mode.startswith('park-pselect') else INTERRUPTED
+                        marker = b'mediate surface=pselect-signal-mask' if mode.startswith('park-pselect') or mode == 'park-poll' else INTERRUPTED
                         assert (marker in audit_bytes) == (mode != 'park-ignored'), (mode, audit_bytes[-4000:])
                     if mode == 'map-signal':
                         assert b'mediate surface=owned-file-mapping' in audit_bytes, audit_bytes[-4000:]
