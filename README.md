@@ -559,6 +559,14 @@ Truncation returns unused pages; sparse gaps and regrowth read as zero. Unlinked
 bytes survive until the last open reference closes; teardown releases mappings.
 Aliases use the common public descriptor table. Handle exhaustion returns `EMFILE`.
 
+Optional `[storage].archive_import = true` lets a workload unpack one POSIX
+tar stream into an owned directory with a single mediated write per MiB instead
+of several mediated calls per member. `ioctl(dirfd, 0x40104701, &request)`
+returns a write-only stream descriptor; each member is applied through the same
+storage calls, contract decisions, limits and audit budget as individual
+creates, and never through a link. It is off by default and answers `ENOTTY`
+when disabled. See [docs/archive-import.md](docs/archive-import.md).
+
 Configured launch uses one table of up to 256 public descriptors for bootstrap
 stdio, immutable-image files, writable files, devices and pipes. Allocation uses
 the lowest free number; native opens reserve a slot before running. Backend

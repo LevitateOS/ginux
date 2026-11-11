@@ -450,6 +450,11 @@ pub fn launch_main(
     filesystem
         .check_image(root_path)
         .unwrap_or_else(|reason| launch_startup_fail(reason));
+    if config.storage_archive_import {
+        filesystem
+            .grant_archive_import(&contract)
+            .unwrap_or_else(|reason| launch_startup_fail(reason));
+    }
     if let Err(reason) = crate::storage_restore::restore(restore_path, &mut filesystem) {
         filesystem
             .teardown()
@@ -954,6 +959,46 @@ pub(crate) fn audit_write(bytes: &[u8]) {
         &record[..length]
     };
     write_stderr(record);
+}
+
+/// One complete record written beside the record being staged, charged to
+/// the same budget. An owner that finishes work outside its own syscall's
+/// result (an archive import closed by its last reference) records it here.
+pub(crate) fn audit_record(arguments: core::fmt::Arguments<'_>) {
+    struct Record {
+        bytes: [u8; AUDIT_RECORD_CAPACITY],
+        len: usize,
+    }
+    impl core::fmt::Write for Record {
+        fn write_str(&mut self, value: &str) -> core::fmt::Result {
+            let end = self.len + value.len();
+            self.bytes
+                .get_mut(self.len..end)
+                .ok_or(core::fmt::Error)?
+                .copy_from_slice(value.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+    let mut record = Record {
+        bytes: [0; AUDIT_RECORD_CAPACITY],
+        len: 0,
+    };
+    unsafe {
+        if AUDIT_DISABLED || AUDIT_CAPPED {
+            return;
+        }
+        // No record is this long; stop auditing rather than split one.
+        if core::fmt::write(&mut record, arguments).is_err()
+            || record.bytes[..record.len].last() != Some(&b'\n')
+            || AUDIT_BYTES + record.len > AUDIT_BYTE_BUDGET
+        {
+            audit_cap();
+            return;
+        }
+        AUDIT_BYTES += record.len;
+    }
+    write_stderr(&record.bytes[..record.len]);
 }
 
 fn audit_cap() {

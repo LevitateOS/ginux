@@ -2,15 +2,20 @@
 //! the supervisor; no writable host descriptor is installed in the workload.
 //! Executable references share the VFS owner. File mappings use a private
 //! backing transfer with validated mapping rights; retained storage is not provided.
+//! An archive import stream (see `docs/archive-import.md`) applies one tar
+//! stream through the same VFS calls and contract decisions as individual
+//! creates.
 
 use crate::storage_memory::{MappedArray, MemoryStorage};
 use crate::supervisor::UserRegs;
 use crate::tracee_io::{copy_memory, read_path};
 use core::sync::atomic::{AtomicBool, Ordering};
+use ginux_contract::{Action as ContractAction, EffectiveContract};
 use ginux_instance::{InstanceConfig, Text};
 use ginux_vfs::{
-    BaseReader, Executable, FileMetadata, Index, NodeKind, Timestamp, VfsError, VirtualFs,
-    MAX_PATH, O_APPEND, O_CLOEXEC, O_CREATE, O_EXCLUSIVE, O_NONBLOCK, O_READ, O_TRUNC, O_WRITE,
+    ArchiveError, ArchiveImport, ArchiveOperation, ArchivePolicy, BaseReader, Executable,
+    FileMetadata, Index, NodeKind, Timestamp, VfsError, VirtualFs, MAX_PATH, O_APPEND, O_CLOEXEC,
+    O_CREATE, O_EXCLUSIVE, O_NONBLOCK, O_READ, O_TRUNC, O_WRITE,
 };
 
 pub const FD_BASE: usize = 1 << 20;
@@ -41,6 +46,53 @@ impl BaseReader for EmptyReader {
     }
 }
 
+/// Concurrent archive import streams per launch.
+const IMPORT_STREAMS: usize = 8;
+/// Bytes copied from the workload per chunk of an import stream write.
+const IMPORT_IO_SIZE: usize = 16 * 1024;
+
+/// One archive import stream. Its handle is a private VFS descriptor of the
+/// destination directory, which pins that directory for the stream's life;
+/// the workload can only write the stream, query it and close it.
+#[derive(Clone, Copy)]
+struct ImportStream {
+    fd: i32,
+    import: ArchiveImport,
+}
+
+/// Each operation an import performs, with the individual calls a
+/// sequential extractor makes for it. All of them are filesystem writes.
+const ARCHIVE_CALLS: [(ArchiveOperation, &[u64]); 9] = [
+    // openat(O_CREAT | O_EXCL), then write.
+    (ArchiveOperation::CreateFile, &[257, 1]),
+    (ArchiveOperation::CreateDirectory, &[258]),
+    (ArchiveOperation::CreateSymlink, &[266]),
+    (ArchiveOperation::CreateHardLink, &[265]),
+    (ArchiveOperation::CreateFifo, &[259]),
+    (ArchiveOperation::Remove, &[263]),
+    (ArchiveOperation::ChangeMode, &[268]),
+    (ArchiveOperation::ChangeFileMode, &[91]),
+    (ArchiveOperation::SetTimes, &[280]),
+];
+
+/// The immutable contract's decision for each operation: zero when every
+/// call it stands for is allowed, otherwise the first call's denial errno.
+#[derive(Clone, Copy)]
+struct ArchiveGrants([i32; ARCHIVE_CALLS.len()]);
+
+impl ArchivePolicy for ArchiveGrants {
+    fn permit(&mut self, operation: ArchiveOperation) -> Result<(), i32> {
+        let index = ARCHIVE_CALLS
+            .iter()
+            .position(|(candidate, _)| *candidate == operation)
+            .ok_or(38)?;
+        match self.0[index] {
+            0 => Ok(()),
+            errno => Err(errno),
+        }
+    }
+}
+
 pub struct RestoreEntry<'a> {
     pub path: &'a [u8],
     pub kind: NodeKind,
@@ -64,6 +116,9 @@ pub struct LaunchFs {
     locks: crate::file_locks::Locks,
     flocks: crate::file_locks::Locks,
     stack_snapshots: [bool; 64],
+    // Present only when the configuration enables archive import.
+    imports: Option<MappedArray<ImportStream>>,
+    archive_grants: ArchiveGrants,
 }
 
 impl LaunchFs {
@@ -175,6 +230,8 @@ impl LaunchFs {
             locks: crate::file_locks::Locks::new(),
             flocks: crate::file_locks::Locks::new(),
             stack_snapshots: [false; 64],
+            imports: None,
+            archive_grants: ArchiveGrants([38; ARCHIVE_CALLS.len()]),
             fs,
             byte_limit: limit,
             prefixes,
@@ -276,6 +333,10 @@ impl LaunchFs {
         let slot = handle.checked_sub(FD_BASE as u32)?;
         if slot >= 64 {
             return None;
+        }
+        if self.import_index(slot as i32 + 3).is_some() {
+            // Always writable, never readable.
+            return Some(0x104);
         }
         self.fs
             .fstat(slot as i32 + 3)
@@ -501,6 +562,13 @@ impl LaunchFs {
     }
     pub fn close_locks(&mut self, handle: u32) {
         if (FD_BASE as u32..FD_BASE as u32 + 64).contains(&handle) {
+            // A stream holds its directory but never its locks.
+            if self
+                .import_index((handle - FD_BASE as u32) as i32 + 3)
+                .is_some()
+            {
+                return;
+            }
             if let Ok(metadata) = self.fs.fstat((handle - FD_BASE as u32) as i32 + 3) {
                 self.locks.release(self.process, Some(metadata.inode));
             }
@@ -591,6 +659,9 @@ impl LaunchFs {
                 .checked_sub(FD_BASE as u32)
                 .filter(|slot| *slot < 64)
                 .ok_or(-9)?;
+            if self.import_index(fd as i32 + 3).is_some() {
+                return Err(-20);
+            }
             self.fs.directory_path(fd as i32 + 3).map_err(errno)?
         };
         join_path(base, text.as_bytes())
@@ -806,6 +877,9 @@ impl LaunchFs {
             .filter(|n| *n < 64)
             .ok_or(-20)? as i32
             + 3;
+        if self.import_index(fd).is_some() {
+            return Err(-20);
+        }
         self.fs.directory_path(fd).map_err(errno)?;
         self.copy_cwd(fd)
     }
@@ -961,8 +1035,266 @@ impl LaunchFs {
             .checked_sub(FD_BASE as u32)
             .filter(|n| *n < 64)
             .ok_or(-95)?;
+        if self.import_index(fd as i32 + 3).is_some() {
+            return Err(-13);
+        }
         let image = self.fs.pin_executable_fd(fd as i32 + 3).map_err(errno)?;
         self.check_exec(pid, image)
+    }
+
+    /// Offer archive import streams (`storage.archive_import`). The contract
+    /// is fixed for the launch, so the decision for each call an import
+    /// stands for is taken once, as syscall entry would take it.
+    pub fn grant_archive_import(
+        &mut self,
+        contract: &EffectiveContract,
+    ) -> Result<(), &'static [u8]> {
+        for (grant, (_, calls)) in self.archive_grants.0.iter_mut().zip(ARCHIVE_CALLS) {
+            *grant = calls
+                .iter()
+                .find_map(|number| {
+                    match contract
+                        .runtime_rule(*number, Some("filesystem.path.write"))
+                        .map_or(ContractAction::Deny(38), |rule| rule.action)
+                    {
+                        ContractAction::Deny(errno) => Some(errno.max(1)),
+                        _ => None,
+                    }
+                })
+                .unwrap_or(0);
+        }
+        let idle = ImportStream {
+            fd: -1,
+            import: ArchiveImport::new(0, 0)
+                .map_err(|_| b"archive import state invalid".as_slice())?,
+        };
+        self.imports = Some(
+            MappedArray::new(IMPORT_STREAMS, idle)
+                .map_err(|_| b"archive import state allocation failed".as_slice())?,
+        );
+        Ok(())
+    }
+
+    pub fn archive_import_enabled(&self) -> bool {
+        self.imports.is_some()
+    }
+
+    fn import_index(&self, fd: i32) -> Option<usize> {
+        self.imports
+            .as_ref()?
+            .iter()
+            .position(|stream| stream.fd == fd)
+    }
+
+    /// `ioctl(directory, ARCHIVE_IMPORT_REQUEST, &request)` on an owned
+    /// directory: the handle of a new write-only import stream into it. Any
+    /// other descriptor answers ENOTTY, as for an ioctl it does not offer.
+    pub fn archive_open(&mut self, pid: usize, handle: u32, argument: u64) -> Result<u32, i64> {
+        let directory = handle
+            .checked_sub(FD_BASE as u32)
+            .filter(|slot| *slot < 64)
+            .ok_or(-25)? as i32
+            + 3;
+        if self.imports.is_none()
+            || self.stack_snapshots[(directory - 3) as usize]
+            || self.import_index(directory).is_some()
+            || self.fs.fstat(directory).map_err(errno)?.kind != NodeKind::Directory
+        {
+            return Err(-25);
+        }
+        let mut request = [0u8; 16];
+        if copy_memory(pid, argument, &mut request, false) != Ok(request.len() as i64) {
+            return Err(-14);
+        }
+        let word = |index: usize| {
+            u32::from_ne_bytes([
+                request[index * 4],
+                request[index * 4 + 1],
+                request[index * 4 + 2],
+                request[index * 4 + 3],
+            ])
+        };
+        if word(1) | word(2) | word(3) != 0 {
+            return Err(-22);
+        }
+        // Missing parents get the mode mkdir(0777) would under this umask.
+        let import = ArchiveImport::new(word(0), 0o777 & !self.creation_mask).map_err(|_| -22)?;
+        let path =
+            Path::from_bytes(self.fs.directory_path(directory).map_err(errno)?).map_err(|_| -36)?;
+        if !self.owns_path(path.as_bytes()) {
+            return Err(-25);
+        }
+        let free = self
+            .imports
+            .as_ref()
+            .and_then(|streams| streams.iter().position(|stream| stream.fd < 0))
+            .ok_or(-24)?;
+        // An independent description of the same directory: the stream never
+        // shares an offset or status flags with the workload's descriptor.
+        let stream = self.fs.open_directory(path.as_bytes(), 0).map_err(errno)?;
+        if self.fs.fstat(stream).map(|m| m.inode) != self.fs.fstat(directory).map(|m| m.inode) {
+            let _ = self.fs.close(stream);
+            return Err(-2);
+        }
+        self.stack_snapshots[(stream - 3) as usize] = false;
+        if let Some(streams) = self.imports.as_mut() {
+            streams[free] = ImportStream { fd: stream, import };
+        }
+        Ok(FD_BASE as u32 + stream as u32 - 3)
+    }
+
+    /// Every descriptor call on an import stream. It is write-only and has
+    /// no name: it never acts as the directory it holds.
+    fn archive_stream_call(
+        &mut self,
+        pid: usize,
+        r: &UserRegs,
+        fd: i32,
+        index: usize,
+    ) -> Result<i64, i64> {
+        match r.orig_rax {
+            1 => self.archive_stream_write(pid, fd, index, r.rsi, r.rdx),
+            20 => {
+                let vectors = crate::tracee_io::IoVectors::read(pid, r.rsi, r.rdx)?;
+                let mut buffer = [0u8; IMPORT_IO_SIZE];
+                let count = vectors.length.min(buffer.len());
+                let copied = vectors.copy(pid, &mut buffer[..count], false)?;
+                let now = realtime()?;
+                self.archive_feed(fd, index, &buffer[..copied], now)?;
+                Ok(copied as i64)
+            }
+            3 => self.archive_stream_close(fd, index),
+            // Complete only once the end-of-archive marker has been applied.
+            74 | 75 => self
+                .imports
+                .as_ref()
+                .ok_or(-9)
+                .and_then(|streams| {
+                    self.fs
+                        .archive_finish(&streams[index].import)
+                        .map_err(archive_errno)
+                })
+                .map(|_| 0),
+            5 => copy_metadata(pid, r.rsi, self.archive_stream_metadata(fd)?, false),
+            262 | 332 => {
+                let flags = if r.orig_rax == 262 { r.r10 } else { r.rdx };
+                let valid = if r.orig_rax == 262 {
+                    flags & !0x1900 == 0
+                } else {
+                    valid_statx(flags, r.r10)
+                };
+                if flags & 0x1000 == 0 || !valid {
+                    return Err(-22);
+                }
+                copy_metadata(
+                    pid,
+                    if r.orig_rax == 262 { r.rdx } else { r.r8 },
+                    self.archive_stream_metadata(fd)?,
+                    r.orig_rax == 332,
+                )
+            }
+            72 if r.rsi == 3 => Ok(1),
+            0 | 17 | 19 => Err(-9),
+            8 | 18 => Err(-29),
+            16 => Err(-25),
+            217 => Err(-20),
+            _ => Err(-22),
+        }
+    }
+
+    /// A stream describes itself as a write-only FIFO; it has no bytes or
+    /// name of its own.
+    fn archive_stream_metadata(&self, fd: i32) -> Result<FileMetadata, i64> {
+        let directory = self.fs.fstat(fd).map_err(errno)?;
+        Ok(FileMetadata {
+            kind: NodeKind::Fifo,
+            mode: 0o200,
+            size: 0,
+            links: 1,
+            ..directory
+        })
+    }
+
+    /// Copies the caller's bytes in bounded chunks and applies each one
+    /// before the next is copied. A failed member stops the stream: the
+    /// write reports its error and members applied before it remain.
+    fn archive_stream_write(
+        &mut self,
+        pid: usize,
+        fd: i32,
+        index: usize,
+        address: u64,
+        length: u64,
+    ) -> Result<i64, i64> {
+        let limit = length.min(1024 * 1024) as usize;
+        let mut buffer = [0u8; IMPORT_IO_SIZE];
+        let now = realtime()?;
+        let mut consumed = 0usize;
+        while consumed < limit {
+            let count = (limit - consumed).min(buffer.len());
+            let copied = match address
+                .checked_add(consumed as u64)
+                .ok_or(-14)
+                .and_then(|address| copy_memory(pid, address, &mut buffer[..count], false))
+            {
+                Ok(n) => n as usize,
+                Err(_) if consumed != 0 => break,
+                Err(error) => return Err(error),
+            };
+            self.archive_feed(fd, index, &buffer[..copied], now)?;
+            consumed += copied;
+            if copied != count {
+                break;
+            }
+        }
+        Ok(consumed as i64)
+    }
+
+    fn archive_feed(
+        &mut self,
+        fd: i32,
+        index: usize,
+        bytes: &[u8],
+        now: Timestamp,
+    ) -> Result<(), i64> {
+        // Members land only beneath the destination, which stays owned.
+        if !self.owns_path(self.fs.directory_path(fd).map_err(errno)?) {
+            return Err(-18);
+        }
+        let mut grants = self.archive_grants;
+        let streams = self.imports.as_mut().ok_or(-9)?;
+        self.fs
+            .archive_write(
+                &mut streams[index].import,
+                fd,
+                bytes,
+                Some(now),
+                &mut grants,
+            )
+            .map_err(archive_errno)
+    }
+
+    /// The last reference closed: release the member being written, record
+    /// the import once, and drop the destination. Never fails.
+    fn archive_stream_close(&mut self, fd: i32, index: usize) -> Result<i64, i64> {
+        let Some(streams) = self.imports.as_mut() else {
+            return Err(-9);
+        };
+        let mut stream = streams[index];
+        streams[index].fd = -1;
+        self.fs.archive_abort(&mut stream.import);
+        let summary = stream.import.summary();
+        let (outcome, result) = match self.fs.archive_finish(&stream.import) {
+            Ok(_) => ("complete", 0),
+            Err(ArchiveError::Truncated) => ("incomplete", archive_errno(ArchiveError::Truncated)),
+            Err(error) => ("failed", archive_errno(error)),
+        };
+        crate::launch::audit_record(format_args!(
+            "ginux: audit archive-import process={} members={} directories={} bytes={} outcome={} result={}\n",
+            self.process, summary.members, summary.directories, summary.bytes, outcome, result
+        ));
+        self.flocks.release((fd - 3) as u32, None);
+        self.fs.close(fd).map(|_| 0).map_err(errno)
     }
 
     pub fn descriptor_path(&self, handle: u32) -> Result<Path, i64> {
@@ -970,6 +1302,9 @@ impl LaunchFs {
             .checked_sub(FD_BASE as u32)
             .filter(|slot| *slot < 64)
             .ok_or(-2)?;
+        if self.import_index(slot as i32 + 3).is_some() {
+            return Err(-2);
+        }
         let path = self.fs.descriptor_path(slot as i32 + 3).map_err(errno)?;
         Path::from_bytes(path).map_err(|_| -36)
     }
@@ -988,7 +1323,7 @@ impl LaunchFs {
             .filter(|n| *n < 64)
             .ok_or(-95)? as i32
             + 3;
-        if self.stack_snapshots[(fd - 3) as usize] {
+        if self.stack_snapshots[(fd - 3) as usize] || self.import_index(fd).is_some() {
             return Err(-95);
         }
         const ALLOWED: u64 = 0o4000 | 0o100000 | 0o200000 | 0o400000 | 0o2000000;
@@ -1114,6 +1449,9 @@ impl LaunchFs {
             .ok_or(-9)?;
         if self.stack_snapshots[slot as usize] {
             return Err(-95);
+        }
+        if self.import_index(slot as i32 + 3).is_some() {
+            return Err(-19);
         }
         let (storage, object) = self
             .fs
@@ -1672,6 +2010,11 @@ impl LaunchFs {
     }
 
     fn descriptor_call(&mut self, pid: usize, r: &UserRegs, fd: i32) -> i64 {
+        if let Some(index) = self.import_index(fd) {
+            return self
+                .archive_stream_call(pid, r, fd, index)
+                .unwrap_or_else(|error| error);
+        }
         if fd >= 3 && self.stack_snapshots.get((fd - 3) as usize) == Some(&true) {
             if matches!(r.orig_rax, 77 | 91 | 93 | 260 | 280 | 452) {
                 return -30;
@@ -2286,6 +2629,20 @@ fn errno(error: VfsError) -> i64 {
         VfsError::ReadOnly => -30,
         VfsError::SymlinkLoop => -40,
         VfsError::InvalidIndex | VfsError::Io => -5,
+    }
+}
+
+/// The Linux error an import reports for what stopped it.
+fn archive_errno(error: ArchiveError) -> i64 {
+    match error {
+        ArchiveError::Fs(error) => errno(error),
+        ArchiveError::NameTooLong => -36,
+        ArchiveError::Malformed => -74,
+        ArchiveError::Unsupported => -95,
+        // As mknod of a device node.
+        ArchiveError::DeviceNode => -1,
+        ArchiveError::Denied(errno) => -(errno as i64),
+        ArchiveError::Truncated => -5,
     }
 }
 

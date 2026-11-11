@@ -431,6 +431,107 @@ static long ownership(int full) {
     CHECK(DO(3,dir,0,0)==0 && DO(3,alias,0,0)==0,119);
     return 0;
 }
+/* Archive import: ioctl(directory, request, &{flags, 0, 0, 0}) opens a
+ * write-only stream; the harness prepared the archives in the image. */
+#define ARCHIVE_IMPORT 0x40104701
+static char zeros[512];
+static long archive_stream(const char *directory, unsigned int flags) {
+    long dir = DO(2, directory, 0200000, 0);
+    if (dir < 0) return dir;
+    unsigned int request[4] = {flags, 0, 0, 0};
+    long stream = DO(16, dir, ARCHIVE_IMPORT, request);
+    if (DO(3, dir, 0, 0) != 0) return -1000;
+    return stream;
+}
+/* Copy an image file into a stream in pieces of `chunk` bytes. The first
+ * failed write's error is returned; short writes are continued. */
+static long archive_copy(long stream, const char *image, word chunk) {
+    long in = DO(2, image, 0, 0);
+    if (in < 0) return -1001;
+    long failure = 0;
+    for (;;) {
+        long n = DO(0, in, data, sizeof data);
+        if (n <= 0) { if (n < 0) failure = -1002; break; }
+        for (word at = 0; at < (word)n && !failure;) {
+            word count = (word)n - at < chunk ? (word)n - at : chunk;
+            long written = DO(1, stream, data + at, count);
+            if (written <= 0) failure = written ? written : -1003;
+            else at += written;
+        }
+        if (failure) break;
+    }
+    DO(3, in, 0, 0);
+    return failure;
+}
+/* The contract denies symlinkat: an import stops at its first link member
+ * with the same error an individual symlinkat gets. */
+static long archive_import_denied(void) {
+    CHECK(call(266, (word)"target", -100, (word)"/work/individual", 0, 0, 0) == -1, 270);
+    long stream = archive_stream("/work", 0); CHECK(stream >= 3, 271);
+    CHECK(archive_copy(stream, "/escape.tar", 4096) == -1 && DO(3, stream, 0, 0) == 0, 272);
+    CHECK(DO(4, "/work/kept", meta, 0) == 0 && DO(6, "/work/link", meta, 0) == -2, 273);
+    return 0;
+}
+static long archive_import(int enabled) {
+    unsigned int request[4] = {0, 0, 0, 0};
+    long dir = DO(2, "/out", 0200000, 0); CHECK(dir >= 3, 230);
+    if (!enabled) {
+        CHECK(DO(16, dir, ARCHIVE_IMPORT, request) == -25 && DO(3, dir, 0, 0) == 0, 231);
+        return 0;
+    }
+    /* Malformed requests and descriptors that do not offer an import. */
+    request[2] = 1; CHECK(DO(16, dir, ARCHIVE_IMPORT, request) == -22, 232);
+    request[2] = 0; request[0] = 4; CHECK(DO(16, dir, ARCHIVE_IMPORT, request) == -22, 233);
+    CHECK(DO(16, dir, ARCHIVE_IMPORT, 1) == -14 && DO(3, dir, 0, 0) == 0, 234);
+    long file = DO(2, "/work/plain", 0101, 0600); CHECK(file >= 3, 235);
+    CHECK(DO(16, file, ARCHIVE_IMPORT, request) == -25 && DO(3, file, 0, 0) == 0, 235);
+    long image = DO(2, "/bin", 0200000, 0); CHECK(image >= 3, 236);
+    CHECK(DO(16, image, ARCHIVE_IMPORT, request) == -25 && DO(3, image, 0, 0) == 0, 236);
+    long path_only = DO(2, "/out", 010200000, 0); CHECK(path_only >= 3, 237);
+    CHECK(DO(16, path_only, ARCHIVE_IMPORT, request) == -9 && DO(3, path_only, 0, 0) == 0, 237);
+    /* A stream is a write-only, close-on-exec FIFO-like descriptor with no
+     * name and no directory authority. */
+    long stream = archive_stream("/out", 1); CHECK(stream >= 3, 238);
+    CHECK(DO(72, stream, 1, 0) == 1 && DO(72, stream, 3, 0) == 1, 239);
+    CHECK(DO(5, stream, meta, 0) == 0 && (*(unsigned int *)(meta+24) & 0170000) == 0010000, 240);
+    CHECK(DO(0, stream, output, 1) == -9 && DO(217, stream, output, sizeof output) == -20, 241);
+    CHECK(call(257, stream, (word)"escape", 0101, 0600, 0, 0) == -20, 242);
+    CHECK(call(258, stream, (word)"escape", 0755, 0, 0, 0) == -20, 242);
+    CHECK(DO(8, stream, 0, 0) == -29 && DO(16, stream, ARCHIVE_IMPORT, request) == -25, 243);
+    CHECK(DO(81, stream, 0, 0) == -20, 244);
+    CHECK(DO(74, stream, 0, 0) == -5, 245);
+    CHECK(archive_copy(stream, "/import.tar", 1000) == 0, 246);
+    CHECK(DO(74, stream, 0, 0) == 0 && DO(75, stream, 0, 0) == 0, 247);
+    long alias = DO(32, stream, 0, 0); CHECK(alias >= 3 && DO(3, stream, 0, 0) == 0, 248);
+    CHECK(DO(1, alias, zeros, 512) == 512 && DO(74, alias, 0, 0) == 0 && DO(3, alias, 0, 0) == 0, 248);
+    CHECK(DO(4, "/out/tree/file", meta, 0) == 0 && *(word *)(meta+48) == 5, 249);
+    /* GNU headers, as many writers emit, in one large write. */
+    stream = archive_stream("/out", 0); CHECK(stream >= 3, 250);
+    CHECK(archive_copy(stream, "/gnu.tar", sizeof data) == 0 && DO(74, stream, 0, 0) == 0, 251);
+    CHECK(DO(3, stream, 0, 0) == 0, 251);
+    /* Extended attributes are refused unless the stream discards them. */
+    stream = archive_stream("/out", 0); CHECK(stream >= 3, 252);
+    CHECK(archive_copy(stream, "/import.tar", 4096) == -95 && DO(74, stream, 0, 0) == -95, 253);
+    CHECK(DO(3, stream, 0, 0) == 0, 253);
+    /* A link the stream made is never followed: the stream stops there and
+     * keeps what it applied before. */
+    stream = archive_stream("/work", 0); CHECK(stream >= 3, 254);
+    CHECK(archive_copy(stream, "/escape.tar", 512) == -40, 255);
+    CHECK(DO(1, stream, zeros, 512) == -40 && DO(74, stream, 0, 0) == -40, 256);
+    CHECK(DO(3, stream, 0, 0) == 0, 256);
+    CHECK(DO(4, "/work/kept", meta, 0) == 0 && DO(6, "/work/link", meta, 0) == 0, 257);
+    CHECK(DO(4, "/out/through", meta, 0) == -2, 258);
+    /* Absolute names never leave the destination either. */
+    stream = archive_stream("/work", 0); CHECK(stream >= 3, 259);
+    CHECK(archive_copy(stream, "/absolute.tar", 512) == -22 && DO(3, stream, 0, 0) == 0, 260);
+    CHECK(DO(4, "/out/absolute", meta, 0) == -2, 260);
+    /* An unfinished stream keeps its members and releases its file. */
+    stream = archive_stream("/work", 0); CHECK(stream >= 3, 261);
+    long in = DO(2, "/gnu.tar", 0, 0); CHECK(in >= 3 && DO(0, in, data, 1536) == 1536, 262);
+    CHECK(DO(1, stream, data, 1536) == 1536 && DO(74, stream, 0, 0) == -5, 263);
+    CHECK(DO(3, in, 0, 0) == 0 && DO(3, stream, 0, 0) == 0, 263);
+    return 0;
+}
 long storage_main(word *stack)
 {
     word argc = *stack;
@@ -446,6 +547,9 @@ long storage_main(word *stack)
     if(argc>1 && equal(argv[1],"ordinary-vectors")) return ordinary_vectors();
     if(argc>1 && equal(argv[1],"ordinary-large-io")) return ordinary_large_io();
     if(argc>1 && equal(argv[1],"positioned")) return positioned();
+    if(argc>1 && equal(argv[1],"archive-import")) return archive_import(1);
+    if(argc>1 && equal(argv[1],"archive-import-disabled")) return archive_import(0);
+    if(argc>1 && equal(argv[1],"archive-import-denied")) return archive_import_denied();
     if(argc>1 && equal(argv[1],"checkpoint")) return checkpoint_data(0);
     if(argc>1 && equal(argv[1],"checkpoint-shared")) return checkpoint_data(1);
     if(argc>1 && equal(argv[1],"events")) return task_events_data();

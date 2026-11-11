@@ -18,7 +18,7 @@ cargo build --quiet -p security-fuzzer
 fuzzer=${CARGO_TARGET_DIR:-target}/debug/security-fuzzer
 test -x "$fuzzer"
 
-for target in config selector elf vfs-index kernel-path device syscall audit; do
+for target in config selector elf vfs-index kernel-path device syscall audit archive; do
     timeout_seconds=$((seconds + 2))
     timeout_marker=$artifacts/timeout-$target
     rm -f "$timeout_marker"
@@ -50,4 +50,4 @@ if find "$artifacts" -type f \( -name 'current-*' -o -name 'crash-*' \) | grep -
     printf 'SECURITY_FUZZ: untriaged artifact remains in %s\n' "$artifacts" >&2
     exit 1
 fi
-printf '%s\n' 'SECURITY_FUZZ: PASS (8 targets, deterministic corpora, bounded time/input/memory)'
+printf '%s\n' 'SECURITY_FUZZ: PASS (9 targets, deterministic corpora, bounded time/input/memory)'

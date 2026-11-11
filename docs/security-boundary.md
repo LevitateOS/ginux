@@ -110,11 +110,11 @@ make demo-gate-13
 limit, five seconds per target, a 60-second suite bound, and a 256 MiB process
 limit. A crash or timeout preserves its current input under
 `build/security-fuzz/`. `make test-security` exercises malformed contracts,
-selectors, ELF images, VFS indexes, kernel-view paths, device ranges, syscall
-dispatch, audit accounting, host-effect denial, host-view isolation, bounded
-resources, teardown, and live supervisor authority. `make test-recovery`
-exercises configured startup failure, supervisor loss, forced-stop cleanup,
-audit bounds, and controlled systemd shutdown.
+selectors, ELF images, VFS indexes, archive imports, kernel-view paths, device
+ranges, syscall dispatch, audit accounting, host-effect denial, host-view
+isolation, bounded resources, teardown, and live supervisor authority.
+`make test-recovery` exercises configured startup failure, supervisor loss,
+forced-stop cleanup, audit bounds, and controlled systemd shutdown.
 
 Passing these tests is regression evidence for the stated configuration. It
 does not replace careful source review, independent adversarial testing,

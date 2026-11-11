@@ -9,7 +9,7 @@ use ginux_devices::{BlockBackend, DeviceError, DeviceName, DeviceView, Partition
 use ginux_instance::InstanceConfig;
 use ginux_kernel_views::SysFs;
 use ginux_runtime::AddressSpace;
-use ginux_vfs::Index;
+use ginux_vfs::{ArchiveImport, ArchiveOperation, BaseReader, Index, VfsError, VirtualFs};
 use std::env;
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -24,6 +24,7 @@ const ELF_SEED: &[u8] = include_bytes!("../../../tests/fuzz-corpus/elf/header.bi
 const VFS_SEED: &[u8] = include_bytes!("../../../tests/fuzz-corpus/vfs-index/header.bin");
 const PATH_SEED: &[u8] = include_bytes!("../../../tests/fuzz-corpus/kernel-path/basic.txt");
 const DEVICE_SEED: &[u8] = include_bytes!("../../../tests/fuzz-corpus/device/basic.txt");
+const ARCHIVE_SEED: &[u8] = include_bytes!("../../../tests/fuzz-corpus/archive/basic.tar");
 
 fn main() {
     let arguments: Vec<String> = env::args().collect();
@@ -74,6 +75,7 @@ fn corpus(target: &str) -> Option<&'static [u8]> {
         "vfs-index" => Some(VFS_SEED),
         "kernel-path" => Some(PATH_SEED),
         "device" => Some(DEVICE_SEED),
+        "archive" => Some(ARCHIVE_SEED),
         "syscall" | "audit" => Some(&[0; 32]),
         _ => None,
     }
@@ -153,6 +155,7 @@ fn run_target(target: &str, input: &[u8]) {
             let _ = sysfs.read(input, &mut output);
         }
         "device" => fuzz_device(input),
+        "archive" => fuzz_archive(input),
         "syscall" => {
             let values = words(input);
             let syscall = values[0];
@@ -191,6 +194,55 @@ fn fuzz_device(input: &[u8]) {
         let _ = partition.read_at(values[3], &mut output);
         let _ = partition.write_at(values[3], &output);
         let _ = partition.close();
+    }
+}
+
+struct NoImage;
+
+impl BaseReader for NoImage {
+    fn read_at(&mut self, _: u64, _: &mut [u8]) -> Result<(), VfsError> {
+        Err(VfsError::Io)
+    }
+}
+
+/// Whatever an import makes of the input, every name it leaves is beneath
+/// its destination.
+fn fuzz_archive(input: &[u8]) {
+    let mut input = input.to_vec();
+    // Reseal header checksums so mutations reach the member logic.
+    for block in input.chunks_mut(512) {
+        if block.len() == 512 && block[257..262] == *b"ustar" {
+            block[148..156].fill(b' ');
+            let sum: u32 = block.iter().map(|byte| u32::from(*byte)).sum();
+            block[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+        }
+    }
+    let mut fs = VirtualFs::<'static, NoImage, 32, 256, 8>::new(Index::root_only(), NoImage);
+    fs.mkdir(b"/dest", 0o755).expect("destination");
+    fs.mkdir(b"/outside", 0o755).expect("outside directory");
+    let destination = fs
+        .open_directory(b"/dest", 0)
+        .expect("destination descriptor");
+    let mut import = ArchiveImport::new(input.len() as u32 & 3, 0o755).expect("import");
+    let mut allow = |_: ArchiveOperation| Ok::<(), i32>(());
+    for piece in input.chunks(509) {
+        if fs
+            .archive_write(&mut import, destination, piece, None, &mut allow)
+            .is_err()
+        {
+            break;
+        }
+    }
+    let _ = fs.archive_finish(&import);
+    fs.archive_abort(&mut import);
+    fs.close(destination).expect("close destination");
+    for slot in 0..fs.namespace_capacity() {
+        if let Some((path, _)) = fs.overlay_entry(slot) {
+            assert!(
+                path == b"/outside" || path == b"/dest" || path.starts_with(b"/dest/"),
+                "import escaped its destination"
+            );
+        }
     }
 }
 

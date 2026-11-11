@@ -2,8 +2,13 @@
 
 use core::ops::{Deref, DerefMut};
 
+mod archive;
 mod namespace;
 
+pub use archive::{
+    ArchiveError, ArchiveImport, ArchiveOperation, ArchivePolicy, ArchiveSummary,
+    ARCHIVE_CLEAR_SPECIAL_MODES, ARCHIVE_DISCARD_XATTRS, ARCHIVE_RECORD_LIMIT,
+};
 use namespace::Namespace;
 pub use namespace::OverlayFile;
 

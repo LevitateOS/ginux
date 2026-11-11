@@ -806,6 +806,11 @@ impl DescriptorTable {
                     },
                 }
             }
+            // Never forwarded: a host descriptor must not see this request.
+            16 if r.rsi as u32 == ginux_contract::ARCHIVE_IMPORT_REQUEST => {
+                call.save(r);
+                self.archive_import(pid, r, backends)
+            }
             0 | 1 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55 | 74
             | 138 | 73 | 75 | 77 | 78 | 91 | 93 | 217 | 285 => {
                 call.save(r);
@@ -863,6 +868,41 @@ impl DescriptorTable {
             _ => Ok(backends.claim(pid, r)),
         };
         result.unwrap_or_else(ready)
+    }
+
+    /// An archive import stream on an owned directory, as a new close-on-exec
+    /// descriptor. Every other descriptor does not offer the request.
+    fn archive_import(
+        &mut self,
+        pid: usize,
+        r: &UserRegs,
+        backends: &mut Backends,
+    ) -> Result<NativeDecision, i64> {
+        let entry = self.get(r.rdi)?;
+        if entry.path_flags != 0 {
+            return Err(-9);
+        }
+        let directory = match entry.handle {
+            Handle::Owned(handle)
+                if (1048576..1048640).contains(&handle)
+                    && backends.filesystem.archive_import_enabled() =>
+            {
+                handle
+            }
+            _ => return Err(-25),
+        };
+        let slot = self.reserve(true)?;
+        match backends.filesystem.archive_open(pid, directory, r.rdx) {
+            Ok(handle) => {
+                backends.refs.retain(handle);
+                self.entries[slot].as_mut().unwrap().handle = Handle::Owned(handle);
+                Ok(ready(slot as i64))
+            }
+            Err(error) => {
+                self.entries[slot] = None;
+                Err(error)
+            }
+        }
     }
 
     fn socket(

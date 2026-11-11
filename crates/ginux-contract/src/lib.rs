@@ -2013,6 +2013,11 @@ impl EffectiveContract {
     }
 }
 
+/// The `ioctl` request that opens a bulk archive import stream on an owned
+/// directory descriptor: `_IOW('G', 1, struct { u32 flags; u32 reserved[3]; })`.
+/// It is a filesystem write and is decided as one. See `docs/archive-import.md`.
+pub const ARCHIVE_IMPORT_REQUEST: u32 = 0x4010_4701;
+
 /// The semantic operation of a syscall whose number alone decides it (for
 /// ioctl, together with its request). Path- and descriptor-dependent
 /// operations are classified by the lane that can inspect them.
@@ -2020,6 +2025,7 @@ pub const fn syscall_semantic_operation(number: u64, request: u64) -> Option<&'s
     match number {
         // The kernel reads an ioctl request as a 32-bit value.
         16 if request as u32 == 0x5413 => Some("ioctl.tty.get_winsize"),
+        16 if request as u32 == ARCHIVE_IMPORT_REQUEST => Some("filesystem.path.write"),
         9..=12 | 25 | 28 => Some("memory.virtual.manage"),
         13..=15 | 62 | 127..=130 | 289 | 424 => Some("signal.virtual.deliver"),
         96 | 228 | 229 => Some("time.clock.read"),
@@ -2663,7 +2669,7 @@ mod tests {
     #[test]
     fn syscall_semantic_operations_are_catalogued() {
         for number in 0..512 {
-            for request in [0, 0x5413] {
+            for request in [0, 0x5413, ARCHIVE_IMPORT_REQUEST as u64] {
                 if let Some(id) = syscall_semantic_operation(number, request) {
                     assert!(CATALOG.iter().any(|operation| operation.id == id), "{id}");
                 }
@@ -2673,6 +2679,10 @@ mod tests {
         assert_eq!(
             syscall_semantic_operation(16, (1 << 32) | 0x5413),
             Some("ioctl.tty.get_winsize")
+        );
+        assert_eq!(
+            syscall_semantic_operation(16, (1 << 32) | ARCHIVE_IMPORT_REQUEST as u64),
+            Some("filesystem.path.write")
         );
         assert_eq!(syscall_semantic_operation(0, 0), None);
         // mremap, madvise, rt_sigreturn (which installs a signal mask),

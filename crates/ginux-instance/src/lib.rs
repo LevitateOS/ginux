@@ -219,6 +219,9 @@ pub struct InstanceConfig {
     pub storage: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     pub storage_max_objects: u64,
     pub storage_max_bytes: u64,
+    /// Lets the workload create many owned-storage entries from one archive
+    /// stream (see `docs/archive-import.md`). Off unless requested.
+    pub storage_archive_import: bool,
     pub volumes: TextList<ASSIGNMENT_ITEMS, POLICY_BYTES>,
     pub devices: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     pub network_backend: NetworkBackend,
@@ -389,6 +392,7 @@ struct ConfigBuilder {
     storage: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     storage_max_objects: u64,
     storage_max_bytes: u64,
+    storage_archive_import: bool,
     volumes: TextList<ASSIGNMENT_ITEMS, POLICY_BYTES>,
     devices: TextList<ASSIGNMENT_ITEMS, ASSIGNMENT_BYTES>,
     network_backend: NetworkBackend,
@@ -470,6 +474,7 @@ impl ConfigBuilder {
             storage: TextList::empty(),
             storage_max_objects: 32,
             storage_max_bytes: 0,
+            storage_archive_import: false,
             volumes: TextList::empty(),
             devices: TextList::empty(),
             network_backend: NetworkBackend::Shared,
@@ -586,6 +591,7 @@ impl ConfigBuilder {
             storage: self.storage,
             storage_max_objects: self.storage_max_objects,
             storage_max_bytes: self.storage_max_bytes,
+            storage_archive_import: self.storage_archive_import,
             volumes: self.volumes,
             devices: self.devices,
             network_backend: self.network_backend,
@@ -801,6 +807,7 @@ impl InstanceConfig {
                     return Err(ConfigError::InvalidValue);
                 }
             }
+            b"storage.archive_import" => self.storage_archive_import = parse_bool(value)?,
             b"volumes.assignments" => self.volumes = parse_list(value)?,
             b"devices.assignments" => self.devices = parse_list(value)?,
             b"network.backend" => {
@@ -1246,6 +1253,9 @@ impl InstanceConfig {
         if self.storage_max_bytes != 0 {
             output.raw(b"\nmax_bytes = ")?;
             output.number(self.storage_max_bytes)?;
+        }
+        if self.storage_archive_import {
+            output.raw(b"\narchive_import = true")?;
         }
         output.raw(b"\n\n[volumes]\nassignments = ")?;
         output.list(self.volumes.as_slice())?;
@@ -1794,6 +1804,10 @@ fn parse_field(
             if builder.storage_max_bytes == 0 {
                 return Err(ConfigError::InvalidValue);
             }
+        }
+        (Section::Storage, b"archive_import") => {
+            builder.mark(1u128 << 87)?;
+            builder.storage_archive_import = parse_bool(value)?;
         }
         (Section::Volumes, b"assignments") => {
             builder.mark(1 << 22)?;
@@ -2483,6 +2497,44 @@ policy = "stop"
             assert!(InstanceConfig::parse(
                 VALID
                     .replace("[storage]", &format!("[storage]\n{field}"))
+                    .as_bytes()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn archive_import_is_opt_in_and_round_trips() {
+        let config = InstanceConfig::parse(VALID.as_bytes()).unwrap();
+        assert!(!config.storage_archive_import);
+        let contains =
+            |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(!contains(
+            config.normalized().unwrap().as_bytes(),
+            b"archive_import"
+        ));
+        let text = VALID.replace("[storage]", "[storage]\narchive_import = true");
+        let config = InstanceConfig::parse(text.as_bytes()).unwrap();
+        assert!(config.storage_archive_import);
+        let normalized = config.normalized().unwrap();
+        assert!(contains(normalized.as_bytes(), b"\narchive_import = true"));
+        assert_eq!(
+            InstanceConfig::parse(normalized.as_bytes()).unwrap(),
+            config
+        );
+        let mut overridden = InstanceConfig::parse(VALID.as_bytes()).unwrap();
+        overridden
+            .apply_override(b"storage.archive_import", b"true")
+            .unwrap();
+        assert!(overridden.storage_archive_import);
+        for field in [
+            "archive_import = 1",
+            "archive_import = \"true\"",
+            "archive_import = true\narchive_import = false",
+        ] {
+            assert!(InstanceConfig::parse(
+                VALID
+                    .replace("[storage]", &std::format!("[storage]\n{field}"))
                     .as_bytes()
             )
             .is_err());
