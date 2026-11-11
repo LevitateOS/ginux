@@ -42,7 +42,7 @@ def main():
             config = template.split('[contract]')[0] + contract + '[storage]' + template.split('[storage]', 1)[1]
             config = config.replace('args = []', 'args = ' + json.dumps([op, str(expected)]))
             if not audit:
-                config = config.replace('mode = "stderr"', 'mode = "disabled"')
+                config = config.replace('enabled = true', 'enabled = false')
             config += extra
             path, result = evidence / (name + '.toml'), evidence / (name + '.json')
             path.write_text(config)
