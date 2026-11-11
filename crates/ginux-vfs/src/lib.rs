@@ -9,8 +9,8 @@ pub use archive::{
     ArchiveError, ArchiveImport, ArchiveOperation, ArchivePolicy, ArchiveSummary,
     ARCHIVE_CLEAR_SPECIAL_MODES, ARCHIVE_DISCARD_XATTRS, ARCHIVE_RECORD_LIMIT,
 };
-use namespace::Namespace;
 pub use namespace::OverlayFile;
+use namespace::{Namespace, Subtree};
 
 pub const INDEX_MAGIC: &[u8; 8] = b"GINUXVFS";
 pub const INDEX_VERSION: u32 = 1;
@@ -1775,15 +1775,24 @@ impl<
         Ok(())
     }
 
+    /// Whether a live overlay entry or an image entry no overlay slot names
+    /// is a child of `path`.
     fn has_children(&self, path: &[u8]) -> Result<bool, VfsError> {
-        if self.overlay.iter().any(|entry| {
-            matches!(
-                entry.state(),
-                Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
-            ) && child_name(path, entry.path().as_bytes()).is_some()
-        }) {
-            return Ok(true);
-        }
+        let children = if self.overlay.has_child(path) {
+            Ok(true)
+        } else {
+            self.has_image_children(path)
+        };
+        #[cfg(test)]
+        assert_eq!(
+            children,
+            self.has_children_linear(path),
+            "overlay child index"
+        );
+        children
+    }
+
+    fn has_image_children(&self, path: &[u8]) -> Result<bool, VfsError> {
         for i in 0..self.index.len() {
             let entry = self.index.entry(i)?;
             if child_name(path, entry.path).is_some() && self.find_overlay(entry.path).is_none() {
@@ -1886,26 +1895,24 @@ impl<
             return Ok(());
         }
         // Check every new descendant path before changing any namespace entry.
-        for entry in self.overlay.iter() {
-            if matches!(
-                entry.state(),
-                Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
-            ) && beneath(entry.path().as_bytes(), source.as_bytes())
+        let moved = self.subtree(source.as_bytes());
+        for slot in self.overlay.listed(moved) {
+            let suffix = self.overlay[slot].path().len - source.len;
+            if destination
+                .len
+                .checked_add(suffix)
+                .is_none_or(|n| n > MAX_PATH)
             {
-                let suffix = entry.path().len - source.len;
-                if destination
-                    .len
-                    .checked_add(suffix)
-                    .is_none_or(|n| n > MAX_PATH)
-                {
-                    return Err(VfsError::InvalidPath);
-                }
+                return Err(VfsError::InvalidPath);
             }
         }
         if let Some(target) = target {
             self.remove_name(target);
         }
-        for slot in 0..self.overlay.len() {
+        // The listing predates removing the target: move only what is live.
+        let mut next = self.overlay.listed(moved).next();
+        while let Some(slot) = next {
+            next = self.overlay.listed_after(moved, slot);
             let entry = &self.overlay[slot];
             if matches!(
                 entry.state(),
@@ -2109,6 +2116,53 @@ impl<
         #[cfg(test)]
         assert_eq!(slot, self.allocate_overlay_linear(), "overlay allocation");
         slot
+    }
+
+    /// Every live overlay entry named `path` or beneath it, for a `path`
+    /// with no image entry beneath it (see `Namespace::subtree`).
+    fn subtree(&mut self, path: &[u8]) -> Subtree {
+        let list = self.overlay.subtree(path);
+        #[cfg(test)]
+        {
+            extern crate std;
+            let mut listed: std::vec::Vec<usize> = self.overlay.listed(list).collect();
+            listed.sort_unstable();
+            let scanned: std::vec::Vec<usize> = self.subtree_linear(path).collect();
+            assert_eq!(listed, scanned, "overlay subtree listing");
+        }
+        list
+    }
+
+    /// The scan `has_children` replaced, kept to check the child index against.
+    #[cfg(test)]
+    fn has_children_linear(&self, path: &[u8]) -> Result<bool, VfsError> {
+        if self.overlay.iter().any(|entry| {
+            matches!(
+                entry.state(),
+                Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
+            ) && child_name(path, entry.path().as_bytes()).is_some()
+        }) {
+            return Ok(true);
+        }
+        for i in 0..self.index.len() {
+            let entry = self.index.entry(i)?;
+            if child_name(path, entry.path).is_some() && self.find_overlay(entry.path).is_none() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The scan `rename` replaced: the slots it moves, in slot order.
+    #[cfg(test)]
+    fn subtree_linear<'p>(&'p self, path: &'p [u8]) -> impl Iterator<Item = usize> + 'p {
+        (0..self.overlay.len()).filter(|slot| {
+            let entry = &self.overlay[*slot];
+            matches!(
+                entry.state(),
+                Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
+            ) && beneath(entry.path().as_bytes(), path)
+        })
     }
 
     /// The scan `find_overlay` replaced, kept to check the index against.
@@ -4695,7 +4749,262 @@ mod tests {
                 assert_eq!(fs.overlay.find(name), fs.find_overlay_linear(name));
             }
             assert_eq!(fs.allocate_overlay(), fs.allocate_overlay_linear());
+            assert_names_held(&fs);
         }
+    }
+
+    /// Every live overlay name is canonical and sits in a visible directory,
+    /// which is what lets `rename` list a subtree from the child index.
+    fn assert_names_held<
+        R: BaseReader,
+        const FILES: usize,
+        const FILE_SIZE: usize,
+        const FDS: usize,
+        S: OverlayStorage,
+        N: Deref<Target = [OverlayFile]> + DerefMut,
+    >(
+        fs: &VirtualFs<'_, R, FILES, FILE_SIZE, FDS, S, N>,
+    ) {
+        for entry in fs.overlay.iter() {
+            if matches!(entry.state(), Slot::Free | Slot::Whiteout) {
+                continue;
+            }
+            let path = entry.path().as_bytes();
+            let shown = std::string::String::from_utf8_lossy(path);
+            assert!(path.len() > 1 && path[0] == b'/', "{shown} is not absolute");
+            assert!(
+                path[1..]
+                    .split(|byte| *byte == b'/')
+                    .all(|part| !matches!(part, b"" | b"." | b"..")),
+                "{shown} is not canonical"
+            );
+            let split = path.iter().rposition(|byte| *byte == b'/').unwrap();
+            let parent = if split == 0 { b"/" } else { &path[..split] };
+            assert_eq!(
+                fs.metadata_at(parent).map(|metadata| metadata.kind),
+                Ok(NodeKind::Directory),
+                "{shown} has no directory"
+            );
+        }
+    }
+
+    /// List what renaming `path` would move, where `rename` would list it:
+    /// with no image entry beneath it.
+    fn list_moved<
+        R: BaseReader,
+        const FILES: usize,
+        const FILE_SIZE: usize,
+        const FDS: usize,
+        S: OverlayStorage,
+        N: Deref<Target = [OverlayFile]> + DerefMut,
+    >(
+        fs: &mut VirtualFs<'_, R, FILES, FILE_SIZE, FDS, S, N>,
+        path: &[u8],
+    ) {
+        if (0..fs.index.len()).all(|i| !beneath(fs.index.entry(i).unwrap().path, path)) {
+            fs.subtree(path);
+        }
+    }
+
+    #[derive(Default)]
+    struct TreeChanges {
+        moved_trees: usize,
+        replaced_directories: usize,
+        removed_empty: usize,
+        refused_full: usize,
+        recreated: usize,
+    }
+
+    /// Drive nested directories through random changes. `has_children` and
+    /// every rename check themselves against the scans they replaced.
+    fn churn_tree<const FILES: usize>(
+        seed: u64,
+        steps: usize,
+        image: bool,
+        changes: &mut TreeChanges,
+    ) {
+        let bytes = index_bytes();
+        let index = if image {
+            Index::new(&bytes).unwrap()
+        } else {
+            Index::root_only()
+        };
+        let mut fs: VirtualFs<'_, Reader, FILES, 8, 6> =
+            VirtualFs::new(index, Reader(*b"BASETOOL"));
+        let directories = [
+            "", "/t", "/t/a", "/t/a/b", "/t/a/b/c", "/t/d", "/u", "/u/a", "/usr/bin",
+        ];
+        let mut paths: Vec<Vec<u8>> = Vec::new();
+        for directory in directories {
+            if !directory.is_empty() {
+                paths.push(directory.as_bytes().to_vec());
+            }
+            for name in ["a", "b", "c", "d", "f"] {
+                paths.push(std::format!("{directory}/{name}").into_bytes());
+            }
+        }
+        let mut fds = Vec::new();
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut below = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for _ in 0..steps {
+            let path = paths[below(paths.len())].clone();
+            let other = paths[below(paths.len())].clone();
+            let whiteout = fs
+                .find_overlay(&path)
+                .is_some_and(|slot| fs.overlay[slot].state() == Slot::Whiteout);
+            match below(13) {
+                0..=2 => {
+                    if fs.mkdir(&path, 0o755).is_ok() && whiteout {
+                        changes.recreated += 1;
+                    }
+                }
+                3 => {
+                    if let Ok(fd) = fs.open(&path, O_CREATE | O_WRITE) {
+                        if whiteout {
+                            changes.recreated += 1;
+                        }
+                        if below(4) == 0 {
+                            fds.push(fd);
+                        } else {
+                            fs.close(fd).unwrap();
+                        }
+                    }
+                }
+                4 => {
+                    let _ = fs.unlink(&path);
+                }
+                5 => match fs.remove_directory(&path) {
+                    Ok(()) => changes.removed_empty += 1,
+                    Err(VfsError::DirectoryNotEmpty) => changes.refused_full += 1,
+                    Err(_) => {}
+                },
+                6..=8 => {
+                    let source = fs.namespace_path(&path, false);
+                    let moving =
+                        source.map_or(0, |source| fs.subtree_linear(source.as_bytes()).count());
+                    let over = fs
+                        .metadata(&other)
+                        .is_ok_and(|metadata| metadata.kind == NodeKind::Directory);
+                    if fs.rename(&path, &other, below(5) == 0).is_ok() {
+                        changes.moved_trees += usize::from(moving >= 3);
+                        changes.replaced_directories += usize::from(over && path != other);
+                    }
+                }
+                9 => {
+                    let _ = fs.hard_link(&path, &other, false);
+                }
+                10 => {
+                    let _ = fs.symlink(b"a", &path);
+                }
+                11 if !fds.is_empty() => {
+                    let fd = fds.swap_remove(below(fds.len()));
+                    fs.close(fd).unwrap();
+                }
+                12 if below(60) == 0 => {
+                    fs.teardown();
+                    fds.clear();
+                }
+                12 => {
+                    let _ = fs.mkfifo(&path, 0o644);
+                }
+                _ => {}
+            }
+            fs.overlay.assert_consistent();
+            assert_names_held(&fs);
+            fs.has_children(b"/").unwrap();
+            for path in &paths {
+                fs.has_children(path).unwrap();
+                list_moved(&mut fs, path);
+            }
+        }
+    }
+
+    #[test]
+    fn random_tree_changes_keep_children_and_renames_exact() {
+        let mut changes = TreeChanges::default();
+        for seed in 1..=6 {
+            churn_tree::<6>(seed, 400, seed % 2 == 0, &mut changes);
+            churn_tree::<16>(seed, 800, seed % 2 == 1, &mut changes);
+            churn_tree::<48>(seed, 1_000, seed % 2 == 0, &mut changes);
+        }
+        assert!(changes.moved_trees > 0, "no rename moved a tree");
+        assert!(
+            changes.replaced_directories > 0,
+            "no rename replaced a directory"
+        );
+        assert!(changes.removed_empty > 0, "no empty directory was removed");
+        assert!(changes.refused_full > 0, "no full directory was refused");
+        assert!(
+            changes.recreated > 0,
+            "no name was created over its whiteout"
+        );
+        std::eprintln!(
+            "tree changes: {} trees moved, {} directories replaced, {} removed, {} refused, {} recreated",
+            changes.moved_trees,
+            changes.replaced_directories,
+            changes.removed_empty,
+            changes.refused_full,
+            changes.recreated
+        );
+    }
+
+    #[test]
+    fn large_directories_move_and_empty_through_the_child_index() {
+        const SLOTS: usize = 1_000;
+        let mut fs: VirtualFs<'_, Reader, 0, 8, 4, InlineStorage<SLOTS, 8>, Vec<OverlayFile>> =
+            VirtualFs::with_namespace(
+                Index::root_only(),
+                Reader(*b"BASETOOL"),
+                InlineStorage::default(),
+                std::vec![OverlayFile::empty(); SLOTS],
+            );
+        let levels: [&[u8]; 3] = [b"/big", b"/big/sub", b"/big/sub/deep"];
+        for directory in levels {
+            fs.mkdir(directory, 0o755).unwrap();
+            for n in 0..300 {
+                let mut name = directory.to_vec();
+                name.extend_from_slice(std::format!("/f{n}").as_bytes());
+                let fd = fs.open(&name, O_CREATE | O_WRITE).unwrap();
+                fs.close(fd).unwrap();
+            }
+        }
+        fs.mkdir(b"/other", 0o755).unwrap();
+        fs.rename(b"/big", b"/other/moved", false).unwrap();
+        assert_eq!(fs.metadata(b"/big"), Err(VfsError::NotFound));
+        assert!(fs.metadata(b"/other/moved/f0").is_ok());
+        assert!(fs.metadata(b"/other/moved/sub/deep/f299").is_ok());
+        assert_eq!(
+            fs.remove_directory(b"/other/moved/sub"),
+            Err(VfsError::DirectoryNotEmpty)
+        );
+        // Replace an empty directory with the deepest one.
+        fs.mkdir(b"/empty", 0o755).unwrap();
+        fs.rename(b"/other/moved/sub/deep", b"/empty", false)
+            .unwrap();
+        assert!(fs.metadata(b"/empty/f299").is_ok());
+        assert_eq!(
+            fs.rename(b"/other/moved", b"/empty", false),
+            Err(VfsError::DirectoryNotEmpty)
+        );
+        for n in 0..300 {
+            assert_eq!(
+                fs.remove_directory(b"/empty"),
+                Err(VfsError::DirectoryNotEmpty)
+            );
+            fs.unlink(std::format!("/empty/f{n}").as_bytes()).unwrap();
+        }
+        fs.remove_directory(b"/empty").unwrap();
+        assert_eq!(
+            fs.remove_directory(b"/other/moved/sub"),
+            Err(VfsError::DirectoryNotEmpty)
+        );
+        fs.overlay.assert_consistent();
+        assert_names_held(&fs);
     }
 
     #[test]

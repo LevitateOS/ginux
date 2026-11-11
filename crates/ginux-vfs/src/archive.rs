@@ -1156,6 +1156,19 @@ mod tests {
             .collect()
     }
 
+    /// Check the namespace indexes against the scans they replaced: the
+    /// name and child chains, then `has_children` and the subtree `rename`
+    /// would move, for every live name (each checks itself).
+    fn indexes_exact(fs: &mut Fs) {
+        fs.overlay.assert_consistent();
+        let names: Vec<Vec<u8>> = snapshot(fs).into_iter().map(|(path, _, _)| path).collect();
+        fs.has_children(b"/").unwrap();
+        for name in names {
+            fs.has_children(&name).unwrap();
+            fs.subtree(&name);
+        }
+    }
+
     fn outside_untouched(fs: &Fs) {
         let names: Vec<Vec<u8>> = snapshot(fs)
             .into_iter()
@@ -1569,7 +1582,7 @@ mod tests {
             let (import, outcome) = import_with(&mut fs, &bytes, chunk, 0, &mut allow);
             assert!(outcome.unwrap().complete, "chunk {chunk}");
             assert_eq!(import.summary().members, specs.len() as u64);
-            fs.overlay.assert_consistent();
+            indexes_exact(&mut fs);
             assert!(snapshot(&fs) == expected_names, "chunk {chunk}");
         }
     }
@@ -1621,7 +1634,7 @@ mod tests {
             let mut fs = instance(64, 1 << 20);
             let flags = (round % 4) as u32;
             let _ = import_with(&mut fs, &bytes, 1 + next(4096), flags, &mut allow);
-            fs.overlay.assert_consistent();
+            indexes_exact(&mut fs);
             outside_untouched(&fs);
         }
     }
