@@ -2,6 +2,11 @@
 
 use core::ops::{Deref, DerefMut};
 
+mod namespace;
+
+use namespace::Namespace;
+pub use namespace::OverlayFile;
+
 pub const INDEX_MAGIC: &[u8; 8] = b"GINUXVFS";
 pub const INDEX_VERSION: u32 = 1;
 pub const HEADER_SIZE: usize = 64;
@@ -466,43 +471,6 @@ enum Slot {
 }
 
 #[derive(Clone, Copy)]
-pub struct OverlayFile {
-    accessed: Timestamp,
-    modified: Timestamp,
-    state: Slot,
-    kind: NodeKind,
-    path: Path,
-    mode: u32,
-    len: usize,
-    executions: usize,
-    links: u64,
-    object: Option<usize>,
-    name_pins: usize,
-    /// The image record this object replaced, as its inode; zero for an
-    /// object created in the instance, whose inode follows from its slot.
-    inode: u64,
-}
-
-impl OverlayFile {
-    pub const fn empty() -> Self {
-        Self {
-            accessed: Timestamp::ZERO,
-            modified: Timestamp::ZERO,
-            state: Slot::Free,
-            kind: NodeKind::File,
-            path: Path::new(),
-            mode: 0,
-            len: 0,
-            executions: 0,
-            links: 0,
-            object: None,
-            name_pins: 0,
-            inode: 0,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
 struct Descriptor {
     open: bool,
     overlay: bool,
@@ -635,7 +603,7 @@ pub struct VirtualFs<
 > {
     index: Index<'a>,
     reader: R,
-    overlay: N,
+    overlay: Namespace<N>,
     storage: S,
     descriptors: [Descriptor; FDS],
     descriptions: [Description; FDS],
@@ -663,7 +631,7 @@ impl<
             index,
             reader,
             storage,
-            overlay: InlineNamespace([OverlayFile::empty(); FILES]),
+            overlay: Namespace::new(InlineNamespace([OverlayFile::empty(); FILES])),
             descriptors: [Descriptor::empty(); FDS],
             descriptions: [Description::new(0); FDS],
         }
@@ -680,13 +648,14 @@ impl<
         N: Deref<Target = [OverlayFile]> + DerefMut,
     > VirtualFs<'a, R, FILES, FILE_SIZE, FDS, S, N>
 {
-    /// Storage must service every slot in the supplied empty namespace.
+    /// Storage must service every slot in the supplied empty namespace,
+    /// which holds fewer than `u32::MAX` slots; its path index lives in them.
     pub fn with_namespace(index: Index<'a>, reader: R, storage: S, namespace: N) -> Self {
         Self {
             index,
             reader,
             storage,
-            overlay: namespace,
+            overlay: Namespace::new(namespace),
             descriptors: [Descriptor::empty(); FDS],
             descriptions: [Description::new(0); FDS],
         }
@@ -799,17 +768,17 @@ impl<
         let object: usize;
         let overlay: bool;
         match overlay_index {
-            Some(index) if self.overlay[index].state == Slot::Whiteout => {
+            Some(index) if self.overlay[index].state() == Slot::Whiteout => {
                 if flags & O_CREATE == 0 {
                     return Err(VfsError::NotFound);
                 }
                 object = self.create_overlay(path, 0o600)?;
                 overlay = true;
             }
-            Some(index) if self.overlay[index].state == Slot::Directory => {
+            Some(index) if self.overlay[index].state() == Slot::Directory => {
                 return Err(VfsError::IsDirectory)
             }
-            Some(index) if self.overlay[index].state == Slot::Symlink => {
+            Some(index) if self.overlay[index].state() == Slot::Symlink => {
                 return Err(VfsError::SymlinkLoop)
             }
             Some(index) => {
@@ -858,7 +827,7 @@ impl<
         }
         if overlay && flags & O_TRUNC != 0 {
             self.storage.resize(object, self.overlay[object].len, 0)?;
-            self.overlay[object].len = 0;
+            self.overlay.entry_mut(object).len = 0;
         }
 
         let entry = if overlay {
@@ -1014,10 +983,10 @@ impl<
         }
         if state.overlay {
             let file = &self.overlay[state.object];
-            if file.state == Slot::Whiteout {
+            if file.state() == Slot::Whiteout {
                 return Err(VfsError::NotFound);
             }
-            Ok(file.path.as_bytes())
+            Ok(file.path().as_bytes())
         } else {
             Ok(self.index.entry(state.object)?.path)
         }
@@ -1032,10 +1001,10 @@ impl<
         }
         let path = if state.overlay {
             let file = &self.overlay[state.object];
-            if file.state == Slot::Whiteout {
+            if file.state() == Slot::Whiteout {
                 return Err(VfsError::NotFound);
             }
-            file.path.as_bytes()
+            file.path().as_bytes()
         } else {
             self.index.entry(state.object)?.path
         };
@@ -1056,7 +1025,7 @@ impl<
         if !state.directory {
             return Err(VfsError::NotDirectory);
         }
-        if state.overlay && self.overlay[state.object].state == Slot::Whiteout {
+        if state.overlay && self.overlay[state.object].state() == Slot::Whiteout {
             return Ok(None);
         }
         let path = self.directory_path(descriptor)?;
@@ -1094,12 +1063,12 @@ impl<
                 let object = ordinal - self.index.len();
                 let entry = &self.overlay[object];
                 if !matches!(
-                    entry.state,
+                    entry.state(),
                     Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
                 ) {
                     continue;
                 }
-                if let Some(name) = child_name(path, entry.path.as_bytes()) {
+                if let Some(name) = child_name(path, entry.path().as_bytes()) {
                     return Ok(Some(DirectoryEntry {
                         name,
                         inode: self.overlay_inode(self.object(object)),
@@ -1227,7 +1196,7 @@ impl<
         self.storage
             .resize(state.object, previous, previous.max(end))?;
         self.storage.write(state.object, offset, input)?;
-        self.overlay[state.object].len = previous.max(end);
+        self.overlay.entry_mut(state.object).len = previous.max(end);
         Ok(Some(end))
     }
 
@@ -1278,30 +1247,30 @@ impl<
 
     fn remove_name(&mut self, slot: usize) {
         let object = self.object(slot);
-        self.overlay[object].links = self.overlay[object]
+        self.overlay.entry_mut(object).links = self.overlay[object]
             .links
             .checked_sub(1)
             .expect("live inode link count");
-        self.overlay[slot].state = Slot::Whiteout;
+        self.overlay.set_state(slot, Slot::Whiteout);
         self.release_unlinked(slot);
     }
 
     fn release_unlinked(&mut self, slot: usize) {
         let object = self.object(slot);
         if object != slot
-            && self.overlay[slot].state == Slot::Whiteout
+            && self.overlay[slot].state() == Slot::Whiteout
             && self.overlay[slot].name_pins == 0
             && !self.referenced(slot)
         {
-            self.overlay[slot].object = None;
+            self.overlay.entry_mut(slot).object = None;
         }
-        if self.overlay[object].state == Slot::Whiteout
+        if self.overlay[object].state() == Slot::Whiteout
             && self.overlay[object].links == 0
             && self.overlay[object].executions == 0
             && !self.referenced(object)
         {
             self.storage.clear(object);
-            self.overlay[object].len = 0;
+            self.overlay.entry_mut(object).len = 0;
         }
     }
 
@@ -1317,17 +1286,17 @@ impl<
         let length = usize::try_from(length).map_err(|_| VfsError::FileTooLarge)?;
         self.storage
             .resize(state.object, self.overlay[state.object].len, length)?;
-        self.overlay[state.object].len = length;
+        self.overlay.entry_mut(state.object).len = length;
         Ok(())
     }
 
     pub fn unlink(&mut self, path: &[u8]) -> Result<(), VfsError> {
         let path = self.namespace_path(path, false)?;
         if let Some(index) = self.find_overlay(path.as_bytes()) {
-            if self.overlay[index].state == Slot::Whiteout {
+            if self.overlay[index].state() == Slot::Whiteout {
                 return Err(VfsError::NotFound);
             }
-            if self.overlay[index].state == Slot::Directory {
+            if self.overlay[index].state() == Slot::Directory {
                 return Err(VfsError::IsDirectory);
             }
             self.remove_name(index);
@@ -1339,11 +1308,7 @@ impl<
             return Err(VfsError::IsDirectory);
         }
         let index = self.allocate_overlay()?;
-        self.overlay[index] = OverlayFile {
-            state: Slot::Whiteout,
-            path,
-            ..OverlayFile::empty()
-        };
+        self.overlay.occupy(index, Slot::Whiteout, path);
         Ok(())
     }
 
@@ -1392,8 +1357,8 @@ impl<
             .name_pins
             .checked_add(1)
             .ok_or(VfsError::OverlayLimit)?;
-        self.overlay[object].executions = executions;
-        self.overlay[entry].name_pins = names;
+        self.overlay.entry_mut(object).executions = executions;
+        self.overlay.entry_mut(entry).name_pins = names;
         Ok(image)
     }
 
@@ -1421,8 +1386,8 @@ impl<
             .name_pins
             .checked_add(1)
             .ok_or(VfsError::OverlayLimit)?;
-        self.overlay[image.object].executions = executions;
-        self.overlay[image.entry].name_pins = names;
+        self.overlay.entry_mut(image.object).executions = executions;
+        self.overlay.entry_mut(image.entry).name_pins = names;
 
         Ok(())
     }
@@ -1451,8 +1416,8 @@ impl<
             .name_pins
             .checked_sub(1)
             .ok_or(VfsError::InvalidDescriptor)?;
-        self.overlay[image.object].executions = executions;
-        self.overlay[image.entry].name_pins = names;
+        self.overlay.entry_mut(image.object).executions = executions;
+        self.overlay.entry_mut(image.entry).name_pins = names;
         self.release_unlinked(image.entry);
         Ok(())
     }
@@ -1493,7 +1458,7 @@ impl<
         if entry.name_pins == 0 || self.object(image.entry) != image.object {
             return Err(VfsError::InvalidDescriptor);
         }
-        Ok((entry.path.as_bytes(), entry.state == Slot::Whiteout))
+        Ok((entry.path().as_bytes(), entry.state() == Slot::Whiteout))
     }
 
     pub fn executable_pins(&self) -> usize {
@@ -1504,7 +1469,7 @@ impl<
         for slot in 0..self.overlay.len() {
             self.storage.clear(slot);
         }
-        self.overlay.fill(OverlayFile::empty());
+        self.overlay.vacate_all();
         self.descriptors.fill(Descriptor::empty());
     }
 
@@ -1512,7 +1477,7 @@ impl<
     /// never follows a symlink or resolves an alternate name for the caller.
     pub fn named_overlay_slot(&self, path: &[u8]) -> Option<usize> {
         self.find_overlay(path)
-            .filter(|slot| self.overlay[*slot].state != Slot::Whiteout)
+            .filter(|slot| self.overlay[*slot].state() != Slot::Whiteout)
     }
 
     /// Enumerate live writable entries while the caller has quiesced mutation.
@@ -1520,12 +1485,12 @@ impl<
     pub fn overlay_entry(&self, slot: usize) -> Option<(&[u8], FileMetadata)> {
         let entry = self.overlay.get(slot)?;
         if !matches!(
-            entry.state,
+            entry.state(),
             Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
         ) {
             return None;
         }
-        Some((entry.path.as_bytes(), self.overlay_metadata(slot)))
+        Some((entry.path().as_bytes(), self.overlay_metadata(slot)))
     }
 
     /// Read a live writable regular file without allocating a guest descriptor.
@@ -1536,7 +1501,7 @@ impl<
         output: &mut [u8],
     ) -> Result<(), VfsError> {
         let entry = self.overlay.get(slot).ok_or(VfsError::NotFound)?;
-        if !matches!(entry.state, Slot::File | Slot::Symlink | Slot::Link) {
+        if !matches!(entry.state(), Slot::File | Slot::Symlink | Slot::Link) {
             return Err(VfsError::NotFound);
         }
         let object = self.object(slot);
@@ -1556,7 +1521,7 @@ impl<
     pub fn overlay_files(&self) -> usize {
         self.overlay
             .iter()
-            .filter(|entry| matches!(entry.state, Slot::File | Slot::Link))
+            .filter(|entry| matches!(entry.state(), Slot::File | Slot::Link))
             .count()
     }
 
@@ -1564,7 +1529,7 @@ impl<
     pub fn overlay_objects(&self) -> usize {
         self.overlay
             .iter()
-            .filter(|entry| entry.state != Slot::Free)
+            .filter(|entry| entry.state() != Slot::Free)
             .count()
     }
 
@@ -1627,20 +1592,11 @@ impl<
             self.storage.clear(slot);
             return Err(error);
         }
-        self.overlay[slot] = OverlayFile {
-            accessed: Timestamp::ZERO,
-            modified: Timestamp::ZERO,
-            state: Slot::Symlink,
-            kind: NodeKind::Symlink,
-            path,
-            mode: 0o777,
-            len: target.len(),
-            executions: 0,
-            links: 1,
-            object: None,
-            name_pins: 0,
-            inode: 0,
-        };
+        let entry = self.overlay.occupy(slot, Slot::Symlink, path);
+        entry.kind = NodeKind::Symlink;
+        entry.mode = 0o777;
+        entry.len = target.len();
+        entry.links = 1;
         Ok(())
     }
 
@@ -1648,10 +1604,10 @@ impl<
         let path = self.resolved_path(name, false, false)?;
         if let Some(slot) = self.find_overlay(path.as_bytes()) {
             let entry = &self.overlay[slot];
-            if entry.state == Slot::Whiteout {
+            if entry.state() == Slot::Whiteout {
                 return Err(VfsError::NotFound);
             }
-            if entry.state != Slot::Symlink {
+            if entry.state() != Slot::Symlink {
                 return Err(VfsError::InvalidArgument);
             }
             let count = entry.len.min(output.len());
@@ -1711,13 +1667,8 @@ impl<
             .ok_or(VfsError::OverlayLimit)?;
         let slot = self.name_slot(destination.as_bytes())?;
         self.storage.clear(slot);
-        self.overlay[object].links = links;
-        self.overlay[slot] = OverlayFile {
-            state: Slot::Link,
-            path: destination,
-            object: Some(object),
-            ..OverlayFile::empty()
-        };
+        self.overlay.entry_mut(object).links = links;
+        self.overlay.occupy(slot, Slot::Link, destination).object = Some(object);
         Ok(())
     }
 
@@ -1735,7 +1686,7 @@ impl<
     fn metadata_at(&self, path: &[u8]) -> Result<FileMetadata, VfsError> {
         if let Some(index) = self.find_overlay(path) {
             let file = &self.overlay[index];
-            if file.state == Slot::Whiteout {
+            if file.state() == Slot::Whiteout {
                 return Err(VfsError::NotFound);
             }
             return Ok(self.overlay_metadata(index));
@@ -1795,8 +1746,8 @@ impl<
         }
         self.require_parent(path.as_bytes())?;
         let slot = self.create_overlay(path, mode & 0o777)?;
-        self.overlay[slot].state = Slot::Directory;
-        self.overlay[slot].kind = NodeKind::Directory;
+        self.overlay.set_state(slot, Slot::Directory);
+        self.overlay.entry_mut(slot).kind = NodeKind::Directory;
         Ok(())
     }
 
@@ -1814,17 +1765,17 @@ impl<
         }
         self.require_parent(path.as_bytes())?;
         let slot = self.create_overlay(path, mode & 0o777)?;
-        self.overlay[slot].state = Slot::Fifo;
-        self.overlay[slot].kind = NodeKind::Fifo;
+        self.overlay.set_state(slot, Slot::Fifo);
+        self.overlay.entry_mut(slot).kind = NodeKind::Fifo;
         Ok(())
     }
 
     fn has_children(&self, path: &[u8]) -> Result<bool, VfsError> {
         if self.overlay.iter().any(|entry| {
             matches!(
-                entry.state,
+                entry.state(),
                 Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
-            ) && child_name(path, entry.path.as_bytes()).is_some()
+            ) && child_name(path, entry.path().as_bytes()).is_some()
         }) {
             return Ok(true);
         }
@@ -1932,11 +1883,11 @@ impl<
         // Check every new descendant path before changing any namespace entry.
         for entry in self.overlay.iter() {
             if matches!(
-                entry.state,
+                entry.state(),
                 Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
-            ) && beneath(entry.path.as_bytes(), source.as_bytes())
+            ) && beneath(entry.path().as_bytes(), source.as_bytes())
             {
-                let suffix = entry.path.len - source.len;
+                let suffix = entry.path().len - source.len;
                 if destination
                     .len
                     .checked_add(suffix)
@@ -1949,19 +1900,20 @@ impl<
         if let Some(target) = target {
             self.remove_name(target);
         }
-        for entry in self.overlay.iter_mut() {
+        for slot in 0..self.overlay.len() {
+            let entry = &self.overlay[slot];
             if matches!(
-                entry.state,
+                entry.state(),
                 Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
-            ) && beneath(entry.path.as_bytes(), source.as_bytes())
+            ) && beneath(entry.path().as_bytes(), source.as_bytes())
             {
                 let mut path = destination;
-                path.extend(&entry.path.as_bytes()[source.len..])?; // Preflight above guarantees capacity.
-                entry.path = path;
+                path.extend(&entry.path().as_bytes()[source.len..])?; // Preflight above guarantees capacity.
+                self.overlay.set_path(slot, path);
             }
         }
         debug_assert_eq!(
-            self.overlay[source_slot].path.as_bytes(),
+            self.overlay[source_slot].path().as_bytes(),
             destination.as_bytes()
         );
         Ok(())
@@ -1973,7 +1925,7 @@ impl<
         let mode = mode & 0o7777;
         let path = self.resolved_path(path, true, false)?;
         let slot = match self.find_overlay(path.as_bytes()) {
-            Some(slot) if self.overlay[slot].state == Slot::Whiteout => {
+            Some(slot) if self.overlay[slot].state() == Slot::Whiteout => {
                 return Err(VfsError::NotFound)
             }
             Some(slot) => slot,
@@ -1986,7 +1938,7 @@ impl<
             return Err(VfsError::PermissionDenied);
         }
         let object = self.object(slot);
-        self.overlay[object].mode = mode;
+        self.overlay.entry_mut(object).mode = mode;
         Ok(())
     }
 
@@ -2001,7 +1953,7 @@ impl<
         let slot = self
             .find_overlay(path.as_bytes())
             .ok_or(VfsError::PermissionDenied)?;
-        if self.overlay[slot].state == Slot::Whiteout {
+        if self.overlay[slot].state() == Slot::Whiteout {
             return Err(VfsError::NotFound);
         }
         self.set_object_times(self.object(slot), accessed, modified)
@@ -2032,10 +1984,10 @@ impl<
             return Err(VfsError::InvalidArgument);
         }
         if let Some(time) = accessed {
-            self.overlay[object].accessed = time;
+            self.overlay.entry_mut(object).accessed = time;
         }
         if let Some(time) = modified {
-            self.overlay[object].modified = time;
+            self.overlay.entry_mut(object).modified = time;
         }
         Ok(())
     }
@@ -2049,7 +2001,7 @@ impl<
         if mode & !0o777 != 0 {
             return Err(VfsError::PermissionDenied);
         }
-        self.overlay[state.object].mode = mode;
+        self.overlay.entry_mut(state.object).mode = mode;
         Ok(())
     }
 
@@ -2121,39 +2073,76 @@ impl<
         Ok(slot)
     }
 
+    /// The lowest live slot named `path`, otherwise its lowest whiteout.
     fn find_overlay(&self, path: &[u8]) -> Option<usize> {
+        let slot = self.overlay.find(path);
+        #[cfg(test)]
+        assert_eq!(slot, self.find_overlay_linear(path), "overlay index lookup");
+        slot
+    }
+
+    /// The lowest free slot, otherwise the lowest whiteout that nothing holds
+    /// and that no longer hides an image name on its own.
+    fn allocate_overlay(&self) -> Result<usize, VfsError> {
+        let slot = self
+            .overlay
+            .first_free()
+            .or_else(|| {
+                (0..self.overlay.len()).find(|slot| {
+                    let entry = &self.overlay[*slot];
+                    entry.state() == Slot::Whiteout
+                        && entry.executions == 0
+                        && entry.name_pins == 0
+                        && entry.links == 0
+                        && !self.referenced(*slot)
+                        && (self.index.lookup_exact(entry.path().as_bytes())
+                            == Err(VfsError::NotFound)
+                            || self.overlay.path_shared(*slot))
+                })
+            })
+            .ok_or(VfsError::OverlayLimit);
+        #[cfg(test)]
+        assert_eq!(slot, self.allocate_overlay_linear(), "overlay allocation");
+        slot
+    }
+
+    /// The scan `find_overlay` replaced, kept to check the index against.
+    #[cfg(test)]
+    fn find_overlay_linear(&self, path: &[u8]) -> Option<usize> {
         self.overlay
             .iter()
             .position(|entry| {
                 matches!(
-                    entry.state,
+                    entry.state(),
                     Slot::File | Slot::Directory | Slot::Symlink | Slot::Fifo | Slot::Link
-                ) && entry.path.as_bytes() == path
+                ) && entry.path().as_bytes() == path
             })
             .or_else(|| {
                 self.overlay.iter().position(|entry| {
-                    entry.state == Slot::Whiteout && entry.path.as_bytes() == path
+                    entry.state() == Slot::Whiteout && entry.path().as_bytes() == path
                 })
             })
     }
 
-    fn allocate_overlay(&self) -> Result<usize, VfsError> {
+    /// The scan `allocate_overlay` replaced, kept to check it against.
+    #[cfg(test)]
+    fn allocate_overlay_linear(&self) -> Result<usize, VfsError> {
         self.overlay
             .iter()
-            .position(|entry| entry.state == Slot::Free)
+            .position(|entry| entry.state() == Slot::Free)
             .or_else(|| {
                 self.overlay.iter().enumerate().position(|(slot, entry)| {
-                    entry.state == Slot::Whiteout
+                    entry.state() == Slot::Whiteout
                         && entry.executions == 0
                         && entry.name_pins == 0
                         && entry.links == 0
                         && !self.referenced(slot)
-                        && (self.index.lookup_exact(entry.path.as_bytes())
+                        && (self.index.lookup_exact(entry.path().as_bytes())
                             == Err(VfsError::NotFound)
                             || self.overlay.iter().enumerate().any(|(other, candidate)| {
                                 other != slot
-                                    && candidate.state != Slot::Free
-                                    && candidate.path.as_bytes() == entry.path.as_bytes()
+                                    && candidate.state() != Slot::Free
+                                    && candidate.path().as_bytes() == entry.path().as_bytes()
                             }))
                 })
             })
@@ -2163,7 +2152,7 @@ impl<
     fn name_slot(&self, path: &[u8]) -> Result<usize, VfsError> {
         match self.find_overlay(path) {
             Some(slot)
-                if self.overlay[slot].state == Slot::Whiteout
+                if self.overlay[slot].state() == Slot::Whiteout
                     && self.overlay[slot].executions == 0
                     && self.overlay[slot].name_pins == 0
                     && self.overlay[slot].links == 0
@@ -2189,7 +2178,7 @@ impl<
     /// descriptor already open on the image follows the same live bytes and
     /// metadata, as it would for one inode.
     fn replace_image_file(&mut self, record: usize, object: usize) {
-        self.overlay[object].inode = record as u64 + 1;
+        self.overlay.entry_mut(object).inode = record as u64 + 1;
         for descriptor in &mut self.descriptors {
             if descriptor.open
                 && !descriptor.overlay
@@ -2206,13 +2195,9 @@ impl<
     fn create_overlay(&mut self, path: Path, mode: u32) -> Result<usize, VfsError> {
         let index = self.name_slot(path.as_bytes())?;
         self.storage.clear(index);
-        self.overlay[index] = OverlayFile {
-            state: Slot::File,
-            path,
-            mode,
-            links: 1,
-            ..OverlayFile::empty()
-        };
+        let entry = self.overlay.occupy(index, Slot::File, path);
+        entry.mode = mode;
+        entry.links = 1;
         Ok(index)
     }
 
@@ -2238,10 +2223,10 @@ impl<
         })();
         if let Err(error) = copied {
             self.storage.clear(index);
-            self.overlay[index] = OverlayFile::empty();
+            self.overlay.vacate(index);
             return Err(error);
         }
-        self.overlay[index].len = size;
+        self.overlay.entry_mut(index).len = size;
         Ok(index)
     }
 
@@ -2269,7 +2254,7 @@ impl<
         resolve_components(path, follow_final, allow_missing, |name, target| {
             if let Some(slot) = self.find_overlay(name) {
                 let entry = &self.overlay[slot];
-                return match entry.state {
+                return match entry.state() {
                     Slot::Whiteout => Err(VfsError::NotFound),
                     Slot::Directory => Ok((NodeKind::Directory, 0)),
                     Slot::Symlink => {
@@ -4556,5 +4541,178 @@ mod tests {
             Err(VfsError::NotDirectory)
         );
         assert_eq!(vfs.overlay_objects(), 1);
+    }
+
+    /// A base reader whose reads can be made to fail, to abandon copy-ups.
+    struct SwitchReader {
+        bytes: [u8; 8],
+        fail: std::rc::Rc<core::cell::Cell<bool>>,
+    }
+    impl BaseReader for SwitchReader {
+        fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), VfsError> {
+            if self.fail.get() {
+                return Err(VfsError::Io);
+            }
+            let offset = offset as usize;
+            output.copy_from_slice(&self.bytes[offset..offset + output.len()]);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct SharedNames {
+        whiteouts: usize,
+        live_and_whiteout: usize,
+        live: usize,
+    }
+
+    /// Drive one filesystem through random namespace changes and compare the
+    /// overlay index with the scans it replaced after every step.
+    fn churn_overlay<const FILES: usize>(seed: u64, steps: usize, shared: &mut SharedNames) {
+        let bytes = index_bytes();
+        let fail = std::rc::Rc::new(core::cell::Cell::new(false));
+        let mut fs: VirtualFs<'_, SwitchReader, FILES, 16, 6> = VirtualFs::new(
+            Index::new(&bytes).unwrap(),
+            SwitchReader {
+                bytes: *b"BASETOOL",
+                fail: fail.clone(),
+            },
+        );
+        let mut paths: Vec<Vec<u8>> = Vec::new();
+        for directory in ["", "/a", "/b", "/a/c", "/usr/bin"] {
+            for name in ["x", "y", "c", "tool", "base"] {
+                paths.push(std::format!("{directory}/{name}").into_bytes());
+            }
+        }
+        paths.extend([
+            b"/a".to_vec(),
+            b"/b".to_vec(),
+            b"/usr".to_vec(),
+            b"/bin".to_vec(),
+        ]);
+        let mut seen = paths.clone();
+        let mut fds = Vec::new();
+        let mut pins = Vec::new();
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut below = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for _ in 0..steps {
+            let path = paths[below(paths.len())].clone();
+            let other = paths[below(paths.len())].clone();
+            match below(14) {
+                0 => {
+                    if let Ok(fd) = fs.open(&path, O_CREATE | O_WRITE | O_READ) {
+                        let _ = fs.write(fd, b"data");
+                        fds.push(fd);
+                    }
+                }
+                1 => {
+                    // Copy an image file up; a failed read abandons the copy.
+                    fail.set(below(3) == 0);
+                    if let Ok(fd) = fs.open(&path, O_WRITE) {
+                        fds.push(fd);
+                    }
+                    fail.set(false);
+                }
+                2 => {
+                    if let Ok(fd) = fs.open(&path, O_CREATE | O_WRITE | O_TRUNC) {
+                        let _ = fs.close(fd);
+                    }
+                }
+                3 => {
+                    let _ = fs.mkdir(&path, 0o755);
+                }
+                4 => {
+                    let _ = fs.mkfifo(&path, 0o644);
+                }
+                5 => {
+                    let _ = fs.symlink(b"x", &path);
+                }
+                6 => {
+                    let _ = fs.hard_link(&path, &other, false);
+                }
+                7 => {
+                    let _ = fs.unlink(&path);
+                }
+                8 => {
+                    let _ = fs.remove_directory(&path);
+                }
+                9 => {
+                    let _ = fs.rename(&path, &other, below(4) == 0);
+                }
+                10 if !fds.is_empty() => {
+                    let fd = fds.swap_remove(below(fds.len()));
+                    fs.close(fd).unwrap();
+                }
+                11 => {
+                    let _ = fs.chmod(&path, 0o755);
+                    if let Ok(image) = fs.pin_executable(&path) {
+                        pins.push(image);
+                    }
+                }
+                12 if !pins.is_empty() => {
+                    let image = pins.swap_remove(below(pins.len()));
+                    fs.release_executable(image).unwrap();
+                }
+                13 if below(40) == 0 => {
+                    fs.teardown();
+                    fds.clear();
+                    pins.clear();
+                }
+                _ => {}
+            }
+            fs.overlay.assert_consistent();
+            for slot in 0..fs.overlay.len() {
+                let entry = &fs.overlay[slot];
+                if entry.state() == Slot::Free {
+                    continue;
+                }
+                let name = entry.path().as_bytes();
+                if !seen.iter().any(|known| known.as_slice() == name) {
+                    seen.push(name.to_vec());
+                }
+                for later in &fs.overlay[slot + 1..] {
+                    if later.state() == Slot::Free || later.path().as_bytes() != name {
+                        continue;
+                    }
+                    match (entry.state(), later.state()) {
+                        (Slot::Whiteout, Slot::Whiteout) => shared.whiteouts += 1,
+                        (Slot::Whiteout, _) | (_, Slot::Whiteout) => shared.live_and_whiteout += 1,
+                        _ => shared.live += 1,
+                    }
+                }
+            }
+            for name in &seen {
+                assert_eq!(fs.overlay.find(name), fs.find_overlay_linear(name));
+            }
+            assert_eq!(fs.allocate_overlay(), fs.allocate_overlay_linear());
+        }
+    }
+
+    #[test]
+    fn random_namespace_changes_keep_the_overlay_index_exact() {
+        let mut shared = SharedNames::default();
+        for seed in 1..=12 {
+            churn_overlay::<1>(seed, 400, &mut shared);
+            churn_overlay::<3>(seed, 800, &mut shared);
+            churn_overlay::<10>(seed, 1_500, &mut shared);
+            churn_overlay::<64>(seed, 1_500, &mut shared);
+        }
+        // The runs must reach the names the index has to rank.
+        assert!(shared.whiteouts > 0, "no slots shared a whiteout name");
+        assert!(
+            shared.live_and_whiteout > 0,
+            "no live name shadowed a whiteout"
+        );
+        std::eprintln!(
+            "shared names: {} whiteout pairs, {} live and whiteout, {} live pairs",
+            shared.whiteouts,
+            shared.live_and_whiteout,
+            shared.live
+        );
     }
 }
