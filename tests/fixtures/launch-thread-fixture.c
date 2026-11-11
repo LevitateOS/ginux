@@ -271,6 +271,7 @@ long thread_main(word *stack)
     char **argv=(char **)(stack+1);
     char mode=argc>1?argv[1][0]:'b';
     if (mode=='m') { thread_flags=0x7d0f00; mode='b'; }
+    if (mode=='G') { thread_flags=0xd0f00; mode='r'; }
     int pi=0;
     CHECK(DO(202,&pi,6,0)==-1 && pi==0,69);
     CHECK(DO(2,"/work/shared",0102,0600)==3 && DO(2,"/input",0,0)==4,10);

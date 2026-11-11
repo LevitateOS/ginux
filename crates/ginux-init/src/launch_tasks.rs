@@ -694,10 +694,7 @@ impl Supervisor<'_> {
     /// parent's group all go together. Returns whether a reservation was
     /// withdrawn; a published child is a task of its own and stays.
     fn cancel_creation(&mut self, parent: usize, instance: &mut Instance) -> bool {
-        let Pending::Fork {
-            child, parent_tid, ..
-        } = self.task(parent).pending
-        else {
+        let Pending::Fork { child, flags, .. } = self.task(parent).pending else {
             return false;
         };
         if self.task(child).host != 0 {
@@ -706,7 +703,7 @@ impl Supervisor<'_> {
         self.task_mut(parent).pending = Pending::None;
         self.release_group(child, instance);
         let (id, reserved) = (self.task(parent).id, self.task(child).id);
-        let rollback = if parent_tid.is_some() {
+        let rollback = if flags & 0x10000 != 0 {
             self.processes.cancel_thread(id, reserved)
         } else {
             self.processes.cancel_fork(id, reserved)
@@ -751,16 +748,13 @@ impl Supervisor<'_> {
                     let Some(task) = self.tasks[index].as_ref() else {
                         return false;
                     };
-                    let Pending::Fork {
-                        child, parent_tid, ..
-                    } = task.pending
-                    else {
+                    let Pending::Fork { child, flags, .. } = task.pending else {
                         return false;
                     };
                     task.alive
                         && self.task(child).host == 0
                         && self.host_tgid(index).is_some_and(|group| {
-                            if parent_tid.is_some() {
+                            if flags & 0x10000 != 0 {
                                 group == tgid
                             } else {
                                 group == parent
