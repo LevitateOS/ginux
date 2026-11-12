@@ -384,6 +384,27 @@ pub const fn futex_priority_inheritance(op: u64) -> bool {
     matches!(op & FUTEX_COMMAND, 6..=8 | 11..=13)
 }
 
+/// Whether a futex operation word selects a wait that a signal or a tracer
+/// stop can end with the kernel's internal `ERESTART_RESTARTBLOCK`:
+/// `FUTEX_WAIT` and `FUTEX_WAIT_BITSET`, whose timed waits restart through
+/// `restart_syscall`. Classified by the low 7 bits as
+/// [`futex_priority_inheritance`] is, so every flag combination is covered.
+pub const fn futex_restart_block(op: u64) -> bool {
+    const FUTEX_COMMAND: u64 = 0x7f;
+    matches!(op & FUTEX_COMMAND, 0 | 9)
+}
+
+/// Whether a call can change the caller's seccomp filters: any `seccomp`
+/// operation, or `prctl(PR_SET_SECCOMP)`. The kernel reads the `prctl`
+/// option as a 32-bit value. Configured launch denies both: its supervisor
+/// relies on no filter of the workload's outranking its own.
+pub const fn seccomp_change_request(syscall: u64, arg0: u64) -> bool {
+    const SYS_PRCTL: u64 = 157;
+    const SYS_SECCOMP: u64 = 317;
+    const PR_SET_SECCOMP: u64 = 22;
+    syscall == SYS_SECCOMP || syscall == SYS_PRCTL && arg0 as u32 as u64 == PR_SET_SECCOMP
+}
+
 /// Whether an `fcntl` or `ioctl` request would set up signal-driven I/O, so
 /// that the host kernel signals a process when a descriptor becomes ready.
 /// The workload could name any host process its credentials may signal
@@ -1630,6 +1651,43 @@ mod tests {
                 assert!(balanced_arguments_allowed(SYS_FUTEX, 0x1000, op, 0));
             }
         }
+    }
+
+    #[test]
+    fn futex_restart_block_covers_waits_only() {
+        const PRIVATE: u64 = 128;
+        const CLOCK_REALTIME: u64 = 256;
+        for command in [0, 9] {
+            for op in [
+                command,
+                command | PRIVATE,
+                command | CLOCK_REALTIME,
+                command | PRIVATE | CLOCK_REALTIME,
+                command | 0xffff_ffff_0000_0000,
+            ] {
+                assert!(futex_restart_block(op), "{op:#x}");
+            }
+        }
+        for command in [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13] {
+            assert!(!futex_restart_block(command | PRIVATE), "{command:#x}");
+        }
+    }
+
+    #[test]
+    fn configured_launch_denies_seccomp_changes() {
+        for (syscall, arg0) in [
+            (317, 0),
+            (317, 1),
+            (317, 2),
+            (157, 22),
+            (157, 0x1_0000_0016),
+        ] {
+            assert!(seccomp_change_request(syscall, arg0), "{syscall} {arg0:#x}");
+            assert_eq!(decide_configured(syscall).action, Action::Deny(38));
+        }
+        assert!(!seccomp_change_request(157, 21));
+        assert!(!seccomp_change_request(157, 38));
+        assert!(!seccomp_change_request(24, 22));
     }
 
     #[test]

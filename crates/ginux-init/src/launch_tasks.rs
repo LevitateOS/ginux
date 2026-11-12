@@ -20,7 +20,14 @@ use ginux_vfs::Executable;
 const TASKS: usize = 32;
 const WALL: usize = 0x4000_0000;
 // Linux x86-64: sys/ptrace and asm/unistd_64.h.
-pub(crate) const OPTIONS: usize = PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL | 2 | 4 | 8 | 16;
+const SYSCALL_STOP_OPTIONS: usize = PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL | 2 | 4 | 8 | 16;
+/// Options the bootstrap tracee is seized with. Seccomp events must already
+/// be traced when it installs the launch filter and executes the workload;
+/// without the filter none arrive, and supervision drops the option.
+pub(crate) const OPTIONS: usize = SYSCALL_STOP_OPTIONS | PTRACE_O_TRACESECCOMP;
+/// Legacy vsyscall page. The kernel emulates calls made there and reports
+/// them to seccomp, but never as ptrace syscall stops.
+const VSYSCALL_PAGE: u64 = 0xffff_ffff_ff60_0000;
 
 #[derive(Clone, Copy)]
 enum Pending {
@@ -104,6 +111,14 @@ struct Task {
     signalled: bool,
     /// Host thread this task's in-flight `tgkill` signals, other than itself.
     signal_target: Option<usize>,
+    /// The task's current syscall has been seen at its entry and its exit
+    /// is still to come: either the task is stopped at that entry, or it was
+    /// resumed to stop at the exit.
+    in_flight: bool,
+    /// The registers the in-flight syscall runs with need its exit: saved
+    /// arguments differ from them, or the kernel may end it with an internal
+    /// restart the exit translates.
+    exit_registers: bool,
 }
 
 /// A parked syscall being returned to its own instruction. The skipped entry
@@ -143,6 +158,8 @@ impl Task {
             reaps_seen: 0,
             signalled: false,
             signal_target: None,
+            in_flight: false,
+            exit_registers: true,
         }
     }
 }
@@ -186,6 +203,12 @@ struct Supervisor<'a> {
     /// Terminal statuses collected so far. Each native reap can queue SIGCHLD
     /// for a task the supervisor is holding in a stop.
     reaps: u64,
+    /// The launch filter is installed: every workload syscall reaches the
+    /// supervisor as a seccomp event at its entry, tasks run between
+    /// syscalls under `PTRACE_CONT`, and a syscall stops at its exit only
+    /// when that exit has work. Without the filter every task is resumed
+    /// with `PTRACE_SYSCALL` and every syscall stops at entry and exit.
+    seccomp: bool,
 }
 
 fn birth_stop(status: i32) -> bool {
@@ -322,11 +345,24 @@ pub fn supervise(
     contract: &EffectiveContract,
 ) -> ! {
     let mut status = 0;
+    let mut seccomp = false;
     let waited = loop {
         let result = wait(root, &mut status);
-        if result != -4 {
-            break result;
+        if result == -4 {
+            continue;
         }
+        // The bootstrap's own exec, and its failure report if that exec
+        // fails, are supervisor code: they run as before, unexamined.
+        if result == root as isize
+            && stopped(status)
+            && (status as u32 >> 16) as usize == PTRACE_EVENT_SECCOMP
+        {
+            seccomp = true;
+            if ptrace(PTRACE_CONT, root, 0, 0) >= 0 {
+                continue;
+            }
+        }
+        break result;
     };
     if waited < 0 {
         if waited != -10 {
@@ -377,6 +413,7 @@ pub fn supervise(
         creation_failure_reported: false,
         argument_guard: None,
         reaps: 0,
+        seccomp,
     };
     s.groups[0] = Some(DescriptorGroup {
         table: descriptors,
@@ -389,7 +426,7 @@ pub fn supervise(
         creation_mask: 0o022,
     });
     s.tasks[0] = Some(Task::new(id, root, 0));
-    if ptrace(PTRACE_SETOPTIONS, root, 0, OPTIONS) < 0 {
+    if ptrace(PTRACE_SETOPTIONS, root, 0, s.options()) < 0 {
         s.fail(instance, b"launch ptrace setup failed");
     }
     line_stderr(b"ginux: launch backend=ptrace-native profile=balanced elf-loader=host");
@@ -554,11 +591,12 @@ pub fn supervise(
             // Real group stops cannot be forwarded as signal delivery.
             s.fail(instance, b"launch group stops are unsupported")
         }
-        if event != 0 {
+        let seccomp_stop = event == PTRACE_EVENT_SECCOMP && s.seccomp;
+        if event != 0 && !seccomp_stop {
             s.fail(instance, b"unsupported task transition")
         }
         let signal = ((status >> 8) & 255) as usize;
-        if signal != 133 {
+        if !seccomp_stop && signal != 133 {
             s.signal_reaches_held_call(index, signal, instance);
             // Injected transactions block signals for their whole duration,
             // so this stop cannot belong to one.
@@ -626,17 +664,44 @@ pub fn supervise(
             s.resume(index, 0, instance);
             continue;
         }
+        if seccomp_stop {
+            if info[0] as u8 != 3 {
+                s.fail(instance, b"unknown syscall stop");
+            }
+            // Never a ptrace syscall stop: the vsyscall page stays unexamined,
+            // as it is without the launch filter. Its emulation refuses any
+            // change of syscall or instruction pointer.
+            if info[1] & !0xfff == VSYSCALL_PAGE {
+                s.resume(index, 0, instance);
+                continue;
+            }
+            // A task resumed for its exit stops there before any new entry,
+            // and no workload filter can exist (see `run`).
+            if s.task(index).in_flight || info[10] as u32 != LAUNCH_FILTER_DATA {
+                s.fail(instance, b"unexpected seccomp stop");
+            }
+        } else if s.seccomp && info[0] as u8 == 1 {
+            // Tasks are resumed with PTRACE_SYSCALL only to stop at the exit
+            // of a call already seen at its seccomp stop.
+            s.fail(instance, b"unexpected syscall-entry stop");
+        }
         match info[0] as u8 {
-            1 => {
+            1 | 3 => {
+                let task = s.task_mut(index);
+                task.in_flight = true;
+                task.exit_registers = true;
                 if s.needs_argument_guard(index, &r) {
                     s.begin_argument_guard(index, instance);
                 }
                 s.entry(index, &mut r, instance);
-                if s.argument_guard == Some(index) && s.task(index).blocked.is_some() {
+                if s.argument_guard == Some(index)
+                    && (s.task(index).blocked.is_some() || !s.task(index).in_flight)
+                {
                     s.release_argument_guard(instance);
                 }
             }
             2 => {
+                s.task_mut(index).in_flight = false;
                 s.syscall_exit(index, &mut r, instance);
                 if s.argument_guard == Some(index)
                     && s.task(index).exec.is_none()
@@ -660,6 +725,15 @@ impl Supervisor<'_> {
     }
     fn table(&self, index: usize) -> &DescriptorTable {
         &self.group(index).table
+    }
+    /// Options for every traced task: seccomp events only while the launch
+    /// filter is installed.
+    fn options(&self) -> usize {
+        if self.seccomp {
+            OPTIONS
+        } else {
+            SYSCALL_STOP_OPTIONS
+        }
     }
     fn needs_argument_guard(&self, index: usize, r: &UserRegs) -> bool {
         // Thread clone publishes parent_tid only after the native birth event.
@@ -841,7 +915,19 @@ impl Supervisor<'_> {
         }
         self.settle_signal_hold(index, instance);
         self.task_mut(index).reaps_seen = self.reaps;
-        let result = ptrace(PTRACE_SYSCALL, self.task(index).host, 0, signal);
+        let request = if !self.seccomp || self.task(index).in_flight && self.exit_needed(index) {
+            PTRACE_SYSCALL
+        } else {
+            if self.task(index).in_flight {
+                // The call runs natively and its exit would change nothing:
+                // finish it here, as its exit would.
+                self.wake_needed |= self.task_mut(index).call.complete_without_exit();
+                self.retire_threads();
+                self.task_mut(index).in_flight = false;
+            }
+            PTRACE_CONT
+        };
+        let result = ptrace(request, self.task(index).host, 0, signal);
         if result == -3 {
             // SIGKILL can end a ptrace stop between an object retry and
             // resume. Keep ownership until wait4 supplies the actual death.
@@ -853,6 +939,36 @@ impl Supervisor<'_> {
             self.task_mut(index).running = true;
         }
     }
+    /// Task state that gives the exit of its in-flight syscall work which
+    /// needs the kernel to have run first, or runs further supervisor-chosen
+    /// syscalls: a skipped call with any of it still takes its exit stop.
+    fn exit_state(&self, index: usize) -> bool {
+        let task = self.task(index);
+        task.call.signal_wait_pending()
+            || task.unpark.is_some()
+            || task.sleep.is_some()
+            || task.mapping.is_some()
+            || task.exec.is_some()
+            || task.path_rewrite.is_some()
+            || task.signal_target.is_some()
+            || !matches!(task.pending, Pending::None)
+            || task.image_chdir.is_some()
+    }
+
+    /// Whether the in-flight syscall of a task about to be resumed must stop
+    /// again at its exit. Exactly when `syscall_exit` would do more than
+    /// `complete_without_exit` and an unchanged register write: the exit
+    /// records the native result while per-syscall audit lasts, an override
+    /// or the argument guard waits for it, or the call's state needs it.
+    fn exit_needed(&self, index: usize) -> bool {
+        let task = self.task(index);
+        crate::launch::audit_tracing()
+            || task.exit_registers
+            || task.override_result.is_some()
+            || self.argument_guard == Some(index)
+            || self.exit_state(index)
+    }
+
     fn injecting(&self, index: usize) -> bool {
         let task = self.task(index);
         task.mapping.is_some()
@@ -1082,11 +1198,33 @@ impl Supervisor<'_> {
     }
 
     fn run(&mut self, index: usize, r: &UserRegs, instance: &mut Instance) {
+        let mut registers = *r;
+        if self.seccomp && self.task(index).in_flight {
+            // A filter the workload installed could outrank the launch
+            // filter and decide calls the supervisor never sees. Configured
+            // launch denies both ways to install one, so none can exist.
+            if ginux_core::seccomp_change_request(r.orig_rax, r.rdi) {
+                self.fail(instance, b"workload seccomp filters are unsupported");
+            }
+            if r.orig_rax == u64::MAX && !self.exit_state(index) {
+                // The kernel runs nothing between the entry of a skipped call
+                // and its exit, and its exit registers are the ones written
+                // here: complete it now, exactly as its exit stop would.
+                self.finish_call(index, &mut registers, instance);
+                registers.orig_rax = u64::MAX;
+                self.task_mut(index).in_flight = false;
+            } else {
+                let exit_registers = self.task(index).call.exit_work(r)
+                    || r.orig_rax == ginux_core::SYS_FUTEX
+                        && ginux_core::futex_restart_block(r.rsi);
+                self.task_mut(index).exit_registers = exit_registers;
+            }
+        }
         let result = ptrace(
             PTRACE_SETREGS,
             self.task(index).host,
             0,
-            r as *const _ as usize,
+            &registers as *const _ as usize,
         );
         if result == -3 {
             // A parked task may die while copyin/readiness is being retried.
@@ -2397,8 +2535,9 @@ impl Supervisor<'_> {
         }
         self.task_mut(slot).host = host;
         let virtual_id = self.task(slot).id.pid;
+        let options = self.options();
         let setup = (|| -> Result<(), &'static [u8]> {
-            if ptrace(PTRACE_SETOPTIONS, host, 0, OPTIONS) < 0 {
+            if ptrace(PTRACE_SETOPTIONS, host, 0, options) < 0 {
                 return Err(b"child supervision setup failed");
             }
             if let Some(address) = child_tid {
@@ -2623,6 +2762,15 @@ impl Supervisor<'_> {
                 }
             }
         }
+        self.finish_call(index, r, instance);
+        self.run(index, r, instance);
+    }
+
+    /// The part of a syscall exit every call shares: settle a creation or a
+    /// child wait, apply the supervisor's result, finish descriptor state and
+    /// record the result. A skipped call with no `exit_state` runs exactly
+    /// this, at its entry.
+    fn finish_call(&mut self, index: usize, r: &mut UserRegs, instance: &mut Instance) {
         let pending = self.task(index).pending;
         match pending {
             Pending::Fork { child, flags, .. } => {
@@ -2737,7 +2885,6 @@ impl Supervisor<'_> {
         audit_write(b" phase=exit result=");
         audit_i64(r.rax as i64);
         audit_write(b"\n");
-        self.run(index, r, instance);
     }
     fn replace_cwd(&mut self, index: usize, next: Option<i32>, instance: &mut Instance) {
         let old = core::mem::replace(&mut self.group_mut(index).cwd, next);
@@ -2909,7 +3056,9 @@ impl Supervisor<'_> {
                 self.begin_argument_guard(index, instance);
             }
             self.entry(index, &mut r, instance);
-            if self.argument_guard == Some(index) && self.task(index).blocked.is_some() {
+            if self.argument_guard == Some(index)
+                && (self.task(index).blocked.is_some() || !self.task(index).in_flight)
+            {
                 self.release_argument_guard(instance);
             }
             self.interrupt_parked(index, instance);

@@ -425,6 +425,43 @@ impl DescriptorCall {
         self.saved_args = Some([r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9, r.orig_rax]);
     }
 
+    /// Whether the matching exit of a call that runs natively with
+    /// registers `r` has work beyond [`DescriptorCall::complete_without_exit`]:
+    /// a result to translate, a reference to release, or arguments that
+    /// differ from the ones the kernel sees and must be restored.
+    pub fn exit_work(&self, r: &UserRegs) -> bool {
+        self.signal_wait.is_some()
+            || self.pending.is_some()
+            || self.success.is_some()
+            || self.pinned.is_some()
+            || self.fifo_open.is_some()
+            || self
+                .saved_args
+                .is_some_and(|args| args != [r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9, r.orig_rax])
+    }
+
+    /// Whether a signal-wait completion owns the matching exit.
+    pub fn signal_wait_pending(&self) -> bool {
+        self.signal_wait.is_some()
+    }
+
+    /// End a native call whose exit the supervisor does not stop at. Only
+    /// valid when [`DescriptorCall::exit_work`] is false: this is then
+    /// everything [`DescriptorCall::finish`] would do, and it returns what
+    /// `finish` would report as changed.
+    pub fn complete_without_exit(&mut self) -> bool {
+        self.clear_per_call();
+        self.saved_args.take().is_some()
+    }
+
+    fn clear_per_call(&mut self) {
+        self.wait_signal_mask = None;
+        self.channel_write = crate::channel_hooks::WriteProgress::new();
+        self.poll_wait = false;
+        self.poll_tick = false;
+        self.poll_deadline = None;
+    }
+
     /// Called at the matching syscall exit, including emulated exits.
     /// Signal-wait scratch has already been restored at the native exit.
     pub fn finish(
@@ -433,11 +470,7 @@ impl DescriptorCall {
         r: &mut UserRegs,
         backends: &mut Backends,
     ) -> Result<bool, &'static [u8]> {
-        self.wait_signal_mask = None;
-        self.channel_write = crate::channel_hooks::WriteProgress::new();
-        self.poll_wait = false;
-        self.poll_tick = false;
-        self.poll_deadline = None;
+        self.clear_per_call();
         let mut changed = false;
         if let Some(success) = self.success.take() {
             if r.rax == 0 {

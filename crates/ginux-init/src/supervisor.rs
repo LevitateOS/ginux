@@ -198,6 +198,67 @@ pub fn install_trace_filter(direct_yield: bool, notify_yield: bool) -> isize {
     }
 }
 
+/// The data the configured-launch filter attaches to its x86-64 trace
+/// result. A seccomp stop carrying other data comes from a filter the
+/// workload installed after this one, which won the tie between equal
+/// actions.
+pub const LAUNCH_FILTER_DATA: u32 = 0x4c47;
+
+/// Install the configured-launch filter in the calling task, the bootstrap
+/// tracee just before it executes the workload. Every later syscall of the
+/// workload and of everything it creates stops in the tracer as a
+/// `PTRACE_EVENT_SECCOMP` event before it can run, so the tracer may resume
+/// tasks with `PTRACE_CONT` and still see each call at its entry. The tracer
+/// must already trace this task with `PTRACE_O_TRACESECCOMP`; without it the
+/// kernel fails each call with `ENOSYS` instead of running it unseen. A call
+/// from another architecture stops with distinct data, as in
+/// [`install_trace_filter`]. Returns the raw `seccomp(2)` result.
+pub fn install_launch_filter() -> isize {
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_RET_K: u16 = 0x06;
+    const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+    const INVALID_ARCH_DATA: u32 = 0xffff;
+    let filter = [
+        SockFilter {
+            code: BPF_LD_W_ABS,
+            jt: 0,
+            jf: 0,
+            k: 4,
+        },
+        SockFilter {
+            code: BPF_JMP_JEQ_K,
+            jt: 1,
+            jf: 0,
+            k: AUDIT_ARCH_X86_64,
+        },
+        SockFilter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_TRACE | INVALID_ARCH_DATA,
+        },
+        SockFilter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_TRACE | LAUNCH_FILTER_DATA,
+        },
+    ];
+    let program = SockFprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr(),
+    };
+    unsafe {
+        syscall3(
+            SYS_SECCOMP,
+            SECCOMP_SET_MODE_FILTER,
+            0,
+            &program as *const _ as usize,
+        )
+    }
+}
+
 /// Select the real host identity for managed code. Virtual credentials are
 /// maintained separately by Ginux and never derive authority from this value.
 pub fn managed_host_identity() -> ManagedHostIdentity {

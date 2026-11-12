@@ -54,7 +54,10 @@ pub fn read_path(pid: usize, address: u64) -> Result<Path, i64> {
         let start = address.checked_add(filled as u64).ok_or(-14)?;
         let room = (MAX_PATH - filled).min(4096 - (start % 4096) as usize);
         let read = copy_memory(pid, start, &mut buffer[filled..filled + room], false)? as usize;
-        if let Some(end) = buffer[filled..filled + read].iter().position(|byte| *byte == 0) {
+        if let Some(end) = buffer[filled..filled + read]
+            .iter()
+            .position(|byte| *byte == 0)
+        {
             return Path::from_bytes(&buffer[..filled + end]).map_err(|_| -36);
         }
         filled += read;

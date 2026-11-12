@@ -914,6 +914,13 @@ pub(crate) fn audit_enabled() -> bool {
     unsafe { !AUDIT_DISABLED }
 }
 
+/// Whether per-syscall audit records are still written: auditing is enabled
+/// and its byte budget has not run out. Every native syscall exit then
+/// records its result.
+pub(crate) fn audit_tracing() -> bool {
+    unsafe { !AUDIT_DISABLED && !AUDIT_CAPPED }
+}
+
 /// Fixed-size summaries bypass only the syscall trace budget. Callers bound
 /// their records by the configured endpoint or compiled operation table.
 pub(crate) fn audit_summary(arguments: core::fmt::Arguments<'_>) {
@@ -1316,6 +1323,12 @@ fn launch_tracee(
             128,
         );
     }
+    // From here every syscall stops in the supervisor at its entry as a
+    // seccomp event, the exec below first. A kernel that refuses the filter
+    // leaves the workload on syscall-entry stops instead: the supervisor
+    // sees the exec event without a seccomp event before it and keeps
+    // resuming every task with PTRACE_SYSCALL.
+    let _ = crate::supervisor::install_launch_filter();
     unsafe {
         syscall3(
             SYS_EXECVE,
