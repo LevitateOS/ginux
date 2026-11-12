@@ -327,6 +327,39 @@ pub fn store_u32(pid: usize, address: u64, value: u32) -> Result<(), i64> {
     Ok(())
 }
 
+/// The total length a `readv` of `count` vectors at `address` requests, read
+/// from the stopped tracee in bounded chunks. `None` when the kernel itself
+/// rejects the array: it cannot be read, it has more than `UIO_MAXIOV`
+/// entries, or one length is negative as `ssize_t`. Like the kernel, only the
+/// low 32 bits of the count are significant; a total beyond `u64` saturates.
+pub fn vector_total(pid: usize, address: u64, count: u64) -> Option<u64> {
+    const UIO_MAXIOV: u64 = 1024;
+    const CHUNK: usize = 64;
+    let count = u64::from(count as u32);
+    if count > UIO_MAXIOV {
+        return None;
+    }
+    let mut bytes = [0u8; CHUNK * 16];
+    let mut total = 0u64;
+    let mut done = 0;
+    while done < count {
+        let size = (count - done).min(CHUNK as u64) as usize * 16;
+        let start = address.checked_add(done * 16)?;
+        if copy_memory(pid, start, &mut bytes[..size], false) != Ok(size as i64) {
+            return None;
+        }
+        for entry in bytes[..size].as_chunks::<16>().0 {
+            let length = u64::from_ne_bytes(entry[8..].try_into().unwrap());
+            if length > i64::MAX as u64 {
+                return None;
+            }
+            total = total.saturating_add(length);
+        }
+        done += (size / 16) as u64;
+    }
+    Some(total)
+}
+
 /// Bounded scatter/gather layout shared by owned byte-stream backends.
 pub struct IoVectors {
     entries: [(u64, usize); 16],

@@ -174,8 +174,8 @@ impl LaunchDevices {
                     Ok(0)
                 }
             }
-            89 => Err(-22), // Character devices are not symlinks.
-            _ => Err(-30),  // Assignment metadata is immutable.
+            89 | 267 => Err(-22), // Character devices are not symlinks.
+            _ => Err(-30),        // Assignment metadata is immutable.
         };
         Some(result.unwrap_or_else(|error| error))
     }

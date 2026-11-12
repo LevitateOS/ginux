@@ -3,7 +3,8 @@ use ginux_contract::{
     AuditBudget,
 };
 use ginux_core::{
-    balanced_arguments_allowed, balanced_surface, decide, decide_balanced, decide_systemd,
+    balanced_arguments_allowed, balanced_surface, configured_arguments_allowed, configured_surface,
+    configured_vectors_allowed, decide, decide_balanced, decide_configured, decide_systemd,
 };
 use ginux_devices::{BlockBackend, DeviceError, DeviceName, DeviceView, Partition};
 use ginux_instance::InstanceConfig;
@@ -164,6 +165,10 @@ fn run_target(target: &str, input: &[u8]) {
             let _ = decide_balanced(syscall);
             let _ = balanced_surface(syscall);
             let _ = balanced_arguments_allowed(syscall, values[1], values[2], values[3]);
+            let _ = decide_configured(syscall);
+            let _ = configured_surface(syscall);
+            let _ = configured_arguments_allowed(syscall, values[1], values[2], values[3]);
+            let _ = configured_vectors_allowed((values[1] & 1 != 0).then_some(values[2]));
         }
         "audit" => {
             let values = words(input);

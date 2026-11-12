@@ -3,6 +3,7 @@
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_STAT: u64 = 4;
 pub const SYS_LSTAT: u64 = 6;
+pub const SYS_READV: u64 = 19;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_FORK: u64 = 57;
 pub const SYS_EXIT: u64 = 60;
@@ -34,6 +35,7 @@ pub const SYS_RENAMEAT: u64 = 264;
 pub const SYS_LINKAT: u64 = 265;
 pub const SYS_SYMLINKAT: u64 = 266;
 pub const SYS_READLINKAT: u64 = 267;
+pub const SYS_FACCESSAT: u64 = 269;
 pub const SYS_MEMFD_CREATE: u64 = 319;
 pub const SYS_CLOSE_RANGE: u64 = 436;
 pub const SYS_PIDFD_OPEN: u64 = 434;
@@ -306,15 +308,33 @@ pub const fn balanced_surface(syscall: u64) -> BalancedSurface {
 }
 
 pub const fn decide_balanced(syscall: u64) -> Decision {
-    let action = match syscall {
-        _ if matches!(
-            balanced_surface(syscall),
-            BalancedSurface::VirtualIdentity | BalancedSurface::Lifecycle
-        ) =>
-        {
-            Action::Emulate
-        }
-        _ if matches!(balanced_surface(syscall), BalancedSurface::Denied) => Action::Deny(38),
+    surface_decision(syscall, balanced_surface(syscall))
+}
+
+/// Configured launch mediates every read-only form of an image read that
+/// programs issue, not only the forms the balanced surface lists: `readv`
+/// on an image descriptor (musl stdio reads into the caller's buffer and its
+/// own buffer at once), and `readlinkat` and `faccessat` on an image path as
+/// `readlink` and `access` are. They take the same image mediation: the
+/// descriptor owner translates only a registered native image descriptor,
+/// and an image path is resolved and rewritten to its canonical form, which
+/// never names a hidden subtree, `/proc` or `/sys`. Native balanced policy
+/// keeps `balanced_surface`.
+pub const fn configured_surface(syscall: u64) -> BalancedSurface {
+    match syscall {
+        SYS_READV | SYS_READLINKAT | SYS_FACCESSAT => BalancedSurface::ImageRead,
+        _ => balanced_surface(syscall),
+    }
+}
+
+pub const fn decide_configured(syscall: u64) -> Decision {
+    surface_decision(syscall, configured_surface(syscall))
+}
+
+const fn surface_decision(syscall: u64, surface: BalancedSurface) -> Decision {
+    let action = match surface {
+        BalancedSurface::VirtualIdentity | BalancedSurface::Lifecycle => Action::Emulate,
+        BalancedSurface::Denied => Action::Deny(38),
         _ => Action::Mediate,
     };
     Decision { syscall, action }
@@ -423,12 +443,26 @@ pub const fn balanced_arguments_allowed(syscall: u64, arg0: u64, arg1: u64, arg2
     }
 }
 
+/// The finite request bound of one configured image read, in bytes.
+pub const CONFIGURED_READ_BOUND: u64 = 64 * 1024 * 1024;
+
 /// Configured image reads have a separate finite request bound. Native callers
 /// retain the balanced policy and its existing transfer errors.
 pub const fn configured_arguments_allowed(syscall: u64, arg0: u64, arg1: u64, arg2: u64) -> bool {
     match syscall {
-        0 | 17 => arg2 <= 64 * 1024 * 1024,
+        0 | 17 => arg2 <= CONFIGURED_READ_BOUND,
         _ => balanced_arguments_allowed(syscall, arg0, arg1, arg2),
+    }
+}
+
+/// Whether a configured `readv` requesting `total` bytes, the sum of its
+/// vector lengths, is within the bound of one image read. `None` is an
+/// array the kernel itself rejects (EFAULT, or EINVAL above `UIO_MAXIOV`
+/// entries or `SSIZE_MAX` bytes), so the call carries its own error.
+pub const fn configured_vectors_allowed(total: Option<u64>) -> bool {
+    match total {
+        Some(total) => total <= CONFIGURED_READ_BOUND,
+        None => true,
     }
 }
 
@@ -790,6 +824,51 @@ mod tests {
                 1024 * 1024 + 1
             ));
         }
+    }
+
+    #[test]
+    fn configured_vectored_reads_share_the_image_read_bound() {
+        // musl stdio's {1, N} and {0, N} shapes, and the bound itself.
+        assert!(configured_vectors_allowed(Some(1 + 1024)));
+        assert!(configured_vectors_allowed(Some(1024)));
+        assert!(configured_vectors_allowed(Some(0)));
+        assert!(configured_vectors_allowed(Some(CONFIGURED_READ_BOUND)));
+        assert!(!configured_vectors_allowed(Some(CONFIGURED_READ_BOUND + 1)));
+        assert!(!configured_vectors_allowed(Some(u64::MAX)));
+        // An array the kernel rejects is answered by the kernel.
+        assert!(configured_vectors_allowed(None));
+    }
+
+    #[test]
+    fn configured_surface_mediates_every_read_only_image_form() {
+        // readv, readlinkat and faccessat are image reads in configured
+        // launch, as read, readlink and access are in both.
+        for (configured, balanced) in [(SYS_READV, 0), (SYS_READLINKAT, 89), (SYS_FACCESSAT, 21)] {
+            assert_eq!(configured_surface(configured), BalancedSurface::ImageRead);
+            assert_eq!(decide_configured(configured).action, Action::Mediate);
+            assert_eq!(balanced_surface(balanced), BalancedSurface::ImageRead);
+            // Native balanced policy is unchanged.
+            assert_eq!(balanced_surface(configured), BalancedSurface::Denied);
+            assert_eq!(decide_balanced(configured).action, Action::Deny(38));
+        }
+        // Every other number keeps its balanced classification and decision.
+        for syscall in 0..1024 {
+            if matches!(syscall, SYS_READV | SYS_READLINKAT | SYS_FACCESSAT) {
+                continue;
+            }
+            assert_eq!(configured_surface(syscall), balanced_surface(syscall));
+            assert_eq!(decide_configured(syscall), decide_balanced(syscall));
+        }
+        // Writing, vectored writing and the uncatalogued read forms stay
+        // outside the image surface: pwritev, writev to an image, preadv,
+        // preadv2, readahead, fadvise64, the xattr reads, sendfile and
+        // copy_file_range.
+        for syscall in [
+            20, 296, 295, 327, 187, 221, 191, 192, 193, 194, 195, 196, 40, 326,
+        ] {
+            assert_ne!(configured_surface(syscall), BalancedSurface::ImageRead);
+        }
+        assert_eq!(decide_configured(u64::MAX).action, Action::Deny(38));
     }
 
     #[test]

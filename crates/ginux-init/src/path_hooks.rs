@@ -362,6 +362,7 @@ impl Rewrite {
             262 => Some((r.rdx, 144)),
             332 => Some((r.r8, 256)),
             89 => Some((r.rsi, r.rdx)),
+            267 => Some((r.rdx, r.r10)),
             _ => None,
         };
         if output.is_some_and(|(start, length)| {

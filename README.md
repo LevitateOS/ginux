@@ -541,7 +541,8 @@ Readv/writev remain bounded to 4096 bytes per call.
 Owned files and pipes accept at most 16 iovecs, including empty entries, with a
 combined length no greater than the signed transfer-result range. Pipe writes
 use the combined vector length for atomicity and retain their existing bounds.
-Native image transfer policy is unchanged. Configured scalar console writes
+Image descriptors read natively: read, pread64 and readv share a 64 MiB
+request bound, readv summing its vectors. Configured scalar console writes
 return a partial count for requests over 4096 bytes, retaining that host transfer
 bound while allowing callers to write the remainder. Metadata defaults to 32 objects (including seeded directories) and 64 independently
 opened files. `[storage].max_objects` permits 1–1000000 namespace slots. Bounded

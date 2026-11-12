@@ -5,7 +5,8 @@
 //! and mediates supported process calls through its own event loop.
 
 use ginux_core::{
-    configured_arguments_allowed, decide_balanced, Action, BalancedSurface, Decision, SYS_FORK,
+    configured_arguments_allowed, configured_vectors_allowed, decide_balanced, decide_configured,
+    Action, BalancedSurface, Decision, SYS_FORK, SYS_READV,
 };
 
 use crate::supervisor::UserRegs;
@@ -54,6 +55,18 @@ pub enum NativeDecision {
 /// exception is fork, which both callers (`launch` and `native`) deny
 /// although the balanced contract lists it in the task surface.
 pub fn decide_native(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> NativeDecision {
+    decide_lanes(syscall, rdi, rsi, rdx, decide_balanced)
+}
+
+/// The lane hooks, then `contract` for anything no hook claims: the balanced
+/// decision natively, the configured one in configured launch.
+fn decide_lanes(
+    syscall: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    contract: fn(u64) -> Decision,
+) -> NativeDecision {
     // Neither caller traces children, so a host fork would leave the child
     // running unsupervised.
     if syscall == SYS_FORK {
@@ -68,23 +81,23 @@ pub fn decide_native(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> NativeDecisi
                 lane: Lane::Process,
                 result,
             },
-            None => NativeDecision::Contract(decide_balanced(syscall)),
+            None => NativeDecision::Contract(contract(syscall)),
         },
         Lane::Filesystem => match crate::fs_hooks::claim(syscall, rdi, rsi, rdx) {
             Some(result) => NativeDecision::Hooked {
                 lane: Lane::Filesystem,
                 result,
             },
-            None => NativeDecision::Contract(decide_balanced(syscall)),
+            None => NativeDecision::Contract(contract(syscall)),
         },
         Lane::Channel => match crate::channel_hooks::claim(syscall, rdi, rsi, rdx) {
             Some(result) => NativeDecision::Hooked {
                 lane: Lane::Channel,
                 result,
             },
-            None => NativeDecision::Contract(decide_balanced(syscall)),
+            None => NativeDecision::Contract(contract(syscall)),
         },
-        Lane::Device | Lane::Contract => NativeDecision::Contract(decide_balanced(syscall)),
+        Lane::Device | Lane::Contract => NativeDecision::Contract(contract(syscall)),
     }
 }
 
@@ -135,11 +148,14 @@ pub fn decide_objects(
             result,
         }
     } else {
-        decide_native(
+        // Only the configured descriptor owner reaches here: a descriptor
+        // argument is already its registered native handle.
+        decide_lanes(
             registers.orig_rax,
             registers.rdi,
             registers.rsi,
             registers.rdx,
+            decide_configured,
         )
     }
 }
@@ -162,7 +178,18 @@ pub fn process_entry(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> Option<i64> 
     crate::process_hooks::claim(syscall, rdi, rsi, rdx)
 }
 
-pub fn launch_arguments_allowed(syscall: u64, registers: &UserRegs) -> bool {
+/// `pid` is the stopped caller, whose `readv` vector array is summed for the
+/// image read bound. The sum is a snapshot: a peer that rewrites its own
+/// array before the kernel reads it can only enlarge its own read of a
+/// read-only descriptor into its own memory, as further calls could.
+pub fn launch_arguments_allowed(pid: usize, syscall: u64, registers: &UserRegs) -> bool {
+    if syscall == SYS_READV {
+        return configured_vectors_allowed(crate::tracee_io::vector_total(
+            pid,
+            registers.rsi,
+            registers.rdx,
+        ));
+    }
     configured_arguments_allowed(syscall, registers.rdi, registers.rsi, registers.rdx)
 }
 

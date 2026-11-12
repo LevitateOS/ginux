@@ -12,7 +12,7 @@ use crate::launch::{
 use crate::supervisor::*;
 use crate::tracee_io::copy_memory;
 use ginux_contract::{Action as ContractAction, EffectiveContract};
-use ginux_core::{balanced_identity_result, balanced_surface, Action};
+use ginux_core::{balanced_identity_result, configured_surface, Action};
 use ginux_instance::Instance;
 use ginux_process::{Credentials, ProcessError, ProcessTable, TaskId, WaitTarget};
 use ginux_vfs::Executable;
@@ -1963,9 +1963,11 @@ impl Supervisor<'_> {
                     balanced_identity_result(original.orig_rax).unwrap_or(0),
                     instance,
                 ),
-                Action::Mediate if launch_arguments_allowed(r.orig_rax, r) => {
+                Action::Mediate
+                    if launch_arguments_allowed(self.task(index).host, r.orig_rax, r) =>
+                {
                     audit_write(b"mediate surface=");
-                    audit_write(balanced_surface_name(balanced_surface(r.orig_rax)));
+                    audit_write(balanced_surface_name(configured_surface(r.orig_rax)));
                     audit_write(b"\n");
                     self.run(index, r, instance)
                 }

@@ -24,6 +24,22 @@ invalid. This is a configured metadata view, not a procfs mount: it adds no
 directory enumeration, host-process view or proc-path open authority, and does
 not change native policy. Explicit contract denial still precedes the view.
 
+Configured `readv` on an image descriptor, and `faccessat` and `readlinkat` on
+an image path, are image reads like `read`, `access` and `readlink`. Only a
+registered native image or inherited console descriptor reaches the kernel;
+`O_PATH` references and closed numbers return EBADF, and image descriptors stay
+unwritable. An image path is first resolved to its canonical form, so hidden
+subtrees, `/proc`, `/sys`, `/dev` and owned storage keep the answers of the
+plain forms; `readlinkat` on `/dev` returns EINVAL as `readlink` does. A
+`readv` shares the 64 MiB request bound of one image read, summed over a
+snapshot of the caller's vectors; an array Linux itself rejects (more than
+1024 entries, a negative length or an unreadable array) keeps the kernel's
+EINVAL or EFAULT. Native policy and catalog membership are unchanged.
+`preadv`, `preadv2`, `readahead`, `fadvise64`, the path xattr reads, `sendfile`
+and `copy_file_range` have no catalog operation and remain ENOSYS; `fgetxattr`
+and `flistxattr` remain ENOSYS because forwarding them would expose host
+security labels of image files.
+
 Configured `/proc/self/maps` is a read-only stack projection. An exact-path
 read open snapshots only the registered process's `[stack]` range and mapping
 permissions; it contains no other mappings, inode/device identities or file
