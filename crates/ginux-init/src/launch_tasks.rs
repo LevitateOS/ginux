@@ -115,6 +115,10 @@ struct Task {
     /// is still to come: either the task is stopped at that entry, or it was
     /// resumed to stop at the exit.
     in_flight: bool,
+    /// The registers read at this task's current stop, while nothing has
+    /// written others: `run` resumes without PTRACE_SETREGS when it would
+    /// write exactly these.
+    stopped: Option<UserRegs>,
     /// The registers the in-flight syscall runs with need its exit: saved
     /// arguments differ from them, or the kernel may end it with an internal
     /// restart the exit translates.
@@ -159,6 +163,7 @@ impl Task {
             signalled: false,
             signal_target: None,
             in_flight: false,
+            stopped: None,
             exit_registers: true,
         }
     }
@@ -337,6 +342,10 @@ fn wait_events(signal_fd: usize, polling: bool) -> Result<(), &'static [u8]> {
     Ok(())
 }
 
+/// Stops between two reads of the checkpoint control socket while the
+/// workload keeps the loop busy.
+const CONTROL_CHECK_STOPS: u32 = 64;
+
 pub fn supervise(
     root: usize,
     instance: &mut Instance,
@@ -435,6 +444,7 @@ pub fn supervise(
     s.signal_fd = Some(signal_fd);
     s.resume(0, 0, instance);
     let mut poll_tick = 0;
+    let mut control_countdown: u32 = 1;
     loop {
         let polling = s
             .tasks
@@ -451,18 +461,27 @@ pub fn supervise(
             }
         }
         s.wake(instance);
-        if let Err(reason) = crate::checkpoint_control::poll(|path| {
-            if s.argument_guard.is_some() {
-                return Ok(false);
+        // The control socket is read when the loop has just waited for events
+        // (its readiness is among them) and otherwise once every
+        // CONTROL_CHECK_STOPS stops, rather than with a failing nonblocking
+        // read on every stop: a busy workload still sees a request within a
+        // few milliseconds.
+        control_countdown = control_countdown.saturating_sub(1);
+        if control_countdown == 0 {
+            control_countdown = CONTROL_CHECK_STOPS;
+            if let Err(reason) = crate::checkpoint_control::poll(|path| {
+                if s.argument_guard.is_some() {
+                    return Ok(false);
+                }
+                // A snapshot has no guest owner: stop every task, including
+                // userspace writers through shared owned-file mappings.
+                s.begin_argument_guard(usize::MAX, instance);
+                let result = s.objects.filesystem.snapshot(path);
+                s.release_argument_guard(instance);
+                result.map(|_| true)
+            }) {
+                s.fail(instance, reason);
             }
-            // A snapshot has no guest owner: stop every task, including
-            // userspace writers through shared owned-file mappings.
-            s.begin_argument_guard(usize::MAX, instance);
-            let result = s.objects.filesystem.snapshot(path);
-            s.release_argument_guard(instance);
-            result.map(|_| true)
-        }) {
-            s.fail(instance, reason);
         }
         status = 0;
         let held = if s.argument_guard.is_none() {
@@ -491,6 +510,7 @@ pub fn supervise(
             if let Err(reason) = wait_events(signal_fd, polling) {
                 s.fail(instance, reason);
             }
+            control_countdown = 1;
             continue;
         }
         if host == -4 {
@@ -642,6 +662,7 @@ pub fn supervise(
             Err(-3) => continue,
             Err(_) => s.fail(instance, b"launch register read failed"),
         };
+        s.task_mut(index).stopped = Some(r);
         let mut info = [0u64; 11];
         let info_length = ptrace(
             0x420e,
@@ -1085,6 +1106,7 @@ impl Supervisor<'_> {
             if let Err(result) = sleep.interrupt(host, &mut registers) {
                 sleep.restore(&mut registers, result);
             }
+            self.task_mut(index).stopped = None;
             if ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize) < 0 {
                 self.fail(instance, b"sleep interruption register update failed");
             }
@@ -1105,6 +1127,7 @@ impl Supervisor<'_> {
             }
             self.wake_needed = true;
             registers.rax = progress.unwrap_or(unpark.restart) as u64;
+            self.task_mut(index).stopped = None;
             let result = ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize);
             if result < 0 && result != -3 {
                 self.fail(instance, b"interrupted call register update failed");
@@ -1220,12 +1243,18 @@ impl Supervisor<'_> {
                 self.task_mut(index).exit_registers = exit_registers;
             }
         }
-        let result = ptrace(
-            PTRACE_SETREGS,
-            self.task(index).host,
-            0,
-            &registers as *const _ as usize,
-        );
+        // Unchanged registers need no write: the kernel still holds the ones
+        // read at this stop.
+        let result = if self.task_mut(index).stopped.take() == Some(registers) {
+            0
+        } else {
+            ptrace(
+                PTRACE_SETREGS,
+                self.task(index).host,
+                0,
+                &registers as *const _ as usize,
+            )
+        };
         if result == -3 {
             // A parked task may die while copyin/readiness is being retried.
             // Do not invent an IO result or a supervisor failure for its exit.
@@ -2453,6 +2482,7 @@ impl Supervisor<'_> {
                     // exec errno here would resume the wrong address space.
                     self.fail(instance, b"new script stack restoration failed");
                 }
+                self.task_mut(index).stopped = None;
                 if ptrace(
                     PTRACE_SETREGS,
                     self.task(index).host,
@@ -2581,6 +2611,7 @@ impl Supervisor<'_> {
                     .read_registers(slot)
                     .map_err(|_| b"child birth register read failed".as_slice())?;
                 registers.rdi = flags;
+                self.task_mut(slot).stopped = None;
                 if ptrace(PTRACE_SETREGS, host, 0, &registers as *const _ as usize) < 0 {
                     return Err(b"child birth register update failed");
                 }
@@ -3135,6 +3166,8 @@ impl Supervisor<'_> {
         }
     }
     fn died(&mut self, index: usize, status: i32, instance: &mut Instance) {
+        // Its pid may be reused: no later lookup may borrow its root.
+        crate::path_hooks::forget_root(self.task(index).host);
         self.wake_needed = true;
         if !self.task(index).alive {
             let task = self.task(index);

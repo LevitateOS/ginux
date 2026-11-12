@@ -280,7 +280,7 @@ pub fn managed_host_identity() -> ManagedHostIdentity {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UserRegs {
     pub r15: u64,
     pub r14: u64,

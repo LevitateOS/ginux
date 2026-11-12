@@ -6,9 +6,75 @@ use ginux_vfs::{NodeKind, VfsError, MAX_PATH};
 /// The tracee's root (an `O_PATH` descriptor of `/proc/<pid>/root`) and the
 /// identity the workload runs as, read once per root rather than once per
 /// path component (`lookup` checks directory search permission with it).
-pub struct ImageRoot(usize, u32, u32);
+/// The fourth field says whether this value owns the descriptor; a borrowed
+/// one belongs to `ROOT`.
+pub struct ImageRoot(usize, u32, u32, bool);
+
+/// One kept root: the last task's root descriptor and identity, reused by its
+/// later lookups instead of opening `/proc/<pid>/root` and reading the
+/// identity again on every path call. A launch task cannot change its root
+/// (chroot, pivot_root and setns are outside the catalog) and every task of
+/// an instance shares it, so the descriptor stays right for the task it was
+/// opened for while that task lives; `forget_root` drops it when the task
+/// dies, before its pid can be reused. Only the single supervisor loop uses
+/// it.
+struct KeptRoot {
+    pid: usize,
+    fd: usize,
+    uid: u32,
+    gid: u32,
+    borrowed: usize,
+}
+static mut ROOT: Option<KeptRoot> = None;
+
+/// Forget the kept root of `pid`, whose task has ended.
+pub fn forget_root(pid: usize) {
+    let kept = unsafe { &mut *core::ptr::addr_of_mut!(ROOT) };
+    if kept
+        .as_ref()
+        .is_some_and(|root| root.pid == pid && root.borrowed == 0)
+    {
+        let root = kept.take().unwrap();
+        unsafe {
+            syscall1(3, root.fd);
+        }
+    } else if let Some(root) = kept.as_mut().filter(|root| root.pid == pid) {
+        // Still borrowed: no later lookup may reuse it; the last borrower's
+        // drop closes it.
+        root.pid = 0;
+    }
+}
+
 impl ImageRoot {
     pub fn new(pid: usize) -> Result<Self, i64> {
+        let kept = unsafe { &mut *core::ptr::addr_of_mut!(ROOT) };
+        if let Some(root) = kept.as_mut().filter(|root| root.pid == pid && pid != 0) {
+            root.borrowed += 1;
+            return Ok(Self(root.fd, root.uid, root.gid, false));
+        }
+        let opened = Self::open(pid)?;
+        if kept.as_ref().is_none_or(|root| root.borrowed == 0) {
+            if let Some(old) = kept.take() {
+                unsafe {
+                    syscall1(3, old.fd);
+                }
+            }
+            *kept = Some(KeptRoot {
+                pid,
+                fd: opened.0,
+                uid: opened.1,
+                gid: opened.2,
+                borrowed: 1,
+            });
+            let fd = opened.0;
+            core::mem::forget(opened);
+            let root = kept.as_ref().unwrap();
+            return Ok(Self(fd, root.uid, root.gid, false));
+        }
+        Ok(opened)
+    }
+
+    fn open(pid: usize) -> Result<Self, i64> {
         let mut name = [0u8; 64];
         name[..6].copy_from_slice(b"/proc/");
         let mut number = pid;
@@ -39,7 +105,12 @@ impl ImageRoot {
             return Err(fd as i64);
         }
         let identity = managed_host_identity();
-        Ok(Self(fd as usize, identity.uid as u32, identity.gid as u32))
+        Ok(Self(
+            fd as usize,
+            identity.uid as u32,
+            identity.gid as u32,
+            true,
+        ))
     }
     /// Inspect only the kernel loader's interpreter metadata. The descriptor
     /// stays private and is closed on every return path.
@@ -292,8 +363,23 @@ pub fn image_stat(
 
 impl Drop for ImageRoot {
     fn drop(&mut self) {
-        unsafe {
-            syscall1(3, self.0);
+        if self.3 {
+            unsafe {
+                syscall1(3, self.0);
+            }
+            return;
+        }
+        let kept = unsafe { &mut *core::ptr::addr_of_mut!(ROOT) };
+        if let Some(root) = kept.as_mut().filter(|root| root.fd == self.0) {
+            root.borrowed -= 1;
+            // A root forgotten while borrowed is closed by its last borrower.
+            if root.borrowed == 0 && root.pid == 0 {
+                let fd = root.fd;
+                *kept = None;
+                unsafe {
+                    syscall1(3, fd);
+                }
+            }
         }
     }
 }
