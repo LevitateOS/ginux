@@ -42,18 +42,22 @@ pub fn copy_memory(pid: usize, address: u64, buffer: &mut [u8], output: bool) ->
     }
 }
 
+/// The NUL-terminated path at `address` of the stopped tracee, at most
+/// `MAX_PATH` bytes. It is read a page at a time (one `process_vm_readv` per
+/// page it touches, not one per byte), so a path that ends just before an
+/// unmapped page is complete and a fault before its NUL is EFAULT, as a
+/// byte-at-a-time read gives.
 pub fn read_path(pid: usize, address: u64) -> Result<Path, i64> {
     let mut buffer = [0; MAX_PATH];
-    for i in 0..MAX_PATH {
-        copy_memory(
-            pid,
-            address.checked_add(i as u64).ok_or(-14)?,
-            &mut buffer[i..i + 1],
-            false,
-        )?;
-        if buffer[i] == 0 {
-            return Path::from_bytes(&buffer[..i]).map_err(|_| -36);
+    let mut filled = 0;
+    while filled < MAX_PATH {
+        let start = address.checked_add(filled as u64).ok_or(-14)?;
+        let room = (MAX_PATH - filled).min(4096 - (start % 4096) as usize);
+        let read = copy_memory(pid, start, &mut buffer[filled..filled + room], false)? as usize;
+        if let Some(end) = buffer[filled..filled + read].iter().position(|byte| *byte == 0) {
+            return Path::from_bytes(&buffer[..filled + end]).map_err(|_| -36);
         }
+        filled += read;
     }
     Err(-36)
 }
