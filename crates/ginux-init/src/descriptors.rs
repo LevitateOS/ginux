@@ -8,7 +8,7 @@ use crate::event_hooks::{Event, Key, ALLOWED_EVENTS, WATCHES};
 use crate::launch_storage::LaunchFs;
 use crate::supervisor::{syscall2, syscall3, syscall4, UserRegs};
 use crate::tracee_io::{copy_memory, read_path};
-use ginux_core::decide_balanced;
+use ginux_core::{decide_balanced, SYS_LSTAT, SYS_NEWFSTATAT, SYS_STAT};
 
 pub const LIMIT: usize = 256;
 pub enum ExecDescriptor {
@@ -220,6 +220,19 @@ impl Backends<'_> {
             NativeDecision::Hooked { result: 0, .. } => Ok(()),
             _ => Err(b"owned backend release failed"),
         }
+    }
+}
+
+/// Rewrite a legacy `stat` or `lstat` entry as its `newfstatat` call.
+fn legacy_stat(r: &mut UserRegs) {
+    if let Some([dirfd, path, buffer, flags]) =
+        ginux_core::legacy_stat_arguments(r.orig_rax, r.rdi, r.rsi)
+    {
+        r.orig_rax = SYS_NEWFSTATAT;
+        r.rdi = dirfd;
+        r.rsi = path;
+        r.rdx = buffer;
+        r.r10 = flags;
     }
 }
 
@@ -848,6 +861,14 @@ impl DescriptorTable {
             }
             258 | 259 | 260 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 | 452 => {
                 call.save(r);
+                self.path_descriptor(pid, r, backends)
+            }
+            // Legacy stat and lstat take the newfstatat form they are defined
+            // as, so they share its resolution, backends and native mediation.
+            // The saved registers return at the matching exit.
+            SYS_STAT | SYS_LSTAT => {
+                call.save(r);
+                legacy_stat(r);
                 self.path_descriptor(pid, r, backends)
             }
             7 | 271 => self.poll(pid, r, backends, call),

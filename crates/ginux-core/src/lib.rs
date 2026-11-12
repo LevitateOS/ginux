@@ -1,6 +1,8 @@
 #![no_std]
 
 pub const SYS_WRITE: u64 = 1;
+pub const SYS_STAT: u64 = 4;
+pub const SYS_LSTAT: u64 = 6;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_FORK: u64 = 57;
 pub const SYS_EXIT: u64 = 60;
@@ -26,6 +28,7 @@ pub const SYS_SETPRIORITY: u64 = 141;
 pub const SYS_REBOOT: u64 = 169;
 pub const SYS_GETTID: u64 = 186;
 pub const SYS_EXIT_GROUP: u64 = 231;
+pub const SYS_NEWFSTATAT: u64 = 262;
 pub const SYS_UNLINKAT: u64 = 263;
 pub const SYS_RENAMEAT: u64 = 264;
 pub const SYS_LINKAT: u64 = 265;
@@ -429,6 +432,21 @@ pub const fn configured_arguments_allowed(syscall: u64, arg0: u64, arg1: u64, ar
     }
 }
 
+/// The `newfstatat` call a legacy `stat` or `lstat` entry is defined as, as
+/// `[dirfd, path, buffer, flags]`: `stat(path, buffer)` is
+/// `newfstatat(AT_FDCWD, path, buffer, 0)` and `lstat(path, buffer)` is
+/// `newfstatat(AT_FDCWD, path, buffer, AT_SYMLINK_NOFOLLOW)`. Both use the
+/// same `struct stat` layout on x86-64. `None` for every other syscall.
+pub const fn legacy_stat_arguments(syscall: u64, path: u64, buffer: u64) -> Option<[u64; 4]> {
+    const AT_FDCWD: u64 = -100i64 as u64;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    match syscall {
+        SYS_STAT => Some([AT_FDCWD, path, buffer, 0]),
+        SYS_LSTAT => Some([AT_FDCWD, path, buffer, AT_SYMLINK_NOFOLLOW]),
+        _ => None,
+    }
+}
+
 /// What a thread-directed signal (`tkill`, `tgkill`) does once its target
 /// thread is known to be a running task of the same instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -478,6 +496,31 @@ pub const fn thread_signal(signal: u64, own_process: bool, default_stop: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_stat_calls_are_their_newfstatat_form() {
+        const AT_FDCWD: u64 = -100i64 as u64;
+        assert_eq!(
+            legacy_stat_arguments(SYS_STAT, 0x1000, 0x2000),
+            Some([AT_FDCWD, 0x1000, 0x2000, 0])
+        );
+        assert_eq!(
+            legacy_stat_arguments(SYS_LSTAT, 0x1000, 0x2000),
+            Some([AT_FDCWD, 0x1000, 0x2000, 0x100])
+        );
+        // Faulting addresses are passed through for the shared path to report.
+        assert_eq!(
+            legacy_stat_arguments(SYS_LSTAT, 0, u64::MAX),
+            Some([AT_FDCWD, 0, u64::MAX, 0x100])
+        );
+        // fstat (5), newfstatat itself, statx and the other legacy path
+        // calls keep their own form.
+        for syscall in [5, 21, 89, SYS_NEWFSTATAT, 332] {
+            assert_eq!(legacy_stat_arguments(syscall, 0x1000, 0x2000), None);
+        }
+        // The rewritten call is mediated on the same image surface.
+        assert_eq!(balanced_surface(SYS_NEWFSTATAT), BalancedSurface::ImageRead);
+    }
 
     #[test]
     fn thread_signals_stay_inside_the_callers_process_except_probe_and_kill() {

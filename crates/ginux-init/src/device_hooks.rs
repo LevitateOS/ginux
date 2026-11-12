@@ -149,7 +149,6 @@ impl LaunchDevices {
                     None => Err(-21),
                 }
             }
-            4 | 6 => Self::stat(pid, r.rsi, false, device),
             262 => {
                 if r.r10 & !0x1900 != 0 {
                     Err(-22)

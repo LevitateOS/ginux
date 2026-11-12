@@ -783,8 +783,8 @@ impl LaunchFs {
             80 => (0, r.rdi, (-100i64) as u64, true, false),
             59 => (0, r.rdi, (-100i64) as u64, true, false),
             322 => (1, r.rsi, r.rdi, r.r8 & 0x100 == 0, false),
-            4 | 21 | 90 | 92 => (0, r.rdi, (-100i64) as u64, true, false),
-            6 | 84 | 87 | 89 | 94 => (0, r.rdi, (-100i64) as u64, false, false),
+            21 | 90 | 92 => (0, r.rdi, (-100i64) as u64, true, false),
+            84 | 87 | 89 | 94 => (0, r.rdi, (-100i64) as u64, false, false),
             83 | 133 => (0, r.rdi, (-100i64) as u64, false, true),
             88 => (1, r.rsi, (-100i64) as u64, false, true),
             266 => (2, r.rdx, r.rsi, false, true),
@@ -1572,7 +1572,6 @@ impl LaunchFs {
         let result = match r.orig_rax {
             2 => self.open(path.as_bytes(), r.rsi, r.rdx),
             257 => self.open(path.as_bytes(), r.rdx, r.r10),
-            4 | 6 => self.stat(pid, path.as_bytes(), r.rsi, false),
             280 => self.timestamps(pid, r).and_then(|times| {
                 self.fs
                     .set_times(path.as_bytes(), false, times[0], times[1])

@@ -26,7 +26,7 @@ pub fn stat(pid: usize, address: u64, statx: bool) -> Result<i64, i64> {
 
 pub fn metadata(pid: usize, r: &crate::supervisor::UserRegs) -> Option<Result<i64, i64>> {
     let address = match r.orig_rax {
-        4 | 6 | 21 | 89 => r.rdi,
+        21 | 89 => r.rdi,
         262 | 267 | 269 | 332 | 439 => r.rsi,
         _ => return None,
     };
@@ -51,11 +51,7 @@ pub fn metadata(pid: usize, r: &crate::supervisor::UserRegs) -> Option<Result<i6
         }
         stat(
             pid,
-            match r.orig_rax {
-                4 | 6 => r.rsi,
-                262 => r.rdx,
-                _ => r.r8,
-            },
+            if r.orig_rax == 262 { r.rdx } else { r.r8 },
             r.orig_rax == 332,
         )
     })())
