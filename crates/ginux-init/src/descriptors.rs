@@ -8,7 +8,12 @@ use crate::event_hooks::{Event, Key, ALLOWED_EVENTS, WATCHES};
 use crate::launch_storage::LaunchFs;
 use crate::supervisor::{syscall2, syscall3, syscall4, UserRegs};
 use crate::tracee_io::{copy_memory, read_path};
-use ginux_core::{decide_balanced, SYS_LSTAT, SYS_NEWFSTATAT, SYS_STAT};
+use ginux_core::{
+    decide_balanced, SYS_COPY_FILE_RANGE, SYS_FADVISE64, SYS_FREMOVEXATTR, SYS_LSTAT,
+    SYS_NEWFSTATAT, SYS_PREADV, SYS_PREADV2, SYS_READAHEAD, SYS_SENDFILE, SYS_SETXATTR, SYS_STAT,
+};
+
+mod file_calls;
 
 pub const LIMIT: usize = 256;
 pub enum ExecDescriptor {
@@ -261,6 +266,9 @@ pub struct DescriptorCall {
     wait_signal_mask: Option<u64>,
     signal_wait: Option<SignalWait>,
     channel_write: crate::channel_hooks::WriteProgress,
+    // A path xattr call runs as its faccessat2(F_OK) resolution; a
+    // successful resolution returns this instead.
+    success: Option<i64>,
 }
 
 /// A bounded native pselect only arbitrates signal delivery, never file IO.
@@ -286,6 +294,7 @@ impl DescriptorCall {
             wait_signal_mask: None,
             signal_wait: None,
             channel_write: crate::channel_hooks::WriteProgress::new(),
+            success: None,
         }
     }
 
@@ -430,6 +439,11 @@ impl DescriptorCall {
         self.poll_tick = false;
         self.poll_deadline = None;
         let mut changed = false;
+        if let Some(success) = self.success.take() {
+            if r.rax == 0 {
+                r.rax = success as u64;
+            }
+        }
         if let Some(pending) = self.pending.take() {
             match pending {
                 Pending::Open { slot } => {
@@ -862,6 +876,18 @@ impl DescriptorTable {
             258 | 259 | 260 | 262 | 263 | 267 | 268 | 269 | 280 | 332 | 439 | 452 => {
                 call.save(r);
                 self.path_descriptor(pid, r, backends)
+            }
+            SYS_PREADV | SYS_PREADV2 => {
+                call.save(r);
+                self.vectored_read(pid, signal_tgid, r, backends, call)
+            }
+            SYS_READAHEAD | SYS_FADVISE64 => self.advice(pid, r, backends),
+            SYS_SENDFILE | SYS_COPY_FILE_RANGE => {
+                self.transfer(pid, signal_tgid, r, backends, call)
+            }
+            SYS_SETXATTR..=SYS_FREMOVEXATTR => {
+                call.save(r);
+                self.xattr(pid, r, backends, call)
             }
             // Legacy stat and lstat take the newfstatat form they are defined
             // as, so they share its resolution, backends and native mediation.

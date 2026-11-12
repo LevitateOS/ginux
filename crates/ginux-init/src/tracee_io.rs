@@ -437,3 +437,136 @@ impl IoVectors {
         Ok(copied)
     }
 }
+
+/// Linux's answer to the xattr name at `address` of the stopped tracee,
+/// read as `strncpy_from_user` reads it: up to 256 bytes, a page at a time,
+/// so a short name that ends just before an unmapped page is complete.
+/// `None` when the name is valid; see `ginux_core::xattr_name_error`.
+pub fn xattr_name_error(pid: usize, address: u64) -> Option<i64> {
+    const LIMIT: usize = 256;
+    let mut bytes = [0u8; LIMIT];
+    let mut copied = 0;
+    while copied < LIMIT && !bytes[..copied].contains(&0) {
+        let Some(start) = address.checked_add(copied as u64) else {
+            break;
+        };
+        let room = (LIMIT - copied).min(4096 - (start % 4096) as usize);
+        match copy_memory(pid, start, &mut bytes[copied..copied + room], false) {
+            Ok(n) => {
+                copied += n as usize;
+                if (n as usize) < room {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    ginux_core::xattr_name_error(&bytes[..copied])
+}
+
+/// Whether all `length` bytes at `address` of the stopped tracee can be
+/// read, as Linux copies an xattr value before using it. The bytes
+/// themselves are discarded.
+pub fn readable(pid: usize, address: u64, length: u64) -> bool {
+    let mut scratch = [0u8; 4096];
+    let mut done = 0;
+    while done < length {
+        let Some(start) = address.checked_add(done) else {
+            return false;
+        };
+        let room = (length - done).min(4096 - start % 4096) as usize;
+        if copy_memory(pid, start, &mut scratch[..room], false) != Ok(room as i64) {
+            return false;
+        }
+        done += room as u64;
+    }
+    true
+}
+
+/// A supervisor duplicate of one registered native descriptor of a stopped
+/// tracee: the same open file description, taken with `pidfd_getfd`, so
+/// every read, write and seek through it is exactly what the tracee itself
+/// could do with that descriptor and nothing more. Closed on drop.
+pub struct NativeFile(usize);
+
+impl NativeFile {
+    pub fn open(pid: usize, fd: u32) -> Result<Self, i64> {
+        use crate::supervisor::{syscall1, syscall2, syscall3};
+        // The caller may be a thread other than its process leader:
+        // address that thread's own descriptor table (PIDFD_THREAD).
+        let mut pidfd = unsafe { syscall2(434, pid, 0x80) };
+        if pidfd == -22 {
+            pidfd = unsafe { syscall2(434, pid, 0) };
+        }
+        if pidfd < 0 {
+            return Err(-5);
+        }
+        let file = unsafe { syscall3(438, pidfd as usize, fd as usize, 0) };
+        unsafe {
+            syscall1(3, pidfd as usize);
+        }
+        if file < 0 {
+            return Err(-5);
+        }
+        Ok(Self(file as usize))
+    }
+
+    /// The host's own view of the description: access and append mode from
+    /// `F_GETFL`, kind, size and identity from `fstat`.
+    pub fn view(&self) -> Result<ginux_core::FileView, i64> {
+        file_view(self.0)
+    }
+
+    pub fn read_at(&self, position: u64, output: &mut [u8]) -> Result<usize, i64> {
+        result(unsafe {
+            syscall4(
+                17,
+                self.0,
+                output.as_mut_ptr() as usize,
+                output.len(),
+                position as usize,
+            )
+        })
+    }
+
+    pub fn position(&self) -> Result<u64, i64> {
+        result(unsafe { crate::supervisor::syscall3(8, self.0, 0, 1) }).map(|n| n as u64)
+    }
+
+    pub fn seek(&self, position: u64) -> Result<(), i64> {
+        result(unsafe { crate::supervisor::syscall3(8, self.0, position as usize, 0) }).map(|_| ())
+    }
+}
+
+impl Drop for NativeFile {
+    fn drop(&mut self) {
+        unsafe {
+            crate::supervisor::syscall1(3, self.0);
+        }
+    }
+}
+
+/// The view of a host descriptor `fd` the supervisor holds.
+pub fn file_view(fd: usize) -> Result<ginux_core::FileView, i64> {
+    let flags = result(unsafe { crate::supervisor::syscall3(72, fd, 3, 0) })? as u32;
+    let mut stat = [0u8; 144];
+    result(unsafe { crate::supervisor::syscall2(5, fd, stat.as_mut_ptr() as usize) })?;
+    let word = |offset: usize| u64::from_ne_bytes(stat[offset..offset + 8].try_into().unwrap());
+    let mode = u32::from_ne_bytes(stat[24..28].try_into().unwrap());
+    Ok(ginux_core::FileView {
+        readable: flags & 3 != 1,
+        writable: flags & 3 != 0,
+        append: flags & 0o2000 != 0,
+        kind: ginux_core::FileKind::from_mode(mode),
+        size: word(48),
+        identity: (word(0), word(8)),
+    })
+}
+
+fn result(value: isize) -> Result<usize, i64> {
+    if value < 0 {
+        Err(value as i64)
+    } else {
+        Ok(value as usize)
+    }
+}

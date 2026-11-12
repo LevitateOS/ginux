@@ -5,7 +5,8 @@
 //! `main.rs`; `launch` runs the executable and arguments from instance config.
 
 use ginux_contract::{
-    syscall_semantic_operation, EffectiveContract, EffectiveRule, Kind, Provenance, Status,
+    configured_semantic_operation, syscall_semantic_operation, EffectiveContract, EffectiveRule,
+    Kind, Provenance, Status,
 };
 use ginux_instance::{
     AuditMode, ConfigError, ExecutionBackend, ExecutionProfile, Instance, InstanceConfig,
@@ -1527,6 +1528,49 @@ pub(crate) fn launch_semantic_operation(
         | 280
         | 316
         | 452 => Some("filesystem.path.write"),
-        n => syscall_semantic_operation(n, r.rsi),
+        // A transfer writes its output descriptor; its input is decided too,
+        // by `launch_transfer_input_operation`.
+        40 => Some(descriptor_write_operation(r.rdi, table)),
+        326 => Some(descriptor_write_operation(r.rdx, table)),
+        n => match configured_semantic_operation(n) {
+            Some(operation) => Some(operation),
+            None => syscall_semantic_operation(n, r.rsi),
+        },
     }
+}
+
+/// The family a write to public descriptor `fd` is decided by.
+fn descriptor_write_operation(
+    fd: u64,
+    table: &crate::descriptors::DescriptorTable,
+) -> &'static str {
+    if table.console_descriptor(fd) {
+        "device.console.write"
+    } else if table.network_descriptor(fd) {
+        "network.inet.tcp.connect"
+    } else {
+        "filesystem.path.write"
+    }
+}
+
+/// `sendfile` and `copy_file_range` read one descriptor and write another.
+/// `launch_semantic_operation` decides the write; this is the family of the
+/// read, decided as `read` on that descriptor would be. Both must be granted,
+/// so a transfer never moves bytes a plain `read` and `write` could not.
+pub(crate) fn launch_transfer_input_operation(
+    r: &crate::supervisor::UserRegs,
+    table: &crate::descriptors::DescriptorTable,
+) -> Option<&'static str> {
+    let fd = match r.orig_rax {
+        40 => r.rsi,
+        326 => r.rdi,
+        _ => return None,
+    };
+    Some(if table.console_descriptor(fd) {
+        "device.console.read"
+    } else if table.network_descriptor(fd) {
+        "network.inet.tcp.connect"
+    } else {
+        "filesystem.path.read"
+    })
 }

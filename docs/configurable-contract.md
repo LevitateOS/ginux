@@ -35,10 +35,78 @@ plain forms; `readlinkat` on `/dev` returns EINVAL as `readlink` does. A
 snapshot of the caller's vectors; an array Linux itself rejects (more than
 1024 entries, a negative length or an unreadable array) keeps the kernel's
 EINVAL or EFAULT. Native policy and catalog membership are unchanged.
-`preadv`, `preadv2`, `readahead`, `fadvise64`, the path xattr reads, `sendfile`
-and `copy_file_range` have no catalog operation and remain ENOSYS; `fgetxattr`
-and `flistxattr` remain ENOSYS because forwarding them would expose host
-security labels of image files.
+
+Catalog 1002 also serves `preadv`, `preadv2`, `readahead`, `fadvise64`,
+`sendfile`, `copy_file_range` and every xattr call, each with no authority
+beyond a call the instance already has on the same descriptor or path, and the
+same errno for the same refusal. Every catalog 1002 digest changed with them.
+
+- `preadv` (295) and `preadv2` (327) are the `preadv` or `readv` they name: a
+  negative offset other than `preadv2`'s -1 is EINVAL before the descriptor is
+  looked up; -1 reads at, and advances, the shared offset as `readv`; any
+  `preadv2` flag is EOPNOTSUPP once the descriptor is known to be open. The
+  plain form then takes its ordinary descriptor path: owned files read at the
+  offset with `readv`'s 4096-byte and 16-vector bounds, devices read as
+  `pread64`, channels and the console answer ESPIPE as `pread64` does, and an
+  image descriptor reads in the kernel under `readv`'s 64 MiB vector bound.
+  They are `filesystem.path.read`, as `pread64` is.
+- `readahead` (187) and `fadvise64` (221) answer for the descriptor as Linux
+  does and have no host effect: no read, no page-cache change. `readahead` is
+  EBADF for a closed, `O_PATH` or write-only descriptor, EINVAL for anything
+  but a regular file, otherwise 0. `fadvise64` is EBADF for a closed or
+  `O_PATH` descriptor, ESPIPE for a pipe or FIFO, EINVAL for a negative length
+  or an advice outside 0..5, otherwise 0; like Linux, sockets, event objects,
+  directories and devices accept the advice. An image descriptor's kind and
+  access mode come from the supervisor's `pidfd_getfd` duplicate of it.
+- The confined filesystem has no extended attributes, and host attributes,
+  security labels included, are never read, listed, set, removed or revealed.
+  `getxattr`, `lgetxattr`, `listxattr`, `llistxattr`, `setxattr`, `lsetxattr`,
+  `removexattr` and `lremovexattr` first check the name (ERANGE when empty or
+  unterminated within 256 bytes, EFAULT when unreadable) and, for the set
+  forms, the flags (EINVAL), size (E2BIG above 65536) and value (EFAULT), as
+  Linux 6.13 and later order them. The path then resolves exactly as `stat`
+  (or `lstat` for the `l` forms) resolves it, as the `faccessat2(AT_FDCWD,
+  path, F_OK[, AT_SYMLINK_NOFOLLOW])` it is rewritten to through every backend
+  and the shared image path mediation, so ENOENT, ENOTDIR, ELOOP, EACCES and
+  EFAULT are the `stat` answers; registers return at the exit. A path that
+  resolves gives ENODATA for a read, 0 (an empty list, the buffer untouched)
+  for a list and ENOTSUP for a change. `fgetxattr`, `flistxattr`,
+  `fsetxattr` and `fremovexattr` check the descriptor first (EBADF for a
+  closed number and, as Linux's `fdget`, an `O_PATH` reference), then the
+  name, and answer the same way for every open descriptor. Reads and lists
+  are `filesystem.path.read`; changes are `filesystem.path.write`.
+- `sendfile` (40) and `copy_file_range` (326) are a read of the input as
+  `pread64` composed with a write of the output as `write` (or `pwrite64` for
+  an explicit `copy_file_range` output offset), a 4096-byte chunk at a time,
+  at most 1 MiB per call and 4096 bytes into the console or a device; a short
+  count is legal and callers loop. The input must be a regular owned or image
+  file; the output an owned file, and for `sendfile` also an assigned device
+  or the inherited console. Owned channel endpoints (pipes, FIFOs, local
+  sockets, event objects) and TCP sockets are EINVAL outputs without consuming
+  input, as configured `splice` is; callers fall back to `read` and `write`.
+  No host `sendfile`, `splice` or `copy_file_range` runs: image bytes are read
+  through the supervisor's `pidfd_getfd` duplicate of the image descriptor
+  (the same open file description, so nothing the workload could not read
+  itself), owned bytes through the owned backends, and console bytes are
+  written to the console's own open file description, which the supervisor
+  shares. A console output that has no room parks the call (EAGAIN when the
+  console is nonblocking); a console reader that has gone away gives EPIPE and
+  SIGPIPE to the caller, never to the supervisor. Offsets follow Linux: a null
+  offset uses and advances the descriptor's shared offset; `sendfile` reads
+  its offset pointer first and always stores the result back (EFAULT if it
+  cannot), `copy_file_range` stores offsets only after moving bytes. Linux's
+  checks keep their order and errno: EBADF for closed, `O_PATH`, unreadable
+  input or unwritable output descriptors; ESPIPE for an explicit `sendfile`
+  offset on a pipe; EINVAL for a non-regular `sendfile` input, an append-mode
+  output, a bad position or count, nonzero `copy_file_range` flags or
+  overlapping ranges of one file; EISDIR and EINVAL for non-regular
+  `copy_file_range` files; EOVERFLOW for a wrapping range. A
+  `copy_file_range` between an image file and owned storage is served, as
+  Linux 5.3 to 5.18 served cross-filesystem copies; later kernels answer EXDEV
+  there. The output is decided as a `write` of its descriptor
+  (`filesystem.path.write`, `device.console.write` or
+  `network.inet.tcp.connect`) and the input as a `read` of its descriptor;
+  either denial refuses the call.
 
 Configured `/proc/self/maps` is a read-only stack projection. An exact-path
 read open snapshots only the registered process's `[stack]` range and mapping

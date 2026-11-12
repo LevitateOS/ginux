@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Actual configured large reads, virtual filesystem stats, credential drops,
-legacy stat/lstat, and readv, faccessat and readlinkat on the read-only image
-root."""
+legacy stat/lstat, readv, faccessat and readlinkat on the read-only image
+root, and preadv/preadv2, readahead, fadvise64, sendfile, copy_file_range and
+the xattr calls on image, owned, device, channel and console descriptors."""
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,16 @@ def main():
         (root / 'image-text').write_bytes(bytes((i * 7 + i // 256) & 0xff for i in range(5120)))
         (root / 'image-link').symlink_to('image')
         (root / 'image-dangling').symlink_to('missing')
+        (root / 'image-ascii').write_bytes(b'console-transfer\n')
+        # Host attributes the instance must never see: a user attribute and,
+        # where the host allows it, a security one (an SELinux host labels
+        # every file anyway).
+        (root / 'image-labelled').write_bytes(b'labelled')
+        os.setxattr(root / 'image-labelled', 'user.ginux', b'host-secret')
+        try:
+            os.setxattr(root / 'image-labelled', 'security.ginux', b'host-label')
+        except OSError:
+            pass
         config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
         config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
         (work / 'instance.toml').write_text(config)
@@ -65,7 +76,80 @@ def main():
         legacy_stat(binary, work, root, config)
         print('PASS legacy stat and lstat as newfstatat on the read-only image root', flush=True)
         image_read_forms(binary, work, root, config)
-    print('PASS readv, faccessat and readlinkat on the image as read, access and readlink', flush=True)
+        print('PASS readv, faccessat and readlinkat on the image as read, access and readlink', flush=True)
+        file_calls(binary, work, root, config)
+    print('PASS preadv/preadv2, readahead, fadvise64, sendfile, copy_file_range and xattrs', flush=True)
+
+
+def file_calls(binary, work, root, config):
+    # Catalog-1002 file calls answered as their plain counterparts: vectored
+    # reads at an offset, advisory calls without effect, transfers composed
+    # of a read and a write, and a filesystem without extended attributes.
+    config = config.replace('[devices]\nassignments = []', '[devices]\nassignments = ["null"]')
+    image = {path: path.read_bytes() for path in root.iterdir() if path.is_file() and not path.is_symlink()}
+    labelled = root / 'image-labelled'
+    labels = {name: os.getxattr(labelled, name) for name in os.listxattr(labelled)}
+    assert labels.get('user.ginux') == b'host-secret', labels
+    deny = 'allow = ["*"]\ndeny = ["preadv2", "readahead", "fadvise64", "getxattr", "flistxattr", ' \
+        '"lsetxattr", "sendfile", "copy_file_range"]'
+    console = 'deny = ["device.mmio.direct", "device.dma.direct", "network.packet.raw", "device.console.read"]'
+    for scenario, policy, expected in [
+            ('R', config, b'vectored-at: PASS\n'),
+            ('T', config, b'console-transfer\ntransfer: PASS\n'),
+            ('X', config, b'xattr: PASS\n'),
+            ('Y', config.replace('allow = ["*"]\ndeny = []', deny), b'file-calls-policy: PASS\n'),
+            ('Z', config.replace('deny = ["device.mmio.direct", "device.dma.direct", "network.packet.raw"]',
+                                 console), b'ole-transfer\ntransfer-policy: PASS\n')]:
+        assert policy.count('args = []') == 1 and policy.count('assignments = ["null"]') == 1
+        policy = policy.replace('args = []', f'args = ["{scenario}"]')
+        if scenario == 'Y':
+            assert deny in policy
+        if scenario == 'Z':
+            assert console in policy
+        (work / 'calls.toml').write_text(policy)
+        result = work / f'calls-{scenario}.json'
+        proc = subprocess.run([binary, 'launch', str(work / 'calls.toml'), str(root),
+                               '--result-file', str(result)], input=b'console\n',
+                              capture_output=True, timeout=120)
+        audit = proc.stderr.decode()
+        assert proc.returncode == 0 and proc.stdout == expected, (scenario, proc.returncode, proc.stdout, audit[-4000:])
+        assert json.loads(result.read_text())['code'] == 0
+        assert 'teardown tasks=0 owned-handles=0' in audit
+        lines = [line for line in audit.splitlines() if ' phase=entry syscall=' in line]
+        def calls(number):
+            return [line for line in lines if f' syscall={number} ' in line]
+        numbers = {'R': ('295', '327', '187', '221'), 'T': ('40', '326'),
+                   'X': tuple(str(n) for n in range(188, 200))}
+        if scenario in numbers:
+            # Served, never the ENOSYS of an uncatalogued call.
+            for number in numbers[scenario]:
+                assert calls(number), number
+                assert not any(line.endswith(' result=-38') for line in calls(number)), calls(number)
+        if scenario == 'R':
+            # preadv on an image descriptor reads in the kernel, bounded and
+            # mediated as readv is.
+            assert any(' action=mediate surface=immutable-image ' in line for line in calls('295'))
+        if scenario == 'Y':
+            for number, name in (('327', 'preadv2'), ('187', 'readahead'), ('221', 'fadvise64'),
+                                 ('191', 'getxattr'), ('196', 'flistxattr'), ('189', 'lsetxattr'),
+                                 ('40', 'sendfile'), ('326', 'copy_file_range')):
+                assert calls(number) and all(
+                    f' operation=syscall.{name} policy-source=exact-deny ' in line
+                    and line.endswith(' action=deny result=-1') for line in calls(number)), calls(number)
+            for number in ('295', '192', '194', '188'):
+                assert calls(number) and not any(' action=deny' in line for line in calls(number))
+        if scenario == 'Z':
+            # The input read decides a transfer from the console.
+            for number in ('40', '326'):
+                denied = [line for line in calls(number) if ' operation=device.console.read ' in line]
+                assert denied and all(line.endswith(' action=deny result=-1') for line in denied), calls(number)
+            # A transfer into the console, from an image file, is admitted.
+            assert any(line.endswith(' operation=syscall.sendfile policy-source=exact-allow '
+                                     'policy-rule=0 action=emulate result=13') for line in calls('40')), calls('40')
+        assert sorted(p.name for p in (root / 'work').iterdir()) == []
+        assert {path: path.read_bytes() for path in image} == image
+        # Nothing read, changed or removed a host attribute.
+        assert {name: os.getxattr(labelled, name) for name in os.listxattr(labelled)} == labels
 
 
 def image_read_forms(binary, work, root, config):

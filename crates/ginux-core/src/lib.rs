@@ -318,11 +318,17 @@ pub const fn decide_balanced(syscall: u64) -> Decision {
 /// `readlink` and `access` are. They take the same image mediation: the
 /// descriptor owner translates only a registered native image descriptor,
 /// and an image path is resolved and rewritten to its canonical form, which
-/// never names a hidden subtree, `/proc` or `/sys`. Native balanced policy
-/// keeps `balanced_surface`.
+/// never names a hidden subtree, `/proc` or `/sys`. `preadv` reads an image
+/// descriptor at an offset as `pread64` does, with `readv`'s vectors and
+/// bound; `preadv2` reaches the kernel only as `readv` or `preadv`, once its
+/// flags are known to be zero. The other configured file calls without a
+/// native form here (`readahead`, `fadvise64`, the xattr calls, `sendfile`,
+/// `copy_file_range`) are answered by the supervisor and stay outside this
+/// surface, so the kernel never runs them. Native balanced policy keeps
+/// `balanced_surface`.
 pub const fn configured_surface(syscall: u64) -> BalancedSurface {
     match syscall {
-        SYS_READV | SYS_READLINKAT | SYS_FACCESSAT => BalancedSurface::ImageRead,
+        SYS_READV | SYS_READLINKAT | SYS_FACCESSAT | SYS_PREADV => BalancedSurface::ImageRead,
         _ => balanced_surface(syscall),
     }
 }
@@ -478,6 +484,319 @@ pub const fn legacy_stat_arguments(syscall: u64, path: u64, buffer: u64) -> Opti
         SYS_STAT => Some([AT_FDCWD, path, buffer, 0]),
         SYS_LSTAT => Some([AT_FDCWD, path, buffer, AT_SYMLINK_NOFOLLOW]),
         _ => None,
+    }
+}
+
+/// The kind of an open file, as the advice and transfer calls distinguish
+/// it. `Other` is an anonymous object such as an event counter or epoll
+/// instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileKind {
+    Regular,
+    Directory,
+    Fifo,
+    Socket,
+    Character,
+    Block,
+    Other,
+}
+
+impl FileKind {
+    /// The kind of a Linux `st_mode`.
+    pub const fn from_mode(mode: u32) -> Self {
+        match mode & 0o170000 {
+            0o100000 => FileKind::Regular,
+            0o040000 => FileKind::Directory,
+            0o010000 => FileKind::Fifo,
+            0o140000 => FileKind::Socket,
+            0o020000 => FileKind::Character,
+            0o060000 => FileKind::Block,
+            _ => FileKind::Other,
+        }
+    }
+
+    /// Whether Linux gives an open of this kind positional I/O
+    /// (`FMODE_PREAD`): pipes, FIFOs, sockets and anonymous objects refuse
+    /// an explicit offset with ESPIPE.
+    pub const fn positional(self) -> bool {
+        !matches!(self, FileKind::Fifo | FileKind::Socket | FileKind::Other)
+    }
+}
+
+/// What the advice and transfer calls need to know about one open file
+/// description: its access mode, append mode, kind, size and identity.
+/// `identity` tells two descriptions of the same file apart from two files;
+/// its first word names the owner (an owned backend or the host device), so
+/// identities of different owners never compare equal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileView {
+    pub readable: bool,
+    pub writable: bool,
+    pub append: bool,
+    pub kind: FileKind,
+    pub size: u64,
+    pub identity: (u64, u64),
+}
+
+pub const SYS_SENDFILE: u64 = 40;
+pub const SYS_SETXATTR: u64 = 188;
+pub const SYS_FREMOVEXATTR: u64 = 199;
+pub const SYS_READAHEAD: u64 = 187;
+pub const SYS_FADVISE64: u64 = 221;
+pub const SYS_PREADV: u64 = 295;
+pub const SYS_COPY_FILE_RANGE: u64 = 326;
+pub const SYS_PREADV2: u64 = 327;
+
+/// The plain call a configured `preadv` or `preadv2` entry is, decided from
+/// its offset before the descriptor is looked up, as Linux does: `preadv`
+/// is `preadv` (295) at a nonnegative offset; `preadv2` at offset -1 is
+/// `readv` (19) at the current position and at a nonnegative offset is
+/// `preadv`. Any other negative offset is EINVAL. On x86-64 the offset is
+/// the whole low word; the high word is ignored.
+pub const fn vectored_read_form(syscall: u64, offset: u64) -> Result<u64, i64> {
+    match syscall {
+        SYS_PREADV2 if offset as i64 == -1 => Ok(SYS_READV),
+        SYS_PREADV | SYS_PREADV2 if (offset as i64) >= 0 => Ok(SYS_PREADV),
+        SYS_PREADV | SYS_PREADV2 => Err(-22),
+        _ => Err(-38),
+    }
+}
+
+/// `preadv2` flags configured launch serves: none. Linux answers an
+/// unsupported `RWF_*` flag with EOPNOTSUPP, and every flag (`RWF_HIPRI`,
+/// `RWF_NOWAIT`, ...) would change how the host performs the read, so each
+/// gets that answer once the descriptor is known to be open. `rwf_t` is a C
+/// `int`: only the low 32 bits count.
+pub const fn vectored_read_flags(flags: u64) -> Result<(), i64> {
+    if flags as u32 == 0 {
+        Ok(())
+    } else {
+        Err(-95)
+    }
+}
+
+/// `readahead(fd, offset, count)` on an open, non-`O_PATH` descriptor: 0
+/// with no host effect for a readable regular file (or block device), EBADF
+/// for a descriptor not open for reading, EINVAL for anything else, in
+/// Linux's order. The offset and count are advisory and never checked.
+pub const fn readahead_result(view: FileView) -> i64 {
+    if !view.readable {
+        -9
+    } else if matches!(view.kind, FileKind::Regular | FileKind::Block) {
+        0
+    } else {
+        -22
+    }
+}
+
+/// `fadvise64(fd, offset, length, advice)` on an open, non-`O_PATH`
+/// descriptor: ESPIPE for a pipe or FIFO, EINVAL for a negative length or an
+/// advice other than `POSIX_FADV_NORMAL` .. `POSIX_FADV_NOREUSE` (0..=5),
+/// otherwise 0 with no host effect. Like Linux, the access mode does not
+/// matter, a socket or anonymous object accepts the advice, and the offset is
+/// never checked. `advice` is a C `int`.
+pub const fn fadvise_result(kind: FileKind, length: u64, advice: u64) -> i64 {
+    if matches!(kind, FileKind::Fifo) {
+        -29
+    } else if (length as i64) < 0 || !matches!(advice as u32 as i32, 0..=5) {
+        -22
+    } else {
+        0
+    }
+}
+
+/// How a configured xattr call resolves its file, and what it answers once
+/// that file resolves. The confined filesystem has no extended attributes:
+/// a read finds none (ENODATA), a list is empty (0) and a change is not
+/// supported (ENOTSUP). Host attributes, security labels included, are never
+/// read, listed, changed or revealed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct XattrCall {
+    /// `None` for the descriptor forms; otherwise whether the path follows a
+    /// final symlink (`stat`) or not (`lstat`).
+    pub follow: Option<bool>,
+    /// Whether the call takes an attribute name (all but the list forms).
+    pub named: bool,
+    /// Whether the call carries a value and flags to validate (set forms).
+    pub value: bool,
+    /// Whether the call would change the file, which decides its policy
+    /// operation (`filesystem.path.write` rather than `.read`).
+    pub write: bool,
+    /// The result once the name, value and file are all valid.
+    pub result: i64,
+}
+
+/// The xattr call of `syscall`, `None` for every other number.
+pub const fn xattr_call(syscall: u64) -> Option<XattrCall> {
+    let (named, value, write, result) = match syscall {
+        188..=190 => (true, true, true, -95),
+        191..=193 => (true, false, false, -61),
+        194..=196 => (false, false, false, 0),
+        197..=199 => (true, false, true, -95),
+        _ => return None,
+    };
+    let follow = match (syscall - 188) % 3 {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    };
+    Some(XattrCall {
+        follow,
+        named,
+        value,
+        write,
+        result,
+    })
+}
+
+/// Linux's answer to an attribute name of which `copied` is the readable
+/// prefix, at most `XATTR_NAME_MAX + 1` (256) bytes: ERANGE for an empty
+/// name or one with no terminator within 256 bytes, EFAULT when it becomes
+/// unreadable before its terminator, otherwise `None`.
+pub fn xattr_name_error(copied: &[u8]) -> Option<i64> {
+    const LIMIT: usize = 256;
+    match copied.iter().position(|byte| *byte == 0) {
+        Some(0) => Some(-34),
+        Some(_) => None,
+        None if copied.len() >= LIMIT => Some(-34),
+        None => Some(-14),
+    }
+}
+
+/// The set forms' flag check, which Linux makes before reading the name:
+/// only `XATTR_CREATE` and `XATTR_REPLACE` exist. `flags` is a C `int`.
+pub const fn xattr_flags_error(flags: u64) -> Option<i64> {
+    if flags as u32 & !3 != 0 {
+        Some(-22)
+    } else {
+        None
+    }
+}
+
+/// The set forms' size check, made after the name and before the value is
+/// read: a value above `XATTR_SIZE_MAX` (65536) is E2BIG.
+pub const fn xattr_size_error(size: u64) -> Option<i64> {
+    if size > 65536 {
+        Some(-7)
+    } else {
+        None
+    }
+}
+
+/// Linux's `MAX_RW_COUNT` on x86-64: one transfer's count is cut to this.
+pub const MAX_RW_COUNT: u64 = 0x7fff_f000;
+
+/// The most bytes one configured `sendfile` or `copy_file_range` moves.
+/// A short count is a legal result; callers loop for the rest. Sinks with a
+/// smaller per-call bound (the console and devices, 4096 bytes) cut it
+/// further, as their `write` does.
+pub const TRANSFER_BOUND: u64 = 1024 * 1024;
+
+/// Linux's `rw_verify_area` for one transfer side: EINVAL for a negative
+/// position, a count beyond `SSIZE_MAX` or a range past the largest offset.
+/// The count is cut to `MAX_RW_COUNT`.
+pub const fn transfer_range(position: u64, count: u64) -> Result<u64, i64> {
+    if (count as i64) < 0 || (position as i64) < 0 {
+        return Err(-22);
+    }
+    if (position as i64).checked_add(count as i64).is_none() {
+        return Err(-22);
+    }
+    Ok(if count > MAX_RW_COUNT {
+        MAX_RW_COUNT
+    } else {
+        count
+    })
+}
+
+/// `sendfile`'s check of its input once the descriptor is open: EBADF for a
+/// descriptor not open for reading, ESPIPE for an explicit offset on a file
+/// without positional reads.
+pub const fn sendfile_input(input: FileView, offset: bool) -> Result<(), i64> {
+    if !input.readable {
+        Err(-9)
+    } else if offset && !input.kind.positional() {
+        Err(-29)
+    } else {
+        Ok(())
+    }
+}
+
+/// `sendfile`'s check of its output against its input, in Linux's order:
+/// EBADF for an output not open for writing, EINVAL for an append-mode
+/// output other than a pipe and for an input that is not a regular file (or
+/// block device). `served` says whether configured launch writes into this
+/// output (an owned file, an assigned device or the inherited console, of
+/// whatever kind). An owned channel endpoint (pipe, FIFO, local socket,
+/// event object) and a TCP socket are not served: EINVAL, without consuming
+/// input. Linux splices into those; callers fall back to read and write, as
+/// they do for configured `splice`.
+pub const fn sendfile_output(input: FileView, output: FileView, served: bool) -> Result<(), i64> {
+    if !output.writable {
+        Err(-9)
+    } else if (output.append && !matches!(output.kind, FileKind::Fifo))
+        || !matches!(input.kind, FileKind::Regular | FileKind::Block)
+        || !served
+    {
+        Err(-22)
+    } else {
+        Ok(())
+    }
+}
+
+/// `copy_file_range`'s checks once both descriptors are open and both
+/// offsets read, in Linux's order: EINVAL for flags, EISDIR for a directory,
+/// EINVAL for any other non-regular file, EBADF for an input not open for
+/// reading or an output not open for writing or open for appending.
+pub const fn copy_range_files(input: FileView, output: FileView, flags: u64) -> Result<(), i64> {
+    if flags as u32 != 0 {
+        return Err(-22);
+    }
+    if matches!(input.kind, FileKind::Directory) || matches!(output.kind, FileKind::Directory) {
+        return Err(-21);
+    }
+    if !matches!(input.kind, FileKind::Regular) || !matches!(output.kind, FileKind::Regular) {
+        return Err(-22);
+    }
+    if !input.readable || !output.writable || output.append {
+        return Err(-9);
+    }
+    Ok(())
+}
+
+/// The count `copy_file_range` copies from `input` at `from` to `output` at
+/// `to`, in Linux's order: EOVERFLOW when either range wraps, the count cut
+/// at the input's end of file, EINVAL for overlapping ranges of one file,
+/// then each side's `transfer_range`. Configured launch serves the copy
+/// whether or not the two files share a filesystem, as Linux 5.3 to 5.18 did;
+/// later kernels answer EXDEV there, which callers also handle.
+pub const fn copy_range_count(
+    input: FileView,
+    from: u64,
+    output: FileView,
+    to: u64,
+    count: u64,
+) -> Result<u64, i64> {
+    if from.checked_add(count).is_none() || to.checked_add(count).is_none() {
+        return Err(-75);
+    }
+    let count = if from >= input.size {
+        0
+    } else if count < input.size - from {
+        count
+    } else {
+        input.size - from
+    };
+    if input.identity.0 == output.identity.0
+        && input.identity.1 == output.identity.1
+        && to + count > from
+        && to < from + count
+    {
+        return Err(-22);
+    }
+    match transfer_range(from, count) {
+        Ok(_) => transfer_range(to, count),
+        Err(error) => Err(error),
     }
 }
 
@@ -745,6 +1064,276 @@ mod tests {
         assert_eq!(local_socket_readiness(0, false, false, true), 0x104);
     }
 
+    const fn view(kind: FileKind, readable: bool, writable: bool) -> FileView {
+        FileView {
+            readable,
+            writable,
+            append: false,
+            kind,
+            size: 100,
+            identity: (1, 1),
+        }
+    }
+
+    #[test]
+    fn vectored_reads_are_their_plain_forms() {
+        // preadv2 at -1 is readv at the current position; elsewhere both
+        // are preadv; any other negative offset is EINVAL before the
+        // descriptor is looked up.
+        assert_eq!(vectored_read_form(SYS_PREADV2, u64::MAX), Ok(SYS_READV));
+        for offset in [0, 1, 4096, i64::MAX as u64] {
+            assert_eq!(vectored_read_form(SYS_PREADV, offset), Ok(SYS_PREADV));
+            assert_eq!(vectored_read_form(SYS_PREADV2, offset), Ok(SYS_PREADV));
+        }
+        assert_eq!(vectored_read_form(SYS_PREADV, u64::MAX), Err(-22));
+        for offset in [-2i64, -5, i64::MIN] {
+            assert_eq!(vectored_read_form(SYS_PREADV, offset as u64), Err(-22));
+            assert_eq!(vectored_read_form(SYS_PREADV2, offset as u64), Err(-22));
+        }
+        assert_eq!(vectored_read_form(SYS_READV, 0), Err(-38));
+        // Only zero flags; every RWF_* flag, known or not, is EOPNOTSUPP.
+        assert_eq!(vectored_read_flags(0), Ok(()));
+        assert_eq!(vectored_read_flags(1 << 32), Ok(()));
+        for flags in [1, 2, 4, 8, 16, 0x100, u32::MAX as u64] {
+            assert_eq!(vectored_read_flags(flags), Err(-95));
+        }
+        // The plain forms reach the kernel only through the image surface.
+        assert_eq!(configured_surface(SYS_PREADV), BalancedSurface::ImageRead);
+        assert_eq!(decide_configured(SYS_PREADV2).action, Action::Deny(38));
+    }
+
+    #[test]
+    fn readahead_answers_as_linux_without_reading() {
+        assert_eq!(readahead_result(view(FileKind::Regular, true, false)), 0);
+        assert_eq!(readahead_result(view(FileKind::Regular, true, true)), 0);
+        assert_eq!(readahead_result(view(FileKind::Block, true, false)), 0);
+        // Not open for reading comes before the kind.
+        assert_eq!(readahead_result(view(FileKind::Regular, false, true)), -9);
+        assert_eq!(readahead_result(view(FileKind::Fifo, false, true)), -9);
+        for kind in [
+            FileKind::Directory,
+            FileKind::Fifo,
+            FileKind::Socket,
+            FileKind::Character,
+            FileKind::Other,
+        ] {
+            assert_eq!(readahead_result(view(kind, true, true)), -22);
+        }
+    }
+
+    #[test]
+    fn fadvise_answers_as_linux_without_advising() {
+        for kind in [
+            FileKind::Regular,
+            FileKind::Directory,
+            FileKind::Socket,
+            FileKind::Character,
+            FileKind::Block,
+            FileKind::Other,
+        ] {
+            for advice in 0..=5 {
+                assert_eq!(fadvise_result(kind, 0, advice), 0);
+                assert_eq!(fadvise_result(kind, u32::MAX as u64, advice), 0);
+            }
+            assert_eq!(fadvise_result(kind, 0, 6), -22);
+            assert_eq!(fadvise_result(kind, 0, u64::MAX), -22);
+            assert_eq!(fadvise_result(kind, u64::MAX, 0), -22);
+            // advice is an int: high bits are ignored.
+            assert_eq!(fadvise_result(kind, 0, (1 << 32) | 4), 0);
+        }
+        // A pipe or FIFO is ESPIPE, before the length and advice checks.
+        assert_eq!(fadvise_result(FileKind::Fifo, 0, 0), -29);
+        assert_eq!(fadvise_result(FileKind::Fifo, u64::MAX, 99), -29);
+    }
+
+    #[test]
+    fn xattr_calls_find_no_attributes() {
+        for syscall in 188..=199 {
+            let call = xattr_call(syscall).unwrap();
+            let index = (syscall - 188) as usize;
+            // path (stat), path (lstat), descriptor (fstat) in every group.
+            assert_eq!(call.follow, [Some(true), Some(false), None][index % 3]);
+            let (named, value, write, result) = match index / 3 {
+                0 => (true, true, true, -95),   // setxattr: ENOTSUP
+                1 => (true, false, false, -61), // getxattr: ENODATA
+                2 => (false, false, false, 0),  // listxattr: empty
+                _ => (true, false, true, -95),  // removexattr: ENOTSUP
+            };
+            assert_eq!(
+                (call.named, call.value, call.write, call.result),
+                (named, value, write, result),
+                "{syscall}"
+            );
+        }
+        for syscall in [0, 187, 200, 221, u64::MAX] {
+            assert_eq!(xattr_call(syscall), None);
+        }
+        // Linux's name import: empty or unterminated within 256 bytes is
+        // ERANGE, a fault before the terminator EFAULT.
+        assert_eq!(xattr_name_error(b"user.x\0"), None);
+        assert_eq!(xattr_name_error(b"\0"), Some(-34));
+        assert_eq!(xattr_name_error(b""), Some(-14));
+        assert_eq!(xattr_name_error(b"user"), Some(-14));
+        let mut long = [b'a'; 256];
+        assert_eq!(xattr_name_error(&long), Some(-34));
+        long[255] = 0;
+        assert_eq!(xattr_name_error(&long), None);
+        // Set flags and sizes.
+        for flags in [0, 1, 2, 3, 1 << 32] {
+            assert_eq!(xattr_flags_error(flags), None);
+        }
+        for flags in [4, 8, u32::MAX as u64] {
+            assert_eq!(xattr_flags_error(flags), Some(-22));
+        }
+        assert_eq!(xattr_size_error(65536), None);
+        assert_eq!(xattr_size_error(65537), Some(-7));
+        assert_eq!(xattr_size_error(u64::MAX), Some(-7));
+        // The supervisor answers every form; none reaches the kernel.
+        for syscall in 188..=199 {
+            assert_eq!(decide_configured(syscall).action, Action::Deny(38));
+        }
+    }
+
+    #[test]
+    fn transfers_check_as_linux_and_stay_bounded() {
+        let file = view(FileKind::Regular, true, true);
+        let read_only = view(FileKind::Regular, true, false);
+        let write_only = view(FileKind::Regular, false, true);
+        // rw_verify_area.
+        assert_eq!(transfer_range(0, 10), Ok(10));
+        assert_eq!(transfer_range(0, u64::MAX >> 1), Ok(MAX_RW_COUNT));
+        assert_eq!(transfer_range(u64::MAX, 10), Err(-22));
+        assert_eq!(transfer_range(0, u64::MAX), Err(-22));
+        assert_eq!(transfer_range(i64::MAX as u64, 1), Err(-22));
+        const { assert!(TRANSFER_BOUND <= MAX_RW_COUNT) };
+        // sendfile input.
+        assert_eq!(sendfile_input(read_only, true), Ok(()));
+        assert_eq!(sendfile_input(write_only, false), Err(-9));
+        assert_eq!(
+            sendfile_input(view(FileKind::Fifo, true, false), true),
+            Err(-29)
+        );
+        assert_eq!(
+            sendfile_input(view(FileKind::Fifo, true, false), false),
+            Ok(())
+        );
+        assert_eq!(
+            sendfile_input(view(FileKind::Character, true, false), true),
+            Ok(())
+        );
+        // sendfile output, then the input kind, then whether it is served.
+        assert_eq!(sendfile_output(read_only, file, true), Ok(()));
+        let device = view(FileKind::Character, false, true);
+        assert_eq!(sendfile_output(read_only, device, true), Ok(()));
+        // A console pipe or socket is served; a closed or read-only output
+        // is EBADF before anything else.
+        for kind in [FileKind::Fifo, FileKind::Socket] {
+            assert_eq!(
+                sendfile_output(read_only, view(kind, false, true), true),
+                Ok(())
+            );
+            assert_eq!(
+                sendfile_output(read_only, view(kind, true, false), false),
+                Err(-9)
+            );
+        }
+        assert_eq!(sendfile_output(read_only, read_only, true), Err(-9));
+        let append = FileView {
+            append: true,
+            ..file
+        };
+        assert_eq!(sendfile_output(read_only, append, true), Err(-22));
+        let append_pipe = FileView {
+            append: true,
+            ..view(FileKind::Fifo, false, true)
+        };
+        assert_eq!(sendfile_output(read_only, append_pipe, true), Ok(()));
+        for kind in [
+            FileKind::Directory,
+            FileKind::Fifo,
+            FileKind::Socket,
+            FileKind::Character,
+        ] {
+            assert_eq!(
+                sendfile_output(view(kind, true, false), file, true),
+                Err(-22)
+            );
+        }
+        assert_eq!(
+            sendfile_output(view(FileKind::Block, true, false), file, true),
+            Ok(())
+        );
+        // Owned channels and TCP sockets are not served.
+        for kind in [FileKind::Fifo, FileKind::Socket, FileKind::Other] {
+            assert_eq!(
+                sendfile_output(read_only, view(kind, true, true), false),
+                Err(-22)
+            );
+        }
+        // copy_file_range files.
+        assert_eq!(copy_range_files(read_only, file, 0), Ok(()));
+        assert_eq!(copy_range_files(read_only, file, 1), Err(-22));
+        assert_eq!(
+            copy_range_files(view(FileKind::Directory, true, false), file, 0),
+            Err(-21)
+        );
+        assert_eq!(
+            copy_range_files(read_only, view(FileKind::Directory, true, false), 0),
+            Err(-21)
+        );
+        assert_eq!(
+            copy_range_files(view(FileKind::Fifo, true, false), file, 0),
+            Err(-22)
+        );
+        assert_eq!(
+            copy_range_files(read_only, view(FileKind::Character, true, true), 0),
+            Err(-22)
+        );
+        assert_eq!(copy_range_files(write_only, file, 0), Err(-9));
+        assert_eq!(copy_range_files(read_only, read_only, 0), Err(-9));
+        assert_eq!(copy_range_files(read_only, append, 0), Err(-9));
+        // copy_file_range count: cut at end of file, overlap in one file.
+        let other = FileView {
+            identity: (1, 2),
+            ..file
+        };
+        assert_eq!(copy_range_count(file, 0, other, 0, 10), Ok(10));
+        assert_eq!(copy_range_count(file, 95, other, 0, 10), Ok(5));
+        assert_eq!(copy_range_count(file, 100, other, 0, 10), Ok(0));
+        assert_eq!(copy_range_count(file, 500, other, 0, 10), Ok(0));
+        assert_eq!(copy_range_count(file, 0, file, 10, 10), Ok(10));
+        assert_eq!(copy_range_count(file, 0, file, 5, 10), Err(-22));
+        assert_eq!(copy_range_count(file, 10, file, 5, 10), Err(-22));
+        assert_eq!(copy_range_count(file, 95, file, 99, 10), Err(-22));
+        assert_eq!(copy_range_count(file, 100, file, 100, 10), Ok(0));
+        assert_eq!(copy_range_count(file, u64::MAX, other, 0, 10), Err(-75));
+        assert_eq!(copy_range_count(file, 0, other, u64::MAX - 5, 10), Err(-75));
+        assert_eq!(
+            copy_range_count(file, 0, other, (-1i64) as u64, 0),
+            Err(-22)
+        );
+        // Different owners never share an identity.
+        let native = FileView {
+            identity: (2, 1),
+            ..file
+        };
+        assert_eq!(copy_range_count(file, 0, native, 5, 10), Ok(10));
+        // None of them reaches the kernel.
+        for syscall in [
+            SYS_SENDFILE,
+            SYS_COPY_FILE_RANGE,
+            SYS_READAHEAD,
+            SYS_FADVISE64,
+        ] {
+            assert_eq!(decide_configured(syscall).action, Action::Deny(38));
+        }
+        assert_eq!(FileKind::from_mode(0o100644), FileKind::Regular);
+        assert_eq!(FileKind::from_mode(0o010600), FileKind::Fifo);
+        assert_eq!(FileKind::from_mode(0o140777), FileKind::Socket);
+        assert_eq!(FileKind::from_mode(0o020666), FileKind::Character);
+        assert_eq!(FileKind::from_mode(0o120777), FileKind::Other);
+    }
+
     #[test]
     fn legacy_stat_calls_are_their_newfstatat_form() {
         const AT_FDCWD: u64 = -100i64 as u64;
@@ -843,7 +1432,12 @@ mod tests {
     fn configured_surface_mediates_every_read_only_image_form() {
         // readv, readlinkat and faccessat are image reads in configured
         // launch, as read, readlink and access are in both.
-        for (configured, balanced) in [(SYS_READV, 0), (SYS_READLINKAT, 89), (SYS_FACCESSAT, 21)] {
+        for (configured, balanced) in [
+            (SYS_READV, 0),
+            (SYS_READLINKAT, 89),
+            (SYS_FACCESSAT, 21),
+            (SYS_PREADV, 17),
+        ] {
             assert_eq!(configured_surface(configured), BalancedSurface::ImageRead);
             assert_eq!(decide_configured(configured).action, Action::Mediate);
             assert_eq!(balanced_surface(balanced), BalancedSurface::ImageRead);
@@ -853,20 +1447,27 @@ mod tests {
         }
         // Every other number keeps its balanced classification and decision.
         for syscall in 0..1024 {
-            if matches!(syscall, SYS_READV | SYS_READLINKAT | SYS_FACCESSAT) {
+            if matches!(
+                syscall,
+                SYS_READV | SYS_READLINKAT | SYS_FACCESSAT | SYS_PREADV
+            ) {
                 continue;
             }
             assert_eq!(configured_surface(syscall), balanced_surface(syscall));
             assert_eq!(decide_configured(syscall), decide_balanced(syscall));
         }
-        // Writing, vectored writing and the uncatalogued read forms stay
-        // outside the image surface: pwritev, writev to an image, preadv,
-        // preadv2, readahead, fadvise64, the xattr reads, sendfile and
-        // copy_file_range.
-        for syscall in [
-            20, 296, 295, 327, 187, 221, 191, 192, 193, 194, 195, 196, 40, 326,
-        ] {
+        // Writing, vectored writing and the calls the supervisor answers
+        // itself never reach the kernel: pwritev, writev to an image,
+        // preadv2 (rewritten as readv or preadv first), readahead,
+        // fadvise64, every xattr call, sendfile and copy_file_range.
+        for syscall in [20, 296, 327, 187, 221, 40, 326]
+            .into_iter()
+            .chain(188..=199)
+        {
             assert_ne!(configured_surface(syscall), BalancedSurface::ImageRead);
+            if syscall != 20 {
+                assert_eq!(decide_configured(syscall).action, Action::Deny(38));
+            }
         }
         assert_eq!(decide_configured(u64::MAX).action, Action::Deny(38));
     }

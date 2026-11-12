@@ -6,7 +6,7 @@
 
 use ginux_core::{
     configured_arguments_allowed, configured_vectors_allowed, decide_balanced, decide_configured,
-    Action, BalancedSurface, Decision, SYS_FORK, SYS_READV,
+    Action, BalancedSurface, Decision, SYS_FORK, SYS_PREADV, SYS_READV,
 };
 
 use crate::supervisor::UserRegs;
@@ -178,12 +178,12 @@ pub fn process_entry(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> Option<i64> 
     crate::process_hooks::claim(syscall, rdi, rsi, rdx)
 }
 
-/// `pid` is the stopped caller, whose `readv` vector array is summed for the
-/// image read bound. The sum is a snapshot: a peer that rewrites its own
-/// array before the kernel reads it can only enlarge its own read of a
-/// read-only descriptor into its own memory, as further calls could.
+/// `pid` is the stopped caller, whose `readv` or `preadv` vector array is
+/// summed for the image read bound. The sum is a snapshot: a peer that
+/// rewrites its own array before the kernel reads it can only enlarge its own
+/// read of a read-only descriptor into its own memory, as further calls could.
 pub fn launch_arguments_allowed(pid: usize, syscall: u64, registers: &UserRegs) -> bool {
-    if syscall == SYS_READV {
+    if syscall == SYS_READV || syscall == SYS_PREADV {
         return configured_vectors_allowed(crate::tracee_io::vector_total(
             pid,
             registers.rsi,

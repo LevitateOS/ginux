@@ -1203,7 +1203,7 @@ impl LaunchFs {
                 )
             }
             72 if r.rsi == 3 => Ok(1),
-            0 | 17 | 19 => Err(-9),
+            0 | 17 | 19 | 295 => Err(-9),
             8 | 18 => Err(-29),
             16 => Err(-25),
             217 => Err(-20),
@@ -1547,6 +1547,7 @@ impl LaunchFs {
                 | 217
                 | 292
                 | 285
+                | 295
         ) && fd >= FD_BASE as i32
         {
             return Some(self.descriptor_call(pid, r, fd - FD_BASE as i32 + 3));
@@ -2047,7 +2048,7 @@ impl LaunchFs {
             0 => self.read(pid, fd, r.rsi, r.rdx, None),
             17 => self.read(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
             1 => self.write(pid, fd, r.rsi, r.rdx, None),
-            19 | 20 => self.vector_io(pid, fd, r),
+            19 | 20 | 295 => self.vector_io(pid, fd, r),
             18 => self.write(pid, fd, r.rsi, r.rdx, Some(r.r10 as i64)),
             3 => {
                 self.flocks.release((fd - 3) as u32, None);
@@ -2371,24 +2372,124 @@ impl LaunchFs {
             }
             Ok(written as i64)
         } else {
-            let offset = self
-                .fs
-                .seek(fd, 0, ginux_vfs::Whence::Current)
-                .map_err(errno)?;
+            // preadv reads at its own offset, which its entry has already
+            // checked is nonnegative, and leaves the shared offset alone.
+            let positional = r.orig_rax == 295;
+            let offset = if positional {
+                r.r10
+            } else {
+                self.fs
+                    .seek(fd, 0, ginux_vfs::Whence::Current)
+                    .map_err(errno)?
+            };
             let read = self
                 .fs
                 .pread(fd, offset, &mut bytes[..count])
                 .map_err(errno)?;
             let copied = vectors.copy(pid, &mut bytes[..read], true)?;
-            self.fs
-                .seek(
-                    fd,
-                    (offset + copied as u64) as i64,
-                    ginux_vfs::Whence::Start,
-                )
-                .map_err(errno)?;
+            if !positional {
+                self.fs
+                    .seek(
+                        fd,
+                        (offset + copied as u64) as i64,
+                        ginux_vfs::Whence::Start,
+                    )
+                    .map_err(errno)?;
+            }
             Ok(copied as i64)
         }
+    }
+
+    /// The owned descriptor of a public owned-file handle.
+    fn handle_descriptor(handle: u32) -> Result<i32, i64> {
+        handle
+            .checked_sub(FD_BASE as u32)
+            .filter(|slot| *slot < 64)
+            .map(|slot| slot as i32 + 3)
+            .ok_or(-9)
+    }
+
+    /// What `readahead`, `fadvise64`, `sendfile` and `copy_file_range` need
+    /// to know about an owned-file handle. An archive import stream is a
+    /// write-only FIFO, as its `fstat` says.
+    pub fn file_view(&mut self, handle: u32) -> Result<ginux_core::FileView, i64> {
+        use ginux_core::FileKind;
+        let fd = Self::handle_descriptor(handle)?;
+        let (metadata, flags) = if self.import_index(fd).is_some() {
+            (self.archive_stream_metadata(fd)?, O_WRITE)
+        } else {
+            (
+                self.fs.fstat(fd).map_err(errno)?,
+                self.fs.status_flags(fd).map_err(errno)?,
+            )
+        };
+        Ok(ginux_core::FileView {
+            readable: flags & O_READ != 0,
+            writable: flags & O_WRITE != 0,
+            append: flags & O_APPEND != 0,
+            kind: match metadata.kind {
+                NodeKind::File => FileKind::Regular,
+                NodeKind::Directory => FileKind::Directory,
+                NodeKind::Fifo => FileKind::Fifo,
+                NodeKind::Symlink => FileKind::Other,
+            },
+            size: metadata.size,
+            // Owned inodes are numbered by this one filesystem.
+            identity: (u64::MAX, metadata.inode),
+        })
+    }
+
+    /// The shared offset of an owned-file handle.
+    pub fn transfer_position(&mut self, handle: u32) -> Result<u64, i64> {
+        let fd = Self::handle_descriptor(handle)?;
+        self.fs
+            .seek(fd, 0, ginux_vfs::Whence::Current)
+            .map_err(errno)
+    }
+
+    /// Move the shared offset of an owned-file handle, as a read or write
+    /// of the transferred bytes would have.
+    pub fn transfer_seek(&mut self, handle: u32, position: u64) -> Result<(), i64> {
+        let fd = Self::handle_descriptor(handle)?;
+        let position = i64::try_from(position).map_err(|_| -22)?;
+        self.fs
+            .seek(fd, position, ginux_vfs::Whence::Start)
+            .map(|_| ())
+            .map_err(errno)
+    }
+
+    /// Read owned-file bytes at `position` into the supervisor's transfer
+    /// buffer, as `pread64` reads them, without moving the shared offset.
+    pub fn transfer_read(
+        &mut self,
+        handle: u32,
+        position: u64,
+        output: &mut [u8],
+    ) -> Result<usize, i64> {
+        let fd = Self::handle_descriptor(handle)?;
+        self.fs.pread(fd, position, output).map_err(errno)
+    }
+
+    /// Write transferred bytes to an owned file as `write` (at the shared
+    /// offset, or the end in append mode) or `pwrite64` (at `position`)
+    /// writes them, updating the modification time.
+    pub fn transfer_write(
+        &mut self,
+        handle: u32,
+        position: Option<u64>,
+        input: &[u8],
+    ) -> Result<usize, i64> {
+        let fd = Self::handle_descriptor(handle)?;
+        let now = realtime()?;
+        let written = match position {
+            Some(position) => self.fs.pwrite(fd, position, input),
+            None => self.fs.write(fd, input),
+        }
+        .map_err(errno)?;
+        if written != 0 {
+            self.fs.fset_times(fd, None, Some(now)).map_err(errno)?;
+        }
+        Ok(written)
     }
 
     /// Copies the caller's bytes in bounded chunks. A positional write goes

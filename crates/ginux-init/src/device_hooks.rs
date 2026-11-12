@@ -103,7 +103,24 @@ impl LaunchDevices {
         if (fd as i32) >= FD_BASE as i32
             && matches!(
                 r.orig_rax,
-                0 | 1 | 3 | 5 | 8 | 16 | 17 | 18 | 19 | 20 | 32 | 33 | 72 | 74 | 75 | 77 | 91 | 292
+                0 | 1
+                    | 3
+                    | 5
+                    | 8
+                    | 16
+                    | 17
+                    | 18
+                    | 19
+                    | 20
+                    | 32
+                    | 33
+                    | 72
+                    | 74
+                    | 75
+                    | 77
+                    | 91
+                    | 292
+                    | 295
             )
         {
             return Some(
@@ -214,9 +231,10 @@ impl LaunchDevices {
             .descriptor_view(INSTANCE, fd)
             .map_err(device_errno)?;
         match r.orig_rax {
-            // read, pread64 and readv. Linux rejects a negative position first.
-            0 | 17 | 19 => {
-                if r.orig_rax == 17 && (r.r10 as i64) < 0 {
+            // read, pread64, readv and preadv. Linux rejects a negative
+            // position first.
+            0 | 17 | 19 | 295 => {
+                if matches!(r.orig_rax, 17 | 295) && (r.r10 as i64) < 0 {
                     return Err(-22);
                 }
                 if flags & ACCESS_MODE == 1 {
@@ -336,9 +354,34 @@ impl LaunchDevices {
         }
     }
 
-    /// One buffer, or a readv/writev array of at most 16 entries.
+    /// What `readahead`, `fadvise64` and `sendfile` need to know about an
+    /// assigned device descriptor: a character device of its open mode.
+    pub fn file_view(&self, handle: u32) -> Result<ginux_core::FileView, i64> {
+        let slot = handle.checked_sub(FD_BASE).ok_or(-9)? as usize;
+        let flags = self.flags.get(slot).copied().flatten().ok_or(-9)?;
+        Ok(ginux_core::FileView {
+            readable: flags & ACCESS_MODE != 1,
+            writable: flags & ACCESS_MODE != 0,
+            append: flags & 0o2000 != 0,
+            kind: ginux_core::FileKind::Character,
+            size: 0,
+            identity: (u64::MAX - 1, u64::from(handle)),
+        })
+    }
+
+    /// Write transferred bytes to an assigned device as `write` does: at
+    /// most 4096 bytes, discarded by every device kind configured launch
+    /// serves.
+    pub fn transfer_write(&mut self, handle: u32, input: &[u8]) -> Result<usize, i64> {
+        let count = input.len().min(IO_SIZE);
+        self.registry
+            .write(INSTANCE, handle, &input[..count])
+            .map_err(device_errno)
+    }
+
+    /// One buffer, or a readv/writev/preadv array of at most 16 entries.
     fn vectors(pid: usize, r: &UserRegs) -> Result<IoVectors, i64> {
-        if matches!(r.orig_rax, 19 | 20) {
+        if matches!(r.orig_rax, 19 | 20 | 295) {
             IoVectors::read(pid, r.rsi, r.rdx)
         } else {
             Ok(IoVectors::single(r.rsi, r.rdx))

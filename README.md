@@ -414,8 +414,16 @@ syscall denial also wins over an ungranted semantic family.
 `config/instance-configured.toml` selects `[contract] version = 1` and
 `catalog = 1002`, using the upstream hierarchical format.
 It adds `lstat`, `readv`, `pipe`, `nanosleep`, `link`, `sched_getaffinity`,
-`clock_getres`, `faccessat`, `renameat2`, `execveat`, `tkill` and `tgkill` to
-upstream catalog 2; `tkill` and `tgkill` are also `signal.virtual.deliver`.
+`clock_getres`, `faccessat`, `renameat2`, `execveat`, `tkill`, `tgkill`,
+`preadv`, `preadv2`, `readahead`, `fadvise64`, `sendfile`, `copy_file_range`,
+`getxattr`, `lgetxattr`, `listxattr`, `llistxattr`, `setxattr`, `lsetxattr`,
+`removexattr` and `lremovexattr` to upstream catalog 2; `tkill` and `tgkill`
+are also `signal.virtual.deliver`. `preadv`, `preadv2`, `readahead`,
+`fadvise64` and the xattr reads and lists (with catalog 2's `fgetxattr` and
+`flistxattr`) are also `filesystem.path.read`, and the xattr changes (with
+`fsetxattr` and `fremovexattr`) `filesystem.path.write`, as their plain
+counterparts are. `sendfile` and `copy_file_range` are decided by their output
+as a `write` and by their input as a `read`; both must be granted.
 Gate 11 advances the upstream catalog from 1 to 2 and adds direct-safe
 `sched_yield`. Our former local catalog number 2 is retired to avoid assigning
 upstream's number a different meaning. Self-contained configured contracts must
@@ -541,8 +549,18 @@ Readv/writev remain bounded to 4096 bytes per call.
 Owned files and pipes accept at most 16 iovecs, including empty entries, with a
 combined length no greater than the signed transfer-result range. Pipe writes
 use the combined vector length for atomicity and retain their existing bounds.
-Image descriptors read natively: read, pread64 and readv share a 64 MiB
-request bound, readv summing its vectors. Configured scalar console writes
+Image descriptors read natively: read, pread64, readv and preadv share a 64 MiB
+request bound, readv and preadv summing their vectors. `preadv` and `preadv2`
+are the `preadv` or `readv` they name (offset -1 is the current position) on
+every descriptor, with that form's bounds and errors; any `preadv2` flag is
+EOPNOTSUPP. `readahead` and `fadvise64` answer as Linux does for the
+descriptor (EBADF, EINVAL for `readahead` on anything but a readable regular
+file, ESPIPE for `fadvise64` on a pipe or FIFO) and otherwise return 0 with no
+host effect. `sendfile` and `copy_file_range` read a regular owned or image
+file as `pread64` and write an owned file (and, for `sendfile`, an assigned
+device or the inherited console) as `write`/`pwrite64`, at most 1 MiB per call
+(4096 bytes into the console or a device); owned channels and TCP sockets are
+EINVAL outputs, without consuming input. Configured scalar console writes
 return a partial count for requests over 4096 bytes, retaining that host transfer
 bound while allowing callers to write the remainder. Metadata defaults to 32 objects (including seeded directories) and 64 independently
 opened files. `[storage].max_objects` permits 1–1000000 namespace slots. Bounded

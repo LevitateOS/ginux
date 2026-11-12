@@ -1200,6 +1200,21 @@ impl Supervisor<'_> {
             r.orig_rax,
             crate::launch::launch_semantic_operation(r, self.table(index)),
         );
+        // A transfer also reads its input: a denial of that read decides it
+        // when its write is admitted.
+        let rule = match crate::launch::launch_transfer_input_operation(r, self.table(index)) {
+            Some(input)
+                if rule.is_some_and(|rule| !matches!(rule.action, ContractAction::Deny(_))) =>
+            {
+                let read = self.contract.runtime_rule(r.orig_rax, Some(input));
+                if read.is_some_and(|read| matches!(read.action, ContractAction::Deny(_))) {
+                    read
+                } else {
+                    rule
+                }
+            }
+            _ => rule,
+        };
         crate::launch::audit_rule(rule);
         audit_write(b" action=");
         // All workload calls pass here before clock/task/storage/FD effects.

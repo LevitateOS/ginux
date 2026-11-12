@@ -187,6 +187,7 @@ impl LaunchChannels {
                 | 77
                 | 91
                 | 292
+                | 295
         ) {
             return None;
         }
@@ -231,7 +232,7 @@ impl LaunchChannels {
                 entry.peer.is_some(),
                 !matches!(self.pipes[entry.pipe].event, Event::None),
             ),
-            8 | 17 | 18 => Err(-29),
+            8 | 17 | 18 | 295 => Err(-29),
             16 if r.rsi == 0x5421 => {
                 // FIONBIO changes the shared open-file status, not this
                 // public descriptor's CLOEXEC bit. Copy the complete int
@@ -620,6 +621,29 @@ impl LaunchChannels {
             events |= (if pipe.len != 0 { 0x41 } else { 0 }) | (if hung_up { 16 } else { 0 });
         }
         Some(events)
+    }
+
+    /// What `readahead`, `fadvise64`, `sendfile` and `copy_file_range` need
+    /// to know about a channel endpoint: a local socket, an event counter or
+    /// epoll instance (an anonymous object), or else a pipe or FIFO end, with
+    /// the access mode of its open.
+    pub fn file_view(&self, handle: u32) -> Result<ginux_core::FileView, i64> {
+        use ginux_core::FileKind;
+        let entry = self.entry(handle.checked_sub(PIPE_FD_BASE).ok_or(-9)? as usize)?;
+        Ok(ginux_core::FileView {
+            readable: entry.readable(),
+            writable: entry.writable(),
+            append: entry.flags & APPEND != 0,
+            kind: if entry.peer.is_some() {
+                FileKind::Socket
+            } else if !matches!(self.pipes[entry.pipe].event, Event::None) {
+                FileKind::Other
+            } else {
+                FileKind::Fifo
+            },
+            size: 0,
+            identity: (u64::MAX - 2, entry.pipe as u64),
+        })
     }
 
     pub fn is_socket(&self, handle: u32) -> bool {

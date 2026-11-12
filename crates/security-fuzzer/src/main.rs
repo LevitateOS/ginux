@@ -4,7 +4,10 @@ use ginux_contract::{
 };
 use ginux_core::{
     balanced_arguments_allowed, balanced_surface, configured_arguments_allowed, configured_surface,
-    configured_vectors_allowed, decide, decide_balanced, decide_configured, decide_systemd,
+    configured_vectors_allowed, copy_range_count, copy_range_files, decide, decide_balanced,
+    decide_configured, decide_systemd, fadvise_result, readahead_result, sendfile_input,
+    sendfile_output, transfer_range, vectored_read_flags, vectored_read_form, xattr_call,
+    xattr_flags_error, xattr_name_error, xattr_size_error, FileKind, FileView, MAX_RW_COUNT,
 };
 use ginux_devices::{BlockBackend, DeviceError, DeviceName, DeviceView, Partition};
 use ginux_instance::InstanceConfig;
@@ -169,6 +172,7 @@ fn run_target(target: &str, input: &[u8]) {
             let _ = configured_surface(syscall);
             let _ = configured_arguments_allowed(syscall, values[1], values[2], values[3]);
             let _ = configured_vectors_allowed((values[1] & 1 != 0).then_some(values[2]));
+            fuzz_file_calls(syscall, &values, input);
         }
         "audit" => {
             let values = words(input);
@@ -179,6 +183,46 @@ fn run_target(target: &str, input: &[u8]) {
             let _ = (budget.emitted(), budget.dropped());
         }
         _ => unreachable!(),
+    }
+}
+
+/// The configured file-call decisions: never a panic, and every count they
+/// admit stays within the request, the input's end and `MAX_RW_COUNT`.
+fn fuzz_file_calls(syscall: u64, values: &[u64; 4], input: &[u8]) {
+    let view = |word: u64, size: u64| FileView {
+        readable: word & 1 != 0,
+        writable: word & 2 != 0,
+        append: word & 4 != 0,
+        kind: FileKind::from_mode((word >> 3) as u32),
+        size,
+        identity: ((word >> 32) & 1, (word >> 33) & 3),
+    };
+    let input_view = view(values[1], values[3]);
+    let output_view = view(values[2], values[3] >> 1);
+    if let Ok(form) = vectored_read_form(syscall, values[1]) {
+        assert!(matches!(form, 19 | 295));
+        assert!(values[1] as i64 >= -1);
+    }
+    let _ = vectored_read_flags(values[2]);
+    let _ = readahead_result(input_view);
+    let _ = fadvise_result(input_view.kind, values[2], values[3]);
+    if let Some(call) = xattr_call(syscall) {
+        assert!((188..=199).contains(&syscall));
+        assert!(matches!(call.result, 0 | -61 | -95));
+    }
+    let _ = xattr_flags_error(values[1]);
+    let _ = xattr_size_error(values[2]);
+    let _ = xattr_name_error(&input[..input.len().min(300)]);
+    if let Ok(count) = transfer_range(values[1], values[2]) {
+        assert!(count <= values[2] && count <= MAX_RW_COUNT);
+    }
+    let _ = sendfile_input(input_view, values[3] & 1 != 0);
+    let _ = sendfile_output(input_view, output_view, values[3] & 2 != 0);
+    let _ = copy_range_files(input_view, output_view, values[3] >> 2);
+    let (from, to, count) = (values[0], values[1], values[2]);
+    if let Ok(copied) = copy_range_count(input_view, from, output_view, to, count) {
+        assert!(copied <= count);
+        assert!(copied == 0 || copied <= input_view.size - from);
     }
 }
 

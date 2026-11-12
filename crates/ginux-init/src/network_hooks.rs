@@ -141,6 +141,21 @@ impl LaunchNetwork {
     pub fn owns(handle: u32) -> bool {
         (FD_BASE..FD_BASE + FDS as u32).contains(&handle)
     }
+
+    /// What `readahead`, `fadvise64` and `sendfile` need to know about a
+    /// granted TCP socket: a socket open for reading and writing.
+    pub fn file_view(&self, handle: u32) -> core::result::Result<ginux_core::FileView, i64> {
+        let slot = handle.checked_sub(FD_BASE).ok_or(-9)? as usize;
+        self.sockets.get(slot).copied().flatten().ok_or(-9)?;
+        Ok(ginux_core::FileView {
+            readable: true,
+            writable: true,
+            append: false,
+            kind: ginux_core::FileKind::Socket,
+            size: 0,
+            identity: (u64::MAX - 3, u64::from(handle)),
+        })
+    }
     pub fn timeout(&self, handle: u32, syscall: u64) -> u64 {
         self.sockets[(handle - FD_BASE) as usize]
             .map(|s| {
@@ -254,6 +269,7 @@ impl LaunchNetwork {
                 | 93
                 | 217
                 | 292
+                | 295
         ) || !Self::owns(r.rdi as u32)
         {
             return None;

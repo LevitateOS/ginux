@@ -3,7 +3,7 @@
 use core::fmt;
 
 pub const CATALOG_VERSION: u32 = 2;
-pub const MAX_OPERATIONS: usize = 199;
+pub const MAX_OPERATIONS: usize = 213;
 pub const DIGEST_HEX_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +222,14 @@ pub static CONFIGURED_OPERATIONS: &[Operation] = &[
         "test-launch"
     ),
     syscall!(
+        "sendfile",
+        40,
+        Partial,
+        Action::Mediate,
+        "regular file into owned file, device or console; bounded copy",
+        "test-launch-image-io"
+    ),
+    syscall!(
         "link",
         86,
         Partial,
@@ -246,6 +254,78 @@ pub static CONFIGURED_OPERATIONS: &[Operation] = &[
         "test-launch"
     ),
     syscall!(
+        "readahead",
+        187,
+        Partial,
+        Action::Mediate,
+        "readable regular descriptor; no host effect",
+        "test-launch-image-io"
+    ),
+    syscall!(
+        "setxattr",
+        188,
+        Partial,
+        Action::Mediate,
+        "instance path; no attributes, ENOTSUP",
+        "test-launch-image-io"
+    ),
+    syscall!(
+        "lsetxattr",
+        189,
+        Partial,
+        Action::Mediate,
+        "instance path; no attributes, ENOTSUP",
+        "test-launch-image-io"
+    ),
+    syscall!(
+        "getxattr",
+        191,
+        Partial,
+        Action::Mediate,
+        "instance path; no attributes, ENODATA",
+        "test-launch-image-io"
+    ),
+    syscall!(
+        "lgetxattr",
+        192,
+        Partial,
+        Action::Mediate,
+        "instance path; no attributes, ENODATA",
+        "test-launch-image-io"
+    ),
+    syscall!(
+        "listxattr",
+        194,
+        Partial,
+        Action::Mediate,
+        "instance path; empty list",
+        "test-launch-image-io"
+    ),
+    syscall!(
+        "llistxattr",
+        195,
+        Partial,
+        Action::Mediate,
+        "instance path; empty list",
+        "test-launch-image-io"
+    ),
+    syscall!(
+        "removexattr",
+        197,
+        Partial,
+        Action::Mediate,
+        "instance path; no attributes, ENOTSUP",
+        "test-launch-image-io"
+    ),
+    syscall!(
+        "lremovexattr",
+        198,
+        Partial,
+        Action::Mediate,
+        "instance path; no attributes, ENOTSUP",
+        "test-launch-image-io"
+    ),
+    syscall!(
         "tkill",
         200,
         Partial,
@@ -260,6 +340,14 @@ pub static CONFIGURED_OPERATIONS: &[Operation] = &[
         Action::Mediate,
         "virtual task and operator CPU mask",
         "test-launch-tasks"
+    ),
+    syscall!(
+        "fadvise64",
+        221,
+        Partial,
+        Action::Mediate,
+        "instance descriptor; advice ignored",
+        "test-launch-image-io"
     ),
     syscall!(
         "clock_getres",
@@ -302,6 +390,14 @@ pub static CONFIGURED_OPERATIONS: &[Operation] = &[
         "test-launch-poll"
     ),
     syscall!(
+        "preadv",
+        295,
+        Partial,
+        Action::Mediate,
+        "bounded instance vectors at an offset",
+        "test-launch-image-io"
+    ),
+    syscall!(
         "renameat2",
         316,
         Partial,
@@ -316,6 +412,22 @@ pub static CONFIGURED_OPERATIONS: &[Operation] = &[
         Action::Mediate,
         "owned or image executable",
         "test-launch-exec"
+    ),
+    syscall!(
+        "copy_file_range",
+        326,
+        Partial,
+        Action::Mediate,
+        "regular files; bounded copy",
+        "test-launch-image-io"
+    ),
+    syscall!(
+        "preadv2",
+        327,
+        Partial,
+        Action::Mediate,
+        "bounded instance vectors; flags 0",
+        "test-launch-image-io"
     ),
 ];
 
@@ -2050,6 +2162,21 @@ pub const fn syscall_semantic_operation(number: u64, request: u64) -> Option<&'s
     }
 }
 
+/// The filesystem family of a configured catalog-1002 file call whose
+/// number alone decides it, as its plain counterpart is decided: the
+/// vectored and advisory reads (`preadv`, `preadv2`, `readahead`,
+/// `fadvise64`) as `pread64`, the xattr reads and lists as `stat`, and the
+/// xattr changes as `chmod`. Configured launch only; native policy keeps
+/// [`syscall_semantic_operation`]. `sendfile` and `copy_file_range` are
+/// decided by their descriptors and are not listed here.
+pub const fn configured_semantic_operation(number: u64) -> Option<&'static str> {
+    match number {
+        187 | 191..=196 | 221 | 295 | 327 => Some("filesystem.path.read"),
+        188..=190 | 197..=199 => Some("filesystem.path.write"),
+        _ => None,
+    }
+}
+
 fn catalog_operations(version: u32) -> impl Iterator<Item = &'static Operation> {
     CATALOG.iter().chain(
         if version == CONFIGURED_CATALOG_VERSION {
@@ -2716,6 +2843,65 @@ mod tests {
         ] {
             assert_eq!(syscall_semantic_operation(number, 0), Some(id));
         }
+    }
+
+    #[test]
+    fn configured_file_calls_take_their_counterparts_family() {
+        for (number, id) in [
+            (295, "filesystem.path.read"),
+            (327, "filesystem.path.read"),
+            (187, "filesystem.path.read"),
+            (221, "filesystem.path.read"),
+            (191, "filesystem.path.read"),
+            (192, "filesystem.path.read"),
+            (193, "filesystem.path.read"),
+            (194, "filesystem.path.read"),
+            (195, "filesystem.path.read"),
+            (196, "filesystem.path.read"),
+            (188, "filesystem.path.write"),
+            (189, "filesystem.path.write"),
+            (190, "filesystem.path.write"),
+            (197, "filesystem.path.write"),
+            (198, "filesystem.path.write"),
+            (199, "filesystem.path.write"),
+        ] {
+            assert_eq!(configured_semantic_operation(number), Some(id), "{number}");
+            assert!(CATALOG.iter().any(|operation| operation.id == id));
+            // Each is a catalogued call of catalog 1002.
+            assert!(catalog_operations(CONFIGURED_CATALOG_VERSION)
+                .any(|operation| operation.abi_number == Some(number)));
+        }
+        // Descriptor-decided transfers and every other number are not.
+        for number in [0, 17, 19, 40, 326, 200, 4096] {
+            assert_eq!(configured_semantic_operation(number), None);
+        }
+        // Native policy is unchanged: none of them has a number-only family.
+        for number in [40, 187, 221, 295, 326, 327].into_iter().chain(188..=199) {
+            assert_eq!(syscall_semantic_operation(number, 0), None);
+        }
+        // A family denial denies the configured calls of that family, and
+        // their own syscall denial is kept.
+        let denied = resolve(
+            b"configured-balanced-v2",
+            &[],
+            &[],
+            &[b"filesystem.path.read"],
+        )
+        .unwrap();
+        for number in [295, 327, 187, 221, 191, 194] {
+            let rule = denied
+                .runtime_rule(number, configured_semantic_operation(number))
+                .unwrap();
+            assert_eq!(rule.action, Action::Deny(1), "{number}");
+            assert_eq!(rule.operation.id, "filesystem.path.read");
+        }
+        let exact = resolve(b"configured-balanced-v2", &[], &[], &[b"syscall.lsetxattr"]).unwrap();
+        let rule = exact
+            .runtime_rule(189, configured_semantic_operation(189))
+            .unwrap();
+        assert_eq!(rule.action, Action::Deny(1));
+        assert_eq!(rule.operation.id, "syscall.lsetxattr");
+        assert_eq!(exact.syscall_action(188), Action::Mediate);
     }
 
     #[test]
