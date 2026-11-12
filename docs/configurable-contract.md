@@ -93,7 +93,7 @@ EBADF. This does not provide zero-copy transfers or expose host descriptors.
 Configured launch implements `eventfd2`, `epoll_create1`, `epoll_ctl`,
 `epoll_wait` and bounded `epoll_pwait` through the public descriptor table.
 Counters and epoll instances share the bounded 32-object channel pool with
-pipes and packet channels. Each epoll instance has at most 32 registrations,
+pipes and local socket pairs. Each epoll instance has at most 32 registrations,
 independent of the 16-socket and 32-channel object limits;
 the existing public descriptor limit (including a lower operator limit) applies.
 No host eventfd or epoll descriptor is created or exposed. Counters support
@@ -101,7 +101,7 @@ No host eventfd or epoll descriptor is created or exposed. Counters support
 shared status flags and per-descriptor close-on-exec. Vector/socket transfers
 on counters are unsupported.
 
-Epoll watches already-owned counters, pipes, packet endpoints and granted TCP
+Epoll watches already-owned counters, pipes, local socket pair endpoints and granted TCP
 sockets. Image/native descriptors, filesystem files and nested epoll instances
 are unsupported. Registrations retain object identity and the registered public
 number: aliases may be registered separately, survive closure of the original
@@ -112,8 +112,8 @@ round-robin delivery of ready registrations are bounded by this set.
 Successful counter writes notify IN even when the counter stays nonzero, so
 edge-triggered wakeup loops may intentionally leave it unread; reads notify OUT.
 Other edge-triggered I/O still requires draining until EAGAIN. ERR/HUP
-are always reported; RDHUP observes actual TCP peer write-half closure and is
-not synthesized from pipe HUP. Events carry the caller's snapshotted 64-bit data.
+are always reported; RDHUP observes actual TCP or local socket pair peer
+write-half closure and is not synthesized from pipe HUP. Events carry the caller's snapshotted 64-bit data.
 
 Waits support zero, finite timeouts up to 300000 ms and negative infinite waits.
 `maxevents` is output capacity and may exceed the 32 registrations. A parked

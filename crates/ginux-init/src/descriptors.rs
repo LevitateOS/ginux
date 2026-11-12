@@ -1184,12 +1184,14 @@ impl DescriptorTable {
         r: &UserRegs,
         backends: &mut Backends,
     ) -> Result<NativeDecision, i64> {
-        let packet = r.orig_rax == 53;
-        if packet && (r.rdi != 1 || r.rsi & !(CLOEXEC | 0o4000) != 5 || r.rdx != 0) {
-            return Err(-95);
-        }
-        let flags = if packet {
-            r.rsi & !5
+        // socketpair admits only connected, unnamed local endpoints.
+        let pair = if r.orig_rax == 53 {
+            Some(ginux_core::local_socket_pair(r.rdi, r.rsi, r.rdx)?)
+        } else {
+            None
+        };
+        let flags = if let Some(pair) = pair {
+            (if pair.cloexec { CLOEXEC } else { 0 }) | (if pair.nonblock { 0o4000 } else { 0 })
         } else if r.orig_rax == 293 {
             r.rsi
         } else {
@@ -1206,8 +1208,11 @@ impl DescriptorTable {
                 return Err(e);
             }
         };
-        let allocated = if packet {
-            backends.channels.allocate_packet_pair(flags & !CLOEXEC)
+        let allocated = if let Some(pair) = pair {
+            backends.channels.allocate_socket_pair(
+                flags & !CLOEXEC,
+                pair.kind == ginux_core::LocalSocketKind::SequencedPacket,
+            )
         } else {
             backends.channels.allocate(flags & !CLOEXEC)
         };
@@ -1222,7 +1227,12 @@ impl DescriptorTable {
         let mut bytes = [0u8; 8];
         bytes[..4].copy_from_slice(&(first as u32).to_le_bytes());
         bytes[4..].copy_from_slice(&(second as u32).to_le_bytes());
-        let copied = copy_memory(pid, if packet { r.r10 } else { r.rdi }, &mut bytes, true);
+        let copied = copy_memory(
+            pid,
+            if pair.is_some() { r.r10 } else { r.rdi },
+            &mut bytes,
+            true,
+        );
         if copied != Ok(8) {
             backends.channels.release(handles[0]);
             backends.channels.release(handles[1]);
@@ -1270,11 +1280,9 @@ impl DescriptorTable {
         }
         let public_fd = r.rdi as u32;
         let network = matches!(entry.handle, Handle::Owned(h) if crate::network_hooks::LaunchNetwork::owns(h));
-        let packet = matches!(entry.handle, Handle::Owned(h) if backends.channels.is_socket(h));
-        if matches!(r.orig_rax, 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55)
-            && !network
-            && !(packet && matches!(r.orig_rax, 44 | 45))
-        {
+        // Local pair endpoints answer socket calls through their channel owner.
+        let socket = matches!(entry.handle, Handle::Owned(h) if backends.channels.is_socket(h));
+        if matches!(r.orig_rax, 42 | 44 | 45 | 48 | 51 | 52 | 54 | 55) && !network && !socket {
             return Err(-88);
         }
         if network

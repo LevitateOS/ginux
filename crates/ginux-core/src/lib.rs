@@ -493,9 +493,223 @@ pub const fn thread_signal(signal: u64, own_process: bool, default_stop: bool) -
     ThreadSignal::Deliver
 }
 
+/// Record semantics of a configured local socket pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalSocketKind {
+    /// `SOCK_STREAM`: an ordered byte stream in each direction.
+    Stream,
+    /// `SOCK_SEQPACKET`: ordered records whose boundaries are preserved.
+    SequencedPacket,
+}
+
+impl LocalSocketKind {
+    /// The `SO_TYPE` value Linux reports for this kind.
+    pub const fn socket_type(self) -> i32 {
+        match self {
+            LocalSocketKind::Stream => 1,
+            LocalSocketKind::SequencedPacket => 5,
+        }
+    }
+}
+
+/// An admitted `socketpair` request: two connected, unnamed endpoints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalSocketPair {
+    pub kind: LocalSocketKind,
+    pub cloexec: bool,
+    pub nonblock: bool,
+}
+
+/// Decide `socketpair(family, type, protocol)` for a supervisor-owned pair.
+/// Only `AF_UNIX` with `SOCK_STREAM` or `SOCK_SEQPACKET` (optionally with
+/// `SOCK_CLOEXEC` and `SOCK_NONBLOCK`) and protocol 0 or `PF_UNIX` qualify.
+/// Such a pair has no name, binds and connects nothing and carries no
+/// descriptors, so it grants no network or filesystem naming authority.
+/// Every other family, type, flag or protocol, including `SOCK_DGRAM`, is
+/// EOPNOTSUPP; arguments are compared at full register width, as configured
+/// `pipe2` compares its flags.
+pub const fn local_socket_pair(
+    family: u64,
+    kind: u64,
+    protocol: u64,
+) -> Result<LocalSocketPair, i64> {
+    const AF_UNIX: u64 = 1;
+    const SOCK_NONBLOCK: u64 = 0o4000;
+    const SOCK_CLOEXEC: u64 = 0o2000000;
+    if family != AF_UNIX || !matches!(protocol, 0 | 1) {
+        return Err(-95);
+    }
+    let kind_only = match kind & !(SOCK_CLOEXEC | SOCK_NONBLOCK) {
+        1 => LocalSocketKind::Stream,
+        5 => LocalSocketKind::SequencedPacket,
+        _ => return Err(-95),
+    };
+    Ok(LocalSocketPair {
+        kind: kind_only,
+        cloexec: kind & SOCK_CLOEXEC != 0,
+        nonblock: kind & SOCK_NONBLOCK != 0,
+    })
+}
+
+/// Directions a local socket `shutdown(how)` closes, as
+/// `(receive, send)` from the caller's endpoint. Linux applies the mirrored
+/// state to the connected peer: a closed send direction is the peer's
+/// end-of-file, and a closed receive direction makes the peer's writes EPIPE.
+pub const fn local_socket_shutdown(how: u64) -> Result<(bool, bool), i64> {
+    match how {
+        0 => Ok((true, false)),
+        1 => Ok((false, true)),
+        2 => Ok((true, true)),
+        _ => Err(-22),
+    }
+}
+
+/// The `getsockopt` value of a local socket pair endpoint. Only identity and
+/// state queries are answered; credentials (`SO_PEERCRED`) and every other
+/// option are ENOPROTOOPT, and levels other than `SOL_SOCKET` EOPNOTSUPP.
+pub const fn local_socket_option(
+    level: u64,
+    name: u64,
+    kind: LocalSocketKind,
+    buffer: usize,
+) -> Result<i32, i64> {
+    if level != 1 {
+        return Err(-95);
+    }
+    match name {
+        // SO_TYPE
+        3 => Ok(kind.socket_type()),
+        // SO_ERROR, SO_ACCEPTCONN and SO_PROTOCOL
+        4 | 30 | 38 => Ok(0),
+        // SO_SNDBUF and SO_RCVBUF: the fixed per-direction bound
+        7 | 8 => Ok(buffer as i32),
+        // The socket family option: AF_UNIX
+        39 => Ok(1),
+        _ => Err(-92),
+    }
+}
+
+/// Validate a local socket pair `setsockopt`. Buffer-size requests
+/// (`SO_SNDBUF`, `SO_RCVBUF`) succeed without changing the fixed bound, as a
+/// clamped Linux request would; every other option is ENOPROTOOPT and other
+/// levels are EOPNOTSUPP. Linux rejects a value shorter than an int first.
+pub const fn local_socket_set_option(level: u64, name: u64, length: u64) -> Result<(), i64> {
+    if level != 1 {
+        return Err(-95);
+    }
+    // The kernel reads the length as an unsigned int.
+    if (length as u32) < 4 {
+        return Err(-22);
+    }
+    match name {
+        7 | 8 => Ok(()),
+        _ => Err(-92),
+    }
+}
+
+/// Linux poll readiness of a local socket endpoint. `inbound` bytes are
+/// queued for this endpoint; `read_closed` means the peer can no longer send
+/// (its endpoint closed or either side shut the direction down); `room` means
+/// a write can make progress; `write_closed` means this endpoint can no longer
+/// send. A closed receive direction is readable end-of-file with RDHUP, both
+/// closed directions are HUP, and a closed send direction stays writable so
+/// the next write reports EPIPE rather than hanging.
+pub const fn local_socket_readiness(
+    inbound: usize,
+    read_closed: bool,
+    room: bool,
+    write_closed: bool,
+) -> u16 {
+    const POLLIN: u16 = 0x1 | 0x40;
+    const POLLOUT: u16 = 0x4 | 0x100;
+    const POLLHUP: u16 = 0x10;
+    const POLLRDHUP: u16 = 0x2000;
+    (if inbound != 0 || read_closed {
+        POLLIN
+    } else {
+        0
+    }) | (if room || write_closed { POLLOUT } else { 0 })
+        | (if read_closed { POLLRDHUP } else { 0 })
+        | (if read_closed && write_closed {
+            POLLHUP
+        } else {
+            0
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_socket_pair_admits_only_unnamed_unix_streams_and_packets() {
+        let stream = local_socket_pair(1, 1 | 0o2000000, 0).unwrap();
+        assert_eq!(stream.kind, LocalSocketKind::Stream);
+        assert!(stream.cloexec && !stream.nonblock);
+        let packet = local_socket_pair(1, 5 | 0o4000, 1).unwrap();
+        assert_eq!(packet.kind, LocalSocketKind::SequencedPacket);
+        assert!(!packet.cloexec && packet.nonblock);
+        assert_eq!(local_socket_pair(1, 1, 0).unwrap().kind.socket_type(), 1);
+        assert_eq!(packet.kind.socket_type(), 5);
+        // Other families keep EOPNOTSUPP, including inet and netlink.
+        for family in [0, 2, 10, 16, 1 << 32 | 1] {
+            assert_eq!(local_socket_pair(family, 1, 0), Err(-95));
+        }
+        // Datagrams, raw and unknown types, unknown flags and protocols.
+        for kind in [0, 2, 3, 4, 6, 10, 1 | 0o40, 1 | 1 << 32] {
+            assert_eq!(local_socket_pair(1, kind, 0), Err(-95));
+        }
+        for protocol in [2, 6, 17, 1 << 32] {
+            assert_eq!(local_socket_pair(1, 1, protocol), Err(-95));
+        }
+    }
+
+    #[test]
+    fn local_socket_shutdown_maps_linux_modes() {
+        assert_eq!(local_socket_shutdown(0), Ok((true, false)));
+        assert_eq!(local_socket_shutdown(1), Ok((false, true)));
+        assert_eq!(local_socket_shutdown(2), Ok((true, true)));
+        for how in [3, u64::MAX, 1 << 32] {
+            assert_eq!(local_socket_shutdown(how), Err(-22));
+        }
+    }
+
+    #[test]
+    fn local_socket_options_answer_identity_only() {
+        let stream = LocalSocketKind::Stream;
+        assert_eq!(local_socket_option(1, 3, stream, 65536), Ok(1));
+        assert_eq!(
+            local_socket_option(1, 3, LocalSocketKind::SequencedPacket, 65536),
+            Ok(5)
+        );
+        assert_eq!(local_socket_option(1, 39, stream, 65536), Ok(1));
+        for name in [4, 30, 38] {
+            assert_eq!(local_socket_option(1, name, stream, 65536), Ok(0));
+        }
+        assert_eq!(local_socket_option(1, 7, stream, 65536), Ok(65536));
+        // SO_PEERCRED, SO_PEERSEC, SO_PASSCRED and unknown options.
+        for name in [17, 31, 16, 999] {
+            assert_eq!(local_socket_option(1, name, stream, 65536), Err(-92));
+        }
+        assert_eq!(local_socket_option(0, 3, stream, 65536), Err(-95));
+        assert_eq!(local_socket_set_option(1, 7, 4), Ok(()));
+        assert_eq!(local_socket_set_option(1, 8, 8), Ok(()));
+        assert_eq!(local_socket_set_option(1, 8, 3), Err(-22));
+        assert_eq!(local_socket_set_option(1, 8, 1 << 32 | 2), Err(-22));
+        assert_eq!(local_socket_set_option(1, 16, 4), Err(-92));
+        assert_eq!(local_socket_set_option(6, 1, 4), Err(-95));
+    }
+
+    #[test]
+    fn local_socket_readiness_follows_linux_unix_poll() {
+        assert_eq!(local_socket_readiness(0, false, true, false), 0x104);
+        assert_eq!(local_socket_readiness(3, false, false, false), 0x41);
+        // Peer shut its sending side: readable EOF with RDHUP, not HUP.
+        assert_eq!(local_socket_readiness(0, true, true, false), 0x2145);
+        // Peer gone: every direction closed, still writable for EPIPE.
+        assert_eq!(local_socket_readiness(0, true, false, true), 0x2155);
+        assert_eq!(local_socket_readiness(0, false, false, true), 0x104);
+    }
 
     #[test]
     fn legacy_stat_calls_are_their_newfstatat_form() {

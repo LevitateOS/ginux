@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run real configured-launch anonymous pipe checks against existing artifacts."""
+"""Run real configured-launch anonymous pipe and local socket pair checks."""
 import json
 import os
 from pathlib import Path
@@ -21,8 +21,10 @@ def main():
         root = work / 'root'
         (root / 'bin').mkdir(parents=True)
         (root / 'work').mkdir()
-        shutil.copyfile(fixture, root / 'bin/fixture')
-        (root / 'bin/fixture').chmod(0o755)
+        # The fixture acts as a static echo when executed as /bin/echo.
+        for name in ('bin/fixture', 'bin/echo'):
+            shutil.copyfile(fixture, root / name)
+            (root / name).chmod(0o755)
         counter = 0
 
         def invoke(args=(), *, assigned=False, sig=None, park=False):
@@ -87,10 +89,14 @@ def main():
         invoke(assigned=True)
         invoke(["packet"], assigned=True)
         invoke(['sigpipe'], sig=signal.SIGPIPE)
+        invoke(['socket-stream'])
+        invoke(['socket-spawn'])
+        invoke(['socket-sigpipe'], sig=signal.SIGPIPE)
         invoke(['blocked-read'], sig=signal.SIGKILL, park=True)
         invoke(['write-full'], sig=signal.SIGKILL, park=True)
         invoke()  # Fresh launch: no live pipe state or buffered bytes.
-        print('test-launch-pipes: PASS (data, atomicity, copyout, aliases, EOF, bounds, blocking, SIGPIPE)')
+        print('test-launch-pipes: PASS (data, atomicity, copyout, aliases, EOF, bounds, blocking, SIGPIPE,'
+              ' socket pairs, spawn capture)')
 
 
 if __name__ == '__main__':

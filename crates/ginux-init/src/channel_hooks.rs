@@ -36,6 +36,9 @@ struct Pipe {
     live: bool,
     event: Event,
     packet: bool,
+    // A local socket shutdown closed this direction: writes get EPIPE and the
+    // reader sees end-of-file once buffered bytes are consumed.
+    shut: bool,
     data: [u8; CAPACITY],
     head: usize,
     len: usize,
@@ -52,6 +55,7 @@ impl Pipe {
             live: false,
             event: Event::None,
             packet: false,
+            shut: false,
             data: [0; CAPACITY],
             head: 0,
             len: 0,
@@ -169,8 +173,14 @@ impl LaunchChannels {
                 | 20
                 | 32
                 | 33
+                | 42
                 | 44
                 | 45
+                | 48
+                | 51
+                | 52
+                | 54
+                | 55
                 | 72
                 | 74
                 | 75
@@ -184,6 +194,13 @@ impl LaunchChannels {
             Ok(entry) => entry,
             Err(error) => return Some(ChannelResult::Ready(error)),
         };
+        if matches!(r.orig_rax, 42 | 48 | 51 | 52 | 54 | 55) {
+            let result = match entry.peer {
+                Some(peer) => self.socket_control(pid, entry, peer, r),
+                None => Err(-88),
+            };
+            return Some(ChannelResult::Ready(result.unwrap_or_else(|e| e)));
+        }
         if matches!(r.orig_rax, 0 | 1 | 19 | 20 | 44 | 45) {
             if !matches!(self.pipes[entry.pipe].event, Event::None) {
                 return Some(
@@ -236,11 +253,13 @@ impl LaunchChannels {
                     _ => Err(-14),
                 }
             }
+            // FIONREAD: queued bytes; a packet socket sums its queued
+            // payloads, as Linux SIOCINQ does.
             16 if r.rsi == 0x541b
                 && matches!(self.pipes[entry.pipe].event, Event::None)
-                && !self.pipes[entry.pipe].packet =>
+                && (entry.peer.is_some() || !self.pipes[entry.pipe].packet) =>
             {
-                let mut bytes = (self.pipes[entry.pipe].len as i32).to_ne_bytes();
+                let mut bytes = (self.queued(entry.pipe) as i32).to_ne_bytes();
                 match copy_memory(pid, r.rdx, &mut bytes, true) {
                     Ok(4) => Ok(0),
                     _ => Err(-14),
@@ -259,7 +278,11 @@ impl LaunchChannels {
                     self.set_flags(slot, flags);
                     Ok(0)
                 }
-                1032 if !matches!(self.pipes[entry.pipe].event, Event::None) => Err(-9),
+                1032 if !matches!(self.pipes[entry.pipe].event, Event::None)
+                    || entry.peer.is_some() =>
+                {
+                    Err(-9)
+                }
                 1032 => Ok(CAPACITY as i64),
                 _ => Err(-95),
             },
@@ -308,6 +331,7 @@ impl LaunchChannels {
         p.live = true;
         p.event = Event::None;
         p.packet = false;
+        p.shut = false;
         p.head = 0;
         p.len = 0;
         p.readers = 1;
@@ -330,9 +354,11 @@ impl LaunchChannels {
         Ok([PIPE_FD_BASE + first as u32, PIPE_FD_BASE + second as u32])
     }
 
-    /// Connected local sequenced-packet endpoints: no names, networking,
-    /// descriptor transfer, or native workload sockets are involved.
-    pub fn allocate_packet_pair(&mut self, flags: u64) -> Result<[u32; 2], i64> {
+    /// Connected local socket endpoints, one bounded buffer per direction:
+    /// no names, networking, descriptor transfer, or native workload sockets
+    /// are involved. `packet` preserves record boundaries (`SOCK_SEQPACKET`);
+    /// otherwise each direction is a byte stream (`SOCK_STREAM`).
+    pub fn allocate_socket_pair(&mut self, flags: u64, packet: bool) -> Result<[u32; 2], i64> {
         let first = self.allocate(flags)?;
         let second = match self.allocate(flags) {
             Ok(pair) => pair,
@@ -354,7 +380,7 @@ impl LaunchChannels {
         self.descriptors[(first[1] - PIPE_FD_BASE) as usize] = None;
         self.descriptors[(second[1] - PIPE_FD_BASE) as usize] = None;
         for index in [pa, pb] {
-            self.pipes[index].packet = true;
+            self.pipes[index].packet = packet;
         }
         Ok([first[0], second[0]])
     }
@@ -394,6 +420,7 @@ impl LaunchChannels {
             pipe.live = true;
             pipe.event = Event::None;
             pipe.packet = false;
+            pipe.shut = false;
             pipe.head = 0;
             pipe.len = 0;
             pipe.readers = 0;
@@ -469,6 +496,7 @@ impl LaunchChannels {
         object.live = true;
         object.event = event;
         object.packet = false;
+        object.shut = false;
         object.head = 0;
         object.len = 0;
         object.readers = 1;
@@ -569,12 +597,15 @@ impl LaunchChannels {
         }
         if let Some(peer) = entry.peer {
             let output = &self.pipes[peer];
-            return Some(
-                (if pipe.len != 0 { 0x41 } else { 0 })
-                    | (if CAPACITY - output.len >= 2 { 0x104 } else { 0 })
-                    | (if pipe.writers == 0 { 16 } else { 0 })
-                    | (if output.readers == 0 { 8 } else { 0 }),
-            );
+            // A stream write of up to IO_SIZE bytes is placed whole, so
+            // writability promises that much room; a record needs its header.
+            let room = if output.packet { 2 } else { IO_SIZE };
+            return Some(ginux_core::local_socket_readiness(
+                pipe.len,
+                pipe.writers == 0 || pipe.shut,
+                CAPACITY - output.len >= room,
+                output.readers == 0 || output.shut,
+            ));
         }
         let mut events = 0;
         if entry.writable() {
@@ -597,6 +628,103 @@ impl LaunchChannels {
             .and_then(|slot| self.descriptors.get(slot as usize))
             .and_then(|entry| *entry)
             .is_some_and(|entry| entry.peer.is_some())
+    }
+
+    /// Bytes a reader of this direction may still receive. Packet buffers
+    /// hold a two-byte length before each record; only payload counts.
+    fn queued(&self, index: usize) -> usize {
+        let pipe = &self.pipes[index];
+        if !pipe.packet {
+            return pipe.len;
+        }
+        let (mut offset, mut total) = (0, 0);
+        while offset < pipe.len {
+            let at = |i: usize| pipe.data[(pipe.head + offset + i) % CAPACITY];
+            let length = u16::from_le_bytes([at(0), at(1)]) as usize;
+            total += length;
+            offset += 2 + length;
+        }
+        total
+    }
+
+    /// Socket calls on a connected local pair endpoint. The pair has no name
+    /// and is already connected, so nothing here resolves, binds or connects
+    /// an address; peer credentials are never disclosed.
+    fn socket_control(
+        &mut self,
+        pid: usize,
+        entry: PipeFd,
+        peer: usize,
+        r: &UserRegs,
+    ) -> Result<i64, i64> {
+        let kind = if self.pipes[peer].packet {
+            ginux_core::LocalSocketKind::SequencedPacket
+        } else {
+            ginux_core::LocalSocketKind::Stream
+        };
+        let length = |address: u64| -> Result<i32, i64> {
+            let mut bytes = [0u8; 4];
+            match copy_memory(pid, address, &mut bytes, false) {
+                Ok(4) => Ok(i32::from_ne_bytes(bytes)),
+                _ => Err(-14),
+            }
+        };
+        let put_length = |address: u64, value: i32| -> Result<i64, i64> {
+            match copy_memory(pid, address, &mut value.to_ne_bytes(), true) {
+                Ok(4) => Ok(0),
+                _ => Err(-14),
+            }
+        };
+        match r.orig_rax {
+            // A pair is connected at creation; the address is never read.
+            42 => Err(-106),
+            48 => {
+                let (receive, send) = ginux_core::local_socket_shutdown(r.rsi)?;
+                if receive {
+                    self.pipes[entry.pipe].shut = true;
+                }
+                if send {
+                    self.pipes[peer].shut = true;
+                }
+                Ok(0)
+            }
+            // getsockname/getpeername: both endpoints are unnamed AF_UNIX
+            // sockets, reported as a bare two-byte family.
+            51 | 52 => {
+                let requested = length(r.rdx)?;
+                if requested < 0 {
+                    return Err(-22);
+                }
+                let mut family = 1u16.to_ne_bytes();
+                let count = (requested as usize).min(family.len());
+                if copy_memory(pid, r.rsi, &mut family[..count], true) != Ok(count as i64) {
+                    return Err(-14);
+                }
+                put_length(r.rdx, family.len() as i32)
+            }
+            54 => {
+                // Linux copies the int before it looks at the option name.
+                let checked = ginux_core::local_socket_set_option(r.rsi, r.rdx, r.r8);
+                if matches!(checked, Ok(()) | Err(-92)) {
+                    length(r.r10)?;
+                }
+                checked.map(|()| 0)
+            }
+            55 => {
+                let requested = length(r.r8)?;
+                if requested < 0 {
+                    return Err(-22);
+                }
+                let value = ginux_core::local_socket_option(r.rsi, r.rdx, kind, CAPACITY)?;
+                let mut bytes = value.to_ne_bytes();
+                let count = (requested as usize).min(bytes.len());
+                if copy_memory(pid, r.r10, &mut bytes[..count], true) != Ok(count as i64) {
+                    return Err(-14);
+                }
+                put_length(r.r8, count as i32)
+            }
+            _ => Err(-95),
+        }
     }
 
     fn entry(&self, slot: usize) -> Result<PipeFd, i64> {
@@ -733,12 +861,21 @@ impl LaunchChannels {
         progress: &mut WriteProgress,
     ) -> Result<ChannelResult, i64> {
         let writing = matches!(r.orig_rax, 1 | 20 | 44);
+        let pipe = if writing {
+            entry.peer.unwrap_or(entry.pipe)
+        } else {
+            entry.pipe
+        };
+        let socket = entry.peer.is_some();
+        let packet = self.pipes[pipe].packet;
         // The current blocking write retains its admitted mode and vector
         // layout while another task can change the shared endpoint flags.
         let nonblock = progress.vectors.is_none()
             && (self.flags(entry) & NONBLOCK != 0
                 || matches!(r.orig_rax, 44 | 45) && r.r10 & 0x40 != 0);
-        let complete_write = writing && !nonblock && entry.peer.is_none();
+        // Pipes and stream sockets complete a blocking write; a record is
+        // placed whole or not at all.
+        let complete_write = writing && !nonblock && !packet;
         let vectors = if let Some(vectors) = progress.vectors.take() {
             vectors
         } else if matches!(r.orig_rax, 19 | 20) {
@@ -755,22 +892,23 @@ impl LaunchChannels {
         if (writing && !entry.writable()) || (!writing && !entry.readable()) {
             return Err(-9);
         }
-        if requested == 0 && entry.peer.is_none() {
+        // An empty request transfers nothing. An empty record is still a
+        // record, and a stream socket write first reports a closed peer.
+        if requested == 0 && !packet && !(socket && writing) {
             return Ok(ChannelResult::Ready(0));
         }
         let fd = PIPE_FD_BASE + slot as u32;
         let mut buffer = [0u8; IO_SIZE];
-        let pipe = if writing {
-            entry.peer.unwrap_or(entry.pipe)
-        } else {
-            entry.pipe
-        };
         let p = &mut self.pipes[pipe];
         if writing {
-            if p.readers == 0 {
+            if p.readers == 0 || p.shut {
                 // Deliver the ordinary SIGPIPE to this supervised caller, not
                 // to the supervisor. Its disposition determines the outcome.
-                if r.orig_rax != 44 || r.r10 & 0x4000 == 0 {
+                // A stream socket that already sent part of the request
+                // returns that count without a signal, as Linux does.
+                if (r.orig_rax != 44 || r.r10 & 0x4000 == 0)
+                    && !(socket && !packet && progress.written != 0)
+                {
                     // kill(2) is process-directed even when pid is a host TID.
                     // The host thread-group ID prevents TID-reuse misdelivery.
                     let _ = unsafe { syscall3(SYS_TGKILL, signal_tgid, pid, 13) };
@@ -837,7 +975,7 @@ impl LaunchChannels {
             }
         } else {
             if p.len == 0 {
-                return Ok(if p.writers == 0 {
+                return Ok(if p.writers == 0 || p.shut {
                     ChannelResult::Ready(0)
                 } else if nonblock {
                     ChannelResult::Ready(-11)
@@ -888,7 +1026,7 @@ impl LaunchChannels {
                 mode: if event {
                     0o600
                 } else if socket {
-                    0o140600
+                    0o140777
                 } else {
                     0o10600
                 },

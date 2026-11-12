@@ -1,4 +1,5 @@
-/* Real configured-launch anonymous pipe checks. No native pipe descriptors. */
+/* Real configured-launch anonymous pipe and local socket pair checks. No native
+   pipe or socket descriptors. */
 typedef unsigned long word;
 static long call(long n, word a, word b, word c, word d, word e, word f)
 {
@@ -108,11 +109,184 @@ static long ordinary_blocking_large(void) {
     }
     return 0;
 }
+/* Local socket pairs: SOCK_STREAM byte streams, both directions. */
+struct __attribute__((packed)) epoll_event_x86 { unsigned events; unsigned long data; };
+static long socket_stream(void){
+    int sv[2],value=0,size=sizeof value;struct {int fd;short events,revents;} polled[2];
+    unsigned short family[4]={0};word vectors[4];
+    CHECK(call(53,1,1,0,(word)sv,0,0)==0 && sv[0]==3 && sv[1]==4,200);
+    CHECK(DO(72,sv[0],1,0)==0 && DO(72,sv[0],3,0)==2,201);
+    CHECK(DO(5,sv[0],meta,0)==0 && (*(unsigned int *)(meta+24)&0170000)==0140000,202);
+    CHECK((*(unsigned int *)(meta+24)&0777)==0777 && DO(8,sv[0],0,0)==-29,203);
+    CHECK(call(262,sv[1],(word)"",(word)meta,0x1000,0,0)==0 && (*(unsigned int *)(meta+24)&0170000)==0140000,204);
+    // Status flags: FIONBIO and F_SETFL share the open socket's O_NONBLOCK.
+    value=1;CHECK(DO(16,sv[0],0x5421,&value)==0 && DO(72,sv[0],3,0)==04002,205);
+    CHECK(DO(72,sv[0],4,0)==0 && DO(72,sv[0],3,0)==2,206);
+    CHECK(DO(72,sv[0],4,04000)==0 && DO(72,sv[1],4,04000)==0,207);
+    CHECK(DO(0,sv[0],buffer,8)==-11 && DO(0,sv[1],buffer,8)==-11,208);
+    CHECK(DO(72,sv[0],1032,0)==-9 && DO(16,sv[0],0x5401,meta)==-25,209);
+    // Identity without names or credentials.
+    CHECK(call(55,sv[0],1,3,(word)&value,(word)&size,0)==0 && value==1 && size==4,210);
+    size=4;CHECK(call(55,sv[1],1,39,(word)&value,(word)&size,0)==0 && value==1,211);
+    size=4;CHECK(call(55,sv[1],1,4,(word)&value,(word)&size,0)==0 && value==0,212);
+    size=4;CHECK(call(55,sv[1],1,17,(word)meta,(word)&size,0)==-92,213);
+    value=65536;CHECK(call(54,sv[0],1,7,(word)&value,4,0)==0 && call(54,sv[0],1,8,(word)&value,4,0)==0,214);
+    CHECK(call(54,sv[0],1,7,(word)&value,2,0)==-22 && call(54,sv[0],1,16,(word)&value,4,0)==-92,215);
+    size=sizeof family;CHECK(call(51,sv[0],(word)family,(word)&size,0,0,0)==0 && family[0]==1 && size==2,216);
+    size=sizeof family;CHECK(call(52,sv[1],(word)family,(word)&size,0,0,0)==0 && family[0]==1 && size==2,217);
+    CHECK(call(42,sv[0],(word)family,2,0,0,0)==-106,218);
+    // Both directions carry bytes; reads ignore write boundaries.
+    CHECK(DO(1,sv[0],"hello",5)==5 && DO(1,sv[1],"world!",6)==6,219);
+    CHECK(DO(16,sv[1],0x541b,&value)==0 && value==5 && DO(16,sv[0],0x541b,&value)==0 && value==6,220);
+    polled[0].fd=sv[0];polled[0].events=5;polled[0].revents=0;polled[1].fd=sv[1];polled[1].events=1;polled[1].revents=0;
+    CHECK(DO(7,polled,2,0)==2 && polled[0].revents==5 && polled[1].revents==1,221);
+    CHECK(DO(0,sv[1],buffer,3)==3 && buffer[0]=='h' && buffer[2]=='l',222);
+    CHECK(DO(1,sv[0],"ab",2)==2 && DO(0,sv[1],buffer,16)==4 && buffer[0]=='l' && buffer[1]=='o' && buffer[3]=='b',223);
+    CHECK(DO(0,sv[0],buffer,16)==6 && buffer[5]=='!',224);
+    CHECK(call(44,sv[0],(word)"xy",2,0x4000,0,0)==2 && call(45,sv[1],(word)buffer,8,0x40,0,0)==2 && buffer[1]=='y',225);
+    CHECK(call(44,sv[0],(word)"xy",2,0,(word)family,2)==-95 && call(45,sv[1],(word)buffer,8,2,0,0)==-95,226);
+    vectors[0]=(word)"vec";vectors[1]=3;vectors[2]=(word)"tor";vectors[3]=3;
+    CHECK(DO(20,sv[1],vectors,2)==6,227);
+    vectors[0]=(word)buffer;vectors[1]=2;vectors[2]=(word)(buffer+2);vectors[3]=8;
+    CHECK(DO(19,sv[0],vectors,2)==6 && buffer[0]=='v' && buffer[5]=='r',228);
+    CHECK(DO(1,sv[0],buffer,0)==0 && DO(0,sv[1],buffer,0)==0,229);
+    // Bounded: a full direction is EAGAIN and not writable until drained.
+    for(word i=0;i<sizeof data;++i) data[i]=(char)(i%251);
+    word filled=0;
+    for(;;){long n=DO(1,sv[1],data+filled%4096,4096);if(n==-11)break;CHECK(n==4096,230);filled+=4096;}
+    CHECK(filled==65536 && DO(1,sv[1],data,1)==-11,231);
+    polled[0].fd=sv[1];polled[0].events=4;polled[0].revents=0;
+    CHECK(DO(7,polled,1,0)==0,232);
+    CHECK(DO(16,sv[0],0x541b,&value)==0 && value==65536,233);
+    CHECK(DO(0,sv[0],buffer,4096)==4096 && buffer[1]==data[1],234);
+    polled[0].revents=0;CHECK(DO(7,polled,1,0)==1 && polled[0].revents==4,235);
+    while(DO(0,sv[0],buffer,4096)>0){}
+    // shutdown(SHUT_WR): the peer drains then reads EOF with RDHUP but no HUP;
+    // the reverse direction keeps working and the shut side gets EPIPE.
+    CHECK(DO(1,sv[0],"tail",4)==4 && DO(48,sv[0],1,0)==0 && DO(48,sv[0],3,0)==-22,236);
+    polled[0].fd=sv[1];polled[0].events=0x2001;polled[0].revents=0;
+    CHECK(DO(7,polled,1,0)==1 && polled[0].revents==0x2001,237);
+    CHECK(DO(0,sv[1],buffer,8)==4 && buffer[0]=='t' && DO(0,sv[1],buffer,8)==0,238);
+    CHECK(call(44,sv[0],(word)"x",1,0x4000,0,0)==-32 && call(44,sv[0],(word)"",0,0x4000,0,0)==-32,239);
+    CHECK(DO(1,sv[1],"back",4)==4 && DO(0,sv[0],buffer,8)==4 && buffer[0]=='b',240);
+    // Closing the peer everywhere: EOF after buffered bytes, HUP, EPIPE.
+    long alias=DO(32,sv[1],0,0);CHECK(alias==5,241);
+    CHECK(DO(1,alias,"last",4)==4 && DO(3,sv[1],0,0)==0 && DO(0,sv[0],buffer,1)==1,242);
+    CHECK(DO(3,alias,0,0)==0,243);
+    polled[0].fd=sv[0];polled[0].events=1;polled[0].revents=0;
+    CHECK(DO(7,polled,1,0)==1 && polled[0].revents==17,244);
+    CHECK(DO(0,sv[0],buffer,8)==3 && buffer[0]=='a' && DO(0,sv[0],buffer,8)==0,245);
+    CHECK(call(44,sv[0],(word)"x",1,0x4000,0,0)==-32,246);
+    CHECK(DO(3,sv[0],0,0)==0,247);
+    // A blocking stream write larger than the buffer completes through a
+    // forked peer; the reader sees every byte then EOF.
+    static char large[196733];
+    for(word i=0;i<sizeof(large);++i) large[i]=(char)(i%253);
+    CHECK(call(53,1,1|02000000,0,(word)sv,0,0)==0 && DO(72,sv[0],1,0)==1,248);
+    long child=DO(57,0,0,0);CHECK(child>=0,249);
+    if(child==0){
+        CHECK(DO(3,sv[0],0,0)==0,250);
+        long n=DO(1,sv[1],large,sizeof(large));
+        DO(60,n==(long)sizeof(large) && DO(0,sv[1],buffer,8)==2 && buffer[0]=='o'?0:251,0,0);__builtin_unreachable();
+    }
+    CHECK(DO(3,sv[1],0,0)==0,252);
+    word received=0;
+    while(received<sizeof(large)){
+        long n=DO(0,sv[0],buffer,sizeof(buffer));CHECK(n>0,253);
+        for(long i=0;i<n;++i)CHECK(buffer[i]==large[received+(word)i],254);
+        received+=(word)n;
+    }
+    CHECK(DO(1,sv[0],"ok",2)==2,255);
+    int status=-1;CHECK(DO(61,child,&status,0)==child && status==0,256);
+    CHECK(DO(0,sv[0],buffer,8)==0 && DO(3,sv[0],0,0)==0,257);
+    // Sequenced packets keep boundaries; FIONREAD sums queued payloads.
+    CHECK(call(53,1,5,0,(word)sv,0,0)==0,258);
+    CHECK(DO(1,sv[0],"abc",3)==3 && DO(1,sv[0],"de",2)==2,259);
+    CHECK(DO(16,sv[1],0x541b,&value)==0 && value==5,260);
+    size=4;CHECK(call(55,sv[1],1,3,(word)&value,(word)&size,0)==0 && value==5,261);
+    CHECK(DO(48,sv[0],1,0)==0 && DO(0,sv[1],buffer,8)==3 && DO(0,sv[1],buffer,8)==2 && DO(0,sv[1],buffer,8)==0,262);
+    CHECK(DO(3,sv[0],0,0)==0 && DO(3,sv[1],0,0)==0,263);
+    // Pipes, FIFOs and counters are not sockets.
+    int pair[2];CHECK(DO(293,pair,0,0)==0,264);
+    CHECK(DO(48,pair[0],1,0)==-88 && call(55,pair[0],1,3,(word)&value,(word)&size,0)==-88,265);
+    CHECK(DO(3,pair[0],0,0)==0 && DO(3,pair[1],0,0)==0,266);
+    // Released pairs return their buffers to the bounded pool.
+    for(int i=0;i<40;++i){CHECK(call(53,1,1,0,(word)sv,0,0)==0,267);CHECK(DO(3,sv[0],0,0)==0 && DO(3,sv[1],0,0)==0,268);}
+    return 0;
+}
+/* What libuv's uv_spawn does for a captured stdout: a CLOEXEC stream pair,
+   buffer-size hints, a CLOEXEC error pipe, fork, dup2 onto stdout, blocking
+   stdout in the child, exec; the parent switches its end to FIONBIO and
+   epoll-reads until EOF, then waits. */
+static long socket_spawn(void){
+    int sv[2],errors[2],value,status=-1;
+    long epfd=DO(291,02000000,0,0);CHECK(epfd>=0,300);
+    CHECK(call(53,1,1|02000000,0,(word)sv,0,0)==0,301);
+    value=65536;
+    for(int i=0;i<2;++i)CHECK(call(54,sv[i],1,8,(word)&value,4,0)==0 && call(54,sv[i],1,7,(word)&value,4,0)==0,302);
+    CHECK(DO(293,errors,02000000,0)==0,303);
+    long child=DO(57,0,0,0);CHECK(child>=0,304);
+    if(child==0){
+        static const char *const argv[]={"/bin/echo","hello","from","socketpair",0};
+        static const char *const envp[]={0};
+        long fd=DO(33,sv[1],1,0);
+        if(fd==1){long flags=DO(72,1,3,0);if(flags>=0)DO(72,1,4,flags&~04000);}
+        int error=-(int)DO(59,argv[0],argv,envp);
+        DO(1,errors[1],&error,sizeof error);
+        DO(60,127,0,0);__builtin_unreachable();
+    }
+    CHECK(DO(3,sv[1],0,0)==0 && DO(3,errors[1],0,0)==0,305);
+    value=1;CHECK(DO(16,sv[0],0x5421,&value)==0,306);
+    CHECK(DO(0,errors[0],&value,sizeof value)==0 && DO(3,errors[0],0,0)==0,307);
+    struct epoll_event_x86 event={1,0x1234567890abcdefUL},ready[4];
+    CHECK(call(233,epfd,1,sv[0],(word)&event,0,0)==0,308);
+    word received=0;
+    for(;;){
+        long n=call(232,epfd,(word)ready,4,-1,0,0);CHECK(n==1 && ready[0].data==0x1234567890abcdefUL,309);
+        int eof=0;
+        for(;;){
+            long got=DO(0,sv[0],buffer+received,sizeof(buffer)-received);
+            if(got==-11)break;
+            CHECK(got>=0,310);
+            if(got==0){eof=1;break;}
+            received+=(word)got;
+        }
+        if(eof)break;
+    }
+    CHECK(DO(61,child,&status,0)==child && status==0,311);
+    static const char expected[]="hello from socketpair\n";
+    CHECK(received==sizeof(expected)-1,312);
+    for(word i=0;i<received;++i)CHECK(buffer[i]==expected[i],313);
+    CHECK(call(233,epfd,2,sv[0],0,0,0)==0 && DO(3,sv[0],0,0)==0 && DO(3,epfd,0,0)==0,314);
+    return 0;
+}
+/* A static echo stand-in for exec targets in this fixture's root. */
+static long echo(word argc,char **argv){
+    word length=0;
+    for(word i=1;i<argc;++i){
+        for(const char *c=argv[i];*c && length<sizeof(buffer)-2;++c)buffer[length++]=*c;
+        if(i+1<argc)buffer[length++]=' ';
+    }
+    buffer[length++]='\n';
+    return DO(1,1,buffer,length)==(long)length?0:1;
+}
 long pipe_main(word *stack)
 {
     word argc = *stack;
     char **argv = (char **)(stack + 1);
     int pair[2];
+    const char *self=argv[0];while(*self)++self;
+    if(self-argv[0]>=4 && named(self-4,"echo")) return echo(argc,argv);
+    if(argc>1 && (named(argv[1],"socket-stream") || named(argv[1],"socket-spawn"))) {
+        long result=named(argv[1],"socket-stream")?socket_stream():socket_spawn();
+        if(result)return result;
+        DO(1,1,"owned-pipes: PASS\n",18);return 0;
+    }
+    if(argc>1 && named(argv[1],"socket-sigpipe")) {
+        CHECK(call(53,1,1,0,(word)pair,0,0)==0 && DO(3,pair[1],0,0)==0,320);
+        DO(1,pair[0],data,1);
+        return 321; // Default SIGPIPE must terminate the caller.
+    }
     if(argc>1 && named(argv[1],"ordinary-blocking-large")) {
         long result=ordinary_blocking_large();if(result)return result;
         DO(1,1,"owned-pipes: PASS\n",18);return 0;
@@ -126,7 +300,7 @@ long pipe_main(word *stack)
         int full=argv[1][0]=='p';
         if(full){
         CHECK(call(53,2,5,0,(word)pair,0,0)==-95,100);
-        CHECK(call(53,1,1,0,(word)pair,0,0)==-95,101);
+        CHECK(call(53,1,2,0,(word)pair,0,0)==-95,101);
         CHECK(call(53,1,5,0,1,0,0)==-14,102);
         }
         CHECK(call(53,1,5|02004000,0,(word)pair,0,0)==0,103);

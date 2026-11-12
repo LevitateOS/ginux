@@ -844,7 +844,7 @@ nonblocking waits, and vfork. The existing native fork fixture also runs. These
 checks do not claim complete libc, job-control, or systemd compatibility.
 
 Configured `poll` resolves at most 16 public descriptors through their existing
-owners: pipes, local packets, TCP, assigned memory files/null and inherited console aliases. Negative
+owners: pipes, local socket pairs, TCP, assigned memory files/null and inherited console aliases. Negative
 descriptors are ignored; closed descriptors report POLLNVAL. Image files remain
 unsupported for this operation. Error/hangup bits are reported independently of
 the requested mask. Zero through 300000 ms and negative infinite waits are
@@ -868,11 +868,38 @@ adjustment cannot extend a request beyond 300 seconds of monotonic time;
 that limit returns ETIMEDOUT. Invalid times or unsupported flags return EINVAL.
 This does not change native execution's clock policy or virtualize vDSO time.
 
-Configured local `AF_UNIX` / `SOCK_SEQPACKET` pairs consume two channel buffers
-and support duplex messages up to4096 bytes, aliases, nonblocking IO and poll.
-Messages preserve boundaries; a short receive discards the remaining message.
-Local socket names, descriptor transfer and socket shutdown are unsupported.
-FIONBIO changes the shared open status of owned pipe and packet endpoints,
+Configured `socketpair(AF_UNIX, SOCK_STREAM | SOCK_SEQPACKET, 0)`, with
+optional `SOCK_CLOEXEC` and `SOCK_NONBLOCK`, returns two connected endpoints
+owned by the supervisor. Each pair consumes two channel buffers, one per
+direction, from the pipe pool, so pipe bounds, quotas and lower operator
+limits apply; no host socket, name or descriptor transfer is involved, and
+creation needs no network grant. Other families and types, including
+`SOCK_DGRAM`, return EOPNOTSUPP.
+
+Read, write and their vector forms, `send`/`recv` (`sendto`/`recvfrom` with a
+null address and only `MSG_DONTWAIT`/`MSG_NOSIGNAL`), aliases, fork, exec with
+close-on-exec, poll, select and epoll behave as for pipes in both directions.
+Stream blocking writes complete across full-buffer waits; stream reads ignore
+write boundaries. Sequenced packets carry up to 4096 bytes, preserve
+boundaries, and a short receive discards the rest of the record. After the
+peer closes everywhere, reads return buffered bytes then end-of-file and
+writes return EPIPE with SIGPIPE unless `MSG_NOSIGNAL` is given. `shutdown`
+closes directions for both endpoints as Linux does: the peer of a closed send
+side drains then reads end-of-file with POLLRDHUP, writes into a closed
+direction return EPIPE, and POLLHUP needs both directions closed. FIONREAD
+reports queued bytes (summed payloads for packets), fstat reports a socket,
+and F_GETFL reports `O_RDWR` with the shared `O_NONBLOCK`.
+
+`getsockname`/`getpeername` report an unnamed `AF_UNIX` address. `getsockopt`
+answers `SO_TYPE`, the socket family option (`AF_UNIX`), `SO_PROTOCOL`, `SO_ERROR`,
+`SO_ACCEPTCONN` and the fixed 65536-byte `SO_SNDBUF`/`SO_RCVBUF`; peer
+credentials and other options return ENOPROTOOPT. `setsockopt` accepts buffer
+size requests without changing the bound and returns ENOPROTOOPT otherwise.
+`connect` returns EISCONN without reading the address. Every socket call is
+still decided by the contract first: a contract that denies `shutdown`,
+`getsockname` or `*sockopt` denies them on these endpoints too. Pipes, FIFOs
+and event objects return ENOTSOCK for socket calls.
+FIONBIO changes the shared open status of owned pipe and socket endpoints,
 preserving other status flags and each public descriptor's CLOEXEC flag.
 
 Configured launch accepts `--export-file <fresh tar path>` to retrieve owned
