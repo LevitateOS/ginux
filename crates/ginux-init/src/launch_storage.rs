@@ -121,6 +121,27 @@ pub struct LaunchFs {
     // Present only when the configuration enables archive import.
     imports: Option<MappedArray<ImportStream>>,
     archive_grants: ArchiveGrants,
+    /// The supervisor's syscall-entry count (`begin_entry`) and the path the
+    /// current entry's read-only path call resolved to, so the claim, the
+    /// descriptor owner and the native rewrite of one call resolve it once.
+    entry: core::cell::Cell<u64>,
+    resolved: core::cell::Cell<Option<ResolvedRequest>>,
+}
+
+/// One read-only path call's `request_path` answer, valid for the entry it
+/// was made in, for this tracee and these argument registers only.
+#[derive(Clone, Copy)]
+struct ResolvedRequest {
+    entry: u64,
+    pid: usize,
+    registers: [u64; 6],
+    answer: Result<Option<(u8, Path)>, i64>,
+}
+
+/// Path calls whose resolution has no effect: the stat family, readlink and
+/// the access checks. Only these reuse an answer within one entry.
+fn resolves_read_only(number: u64) -> bool {
+    matches!(number, 4 | 6 | 21 | 89 | 262 | 267 | 269 | 332 | 439)
 }
 
 impl LaunchFs {
@@ -234,6 +255,8 @@ impl LaunchFs {
             stack_snapshots: [false; 64],
             imports: None,
             archive_grants: ArchiveGrants([38; ARCHIVE_CALLS.len()]),
+            entry: core::cell::Cell::new(0),
+            resolved: core::cell::Cell::new(None),
             fs,
             byte_limit: limit,
             prefixes,
@@ -628,7 +651,7 @@ impl LaunchFs {
         self.statfs(pid, output, self.owns_path(resolved.as_bytes()))
     }
 
-    fn owns_path(&self, path: &[u8]) -> bool {
+    pub(crate) fn owns_path(&self, path: &[u8]) -> bool {
         self.prefixes[..self.count]
             .iter()
             .any(|p| within(path, p.as_bytes()))
@@ -741,7 +764,38 @@ impl LaunchFs {
         Ok(resolved)
     }
 
+    /// A new supervised syscall entry begins: nothing resolved before it is
+    /// reused.
+    pub(crate) fn begin_entry(&self) {
+        self.entry.set(self.entry.get().wrapping_add(1));
+        self.resolved.set(None);
+    }
+
+    /// `request_path_now`, reused within one entry for read-only path calls
+    /// (`resolves_read_only`): the tracee is stopped and resolving changes
+    /// nothing, so a second resolution of the same call can only repeat the
+    /// first, at the cost of every component's lookup again.
     pub(crate) fn request_path(&self, pid: usize, r: &UserRegs) -> Result<Option<(u8, Path)>, i64> {
+        if !resolves_read_only(r.orig_rax) {
+            return self.request_path_now(pid, r);
+        }
+        let registers = [r.orig_rax, r.rdi, r.rsi, r.rdx, r.r10, r.r8];
+        if let Some(saved) = self.resolved.get() {
+            if saved.entry == self.entry.get() && saved.pid == pid && saved.registers == registers {
+                return saved.answer;
+            }
+        }
+        let answer = self.request_path_now(pid, r);
+        self.resolved.set(Some(ResolvedRequest {
+            entry: self.entry.get(),
+            pid,
+            registers,
+            answer,
+        }));
+        answer
+    }
+
+    fn request_path_now(&self, pid: usize, r: &UserRegs) -> Result<Option<(u8, Path)>, i64> {
         if r.orig_rax == 452 {
             if r.r10 & !0x1100 != 0 {
                 return Err(-22);

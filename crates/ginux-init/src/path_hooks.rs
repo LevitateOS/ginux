@@ -3,7 +3,10 @@
 use crate::supervisor::{managed_host_identity, syscall1, syscall4, UserRegs};
 use crate::tracee_io::copy_memory;
 use ginux_vfs::{NodeKind, VfsError, MAX_PATH};
-pub struct ImageRoot(usize);
+/// The tracee's root (an `O_PATH` descriptor of `/proc/<pid>/root`) and the
+/// identity the workload runs as, read once per root rather than once per
+/// path component (`lookup` checks directory search permission with it).
+pub struct ImageRoot(usize, u32, u32);
 impl ImageRoot {
     pub fn new(pid: usize) -> Result<Self, i64> {
         let mut name = [0u8; 64];
@@ -35,7 +38,8 @@ impl ImageRoot {
         if fd < 0 {
             return Err(fd as i64);
         }
-        Ok(Self(fd as usize))
+        let identity = managed_host_identity();
+        Ok(Self(fd as usize, identity.uid as u32, identity.gid as u32))
     }
     /// Inspect only the kernel loader's interpreter metadata. The descriptor
     /// stays private and is closed on every return path.
@@ -146,10 +150,9 @@ impl ImageRoot {
                 let uid = (stat[3] >> 32) as u32;
                 let gid = stat[4] as u32;
                 // Search permission as the identity the workload runs as.
-                let identity = managed_host_identity();
-                let shift = if uid == identity.uid as u32 {
+                let shift = if uid == self.1 {
                     6
-                } else if gid == identity.gid as u32 {
+                } else if gid == self.2 {
                     3
                 } else {
                     0
@@ -182,6 +185,111 @@ impl ImageRoot {
         }
     }
 }
+/// `newfstatat` and `statx` of an image file, answered by the supervisor
+/// instead of rewriting the path and letting the kernel run the call.
+///
+/// `request_path` already resolved the path beneath the tracee root exactly
+/// as the kernel would (following the final link only when the call does),
+/// checking search permission on every directory as the workload's identity;
+/// the file itself needs no permission to be stat'ed. So the supervisor stats
+/// that resolved path through the same root, never following a final link,
+/// and copies the result into the caller's buffer: one write instead of the
+/// path rewrite, the native round trip and its exit stop. `None` leaves the
+/// call to the native path: owned storage, devices, empty paths, flags or
+/// masks this does not know.
+pub fn image_stat(
+    fs: &crate::launch_storage::LaunchFs,
+    pid: usize,
+    r: &UserRegs,
+) -> Result<Option<i64>, i64> {
+    const NOFOLLOW: u64 = 0x100;
+    let (flags, known) = match r.orig_rax {
+        262 => (r.r10, 0x100 | 0x800 | 0x1000),
+        332 => (r.rdx, 0x100 | 0x800 | 0x1000 | 0x6000),
+        _ => return Ok(None),
+    };
+    if flags & !known != 0 || (r.orig_rax == 332 && r.r10 & 0x8000_0000 != 0) {
+        return Ok(None);
+    }
+    let Some((_, path)) = fs.request_path(pid, r)? else {
+        return Ok(None);
+    };
+    let path = path.as_bytes();
+    if fs.owns_path(path) || path == b"/dev" || path.starts_with(b"/dev/") {
+        return Ok(None);
+    }
+    // Where the native path would have rewritten the call (its pathname
+    // differs from the resolved one), keep that path's observable checks:
+    // an output buffer overlapping the scratch below the stack, or scratch
+    // that cannot be read and written, is EFAULT (`Rewrite::prepare`). The
+    // scratch bytes are written back unchanged.
+    if fs.native_path(pid, r)?.is_some() {
+        let address = r.rsp.checked_sub(512).ok_or(-14)?;
+        let (start, length) = if r.orig_rax == 262 {
+            (r.rdx, 144)
+        } else {
+            (r.r8, 256)
+        };
+        if start < address + (MAX_PATH + 1) as u64
+            && start.checked_add(length).is_none_or(|end| end > address)
+        {
+            return Err(-14);
+        }
+        let mut saved = [0u8; MAX_PATH + 1];
+        if copy_memory(pid, address, &mut saved, false)? != saved.len() as i64
+            || copy_memory(pid, address, &mut saved, true)? != saved.len() as i64
+        {
+            return Err(-14);
+        }
+    }
+    let relative = path.strip_prefix(b"/").ok_or(-22)?;
+    let mut name = [0u8; MAX_PATH + 1];
+    if relative.is_empty() {
+        name[0] = b'.';
+    } else {
+        name[..relative.len()].copy_from_slice(relative);
+    }
+    let image = ImageRoot::new(pid)?;
+    if r.orig_rax == 262 {
+        let mut stat = [0u8; 144];
+        let result = unsafe {
+            syscall4(
+                262,
+                image.0,
+                name.as_ptr() as usize,
+                stat.as_mut_ptr() as usize,
+                NOFOLLOW as usize,
+            )
+        };
+        if result < 0 {
+            return Ok(Some(result as i64));
+        }
+        if copy_memory(pid, r.rdx, &mut stat, true) != Ok(stat.len() as i64) {
+            return Ok(Some(-14));
+        }
+    } else {
+        let mut statx = [0u8; 256];
+        let result = unsafe {
+            crate::supervisor::syscall6(
+                332,
+                image.0,
+                name.as_ptr() as usize,
+                ((flags & !(NOFOLLOW | 0x1000)) | NOFOLLOW) as usize,
+                r.r10 as usize,
+                statx.as_mut_ptr() as usize,
+                0,
+            )
+        };
+        if result < 0 {
+            return Ok(Some(result as i64));
+        }
+        if copy_memory(pid, r.r8, &mut statx, true) != Ok(statx.len() as i64) {
+            return Ok(Some(-14));
+        }
+    }
+    Ok(Some(0))
+}
+
 impl Drop for ImageRoot {
     fn drop(&mut self) {
         unsafe {

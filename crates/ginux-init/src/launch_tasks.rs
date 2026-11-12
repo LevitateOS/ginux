@@ -1247,6 +1247,7 @@ impl Supervisor<'_> {
         self.run(index, r, instance);
     }
     fn entry(&mut self, index: usize, r: &mut UserRegs, instance: &mut Instance) {
+        self.objects.filesystem.begin_entry();
         if let Some(unpark) = self.task_mut(index).unpark.take() {
             if !unpark.replaying
                 || r.orig_rax != unpark.original.orig_rax
@@ -2035,19 +2036,43 @@ impl Supervisor<'_> {
         };
         let decision = match decision {
             NativeDecision::Contract(decision) => {
-                match crate::path_hooks::Rewrite::prepare(
-                    self.objects.filesystem,
-                    self.task(index).host,
-                    r,
-                ) {
-                    Ok(rewrite) => {
-                        self.task_mut(index).path_rewrite = rewrite;
-                        NativeDecision::Contract(decision)
+                match if matches!(decision.action, Action::Mediate)
+                    && launch_arguments_allowed(self.task(index).host, r.orig_rax, r)
+                {
+                    crate::path_hooks::image_stat(self.objects.filesystem, self.task(index).host, r)
+                } else {
+                    Ok(None)
+                } {
+                    // An image file's stat the contract mediates, answered here
+                    // (`image_stat`) with the audit line its native run writes.
+                    Ok(Some(result)) => {
+                        audit_write(b"mediate surface=");
+                        audit_write(balanced_surface_name(configured_surface(r.orig_rax)));
+                        audit_write(b"\n");
+                        NativeDecision::Hooked {
+                            lane: crate::dispatch::Lane::Filesystem,
+                            result,
+                        }
                     }
-                    Err(-5) => self.fail(instance, b"launch path scratch restoration failed"),
+                    // A path that does not resolve: the rewrite gives the same.
                     Err(result) => NativeDecision::Hooked {
                         lane: crate::dispatch::Lane::Filesystem,
                         result,
+                    },
+                    Ok(None) => match crate::path_hooks::Rewrite::prepare(
+                        self.objects.filesystem,
+                        self.task(index).host,
+                        r,
+                    ) {
+                        Ok(rewrite) => {
+                            self.task_mut(index).path_rewrite = rewrite;
+                            NativeDecision::Contract(decision)
+                        }
+                        Err(-5) => self.fail(instance, b"launch path scratch restoration failed"),
+                        Err(result) => NativeDecision::Hooked {
+                            lane: crate::dispatch::Lane::Filesystem,
+                            result,
+                        },
                     },
                 }
             }
