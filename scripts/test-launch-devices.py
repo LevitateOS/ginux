@@ -28,13 +28,15 @@ def main():
         (root / 'bin/fixture').chmod(0o755)
         counter = 0
 
-        def invoke(devices, storage=False, expected=0):
+        def invoke(devices, storage=False, expected=0, mode=None, output=b'null-device: PASS\n'):
             nonlocal counter
             counter += 1
             config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
             config = config.replace('[devices]\nassignments = []', '[devices]\nassignments = ' + json.dumps(devices))
             if not devices:
                 config = config.replace('args = []', 'args = ["none"]')
+            elif mode:
+                config = config.replace('args = []', 'args = ' + json.dumps([mode]))
             if storage:
                 config = config.replace('[storage]\nassignments = []', '[storage]\nassignments = ["memory:/work"]')
             path = work / f'{counter}.toml'
@@ -47,7 +49,7 @@ def main():
             assert record['outcome'] == ('exited' if expected == 0 else 'supervisor-error'), record
             if expected == 0:
                 assert record['code'] == 0 and record['generation'] is None, record
-                assert proc.stdout == (b'null-device: PASS\n' if devices else b''), proc.stdout
+                assert proc.stdout == (output if devices else b''), proc.stdout
             for name in ['null', 'image-device']:
                 assert (root / 'dev' / name).read_bytes() == b'image device bytes must stay untouched'
 
@@ -55,9 +57,14 @@ def main():
         invoke(['null'])
         invoke(['null'], storage=True)
         invoke(['null'])  # No descriptors survive a fresh supervisor.
-        for devices in [['zero'], ['null', 'null'], ['null', 'console'], ['disk0']]:
+        invoke(['null', 'random', 'urandom'], mode='random', output=b'random-device: PASS\n')
+        invoke(['urandom', 'null', 'random'], storage=True, mode='random',
+               output=b'random-device: PASS\n')
+        invoke(['urandom'], mode='urandom', output=b'urandom-device: PASS\n')
+        for devices in [['zero'], ['null', 'null'], ['null', 'console'], ['disk0'],
+                        ['random', 'random'], ['urandom', 'zero'], ['Random'], ['urandom0']]:
             invoke(devices, expected=2)
-        print('test-launch-devices: PASS (assignment, IO, metadata, bounds, isolation)')
+        print('test-launch-devices: PASS (assignment, IO, random, metadata, bounds, isolation)')
 
 
 if __name__ == '__main__':

@@ -398,7 +398,8 @@ impl DescriptorCall {
         (written != 0).then_some(written as i64)
     }
 
-    fn save(&mut self, r: &UserRegs) {
+    /// Restore these arguments and syscall number at the matching exit.
+    pub(crate) fn save(&mut self, r: &UserRegs) {
         self.saved_args = Some([r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9, r.orig_rax]);
     }
 

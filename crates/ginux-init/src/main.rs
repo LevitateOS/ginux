@@ -2763,7 +2763,14 @@ fn devices_main(config_path: *const u8, block_path: *const u8) -> ! {
         .open(instance_id, b"zero")
         .unwrap_or_else(|_| device_fail(b"zero open failed"));
     let mut zeros = [1u8; 16];
-    if registry.read(instance_id, zero, &mut zeros) != Ok(16) || zeros != [0; 16] {
+    if registry.read(
+        instance_id,
+        zero,
+        &mut zeros,
+        &mut crate::device_hooks::HostEntropy,
+    ) != Ok(16)
+        || zeros != [0; 16]
+    {
         device_fail(b"zero read failed");
     }
     let console = registry
@@ -9751,7 +9758,14 @@ fn instance_validate_main(config_path: *const u8) -> ! {
     write_all(contract.digest());
     write_all(b" operations=");
     write_u64(contract.rules().len() as u64);
-    write_all(b" configured-network-audit=1 configured-denial-audit=1\n");
+    write_all(b" configured-network-audit=1 configured-denial-audit=1 configured-devices=");
+    for (index, (name, _)) in crate::device_hooks::LAUNCH_DEVICES.iter().enumerate() {
+        if index != 0 {
+            write_all(b",");
+        }
+        write_all(name);
+    }
+    write_all(b"\n");
     exit_process(0)
 }
 

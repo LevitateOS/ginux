@@ -100,6 +100,10 @@ struct Task {
     signal_hold: Option<u64>,
     /// Native reaps the supervisor had completed when this task last resumed.
     reaps_seen: u64,
+    /// A peer queued a signal on this task since a park last examined it.
+    signalled: bool,
+    /// Host thread this task's in-flight `tgkill` signals, other than itself.
+    signal_target: Option<usize>,
 }
 
 /// A parked syscall being returned to its own instruction. The skipped entry
@@ -137,6 +141,8 @@ impl Task {
             unpark: None,
             signal_hold: None,
             reaps_seen: 0,
+            signalled: false,
+            signal_target: None,
         }
     }
 }
@@ -915,10 +921,11 @@ impl Supervisor<'_> {
         };
         // pselect arbitrates its snapshotted temporary mask in its descriptor
         // owner and the kernel's zero-FD completion call.
-        if matches!(original.orig_rax, 270 | 271) || task.reaps_seen == reaps {
+        if matches!(original.orig_rax, 270 | 271) || task.reaps_seen == reaps && !task.signalled {
             return;
         }
         task.reaps_seen = reaps;
+        task.signalled = false;
         let host = task.host;
         let mut instruction = [0u8; 2];
         if !crate::task_signals::Signals::read(host)
@@ -1817,6 +1824,10 @@ impl Supervisor<'_> {
                 self.wait_entry(index, r, instance);
                 return;
             }
+            200 | 234 => {
+                self.thread_kill(index, r, instance);
+                return;
+            }
             62 => {
                 let target = r.rdi as i32;
                 let signal = r.rsi;
@@ -2586,6 +2597,15 @@ impl Supervisor<'_> {
                 self.fail(instance, reason);
             }
         }
+        if let Some(host) = self.task_mut(index).signal_target.take() {
+            // The kernel has queued the signal; a parked peer must notice it.
+            if r.rax == 0 {
+                if let Some(target) = self.tasks.iter_mut().flatten().find(|t| t.host == host) {
+                    target.signalled = true;
+                    self.wake_needed = true;
+                }
+            }
+        }
         let pending = self.task(index).pending;
         match pending {
             Pending::Fork { child, flags, .. } => {
@@ -2707,6 +2727,74 @@ impl Supervisor<'_> {
         if let Some(fd) = old {
             if self.objects.filesystem.close_cwd(fd).is_err() {
                 self.fail(instance, b"cwd reference release failed");
+            }
+        }
+    }
+
+    /// `tkill` and `tgkill` name virtual thread ids. A signal for a thread of
+    /// the caller's own process is queued by the kernel: the caller runs
+    /// `tgkill` with its own host thread group and the target's host thread,
+    /// so the kernel itself refuses any thread outside that group, and
+    /// delivery takes the ordinary forwarded path with the sender's identity
+    /// projected back to its virtual pid. Other processes of the instance get
+    /// the `kill` subset; every other id is ESRCH, never a host task.
+    fn thread_kill(&mut self, index: usize, r: &mut UserRegs, instance: &mut Instance) {
+        let (tgid, tid, signal) = if r.orig_rax == 234 {
+            (Some(r.rdi as i32), r.rsi as i32, r.rdx)
+        } else {
+            (None, r.rdi as i32, r.rsi)
+        };
+        if tid <= 0 || tgid.is_some_and(|tgid| tgid <= 0) {
+            self.emulate(index, r, -22, instance);
+            return;
+        }
+        let target = self
+            .processes
+            .thread_signal_target(
+                self.task(index).id,
+                tgid.map(|tgid| tgid as u32),
+                tid as u32,
+            )
+            .ok()
+            .and_then(|(view, own)| {
+                self.tasks
+                    .iter()
+                    .position(|t| t.as_ref().is_some_and(|t| t.id == view.id && t.host != 0))
+                    .map(|target| (target, own))
+            });
+        let Some((target, own_process)) = target else {
+            self.emulate(index, r, -3, instance);
+            return;
+        };
+        let host = self.task(target).host;
+        // An unreadable signal view keeps the conservative answer.
+        let default_stop = matches!(signal, 20..=22)
+            && crate::task_signals::Signals::read(host)
+                .is_none_or(|signals| signals.default_action(signal as usize));
+        match ginux_core::thread_signal(signal, own_process, default_stop) {
+            ginux_core::ThreadSignal::Exists => self.emulate(index, r, 0, instance),
+            ginux_core::ThreadSignal::Refuse(errno) => self.emulate(index, r, errno, instance),
+            ginux_core::ThreadSignal::Kill => {
+                let result = unsafe { syscall2(SYS_KILL, host, SIGKILL) } as i64;
+                self.emulate(index, r, result, instance)
+            }
+            ginux_core::ThreadSignal::Deliver => {
+                let Some((thread_group, _)) =
+                    crate::tracee_io::native_identity(self.task(index).host)
+                else {
+                    self.emulate(index, r, -3, instance);
+                    return;
+                };
+                self.task_mut(index).call.save(r);
+                if target != index {
+                    self.task_mut(index).signal_target = Some(host);
+                }
+                r.orig_rax = 234;
+                r.rdi = thread_group as u64;
+                r.rsi = host as u64;
+                r.rdx = signal;
+                audit_write(b"mediate surface=own-process-thread-signal\n");
+                self.run(index, r, instance);
             }
         }
     }

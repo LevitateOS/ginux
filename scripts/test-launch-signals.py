@@ -27,6 +27,8 @@ SLEEPS = ('sleep-peer', 'sleep-ignored', 'sleep-handled')
 PSELECT = ('pending-pselect', 'pending-zero-pselect', 'ready-pselect')
 CREATION = ('birth-orphan',)
 RACES = ('race-thread-exit', 'race-fork-kill')
+# Thread-directed signals: raise, pthread_kill, abort and foreign ids.
+THREAD_SIGNALS = ('raise-handled', 'thread-kill', 'abort-child', 'foreign-tid', 'abort-init')
 INTERRUPTED = b'park interrupted surface=pending-signal'
 
 
@@ -106,7 +108,7 @@ def main():
     if len(sys.argv) < 3 or os.geteuid() != 0:
         sys.exit('usage (as root): test-launch-signals.py <ginux> <signal-fixture> [scenario ...]')
     binary, fixture = [str(Path(p).resolve()) for p in sys.argv[1:3]]
-    scenarios = (*PARKED, *PSELECT, *SLEEPS, *INJECTED, *CREATION, *RACES)
+    scenarios = (*PARKED, *PSELECT, *SLEEPS, *INJECTED, *CREATION, *RACES, *THREAD_SIGNALS)
     selected = sys.argv[3:] or scenarios
     if any(mode not in scenarios for mode in selected):
         sys.exit('unknown signal scenario')
@@ -124,7 +126,9 @@ def main():
             path, result, audit_path = work / f'{mode}.toml', work / f'{mode}.json', work / f'{mode}.audit'
             # Creation races need tasks that really run at the same time.
             case = config.replace('vcpus = 1', 'vcpus = 2') if mode in RACES else config
-            path.write_text(case.replace('args = []', 'args = ' + json.dumps([mode])))
+            # A host pid the instance must never reach: this runner's own.
+            arguments = [mode, str(os.getpid())] if mode == 'foreign-tid' else [mode]
+            path.write_text(case.replace('args = []', 'args = ' + json.dumps(arguments)))
             with audit_path.open('wb') as audit:
                 proc = subprocess.Popen([binary, 'launch', str(path), str(root), '--result-file', str(result)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=audit)
@@ -162,6 +166,14 @@ def main():
                         sent = orphan_newborn(proc, audit_path)
                     stdout, _ = proc.communicate(sent, timeout=180 if mode in RACES else 20)
                     audit_bytes = audit_path.read_bytes()
+                    if mode == 'abort-init':
+                        # The launcher reports the workload's own SIGABRT.
+                        record = json.loads(result.read_text())
+                        assert proc.returncode == 128 + 6 and stdout == b'', (proc.returncode, stdout, audit_bytes[-4000:])
+                        assert record == {'version': 1, 'outcome': 'signaled', 'code': None, 'signal': 6, 'generation': None}, record
+                        assert b'mediate surface=own-process-thread-signal' in audit_bytes
+                        print(f'PASS launch signals: {mode}', flush=True)
+                        continue
                     assert proc.returncode == 0 and stdout.endswith(b'held-signals: PASS\n'), \
                         (mode, proc.returncode, stdout, audit_bytes[-4000:])
                     record = json.loads(result.read_text())
@@ -171,6 +183,8 @@ def main():
                         # Only a handler hands the parked call back to the kernel.
                         marker = b'mediate surface=pselect-signal-mask' if mode.startswith('park-pselect') or mode == 'park-poll' else INTERRUPTED
                         assert (marker in audit_bytes) == (mode != 'park-ignored'), (mode, audit_bytes[-4000:])
+                    if mode in THREAD_SIGNALS and mode != 'foreign-tid':
+                        assert b'mediate surface=own-process-thread-signal' in audit_bytes, audit_bytes[-4000:]
                     if mode == 'map-signal':
                         assert b'mediate surface=owned-file-mapping' in audit_bytes, audit_bytes[-4000:]
                 finally:

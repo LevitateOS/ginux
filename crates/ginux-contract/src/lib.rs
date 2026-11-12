@@ -3,7 +3,7 @@
 use core::fmt;
 
 pub const CATALOG_VERSION: u32 = 2;
-pub const MAX_OPERATIONS: usize = 197;
+pub const MAX_OPERATIONS: usize = 199;
 pub const DIGEST_HEX_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,6 +246,14 @@ pub static CONFIGURED_OPERATIONS: &[Operation] = &[
         "test-launch"
     ),
     syscall!(
+        "tkill",
+        200,
+        Partial,
+        Action::Mediate,
+        "own virtual process; kill subset elsewhere",
+        "test-launch-signals"
+    ),
+    syscall!(
         "sched_getaffinity",
         204,
         Partial,
@@ -260,6 +268,14 @@ pub static CONFIGURED_OPERATIONS: &[Operation] = &[
         Action::Mediate,
         "supported global clocks only",
         "test-launch"
+    ),
+    syscall!(
+        "tgkill",
+        234,
+        Partial,
+        Action::Mediate,
+        "own virtual process; kill subset elsewhere",
+        "test-launch-signals"
     ),
     syscall!(
         "fchmodat",
@@ -2027,7 +2043,7 @@ pub const fn syscall_semantic_operation(number: u64, request: u64) -> Option<&'s
         16 if request as u32 == 0x5413 => Some("ioctl.tty.get_winsize"),
         16 if request as u32 == ARCHIVE_IMPORT_REQUEST => Some("filesystem.path.write"),
         9..=12 | 25 | 28 => Some("memory.virtual.manage"),
-        13..=15 | 62 | 127..=130 | 289 | 424 => Some("signal.virtual.deliver"),
+        13..=15 | 62 | 127..=130 | 200 | 234 | 289 | 424 => Some("signal.virtual.deliver"),
         96 | 228 | 229 => Some("time.clock.read"),
         105 | 106 | 113 | 114 | 116 | 117 | 119 | 122 | 123 => Some("credential.virtual.set"),
         _ => None,
@@ -2693,6 +2709,8 @@ mod tests {
             (28, "memory.virtual.manage"),
             (15, "signal.virtual.deliver"),
             (424, "signal.virtual.deliver"),
+            (200, "signal.virtual.deliver"),
+            (234, "signal.virtual.deliver"),
             (113, "credential.virtual.set"),
             (114, "credential.virtual.set"),
         ] {

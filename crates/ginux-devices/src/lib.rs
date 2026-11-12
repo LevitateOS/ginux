@@ -4,6 +4,14 @@ pub const MAX_DEVICE_NAME: usize = 16;
 pub const MAX_FRAME_SIZE: usize = 2048;
 pub const IOCTL_CONSOLE_GET_SIZE: u64 = 0x5413;
 pub const IOCTL_BLOCK_GET_SIZE: u64 = 0x8008_1272;
+/// Linux `RNDGETENTCNT`: the entropy count of the random devices.
+pub const IOCTL_RANDOM_GET_ENTROPY_COUNT: u64 = 0x8004_5200;
+/// Linux `RNDADDTOENTCNT`, `RNDADDENTROPY`, `RNDZAPENTCNT`, `RNDCLEARPOOL` and
+/// `RNDRESEEDCRNG`: they change the host entropy pool and need `CAP_SYS_ADMIN`.
+pub const IOCTL_RANDOM_PRIVILEGED: [u64; 5] = [0x4004_5201, 0x4008_5203, 0x5204, 0x5206, 0x5207];
+/// The entropy count Linux reports once its random generator is ready. The
+/// random devices only ever serve bytes from a ready generator.
+pub const RANDOM_READY_ENTROPY_BITS: u32 = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceError {
@@ -25,6 +33,18 @@ pub enum DeviceError {
     FrameTooLarge,
     QueueFull,
     QueueEmpty,
+    /// The device has ioctls, but not this request (Linux EINVAL). A device
+    /// without any ioctl reports `UnknownIoctl` (Linux ENOTTY) instead.
+    UnsupportedRequest,
+    /// The entropy source is not ready and the read would have to wait.
+    WouldBlock,
+}
+
+/// The source of bytes read from the random devices. It must be
+/// cryptographically secure and must never block; a source that is not ready
+/// reports `DeviceError::WouldBlock`.
+pub trait EntropySource {
+    fn fill(&mut self, output: &mut [u8]) -> Result<(), DeviceError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,7 +52,11 @@ pub enum DeviceKind {
     Console,
     Null,
     Zero,
+    /// Linux `/dev/random` (1:8). Like Linux since 5.18 it never blocks once
+    /// the entropy source is ready, so it behaves exactly as `Urandom`.
     Random,
+    /// Linux `/dev/urandom` (1:9).
+    Urandom,
     Block,
     Network,
 }
@@ -118,7 +142,6 @@ impl Descriptor {
 pub struct DeviceRegistry<const DEVICES: usize, const FDS: usize> {
     assignments: [Assignment; DEVICES],
     descriptors: [Descriptor; FDS],
-    random_state: u64,
 }
 
 impl<const DEVICES: usize, const FDS: usize> Default for DeviceRegistry<DEVICES, FDS> {
@@ -132,7 +155,6 @@ impl<const DEVICES: usize, const FDS: usize> DeviceRegistry<DEVICES, FDS> {
         Self {
             assignments: [Assignment::empty(); DEVICES],
             descriptors: [Descriptor::empty(); FDS],
-            random_state: 0x6a09_e667_f3bc_c909,
         }
     }
 
@@ -197,6 +219,7 @@ impl<const DEVICES: usize, const FDS: usize> DeviceRegistry<DEVICES, FDS> {
                 DeviceKind::Null => (1, 3),
                 DeviceKind::Zero => (1, 5),
                 DeviceKind::Random => (1, 8),
+                DeviceKind::Urandom => (1, 9),
                 DeviceKind::Block => (254, index as u32),
                 DeviceKind::Network => (0, index as u32 + 1),
             };
@@ -209,6 +232,31 @@ impl<const DEVICES: usize, const FDS: usize> DeviceRegistry<DEVICES, FDS> {
             count += 1;
         }
         count
+    }
+
+    /// The view of one device assigned to `instance` under `name`.
+    pub fn view(&self, instance: u64, name: &[u8]) -> Option<DeviceView> {
+        let mut views = [DeviceView {
+            name: DeviceName {
+                bytes: [0; MAX_DEVICE_NAME],
+                len: 0,
+            },
+            kind: DeviceKind::Null,
+            major: 0,
+            minor: 0,
+        }; DEVICES];
+        let count = self.views(instance, &mut views);
+        views[..count]
+            .iter()
+            .find(|view| view.name.as_bytes() == name)
+            .copied()
+    }
+
+    /// The view of the device an open descriptor of `instance` refers to.
+    pub fn descriptor_view(&self, instance: u64, fd: u32) -> Result<DeviceView, DeviceError> {
+        let name = self.descriptor(instance, fd)?.name;
+        self.view(instance, name.as_bytes())
+            .ok_or(DeviceError::InvalidDescriptor)
     }
 
     pub fn open(&mut self, instance: u64, name: &[u8]) -> Result<u32, DeviceError> {
@@ -248,11 +296,14 @@ impl<const DEVICES: usize, const FDS: usize> DeviceRegistry<DEVICES, FDS> {
             .ok_or(DeviceError::InvalidDescriptor)
     }
 
-    pub fn read(
-        &mut self,
+    /// Fill `output` from the device. Only the random devices consult
+    /// `entropy`; every other device ignores it.
+    pub fn read<E: EntropySource>(
+        &self,
         instance: u64,
         fd: u32,
         output: &mut [u8],
+        entropy: &mut E,
     ) -> Result<usize, DeviceError> {
         let kind = self.descriptor(instance, fd)?.kind;
         match kind {
@@ -261,23 +312,23 @@ impl<const DEVICES: usize, const FDS: usize> DeviceRegistry<DEVICES, FDS> {
                 output.fill(0);
                 Ok(output.len())
             }
-            DeviceKind::Random => {
-                for byte in output.iter_mut() {
-                    self.random_state ^= self.random_state << 13;
-                    self.random_state ^= self.random_state >> 7;
-                    self.random_state ^= self.random_state << 17;
-                    *byte = self.random_state as u8;
-                }
+            DeviceKind::Random | DeviceKind::Urandom => {
+                entropy.fill(output)?;
                 Ok(output.len())
             }
             DeviceKind::Block | DeviceKind::Network => Err(DeviceError::PermissionDenied),
         }
     }
 
+    /// Writes to null and console are consumed. Writes to the random devices
+    /// are accepted and discarded, as Linux does for a caller that may not
+    /// credit entropy: an instance never feeds the host entropy pool.
     pub fn write(&self, instance: u64, fd: u32, input: &[u8]) -> Result<usize, DeviceError> {
         match self.descriptor(instance, fd)?.kind {
-            DeviceKind::Null | DeviceKind::Console => Ok(input.len()),
-            DeviceKind::Zero | DeviceKind::Random | DeviceKind::Block | DeviceKind::Network => {
+            DeviceKind::Null | DeviceKind::Console | DeviceKind::Random | DeviceKind::Urandom => {
+                Ok(input.len())
+            }
+            DeviceKind::Zero | DeviceKind::Block | DeviceKind::Network => {
                 Err(DeviceError::PermissionDenied)
             }
         }
@@ -297,6 +348,21 @@ impl<const DEVICES: usize, const FDS: usize> DeviceRegistry<DEVICES, FDS> {
                 Ok(())
             }
             (DeviceKind::Console, IOCTL_CONSOLE_GET_SIZE) => Err(DeviceError::InvalidPayload),
+            (DeviceKind::Random | DeviceKind::Urandom, IOCTL_RANDOM_GET_ENTROPY_COUNT)
+                if payload.len() == 4 =>
+            {
+                payload.copy_from_slice(&RANDOM_READY_ENTROPY_BITS.to_ne_bytes());
+                Ok(())
+            }
+            (DeviceKind::Random | DeviceKind::Urandom, IOCTL_RANDOM_GET_ENTROPY_COUNT) => {
+                Err(DeviceError::InvalidPayload)
+            }
+            (DeviceKind::Random | DeviceKind::Urandom, request)
+                if IOCTL_RANDOM_PRIVILEGED.contains(&request) =>
+            {
+                Err(DeviceError::PermissionDenied)
+            }
+            (DeviceKind::Random | DeviceKind::Urandom, _) => Err(DeviceError::UnsupportedRequest),
             _ => Err(DeviceError::UnknownIoctl),
         }
     }
@@ -1030,6 +1096,32 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
+    /// A recognisable, counting entropy source for registry tests.
+    struct Counting {
+        calls: usize,
+        ready: bool,
+    }
+
+    impl EntropySource for Counting {
+        fn fill(&mut self, output: &mut [u8]) -> Result<(), DeviceError> {
+            if !self.ready {
+                return Err(DeviceError::WouldBlock);
+            }
+            self.calls += 1;
+            for (index, byte) in output.iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_add(self.calls as u8) | 0x80;
+            }
+            Ok(())
+        }
+    }
+
+    fn entropy() -> Counting {
+        Counting {
+            calls: 0,
+            ready: true,
+        }
+    }
+
     struct MemoryBlock {
         bytes: Vec<u8>,
         flushes: usize,
@@ -1116,17 +1208,107 @@ mod tests {
         }
         let zero = registry.open(7, b"zero").unwrap();
         let mut bytes = [9; 8];
-        assert_eq!(registry.read(7, zero, &mut bytes), Ok(8));
+        let mut source = entropy();
+        assert_eq!(registry.read(7, zero, &mut bytes, &mut source), Ok(8));
         assert_eq!(bytes, [0; 8]);
         let random = registry.open(7, b"random").unwrap();
-        registry.read(7, random, &mut bytes).unwrap();
+        registry.read(7, random, &mut bytes, &mut source).unwrap();
         assert_ne!(bytes, [0; 8]);
+        assert_eq!(source.calls, 1);
         let console = registry.open(7, b"console").unwrap();
         let mut size = [0; 8];
         registry
             .ioctl(7, console, IOCTL_CONSOLE_GET_SIZE, &mut size)
             .unwrap();
         assert_eq!(&size[..4], &[24, 0, 80, 0]);
+    }
+
+    #[test]
+    fn random_devices_draw_only_from_the_entropy_source() {
+        let mut registry: DeviceRegistry<4, 4> = DeviceRegistry::new();
+        for (backend, name, kind) in [
+            (1, b"null".as_slice(), DeviceKind::Null),
+            (2, b"random", DeviceKind::Random),
+            (3, b"urandom", DeviceKind::Urandom),
+        ] {
+            registry
+                .assign(1, backend, DeviceName::new(name).unwrap(), kind)
+                .unwrap();
+        }
+        let mut source = entropy();
+        let null = registry.open(1, b"null").unwrap();
+        let mut bytes = [0u8; 16];
+        assert_eq!(registry.read(1, null, &mut bytes, &mut source), Ok(0));
+        assert_eq!(source.calls, 0, "null never consumes entropy");
+        for name in [b"random".as_slice(), b"urandom"] {
+            let fd = registry.open(1, name).unwrap();
+            bytes = [0; 16];
+            assert_eq!(registry.read(1, fd, &mut bytes, &mut source), Ok(16));
+            assert!(bytes.iter().all(|byte| *byte & 0x80 != 0));
+            assert_eq!(registry.write(1, fd, b"never credited"), Ok(14));
+            assert_eq!(registry.read(1, fd, &mut [], &mut source), Ok(0));
+        }
+        assert_eq!(source.calls, 4);
+        let fd = registry.open(1, b"urandom").unwrap();
+        let mut unready = Counting {
+            calls: 0,
+            ready: false,
+        };
+        assert_eq!(
+            registry.read(1, fd, &mut bytes, &mut unready),
+            Err(DeviceError::WouldBlock)
+        );
+        assert_eq!(
+            registry.read(2, fd, &mut bytes, &mut source),
+            Err(DeviceError::InvalidDescriptor)
+        );
+    }
+
+    #[test]
+    fn random_device_identity_and_ioctls_match_an_unprivileged_linux_caller() {
+        let mut registry: DeviceRegistry<3, 8> = DeviceRegistry::new();
+        for (backend, name, kind) in [
+            (1, b"null".as_slice(), DeviceKind::Null),
+            (2, b"random", DeviceKind::Random),
+            (3, b"urandom", DeviceKind::Urandom),
+        ] {
+            registry
+                .assign(1, backend, DeviceName::new(name).unwrap(), kind)
+                .unwrap();
+        }
+        for (name, minor) in [(b"null".as_slice(), 3), (b"random", 8), (b"urandom", 9)] {
+            let view = registry.view(1, name).unwrap();
+            assert_eq!((view.major, view.minor), (1, minor));
+            let fd = registry.open(1, name).unwrap();
+            assert_eq!(registry.descriptor_view(1, fd), Ok(view));
+        }
+        assert_eq!(registry.view(1, b"zero"), None);
+        assert_eq!(registry.view(2, b"random"), None);
+        let null = registry.open(1, b"null").unwrap();
+        assert_eq!(
+            registry.ioctl(1, null, IOCTL_RANDOM_GET_ENTROPY_COUNT, &mut [0; 4]),
+            Err(DeviceError::UnknownIoctl)
+        );
+        let random = registry.open(1, b"urandom").unwrap();
+        let mut count = [0u8; 4];
+        registry
+            .ioctl(1, random, IOCTL_RANDOM_GET_ENTROPY_COUNT, &mut count)
+            .unwrap();
+        assert_eq!(u32::from_ne_bytes(count), RANDOM_READY_ENTROPY_BITS);
+        for request in IOCTL_RANDOM_PRIVILEGED {
+            assert_eq!(
+                registry.ioctl(1, random, request, &mut []),
+                Err(DeviceError::PermissionDenied)
+            );
+        }
+        assert_eq!(
+            registry.ioctl(1, random, 0x5401, &mut []),
+            Err(DeviceError::UnsupportedRequest)
+        );
+        assert_eq!(
+            registry.map(1, random),
+            Err(DeviceError::DirectMappingDenied)
+        );
     }
 
     #[test]

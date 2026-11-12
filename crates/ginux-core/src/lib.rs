@@ -429,9 +429,84 @@ pub const fn configured_arguments_allowed(syscall: u64, arg0: u64, arg1: u64, ar
     }
 }
 
+/// What a thread-directed signal (`tkill`, `tgkill`) does once its target
+/// thread is known to be a running task of the same instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadSignal {
+    /// Signal 0: the target exists and nothing is sent.
+    Exists,
+    /// The kernel queues the signal on a thread of the caller's own process,
+    /// with the caller's own identity, exactly as `raise` and `pthread_kill`
+    /// expect.
+    Deliver,
+    /// SIGKILL to another process of the instance, as `kill` allows.
+    Kill,
+    /// Refused with this negative errno.
+    Refuse(i64),
+}
+
+/// Decide a thread-directed signal. `own_process` says whether the target is
+/// a thread of the caller's own process. `default_stop` says whether the
+/// target would take the default action of SIGTSTP, SIGTTIN or SIGTTOU (no
+/// handler, not ignored). Stopping a process is a group stop, which
+/// supervised execution does not offer, so SIGSTOP and default-action stop
+/// signals are refused like the other signals `kill` does not support.
+/// Another process of the instance can only be probed or killed, as with
+/// `kill`.
+pub const fn thread_signal(signal: u64, own_process: bool, default_stop: bool) -> ThreadSignal {
+    const SIGKILL: u64 = 9;
+    const SIGSTOP: u64 = 19;
+    if signal > 64 {
+        return ThreadSignal::Refuse(-22);
+    }
+    if signal == 0 {
+        return ThreadSignal::Exists;
+    }
+    if !own_process {
+        return if signal == SIGKILL {
+            ThreadSignal::Kill
+        } else {
+            ThreadSignal::Refuse(-95)
+        };
+    }
+    if signal == SIGSTOP || (matches!(signal, 20..=22) && default_stop) {
+        return ThreadSignal::Refuse(-95);
+    }
+    ThreadSignal::Deliver
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_signals_stay_inside_the_callers_process_except_probe_and_kill() {
+        // raise(), abort() and pthread_kill() within one process.
+        for signal in [1, 6, 9, 10, 11, 12, 15, 17, 18, 34, 64] {
+            assert_eq!(thread_signal(signal, true, true), ThreadSignal::Deliver);
+        }
+        assert_eq!(thread_signal(0, true, false), ThreadSignal::Exists);
+        assert_eq!(thread_signal(0, false, false), ThreadSignal::Exists);
+        assert_eq!(thread_signal(65, true, false), ThreadSignal::Refuse(-22));
+        assert_eq!(
+            thread_signal(u64::MAX, false, false),
+            ThreadSignal::Refuse(-22)
+        );
+        // Group stops are never started.
+        assert_eq!(thread_signal(19, true, false), ThreadSignal::Refuse(-95));
+        for signal in 20..=22 {
+            assert_eq!(thread_signal(signal, true, true), ThreadSignal::Refuse(-95));
+            assert_eq!(thread_signal(signal, true, false), ThreadSignal::Deliver);
+        }
+        // Another process of the instance: the kill subset only.
+        assert_eq!(thread_signal(9, false, false), ThreadSignal::Kill);
+        for signal in [1, 6, 10, 15, 19] {
+            assert_eq!(
+                thread_signal(signal, false, false),
+                ThreadSignal::Refuse(-95)
+            );
+        }
+    }
 
     #[test]
     fn configured_image_reads_allow_large_headers_with_a_finite_bound() {

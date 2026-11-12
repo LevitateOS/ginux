@@ -224,7 +224,7 @@ fn device_class(kind: DeviceKind) -> &'static [u8] {
         DeviceKind::Block => b"block",
         DeviceKind::Network => b"net",
         DeviceKind::Console => b"tty",
-        DeviceKind::Null | DeviceKind::Zero | DeviceKind::Random => b"misc",
+        DeviceKind::Null | DeviceKind::Zero | DeviceKind::Random | DeviceKind::Urandom => b"misc",
     }
 }
 
@@ -236,6 +236,7 @@ fn device_type(kind: DeviceKind) -> &'static [u8] {
         DeviceKind::Null => b"null",
         DeviceKind::Zero => b"zero",
         DeviceKind::Random => b"random",
+        DeviceKind::Urandom => b"urandom",
     }
 }
 

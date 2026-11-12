@@ -1,4 +1,5 @@
-/* Signals against supervisor-held syscalls, and task creation racing death. */
+/* Signals against supervisor-held syscalls, task creation racing death, and
+   thread-directed signals (tkill, tgkill) as raise, abort and pthread_kill use them. */
 typedef unsigned long word;
 static long call(long n, word a, word b, word c, word d, word e, word f)
 {
@@ -57,6 +58,37 @@ static long spawner(void)
     }
     return 0;
 }
+static volatile int handler_tid, sibling_result, sibling_go;
+static int sibling_pipe[2];
+static void tid_handler(int signal) { handled_signal=signal; handler_tid=(int)DO(186,0,0,0); ++handled; }
+static long install_tid(int signal)
+{
+    word action[4]={(word)tid_handler,0x04000000UL,(word)signal_return,0};
+    return call(13,signal,(word)action,0,8,0,0);
+}
+static long spinning_sibling(void) { while (!handled) __asm__ volatile("pause"); return 0; }
+static long parked_sibling(void)
+{
+    char byte;
+    sibling_go=1;
+    sibling_result=(int)DO(0,sibling_pipe[0],&byte,1);
+    return 0;
+}
+/* glibc raise(): block every signal, signal this thread, restore the mask. */
+static long glibc_raise(int signal)
+{
+    word all=~0UL, saved=0;
+    if (call(14,0,(word)&all,(word)&saved,8,0,0)!=0) return -1000;
+    long result=DO(234,DO(39,0,0,0),DO(186,0,0,0),signal);
+    if (call(14,2,(word)&saved,0,8,0,0)!=0) return -1001;
+    return result;
+}
+static long decimal(const char *text)
+{
+    long value=0;
+    while (*text>='0' && *text<='9') value=value*10+(*text++-'0');
+    return value;
+}
 static int same(const char *a, const char *b)
 {
     while (*a && *a==*b) { ++a; ++b; }
@@ -69,6 +101,7 @@ long signal_main(word *stack)
     char byte=0;
     long status=0;
     if (same(mode,"exec-done")) { say("held-signals: PASS\n"); return 0; }
+    if (same(mode,"abort-init")) { glibc_raise(6); return 120; }
     CHECK(DO(293,wake_pipe,0,0)==0,10);
 
     /* A handler ends a parked wait; the kernel applies its restart flags. */
@@ -252,6 +285,64 @@ long signal_main(word *stack)
             CHECK(DO(62,pid,9,0)==0 && call(61,pid,0,0,0,0,0)==pid,111);
             while (call(61,-1,0,1,0,0,0)>0);
         }
+
+    /* raise(): the handler runs in the calling thread, after the mask is restored. */
+    } else if (same(mode,"raise-handled")) {
+        long self=DO(186,0,0,0), process=DO(39,0,0,0);
+        CHECK(install_tid(10)==0,160);
+        CHECK(DO(234,process,self,0)==0 && handled==0,161);
+        CHECK(DO(234,process,self,10)==0,162);
+        CHECK(handled==1 && handled_signal==10 && handler_tid==self,163);
+        CHECK(glibc_raise(10)==0 && handled==2,164);
+        CHECK(DO(200,self,10,0)==0 && handled==3,165);
+        CHECK(install(12,0)==0 && DO(200,self,12,0)==0 && handled==4 && handled_signal==12,166);
+        CHECK(DO(0,wake_pipe[0],&byte,1)==1 && byte=='x',167);
+
+    /* pthread_kill(): a sibling thread receives it, running or parked. */
+    } else if (same(mode,"thread-kill")) {
+        long process=DO(39,0,0,0);
+        CHECK(install_tid(10)==0 && DO(293,sibling_pipe,0,0)==0,170);
+        spawn_thread((word)(stacks[1]+sizeof stacks[1]), &tid[1], spinning_sibling);
+        while (!tid[1]) __asm__ volatile("pause");
+        int first=tid[1];
+        CHECK(first!=process,171);
+        CHECK(DO(234,process,first,10)==0,172);
+        while (tid[1]) __asm__ volatile("pause");
+        CHECK(handled==1 && handler_tid==first,173);
+        spawn_thread((word)(stacks[2]+sizeof stacks[2]), &tid[2], parked_sibling);
+        while (!tid[2] || !sibling_go) __asm__ volatile("pause");
+        int second=tid[2];
+        spin(20000000);  /* let the sibling park in its pipe read */
+        CHECK(DO(200,second,10,0)==0,174);
+        while (tid[2]) __asm__ volatile("pause");
+        CHECK(handled==2 && handler_tid==second && sibling_result==-4,175);
+
+    /* abort(): SIGABRT's default action ends the process with signal 6. */
+    } else if (same(mode,"abort-child")) {
+        long child=fork_();
+        if (child==0) { glibc_raise(6); DO(60,121,0,0); }
+        CHECK(child>0 && call(61,child,(word)&status,0,0,0,0)==child,180);
+        CHECK((status&0x7f)==6,181);
+
+    /* Ids only name tasks of this instance; anything else does not exist. */
+    } else if (same(mode,"foreign-tid")) {
+        long self=DO(186,0,0,0), process=DO(39,0,0,0);
+        long host=stack[0]>2?decimal(argv[2]):0;
+        CHECK(host>1,190);
+        CHECK(DO(200,host,0,0)==-3 && DO(200,host,9,0)==-3,191);
+        CHECK(DO(234,host,host,9)==-3 && DO(234,process,host,9)==-3,192);
+        CHECK(DO(234,process,4242,10)==-3 && DO(200,4242,0,0)==-3,193);
+        CHECK(DO(234,process,0,10)==-22 && DO(200,-1,10,0)==-22 && DO(234,-5,self,10)==-22,194);
+        CHECK(DO(234,process,self,65)==-22,195);
+        /* No group stop starts: SIGSTOP, and SIGTSTP at its default action. */
+        CHECK(DO(234,process,self,19)==-95 && DO(200,self,20,0)==-95,196);
+        long child=fork_();
+        if (child==0) for (;;) __asm__ volatile("pause");
+        CHECK(child>0,197);
+        CHECK(DO(234,process,child,10)==-3 && DO(234,child,self,10)==-3,198);
+        CHECK(DO(234,child,child,0)==0 && DO(200,child,10,0)==-95,199);
+        CHECK(DO(234,child,child,9)==0,200);
+        CHECK(call(61,child,(word)&status,0,0,0,0)==child && (status&0x7f)==9,201);
     } else return 2;
     say("held-signals: PASS\n");
     return 0;

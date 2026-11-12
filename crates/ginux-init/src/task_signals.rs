@@ -107,6 +107,11 @@ impl Signals {
         (1..=64).contains(&signal) && self.caught & (1u64 << (signal - 1)) != 0
     }
 
+    /// Whether delivering `signal` takes its default action in this task.
+    pub fn default_action(&self, signal: usize) -> bool {
+        (1..=64).contains(&signal) && (self.caught | self.ignored) & (1u64 << (signal - 1)) == 0
+    }
+
     /// Whether a queued, unblocked signal would run a handler or end the
     /// task. A call held for such a signal must be handed back to the kernel;
     /// one the task ignores leaves the call held, as it would natively.

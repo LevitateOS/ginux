@@ -414,7 +414,8 @@ syscall denial also wins over an ungranted semantic family.
 `config/instance-configured.toml` selects `[contract] version = 1` and
 `catalog = 1002`, using the upstream hierarchical format.
 It adds `lstat`, `readv`, `pipe`, `nanosleep`, `link`, `sched_getaffinity`,
-`clock_getres`, `faccessat`, `renameat2` and `execveat` to upstream catalog 2.
+`clock_getres`, `faccessat`, `renameat2`, `execveat`, `tkill` and `tgkill` to
+upstream catalog 2; `tkill` and `tgkill` are also `signal.virtual.deliver`.
 Gate 11 advances the upstream catalog from 1 to 2 and adds direct-safe
 `sched_yield`. Our former local catalog number 2 is retired to avoid assigning
 upstream's number a different meaning. Self-contained configured contracts must
@@ -649,16 +650,31 @@ No retention, mapping budget or wider Linux compatibility is promised.
 
 The configured `/dev` view is an immutable virtual directory, empty by default;
 image entries beneath it are hidden. The script descriptor reopen operation
-described above is separate from directory enumeration. `[devices].assignments = ["null"]` exposes
-`/dev/null` through the existing device registry: reads return EOF and writes
-discard up to 4096 bytes per call. Stat/fstat/fstatat/statx report a character
-device with instance-owned identity and major/minor 1:3. Open access modes,
-close-on-exec descriptor flags, seek, close and basic access queries are
+described above is separate from directory enumeration. `[devices].assignments`
+accepts `null`, `random` and `urandom`; each assigned name appears as
+`/dev/<name>` through the existing device registry, and every other `/dev`
+entry stays absent. Null reads return EOF and writes discard up to 4096 bytes
+per call without reading the buffer. Random and urandom reads (`read`,
+`pread64`, `readv`) return up to 4096 bytes per call from the host
+`getrandom(2)` without blocking, which a workload can already call directly;
+like Linux since 5.18, `/dev/random` does not block once the host generator is
+ready. Bytes leave through the strict copy path, so an inaccessible buffer
+gives EFAULT or a short read. Writes are read from the caller and discarded,
+as Linux does for a caller that may not credit entropy; an instance never
+feeds the host pool. `RNDGETENTCNT` reports 256 (a ready generator), the
+privileged random ioctls return EPERM and other requests EINVAL; null ioctls
+return ENOTTY. Stat/fstat/fstatat/statx report a character device, mode 0666,
+with instance-owned identity and major/minor 1:3, 1:8 or 1:9. Open access
+modes, close-on-exec descriptor flags, seek, close and basic access queries are
 supported; device metadata cannot be changed. There are 64 open-device slots.
 Unknown and duplicate assignments fail before launch. Device aliases share the
 common descriptor table and handle lifetime. No host device node or descriptor
-is used. Assigned null descriptors are always ready for configured polling. Additional
-device types are not implemented by configured launch yet.
+is used. Assigned device descriptors are always ready for configured polling.
+Reads, writes and opens are decided and audited as `filesystem.path.read` and
+`filesystem.path.write`, exactly as for null. `instance-validate` lists the
+names this launcher serves as `configured-devices=null,random,urandom`; a
+launcher without that field serves only `null`, and like any launcher rejects
+an unsupported name when the launch starts, before the workload runs.
 
 Anonymous `pipe`/`pipe2` are emulated with supervisor-owned memory and virtual
 handles. Up to sixteen channel buffers hold 65536 bytes each; aliases use the common table.
@@ -717,7 +733,17 @@ child-TID writes and forwarded signal senders use virtual identities. Actual
 credentials remain UID/GID 1000. `wait4` supports a positive child PID or -1,
 optional `WNOHANG`, and a null rusage pointer. A faulty status destination still
 reaps the child and leaves the status word unchanged. Kill supports only signal
-0 and SIGKILL directed at a positive virtual PID. Ignoring SIGCHLD and
+0 and SIGKILL directed at a positive virtual PID. `tkill` and `tgkill` name
+virtual thread IDs, as `raise`, `abort` and `pthread_kill` use them: any signal
+for a thread of the caller's own process is queued by the kernel, with the
+sender projected to its virtual PID on delivery. The caller runs `tgkill` with
+its own host thread group, so the kernel itself refuses any thread outside it.
+A handler runs in the named thread, also when it is parked in an owned wait,
+and a default fatal action such as `abort`'s SIGABRT ends the process with that
+signal. SIGSTOP, and SIGTSTP/SIGTTIN/SIGTTOU at their default action, return
+EOPNOTSUPP because a group stop is not supported. Another process of the
+instance gets the `kill` subset (signal 0 and SIGKILL, otherwise EOPNOTSUPP);
+any other ID is ESRCH and never names a host task. Ignoring SIGCHLD and
 `SA_NOCLDWAIT` are unsupported. A leader exiting alone keeps its remaining threads and resources alive. The
 last thread publishes the leader's status. Process completion kills and reaps all
 remaining descendants before the launcher reports completion. Exec requires the

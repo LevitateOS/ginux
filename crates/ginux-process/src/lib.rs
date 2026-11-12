@@ -356,6 +356,26 @@ impl<const TASKS: usize> ProcessTable<TASKS> {
             })
     }
 
+    /// The target of a thread-directed signal (`tkill`, or `tgkill` with
+    /// `tgid`) sent by `caller`: a running task with virtual thread id `tid`,
+    /// in thread group `tgid` when one is given. The flag says whether it is a
+    /// thread of the caller's own process. Ids are virtual and only name tasks
+    /// of this table; anything else is `InvalidTask` (Linux ESRCH).
+    pub fn thread_signal_target(
+        &self,
+        caller: TaskId,
+        tgid: Option<u32>,
+        tid: u32,
+    ) -> Result<(TaskView, bool), ProcessError> {
+        let caller = self.view(caller)?;
+        let target = self
+            .lookup(tid)
+            .filter(|target| target.state == TaskState::Running)
+            .filter(|target| tgid.is_none_or(|tgid| target.tgid == tgid))
+            .ok_or(ProcessError::InvalidTask)?;
+        Ok((target, target.tgid == caller.tgid))
+    }
+
     pub fn view(&self, id: TaskId) -> Result<TaskView, ProcessError> {
         let task = self.tasks[self.index(id)?];
         Ok(TaskView {
@@ -1685,6 +1705,50 @@ impl<const TASKS: usize, const FDS: usize, const PIPES: usize> PipeSpace<TASKS, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_signal_targets_are_running_virtual_tasks() {
+        let mut table: ProcessTable<6> = ProcessTable::new();
+        let init = table.create_init(Credentials::root()).unwrap();
+        let thread = table.clone_thread(init).unwrap();
+        let child = table.fork(init).unwrap();
+        // The caller itself, as raise() and abort() name it.
+        let (target, own) = table
+            .thread_signal_target(init, Some(init.pid), init.pid)
+            .unwrap();
+        assert_eq!((target.id, own), (init, true));
+        // A sibling thread, by tgkill and by tkill.
+        let (target, own) = table
+            .thread_signal_target(init, Some(init.pid), thread.pid)
+            .unwrap();
+        assert_eq!((target.id, own), (thread, true));
+        assert!(
+            table
+                .thread_signal_target(thread, None, init.pid)
+                .unwrap()
+                .1
+        );
+        // Another process of the instance is found but is not the caller's.
+        let (target, own) = table.thread_signal_target(init, None, child.pid).unwrap();
+        assert_eq!((target.id, own), (child, false));
+        // A thread named under the wrong thread group does not exist.
+        assert_eq!(
+            table.thread_signal_target(init, Some(child.pid), thread.pid),
+            Err(ProcessError::InvalidTask)
+        );
+        // Unknown ids, never host ids, and exited tasks are absent.
+        for tid in [0, 4, 4242, u32::MAX] {
+            assert_eq!(
+                table.thread_signal_target(init, None, tid),
+                Err(ProcessError::InvalidTask)
+            );
+        }
+        table.exit(child, 0).unwrap();
+        assert_eq!(
+            table.thread_signal_target(init, Some(child.pid), child.pid),
+            Err(ProcessError::InvalidTask)
+        );
+    }
 
     #[test]
     fn process_lifecycle_uses_virtual_generation_safe_identity() {

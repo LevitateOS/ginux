@@ -111,7 +111,9 @@ pub struct LaunchFs {
     cwd: Option<i32>,
     creation_mask: u32,
     init: Path,
-    null: bool,
+    /// Which `device_hooks::LAUNCH_DEVICES` entries are assigned; each one
+    /// resolves as an existing `/dev/<name>` entry.
+    devices: [bool; crate::device_hooks::LAUNCH_DEVICES.len()],
     process: u32,
     locks: crate::file_locks::Locks,
     flocks: crate::file_locks::Locks,
@@ -238,11 +240,13 @@ impl LaunchFs {
             count,
             cwd: None,
             creation_mask: 0o022,
-            null: config
-                .devices
-                .as_slice()
-                .iter()
-                .any(|name| name.as_bytes() == b"null"),
+            devices: crate::device_hooks::LAUNCH_DEVICES.map(|(device, _)| {
+                config
+                    .devices
+                    .as_slice()
+                    .iter()
+                    .any(|name| name.as_bytes() == device)
+            }),
             init: Path::from_bytes(config.init.as_bytes())
                 .map_err(|_| b"init path exceeds bound".as_slice())?,
         })
@@ -688,7 +692,12 @@ impl LaunchFs {
             if path == b"/dev" {
                 return Ok((NodeKind::Directory, 0));
             }
-            if path == b"/dev/null" && self.null {
+            if path.strip_prefix(b"/dev/").is_some_and(|name| {
+                crate::device_hooks::LAUNCH_DEVICES
+                    .iter()
+                    .zip(self.devices)
+                    .any(|((device, _), assigned)| assigned && *device == name)
+            }) {
                 return Ok((NodeKind::File, 0));
             }
             if within(path, b"/dev") {
