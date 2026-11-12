@@ -161,6 +161,7 @@ pub fn decide_objects(
 }
 
 /// Configured launch resolves the public descriptor ABI before backend handles.
+/// `shared`: another task uses the same descriptor table.
 pub fn decide_launch(
     pid: usize,
     signal_tgid: usize,
@@ -168,8 +169,9 @@ pub fn decide_launch(
     descriptors: &mut crate::descriptors::DescriptorTable,
     backends: &mut crate::descriptors::Backends,
     call: &mut crate::descriptors::DescriptorCall,
+    shared: bool,
 ) -> NativeDecision {
-    descriptors.enter(pid, signal_tgid, registers, backends, call)
+    descriptors.enter(pid, signal_tgid, registers, backends, call, shared)
 }
 
 /// Dispatch one process-supervision entry through the process-lane hook.

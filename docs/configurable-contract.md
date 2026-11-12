@@ -180,7 +180,9 @@ Counters and epoll instances share the bounded 32-object channel pool with
 pipes and local socket pairs. Each epoll instance has at most 32 registrations,
 independent of the 16-socket and 32-channel object limits;
 the existing public descriptor limit (including a lower operator limit) applies.
-No host eventfd or epoll descriptor is created or exposed. Counters support
+No host eventfd or epoll descriptor is exposed; the only host eventfds are the
+inert number placeholders the descriptor table places, which no workload call
+reaches. Counters support
 8-byte scalar transfers, semaphore/nonblocking modes, overflow backpressure,
 shared status flags and per-descriptor close-on-exec. Vector/socket transfers
 on counters are unsupported.

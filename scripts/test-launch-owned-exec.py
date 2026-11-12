@@ -15,6 +15,21 @@ def children(pid):
     return [int(p) for p in Path(f'/proc/{pid}/task/{pid}/children').read_text().split()]
 
 
+def host_fds(pid):
+    """Host descriptor numbers of a task, without the inert eventfd
+    placeholders that align host and public numbers (no workload object is a
+    host eventfd)."""
+    fds = []
+    for entry in Path(f'/proc/{pid}/fd').iterdir():
+        try:
+            if os.readlink(entry) == 'anon_inode:[eventfd]':
+                continue
+        except FileNotFoundError:
+            continue
+        fds.append(int(entry.name))
+    return sorted(fds)
+
+
 def main():
     if len(sys.argv) < 3 or os.geteuid() != 0:
         sys.exit('usage (as root): test-launch-owned-exec.py <ginux> <owned-exec-fixture> [scenario ...]')
@@ -60,8 +75,9 @@ def main():
                     roots = children(proc.pid)
                     assert len(roots) == 1, roots
                     initial = roots[0]
-                    fds = sorted(int(p.name) for p in Path(f'/proc/{initial}/fd').iterdir())
-                    assert fds == [0, 1, 2, 3], ('failed exec leaked private descriptors', mode, fds)
+                    # The image file and its duplicate hold their public numbers.
+                    fds = host_fds(initial)
+                    assert fds == [0, 1, 2, 6, 7], ('failed exec leaked private descriptors', mode, fds)
                     proc.stdin.write(b'G'); proc.stdin.flush()
                     assert select.select([proc.stdout], [], [], 10)[0], ('owned exec stalled', mode, audit_path.read_text())
                     ready = proc.stdout.readline()
@@ -71,8 +87,10 @@ def main():
                         descendants = children(initial)
                         assert len(descendants) == 1, descendants
                         target = descendants[0]
+                    # Only the duplicate without close-on-exec survives,
+                    # and exec closes every placeholder.
                     fds = sorted(int(p.name) for p in Path(f'/proc/{target}/fd').iterdir())
-                    assert fds == [0, 1, 2, 3], ('successful exec leaked private descriptors', mode, fds)
+                    assert fds == [0, 1, 2, 7], ('successful exec leaked private descriptors', mode, fds)
                     with open(f'/proc/{target}/exe', 'rb') as executable:
                         assert executable.read() == Path(fixture).read_bytes(), 'executed bytes differ from the owned ELF'
                         seals = fcntl.fcntl(executable.fileno(), 1034)

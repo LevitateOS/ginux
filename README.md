@@ -602,7 +602,16 @@ the lowest free number; native opens reserve a slot before running. Backend
 handles stay private, including when the kernel reuses an underlying fd number.
 Dup/dup2/dup3 and fcntl duplication share an open description across owners;
 close-on-exec flags belong to each public descriptor. The backend closes only
-after its last alias. Syscall arguments are translated for native IO/metadata/
+after its last alias. A native image descriptor's host number is its public
+number wherever the table can arrange it, so its calls run with the workload's
+own registers: before a native open, free host numbers below the reserved one
+are filled with inert close-on-exec placeholders (a placeholder at the reserved
+number is closed), and duplicating a native image descriptor duplicates it in
+the kernel onto the public target. A plain close of an owned descriptor closes
+its placeholder in the same call. Placeholders are never reachable by a
+workload call, which is translated or answered by the table first. Where the
+numbers still differ (console aliases, or a host number another public
+descriptor holds), syscall arguments are translated for native IO/metadata/
 mmap and restored at exit. Owned regular files support POSIX byte-range locks
 (`F_GETLK`, `F_SETLK`, `F_SETLKW`) with virtual process ownership. Fork does not
 inherit record locks; closing any descriptor for the inode releases that

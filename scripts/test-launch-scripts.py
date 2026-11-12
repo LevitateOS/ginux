@@ -14,6 +14,21 @@ def children(pid):
     return [int(p) for p in Path(f'/proc/{pid}/task/{pid}/children').read_text().split()]
 
 
+def host_fds(pid):
+    """Host descriptor numbers of a task, without the inert eventfd
+    placeholders that align host and public numbers (no workload object is a
+    host eventfd)."""
+    fds = []
+    for entry in Path(f'/proc/{pid}/fd').iterdir():
+        try:
+            if os.readlink(entry) == 'anon_inode:[eventfd]':
+                continue
+        except FileNotFoundError:
+            continue
+        fds.append(int(entry.name))
+    return sorted(fds)
+
+
 def main():
     if len(sys.argv) < 3 or os.geteuid() != 0:
         sys.exit('usage (as root): test-launch-scripts.py <ginux> <script-fixture> [scenario ...]')
@@ -63,7 +78,8 @@ def main():
                     roots = children(proc.pid)
                     assert len(roots) == 1, roots
                     initial = roots[0]
-                    assert sorted(int(p.name) for p in Path(f'/proc/{initial}/fd').iterdir()) == [0, 1, 2, 3]
+                    # The image file holds its public number.
+                    assert host_fds(initial) == [0, 1, 2, 5], host_fds(initial)
                     proc.stdin.write(b'G'); proc.stdin.flush()
                     assert select.select([proc.stdout], [], [], 10)[0], (mode, 'script exec stalled', audit_path.read_text())
                     assert proc.stdout.readline() == b'script-ready\n', (mode, audit_path.read_text())

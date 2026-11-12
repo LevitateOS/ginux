@@ -12,7 +12,7 @@ use crate::launch::{
 use crate::supervisor::*;
 use crate::tracee_io::copy_memory;
 use ginux_contract::{Action as ContractAction, EffectiveContract};
-use ginux_core::{balanced_identity_result, configured_surface, Action};
+use ginux_core::{balanced_identity_result, configured_surface, Action, NumberStep};
 use ginux_instance::Instance;
 use ginux_process::{Credentials, ProcessError, ProcessTable, TaskId, WaitTarget};
 use ginux_vfs::Executable;
@@ -28,6 +28,10 @@ pub(crate) const OPTIONS: usize = SYSCALL_STOP_OPTIONS | PTRACE_O_TRACESECCOMP;
 /// Legacy vsyscall page. The kernel emulates calls made there and reports
 /// them to seccomp, but never as ptrace syscall stops.
 const VSYSCALL_PAGE: u64 = 0xffff_ffff_ff60_0000;
+/// Linux x86-64 `eventfd2` and its `EFD_CLOEXEC`: an inert host placeholder
+/// at the lowest free number, closed by any exec.
+const SYS_EVENTFD2: u64 = 290;
+const EFD_CLOEXEC: u64 = 0o2000000;
 
 #[derive(Clone, Copy)]
 enum Pending {
@@ -123,6 +127,27 @@ struct Task {
     /// arguments differ from them, or the kernel may end it with an internal
     /// restart the exit translates.
     exit_registers: bool,
+    alignment: Option<Alignment>,
+}
+
+/// A native open whose host table is being made to give it its public
+/// number. Each placeholder step replaces the stopped open, its exit replays
+/// the open's own instruction, and the open runs once no step is left. The
+/// open holds the argument guard throughout, so no other task changes the
+/// host table meanwhile.
+#[derive(Clone, Copy)]
+struct Alignment {
+    /// The workload's registers at the open's entry, replayed after each step.
+    original: UserRegs,
+    /// The open as it runs once the table is aligned.
+    open: UserRegs,
+    /// The public number the open has reserved.
+    slot: usize,
+    /// The step in flight, settled at its exit.
+    step: Option<NumberStep>,
+    /// The kernel had no descriptor for a placeholder: the open runs as it
+    /// stands, and its number is translated as any unequal one is.
+    abandoned: bool,
 }
 
 /// A parked syscall being returned to its own instruction. The skipped entry
@@ -165,6 +190,7 @@ impl Task {
             in_flight: false,
             stopped: None,
             exit_registers: true,
+            alignment: None,
         }
     }
 }
@@ -621,6 +647,7 @@ pub fn supervise(
             // Injected transactions block signals for their whole duration,
             // so this stop cannot belong to one.
             if s.task(index).mapping.is_some()
+                || s.task(index).alignment.is_some()
                 || s.task(index).exec.is_some_and(|e| {
                     matches!(
                         e.stage,
@@ -727,6 +754,7 @@ pub fn supervise(
                 if s.argument_guard == Some(index)
                     && s.task(index).exec.is_none()
                     && s.task(index).mapping.is_none()
+                    && s.task(index).alignment.is_none()
                 {
                     s.release_argument_guard(instance);
                 }
@@ -974,6 +1002,7 @@ impl Supervisor<'_> {
             || task.signal_target.is_some()
             || !matches!(task.pending, Pending::None)
             || task.image_chdir.is_some()
+            || task.alignment.is_some()
     }
 
     /// Whether the in-flight syscall of a task about to be resumed must stop
@@ -993,6 +1022,7 @@ impl Supervisor<'_> {
     fn injecting(&self, index: usize) -> bool {
         let task = self.task(index);
         task.mapping.is_some()
+            || task.alignment.is_some()
             || task.exec.is_some_and(|e| {
                 matches!(
                     e.stage,
@@ -1306,6 +1336,16 @@ impl Supervisor<'_> {
             }
             return;
         }
+        if let Some(alignment) = self.task(index).alignment {
+            if r.orig_rax != alignment.original.orig_rax || r.rip != alignment.original.rip {
+                self.fail(
+                    instance,
+                    b"descriptor alignment left its syscall instruction",
+                );
+            }
+            self.alignment_step(index, instance);
+            return;
+        }
 
         if let Some(exec) = self.task(index).exec {
             match exec.stage {
@@ -1524,7 +1564,7 @@ impl Supervisor<'_> {
                         self.task(index).host,
                         original,
                         backing,
-                        self.table(index).native_descriptor_set(),
+                        self.table(index).host_descriptor_set(),
                     ) {
                         Ok(mapping) => mapping,
                         Err(reason) => self.fail(instance, reason),
@@ -2054,17 +2094,23 @@ impl Supervisor<'_> {
                 .filter(|host| *host != 0)
                 .unwrap_or_else(|| self.fail(instance, b"thread group leader missing"));
             let task = self.tasks[index].as_mut().unwrap();
+            let state = self.groups[group].as_mut().unwrap();
+            let shared = state.owners > 1;
             decide_launch(
                 task.host,
                 signal_tgid,
                 r,
-                &mut self.groups[group].as_mut().unwrap().table,
+                &mut state.table,
                 &mut self.objects,
                 &mut task.call,
+                shared,
             )
         };
+        // The descriptor owner already rewrote the call into the host change
+        // it decided: no path or stat handling applies to it.
+        let effect = self.task(index).call.kernel_effect();
         let decision = match decision {
-            NativeDecision::Contract(decision) => {
+            NativeDecision::Contract(decision) if !effect => {
                 match if matches!(decision.action, Action::Mediate)
                     && launch_arguments_allowed(self.task(index).host, r.orig_rax, r)
                 {
@@ -2153,7 +2199,18 @@ impl Supervisor<'_> {
             }
             NativeDecision::Hooked { result, .. } => {
                 self.wake_needed = true;
-                self.emulate(index, r, result, instance)
+                if self.task_mut(index).call.take_kernel_effect() {
+                    // Decided and audited as this result; the kernel makes
+                    // the host descriptor change with the registers the
+                    // descriptor owner set, and its exit checks any result.
+                    audit_write(b"emulate result=");
+                    audit_i64(result);
+                    self.objects.devices.network.audit_attempt();
+                    audit_write(b"\n");
+                    self.run(index, r, instance);
+                } else {
+                    self.emulate(index, r, result, instance)
+                }
             }
             NativeDecision::Contract(decision) => match decision.action {
                 Action::Emulate if matches!(original.orig_rax, 60 | 231) => {
@@ -2170,13 +2227,24 @@ impl Supervisor<'_> {
                     balanced_identity_result(original.orig_rax).unwrap_or(0),
                     instance,
                 ),
+                Action::Mediate if self.task_mut(index).call.take_kernel_effect() => {
+                    // A host change in place of the native call the decision
+                    // names (a duplication that replaces a native target in
+                    // place of closing it): audited as that call.
+                    audit_write(b"mediate surface=");
+                    audit_write(balanced_surface_name(configured_surface(decision.syscall)));
+                    audit_write(b"\n");
+                    self.run(index, r, instance)
+                }
                 Action::Mediate
                     if launch_arguments_allowed(self.task(index).host, r.orig_rax, r) =>
                 {
                     audit_write(b"mediate surface=");
                     audit_write(balanced_surface_name(configured_surface(r.orig_rax)));
                     audit_write(b"\n");
-                    self.run(index, r, instance)
+                    if !self.begin_alignment(index, &original, r, instance) {
+                        self.run(index, r, instance)
+                    }
                 }
                 Action::Mediate => self.emulate(index, r, -1, instance),
                 Action::Deny(errno) => {
@@ -2190,6 +2258,117 @@ impl Supervisor<'_> {
             },
         }
     }
+    /// Start aligning the host table for a native open about to run with
+    /// registers `r`, when the kernel would not give it its reserved public
+    /// number. Returns whether the alignment now owns the call. Only with the
+    /// launch filter, where an equal number spares later calls their exit
+    /// stops, and only under the open's argument guard.
+    fn begin_alignment(
+        &mut self,
+        index: usize,
+        original: &UserRegs,
+        r: &UserRegs,
+        instance: &mut Instance,
+    ) -> bool {
+        if !self.seccomp || self.argument_guard != Some(index) {
+            return false;
+        }
+        let Some(slot) = self.task(index).call.pending_open() else {
+            return false;
+        };
+        if self.table(index).number_step(slot).is_none() {
+            return false;
+        }
+        // Each step's exit replays the open's own syscall instruction.
+        let mut instruction = [0u8; 2];
+        if original.rip < 2
+            || copy_memory(
+                self.task(index).host,
+                original.rip - 2,
+                &mut instruction,
+                false,
+            ) != Ok(2)
+            || instruction != [0x0f, 0x05]
+        {
+            return false;
+        }
+        self.task_mut(index).alignment = Some(Alignment {
+            original: *original,
+            open: *r,
+            slot,
+            step: None,
+            abandoned: false,
+        });
+        self.alignment_step(index, instance);
+        true
+    }
+
+    /// Run an aligning open's next placeholder step in place of the open,
+    /// or the open itself once none is left.
+    fn alignment_step(&mut self, index: usize, instance: &mut Instance) {
+        let mut alignment = self.task(index).alignment.unwrap();
+        let step = if alignment.abandoned {
+            None
+        } else {
+            self.table(index).number_step(alignment.slot)
+        };
+        let Some(step) = step else {
+            self.task_mut(index).alignment = None;
+            self.run(index, &alignment.open, instance);
+            return;
+        };
+        let mut next = alignment.open;
+        match step {
+            NumberStep::Release(fd) => {
+                next.orig_rax = 3;
+                next.rdi = fd as u64;
+            }
+            NumberStep::Occupy(_) => {
+                next.orig_rax = SYS_EVENTFD2;
+                next.rdi = 0;
+                next.rsi = EFD_CLOEXEC;
+            }
+        }
+        next.rax = next.orig_rax;
+        alignment.step = Some(step);
+        self.task_mut(index).alignment = Some(alignment);
+        self.run(index, &next, instance);
+    }
+
+    /// Settle a placeholder step at its exit and replay the open.
+    fn alignment_exit(
+        &mut self,
+        index: usize,
+        mut alignment: Alignment,
+        r: &UserRegs,
+        instance: &mut Instance,
+    ) {
+        let result = r.rax as i64;
+        match alignment.step.take() {
+            Some(NumberStep::Release(fd)) if r.orig_rax == 3 => {
+                if result != 0 {
+                    self.fail(instance, b"descriptor placeholder close failed");
+                }
+                self.group_mut(index).table.placeholder_released(fd);
+            }
+            Some(NumberStep::Occupy(fd)) if r.orig_rax == SYS_EVENTFD2 => {
+                if result < 0 {
+                    alignment.abandoned = true;
+                } else if result as usize != fd {
+                    self.fail(instance, b"descriptor placeholder outside its number");
+                } else {
+                    self.group_mut(index).table.placeholder_placed(fd);
+                }
+            }
+            _ => self.fail(instance, b"descriptor alignment lost its syscall"),
+        }
+        self.task_mut(index).alignment = Some(alignment);
+        let mut replay = alignment.original;
+        replay.rip -= 2;
+        replay.rax = replay.orig_rax;
+        self.run(index, &replay, instance);
+    }
+
     fn prepare_exec(&mut self, index: usize, r: &mut UserRegs) -> Result<(), i64> {
         let host = self.task(index).host;
         let mut instruction = [0; 2];
@@ -2679,6 +2858,10 @@ impl Supervisor<'_> {
                 }
                 Err(reason) => self.fail(instance, reason),
             }
+            return;
+        }
+        if let Some(alignment) = self.task(index).alignment {
+            self.alignment_exit(index, alignment, r, instance);
             return;
         }
 

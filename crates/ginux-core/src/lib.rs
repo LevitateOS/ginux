@@ -405,6 +405,40 @@ pub const fn seccomp_change_request(syscall: u64, arg0: u64) -> bool {
     syscall == SYS_SECCOMP || syscall == SYS_PRCTL && arg0 as u32 as u64 == PR_SET_SECCOMP
 }
 
+/// One host descriptor change that brings a host table closer to giving its
+/// next allocation exactly the number `slot`, as Linux gives the lowest free
+/// number.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NumberStep {
+    /// Close the placeholder that holds `slot`.
+    Release(usize),
+    /// Fill this free number below `slot` with a placeholder.
+    Occupy(usize),
+}
+
+/// The next step that makes a host table whose numbers are held by real
+/// descriptors (`native`) and by inert placeholders (`placeholder`) allocate
+/// `slot` next: release a placeholder at `slot`, then fill the lowest free
+/// number below it. `None` once the next allocation yields `slot`, or when a
+/// real descriptor holds `slot`: nothing may close that one, and no step
+/// helps. A number past either slice holds nothing.
+pub fn descriptor_number_step(
+    slot: usize,
+    native: &[bool],
+    placeholder: &[bool],
+) -> Option<NumberStep> {
+    let held = |table: &[bool], n: usize| table.get(n).copied().unwrap_or(false);
+    if held(native, slot) {
+        return None;
+    }
+    if held(placeholder, slot) {
+        return Some(NumberStep::Release(slot));
+    }
+    (0..slot)
+        .find(|&n| !held(native, n) && !held(placeholder, n))
+        .map(NumberStep::Occupy)
+}
+
 /// Whether an `fcntl` or `ioctl` request would set up signal-driven I/O, so
 /// that the host kernel signals a process when a descriptor becomes ready.
 /// The workload could name any host process its credentials may signal
@@ -1688,6 +1722,47 @@ mod tests {
         assert!(!seccomp_change_request(157, 21));
         assert!(!seccomp_change_request(157, 38));
         assert!(!seccomp_change_request(24, 22));
+    }
+
+    #[test]
+    fn descriptor_number_step_aligns_the_next_allocation() {
+        let mut native = [false; 8];
+        let mut placeholder = [false; 8];
+        // Nothing held: the lowest free number is already the slot.
+        assert_eq!(descriptor_number_step(0, &native, &placeholder), None);
+        native[0] = true;
+        native[1] = true;
+        assert_eq!(descriptor_number_step(2, &native, &placeholder), None);
+        // Free numbers below the slot fill from the lowest.
+        native[1] = false;
+        assert_eq!(
+            descriptor_number_step(4, &native, &placeholder),
+            Some(NumberStep::Occupy(1))
+        );
+        placeholder[1] = true;
+        assert_eq!(
+            descriptor_number_step(4, &native, &placeholder),
+            Some(NumberStep::Occupy(2))
+        );
+        placeholder[2] = true;
+        placeholder[3] = true;
+        assert_eq!(descriptor_number_step(4, &native, &placeholder), None);
+        // A placeholder at the slot goes first.
+        placeholder[4] = true;
+        placeholder[1] = false;
+        assert_eq!(
+            descriptor_number_step(4, &native, &placeholder),
+            Some(NumberStep::Release(4))
+        );
+        // A real descriptor at the slot is never closed: no step helps.
+        native[4] = true;
+        assert_eq!(descriptor_number_step(4, &native, &placeholder), None);
+        // Numbers past the tables hold nothing.
+        assert_eq!(
+            descriptor_number_step(9, &[true; 8], &[false; 8]),
+            Some(NumberStep::Occupy(8))
+        );
+        assert_eq!(descriptor_number_step(8, &[true; 8], &[false; 8]), None);
     }
 
     #[test]

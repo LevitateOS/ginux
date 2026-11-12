@@ -79,10 +79,11 @@ def main():
                         descendants = children(target)
                         assert len(descendants) == 1, descendants
                         target = descendants[0]
-                    # The all-CLOEXEC image fd is gone in the kernel. A mixed
-                    # alias keeps only its single native handle, number 3.
+                    # The all-CLOEXEC image fd is gone in the kernel. The
+                    # surviving alias is its own native handle at its public
+                    # number, 12; placeholders closed with exec.
                     native_fds = sorted(int(p.name) for p in Path(f'/proc/{target}/fd').iterdir())
-                    assert native_fds == [0, 1, 2, 3], (mode, native_fds)
+                    assert native_fds == [0, 1, 2, 12], (mode, native_fds)
                     stdout, _ = proc.communicate(b'G', timeout=5)
                     expected = b'exec: PASS\n' + (b'parent: PASS\n' if mode == 'child' else b'')
                     assert proc.returncode == 0 and stdout == expected, (mode, proc.returncode, stdout, audit_path.read_text())

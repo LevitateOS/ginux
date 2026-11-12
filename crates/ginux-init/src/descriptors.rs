@@ -38,12 +38,18 @@ struct Descriptor {
     cloexec: bool,
     // Immutable metadata-only kind; copies/aliases must never gain data access.
     path_flags: u32,
+    // The native open this descriptor duplicates (0: none). Kernel
+    // duplicates of one open share it, as table aliases share a handle.
+    origin: u32,
 }
 
+/// A native descriptor change the call's exit settles. `Dup`: the kernel
+/// duplicates a native descriptor onto this public number.
 #[derive(Clone, Copy)]
 enum Pending {
     Open { slot: usize },
     Close { result: Option<i64> },
+    Dup { target: usize },
 }
 
 /// Owned backend handles are instance-wide; native kernel numbers are per task.
@@ -245,9 +251,20 @@ fn empty_regs() -> UserRegs {
     unsafe { core::mem::zeroed() }
 }
 
+/// Public numbers equal host numbers for native descriptors wherever the
+/// table can arrange it: a native call then runs with the workload's own
+/// registers. A host number that a public non-native entry (owned object,
+/// reservation, alias) occupies holds nothing or an inert placeholder, never
+/// a descriptor a workload call can reach: every call that names a number is
+/// translated or answered here first.
 pub struct DescriptorTable {
     entries: [Option<Descriptor>; LIMIT],
     capacity: usize,
+    /// Host numbers that hold a close-on-exec placeholder the supervisor
+    /// placed so the kernel's next open lands on the public number.
+    placeholders: [bool; LIMIT],
+    /// The last native open's origin number.
+    origins: u32,
 }
 
 /// A traced task owns its in-flight syscall and poll state independently of
@@ -269,6 +286,9 @@ pub struct DescriptorCall {
     // A path xattr call runs as its faccessat2(F_OK) resolution; a
     // successful resolution returns this instead.
     success: Option<i64>,
+    // The entry's decided result is carried out by the kernel: the call runs
+    // with the registers set here instead of being skipped.
+    kernel_effect: bool,
 }
 
 /// A bounded native pselect only arbitrates signal delivery, never file IO.
@@ -295,11 +315,32 @@ impl DescriptorCall {
             signal_wait: None,
             channel_write: crate::channel_hooks::WriteProgress::new(),
             success: None,
+            kernel_effect: false,
         }
     }
 
     pub fn native_mutation(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// Whether this entry's decision is a host descriptor change the kernel
+    /// makes with the call's registers: audited as decided, but run rather
+    /// than skipped.
+    pub fn kernel_effect(&self) -> bool {
+        self.kernel_effect
+    }
+
+    /// Consume [`DescriptorCall::kernel_effect`] for the run that carries it out.
+    pub fn take_kernel_effect(&mut self) -> bool {
+        core::mem::take(&mut self.kernel_effect)
+    }
+
+    /// The public number a native open about to run has reserved.
+    pub fn pending_open(&self) -> Option<usize> {
+        match self.pending {
+            Some(Pending::Open { slot }) => Some(slot),
+            _ => None,
+        }
     }
     pub fn reset(
         &mut self,
@@ -484,10 +525,16 @@ impl DescriptorCall {
                         if r.rax >= LIMIT as u64 {
                             return Err(b"native descriptor outside bounded table");
                         }
-                        table.entries[slot].as_mut().unwrap().handle = Handle::Native {
+                        if table.placeholders[r.rax as usize] {
+                            return Err(b"native descriptor landed on a placeholder");
+                        }
+                        table.origins = table.origins.checked_add(1).unwrap_or(1);
+                        let entry = table.entries[slot].as_mut().unwrap();
+                        entry.handle = Handle::Native {
                             fd: r.rax as u32,
                             console: false,
                         };
+                        entry.origin = table.origins;
                         r.rax = slot as u64;
                     } else {
                         table.entries[slot] = None;
@@ -500,6 +547,13 @@ impl DescriptorCall {
                     }
                     if let Some(result) = result {
                         r.rax = result as u64;
+                    }
+                }
+                Pending::Dup { target } => {
+                    // The table committed the duplicate at entry; any other
+                    // result means the host table no longer matches it.
+                    if r.rax != target as u64 {
+                        return Err(b"native descriptor duplication failed");
                     }
                 }
             }
@@ -532,6 +586,8 @@ impl DescriptorTable {
         let mut table = Self {
             entries: [None; LIMIT],
             capacity: limits[0].min(LIMIT as u64) as usize,
+            placeholders: [false; LIMIT],
+            origins: 0,
         };
         for fd in 0..3 {
             // Bootstrap exec closes CLOEXEC stdio just like an already closed
@@ -544,6 +600,7 @@ impl DescriptorTable {
                     },
                     cloexec: false,
                     path_flags: 0,
+                    origin: 0,
                 });
             }
         }
@@ -584,9 +641,12 @@ impl DescriptorTable {
                 _ => {}
             }
         }
+        // The kernel copies placeholders with the rest of the host table.
         Ok(Self {
             entries,
             capacity: self.capacity,
+            placeholders: self.placeholders,
+            origins: self.origins,
         })
     }
 
@@ -609,7 +669,7 @@ impl DescriptorTable {
         None
     }
 
-    pub fn native_descriptor_set(&self) -> [bool; LIMIT] {
+    fn native_descriptor_set(&self) -> [bool; LIMIT] {
         let mut used = [false; LIMIT];
         for descriptor in self.entries.iter().flatten() {
             if let Handle::Native { fd, .. } = descriptor.handle {
@@ -617,6 +677,33 @@ impl DescriptorTable {
             }
         }
         used
+    }
+
+    /// Host numbers this table's tasks hold: native descriptors and
+    /// placeholders.
+    pub fn host_descriptor_set(&self) -> [bool; LIMIT] {
+        let mut used = self.native_descriptor_set();
+        for (used, placeholder) in used.iter_mut().zip(self.placeholders) {
+            *used |= placeholder;
+        }
+        used
+    }
+
+    /// The next placeholder change that makes the native open reserving
+    /// `slot` receive `slot` from the kernel. Only valid while no other task
+    /// can change this host table.
+    pub fn number_step(&self, slot: usize) -> Option<ginux_core::NumberStep> {
+        ginux_core::descriptor_number_step(slot, &self.native_descriptor_set(), &self.placeholders)
+    }
+
+    /// The kernel placed a placeholder at `fd`.
+    pub fn placeholder_placed(&mut self, fd: usize) {
+        self.placeholders[fd] = true;
+    }
+
+    /// The kernel closed the placeholder at `fd`.
+    pub fn placeholder_released(&mut self, fd: usize) {
+        self.placeholders[fd] = false;
     }
 
     pub fn mapping_file(&self, fd: u64) -> Result<Option<u32>, i64> {
@@ -709,6 +796,8 @@ impl DescriptorTable {
                 // Kernel closed native handles with no surviving aliases.
             }
         }
+        // Placeholders are close-on-exec.
+        self.placeholders = [false; LIMIT];
         Ok(())
     }
 
@@ -758,10 +847,14 @@ impl DescriptorTable {
             handle: Handle::Reserved,
             cloexec,
             path_flags: 0,
+            origin: 0,
         });
         Ok(slot)
     }
 
+    /// Decide one entry. `shared`: another task uses this table, so a host
+    /// descriptor change must finish at the call's exit before a creation
+    /// can copy the table.
     pub fn enter(
         &mut self,
         pid: usize,
@@ -769,9 +862,11 @@ impl DescriptorTable {
         r: &mut UserRegs,
         backends: &mut Backends,
         call: &mut DescriptorCall,
+        shared: bool,
     ) -> NativeDecision {
+        call.kernel_effect = false;
         backends.refresh_epolls();
-        let result = self.enter_inner(pid, signal_tgid, r, backends, call);
+        let result = self.enter_inner(pid, signal_tgid, r, backends, call, shared);
         backends.refresh_epolls();
         result
     }
@@ -783,6 +878,7 @@ impl DescriptorTable {
         r: &mut UserRegs,
         backends: &mut Backends,
         call: &mut DescriptorCall,
+        shared: bool,
     ) -> NativeDecision {
         // Resource changes cannot invalidate the public allocator or address-space bound.
         if r.orig_rax == 302 && matches!(r.rsi, 7 | 9) && r.rdx != 0 {
@@ -835,11 +931,11 @@ impl DescriptorTable {
             3 => {
                 call.save(r);
                 self.get(r.rdi)
-                    .and_then(|_| self.close(r.rdi as u32 as usize, r, pid, backends, call))
+                    .and_then(|_| self.close(r.rdi as u32 as usize, r, pid, backends, call, shared))
             }
             32 | 33 | 292 => {
                 call.save(r);
-                self.dup(pid, r, backends, call)
+                self.dup(pid, r, backends, call, shared)
             }
             280 if r.rsi == 0 => {
                 call.save(r);
@@ -853,7 +949,7 @@ impl DescriptorTable {
                 match self.get(r.rdi) {
                     Err(e) => Err(e),
                     Ok(entry) => match r.rsi {
-                        0 | 1030 => self.dup(pid, r, backends, call),
+                        0 | 1030 => self.dup(pid, r, backends, call, shared),
                         1 => Ok(ready(entry.cloexec as i64)),
                         2 if r.rdx & !1 == 0 => {
                             self.entries[r.rdi as u32 as usize]
@@ -1431,6 +1527,7 @@ impl DescriptorTable {
         pid: usize,
         backends: &mut Backends,
         call: &mut DescriptorCall,
+        shared: bool,
     ) -> Result<NativeDecision, i64> {
         let result = if r.orig_rax == 3 {
             None
@@ -1441,6 +1538,7 @@ impl DescriptorTable {
         if let Handle::Owned(handle) = entry.handle {
             backends.filesystem.close_locks(handle);
             if !backends.refs.release(handle) {
+                self.release_placeholder(slot, r, call, shared);
                 return Ok(ready(result.unwrap_or(0)));
             }
         } else if self
@@ -1455,7 +1553,20 @@ impl DescriptorTable {
             Handle::Native { fd, .. } => {
                 r.orig_rax = 3;
                 r.rdi = fd as u64;
-                call.pending = Some(Pending::Close { result });
+                // A plain close of a number equal to its host number has no
+                // result to translate. In an unshared table nothing can copy
+                // the host table before the kernel has closed it, so its exit
+                // has no work; otherwise the exit settles the close first.
+                if result.is_some() || fd as usize != slot || shared {
+                    call.pending = Some(Pending::Close { result });
+                }
+                // Another public number still duplicates this open: the
+                // kernel drops one of its descriptors, which is decided and
+                // audited as the alias close it is.
+                if self.duplicated(entry.origin) {
+                    call.kernel_effect = true;
+                    return Ok(ready(result.unwrap_or(0)));
+                }
                 Ok(NativeDecision::Contract(decide_balanced(3)))
             }
             Handle::Owned(handle) => {
@@ -1463,12 +1574,110 @@ impl DescriptorTable {
                 close.orig_rax = 3;
                 close.rdi = handle as u64;
                 match backends.claim(pid, &close) {
-                    NativeDecision::Hooked { result: 0, .. } => Ok(ready(result.unwrap_or(0))),
+                    NativeDecision::Hooked { result: 0, .. } => {
+                        self.release_placeholder(slot, r, call, shared);
+                        Ok(ready(result.unwrap_or(0)))
+                    }
                     _ => Err(-5),
                 }
             }
             Handle::Reserved | Handle::OpeningFifo(_) => Err(-9),
         }
+    }
+
+    /// A plain `close` of a public number whose host number holds a
+    /// placeholder closes the placeholder too: the call runs as the workload
+    /// made it, so the host number is free again when the public one is. A
+    /// shared table keeps the placeholder, which a later native open
+    /// releases when it needs the number.
+    fn release_placeholder(
+        &mut self,
+        slot: usize,
+        r: &UserRegs,
+        call: &mut DescriptorCall,
+        shared: bool,
+    ) {
+        if r.orig_rax == 3 && !shared && self.placeholders[slot] {
+            self.placeholders[slot] = false;
+            call.kernel_effect = true;
+        }
+    }
+
+    /// Whether a public number duplicates native open `origin`.
+    fn duplicated(&self, origin: u32) -> bool {
+        origin != 0
+            && self.entries.iter().flatten().any(|entry| {
+                entry.origin == origin && matches!(entry.handle, Handle::Native { .. })
+            })
+    }
+
+    /// Whether a native duplication may put its copy at host number
+    /// `target`: that number holds nothing, a placeholder, or the public
+    /// target's own native descriptor, and no other public number's.
+    fn duplication_target(&self, target: usize) -> bool {
+        let own = match self.entries[target].map(|d| d.handle) {
+            None | Some(Handle::Owned(_)) => true,
+            Some(Handle::Native { fd, .. }) => fd as usize == target,
+            Some(Handle::Reserved | Handle::OpeningFifo(_)) => false,
+        };
+        own && !self.entries.iter().enumerate().any(|(slot, entry)| {
+            slot != target
+                && matches!(
+                    entry.map(|d| d.handle),
+                    Some(Handle::Native { fd, .. }) if fd as usize == target
+                )
+        })
+    }
+
+    /// Duplicate native descriptor `fd` onto public `target` in the kernel
+    /// too, so the copy's host number is its public number. The public
+    /// target retires first, as `dup2` retires it; a native one is replaced
+    /// by the kernel in the same call. The decision is audited as the
+    /// table-only duplication would be: the target's close when the kernel
+    /// replaces a native target, otherwise the result.
+    #[allow(clippy::too_many_arguments)]
+    fn native_dup(
+        &mut self,
+        fd: u32,
+        target: usize,
+        entry: Descriptor,
+        r: &mut UserRegs,
+        pid: usize,
+        backends: &mut Backends,
+        call: &mut DescriptorCall,
+        shared: bool,
+    ) -> Result<NativeDecision, i64> {
+        let decision = match self.entries[target] {
+            Some(
+                old @ Descriptor {
+                    handle: Handle::Native { .. },
+                    ..
+                },
+            ) => {
+                self.entries[target] = None;
+                if self.duplicated(old.origin) {
+                    ready(target as i64)
+                } else {
+                    NativeDecision::Contract(decide_balanced(3))
+                }
+            }
+            Some(_) => self.close(target, r, pid, backends, call, shared)?,
+            None => ready(target as i64),
+        };
+        self.entries[target] = Some(Descriptor {
+            handle: Handle::Native {
+                fd: target as u32,
+                console: false,
+            },
+            ..entry
+        });
+        self.placeholders[target] = false;
+        r.orig_rax = 33;
+        r.rdi = fd as u64;
+        r.rsi = target as u64;
+        call.pending = Some(Pending::Dup { target });
+        call.kernel_effect = true;
+        Ok(decision)
     }
 
     fn dup(
@@ -1477,6 +1686,7 @@ impl DescriptorTable {
         r: &mut UserRegs,
         backends: &mut Backends,
         call: &mut DescriptorCall,
+        shared: bool,
     ) -> Result<NativeDecision, i64> {
         let source = r.rdi as i32;
         let mut entry = self.get(r.rdi)?;
@@ -1504,9 +1714,15 @@ impl DescriptorTable {
             return Err(-16);
         }
         entry.cloexec = cloexec;
+        // A console keeps its supervisor-shared number; an alias names it.
+        if let Handle::Native { fd, console: false } = entry.handle {
+            if self.duplication_target(target) {
+                return self.native_dup(fd, target, entry, r, pid, backends, call, shared);
+            }
+        }
         // Preserve the source in its own slot until target retirement completes.
         let decision = if self.entries[target].is_some() {
-            self.close(target, r, pid, backends, call)?
+            self.close(target, r, pid, backends, call, shared)?
         } else {
             ready(target as i64)
         };
