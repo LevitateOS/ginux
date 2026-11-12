@@ -122,6 +122,14 @@ multi-instance density, hardware-accelerated behavior, or a new tolerance.
 Gate 11 remains authoritative for native-parity goals and exceptions; Gate 13
 uses its own current-main regression boundary.
 
+## Launch mode
+
+The matrix above measures instance modes with compute-bound sysbench loops.
+Workloads run through `ginux launch` are syscall-bound; their overhead,
+supervisor stops per syscall and regression budgets are measured by
+`make bench-launch` and described in [launch-performance.md](launch-performance.md).
+The 4% native budget does not apply to those rows.
+
 ## Troubleshooting
 
 - A missing dependency or image means `make bench-modes-prepare` has not

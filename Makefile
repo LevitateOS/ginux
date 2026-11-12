@@ -8,7 +8,7 @@ BASELINE := target/$(X86_TARGET)/release/baseline-runner
 RUNTIME_FIXTURE := target/$(X86_TARGET)/release/runtime-fixture
 PROCESS_NATIVE_FIXTURE := target/$(X86_TARGET)/release/process-native-fixture
 
-.PHONY: doctor host-image-fetch host-image-verify host-boot-test host-run host-reset test-host-lifecycle image-helper-fetch image-prepare instance-image-fetch instance-image-verify instance-image-prepare systemd-image-fetch systemd-image-verify systemd-image-prepare test-image test-oci-image test-oci-layers test-vfs test-native-vfs image-cache-clean build check-name check-instance-terminology check test-ci-changes contract-doc test-contract test-contract-runtime test test-unit test-intercept test-runtime test-config test-instance test-instance-terminology test-process build-process-fixtures test-process-native test-devices test-kernel-views test-systemd test-systemd-live test-systemd-interactive test-multi-instance test-gate975-network test-gate975-hooks test-gate125-lock test-cgroup test-block test-network test-security test-recovery check-security-doc fuzz-security test-bench-compare test-gate15-report bench-prepare bench bench-baseline bench-compare bench-systemd bench-report bench-block bench-network bench-modes-prepare bench-modes bench-modes-report demo-gate-1 demo-gate-2 demo-gate-3 demo-gate-4 demo-gate-5 demo-gate-6 demo-gate-7 demo-gate-8 demo-gate-9 demo-gate-9.5 demo-gate-9.75 demo-gate-10 demo-gate-10.25 demo-gate-10.5 demo-gate-11 demo-gate-12 demo-gate-12.1 demo-gate-12.25 demo-gate-12.5 demo-gate-13 demo-gate-15 demo-gate-17 clean
+.PHONY: doctor host-image-fetch host-image-verify host-boot-test host-run host-reset test-host-lifecycle image-helper-fetch image-prepare instance-image-fetch instance-image-verify instance-image-prepare systemd-image-fetch systemd-image-verify systemd-image-prepare test-image test-oci-image test-oci-layers test-vfs test-native-vfs image-cache-clean build check-name check-instance-terminology check test-ci-changes contract-doc test-contract test-contract-runtime test test-unit test-intercept test-runtime test-config test-instance test-instance-terminology test-process build-process-fixtures test-process-native test-devices test-kernel-views test-systemd test-systemd-live test-systemd-interactive test-multi-instance test-gate975-network test-gate975-hooks test-gate125-lock test-cgroup test-block test-network test-security test-recovery check-security-doc fuzz-security test-bench-compare test-gate15-report bench-prepare bench bench-baseline bench-compare bench-systemd bench-report bench-block bench-network bench-modes-prepare bench-modes bench-modes-report build-bench-launch-fixture bench-launch bench-launch-compare bench-launch-accept test-bench-launch demo-gate-1demo-gate-2 demo-gate-3 demo-gate-4 demo-gate-5 demo-gate-6 demo-gate-7 demo-gate-8 demo-gate-9 demo-gate-9.5 demo-gate-9.75 demo-gate-10 demo-gate-10.25 demo-gate-10.5 demo-gate-11 demo-gate-12 demo-gate-12.1 demo-gate-12.25 demo-gate-12.5 demo-gate-13 demo-gate-15 demo-gate-17 clean
 
 doctor:
 	@./scripts/doctor.sh
@@ -264,6 +264,34 @@ bench-modes: build
 
 bench-modes-report:
 	@./scripts/gate15-report.sh
+
+# Launch-mode overhead: `ginux launch` against a native chroot of the same
+# root, per syscall class and build-shaped workload. See docs/launch-performance.md.
+BENCH_LAUNCH_FIXTURE := $(BUILD_DIR)/bench-launch/launch-bench-fixture
+
+build-bench-launch-fixture:
+	mkdir -p $(BUILD_DIR)/bench-launch
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror benchmarks/launch/launch-bench-fixture.c -o $(BENCH_LAUNCH_FIXTURE)
+
+# Variables: GINUX_BENCH_BINARY (default $(GINUX)), BENCH_REPS, BENCH_SCALE, BENCH_ROWS.
+bench-launch: build-bench-launch-fixture
+	@python3 scripts/bench-launch.py run --ginux "current=$${GINUX_BENCH_BINARY:-$(GINUX)}" \
+		--reps "$${BENCH_REPS:-5}" --scale "$${BENCH_SCALE:-1}" $${BENCH_ROWS:+--rows "$$BENCH_ROWS"}
+
+# Without BENCH_A and BENCH_B: compare build/bench-launch/latest (or RUN=dir) with
+# benchmarks/launch/baseline.json. With both (LABEL=PATH): run the two binaries
+# alternately and compare them.
+bench-launch-compare: build-bench-launch-fixture
+	@if test -n "$${BENCH_A:-}" && test -n "$${BENCH_B:-}"; then \
+		python3 scripts/bench-launch.py ab --a "$$BENCH_A" --b "$$BENCH_B" \
+			--reps "$${BENCH_REPS:-5}" --scale "$${BENCH_SCALE:-1}" $${BENCH_ROWS:+--rows "$$BENCH_ROWS"}; \
+	else python3 scripts/bench-launch.py compare $${RUN:-}; fi
+
+bench-launch-accept:
+	@python3 scripts/bench-launch.py accept $${RUN:-}
+
+test-bench-launch:
+	@python3 scripts/bench-launch.py selftest
 
 demo-gate-11: doctor build
 	@./scripts/demo-gate-11.sh

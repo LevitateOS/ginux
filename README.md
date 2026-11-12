@@ -169,6 +169,8 @@ make bench              # matched native/Ginux matrix plus mandatory budget chec
 make bench-modes-prepare # one-time setup for the three-way dispatch comparison
 make bench-modes        # native/selective/paranoid tables and graphs
 make demo-gate-15       # bounded reproducible three-way comparison
+make bench-launch       # launch-mode per-syscall and workload overhead against native
+make bench-launch-compare # launch-mode run against its baseline, or two binaries (A/B)
 make demo-gate-17       # operator-readable concurrent-instance isolation check
 make test-systemd-live  # shared network plus real upstream dnf -y update
 make host-run           # general interactive Rocky host with Ginux installed
@@ -198,6 +200,13 @@ accepted baseline is published under `benchmarks/gate11/`, against that Ginux
 baseline as well. Environment mismatches are reported separately from
 performance regressions. `make demo-gate-11` runs a bounded human-inspectable
 comparison and returns nonzero when a mandatory row misses its budget.
+
+Those benchmarks are compute loops that barely make syscalls. For
+`ginux launch` workloads, which are syscall-bound, `make bench-launch` measures
+per-syscall-class and build-shaped rows against a native chroot of the same
+root, with supervisor stop and ptrace counts, and `make bench-launch-compare`
+checks a run against an accepted baseline or compares two binaries; see
+[docs/launch-performance.md](docs/launch-performance.md).
 
 Gate 15 provides a separate characterization workflow across native Rocky,
 selective Ginux, and paranoid Ginux. Native is the no-mediation control, not a
