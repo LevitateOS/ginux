@@ -225,7 +225,8 @@ def main():
                b"pi_word=0\nfutex_lock_pi_flags=-1\npi_flags_word=0\n")
         invoke(["descriptor", "0"], 0, "exited", cloexec_stdin=True)
         invoke(["ysinfo"], 0, "exited",
-               stdout=b"sysinfo=0\nsysinfo-zero=1\nmem-unit=1\nsysinfo-null=-14\n")
+               stdout=b"sysinfo=0\nsysinfo-private=1\ntotalram=268435456\n"
+               b"mem-unit=1\nsysinfo-null=-14\n")
         # Configured image reads keep their 64 MiB request bound, so the whole
         # 1 MiB + 1 file is read; console writes still return 4096.
         invoke(["oversized"], 0, "exited",
@@ -237,6 +238,10 @@ def main():
             secret.seek(0)
             invoke(["descriptor", str(secret.fileno())], 0, "exited", pass_fds=(secret.fileno(),))
         proc = invoke(["budget"], 0, "exited")
+        # Run as root, the header reports the identity the workload got.
+        if b"ginux: launch tracee-uid=65534 tracee-gid=65534 root=host-path-read-only\n" not in proc.stderr:
+            header = [line for line in proc.stderr.splitlines() if b"launch tracee-" in line]
+            raise RuntimeError(f"launch header identity: {header!r}")
         # Contract normalization has more fields after the upstream schema
         # migration. Bound the actual trace independently of that preamble.
         config_begin = proc.stderr.index(b"ginux: effective config begin\n")
@@ -344,6 +349,29 @@ def main():
             if proc.returncode != 2 or proc.stdout or b"ginux: usage:" not in proc.stderr:
                 raise RuntimeError(f"unknown or incomplete argv ran the demonstration: {proc!r}")
         print("PASS unknown and incomplete commands report usage without running a demo")
+        valid = work / "valid.toml"
+        valid.write_text(template)
+        proc = subprocess.run([binary, "instance-validate", str(valid)], capture_output=True,
+                              timeout=10)
+        if proc.returncode != 0 or b"Contract valid:" not in proc.stdout:
+            raise RuntimeError(f"fixed-arity command no longer succeeds: {proc!r}")
+        # Each command takes exactly this many operands; one more is a usage
+        # error, never ignored. `native` takes one optional, named mode.
+        operands = {"runtime": 1, "config": 1, "instance-plan": 1, "instance-validate": 1,
+                    "instance-inspect": 1, "hook-plan": 1, "lifecycle": 1, "process": 1,
+                    "kernel-views": 1, "instance-explain": 2, "instance-diff": 2,
+                    "instance": 2, "process-native": 2, "devices": 2, "vfs": 3,
+                    "native-hook": 3, "device-bench": 3, "native": 3}
+        for command, count in operands.items():
+            args = [str(valid)] * (count + 1)
+            proc = subprocess.run([binary, command, *args], capture_output=True, timeout=10)
+            if proc.returncode != 2 or proc.stdout or b"ginux: usage:" not in proc.stderr:
+                raise RuntimeError(f"{command} accepted an extra argument: {proc!r}")
+        proc = subprocess.run([binary, "native", str(valid), str(root), "configurd"],
+                              capture_output=True, timeout=10)
+        if proc.returncode != 2 or proc.stdout or b"ginux: usage:" not in proc.stderr:
+            raise RuntimeError(f"native accepted an unknown mode: {proc!r}")
+        print("PASS fixed-arity commands reject extra arguments and unknown modes")
         # A real unprivileged process bootstraps through a private user
         # namespace, or reports explicitly that the host refuses one.
         work.chmod(0o755)

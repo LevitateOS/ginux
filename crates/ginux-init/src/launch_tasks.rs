@@ -7,7 +7,7 @@ use crate::dispatch::{
 };
 use crate::launch::{
     audit_i64, audit_u64, audit_write, finish_exited, finish_signaled, launch_early_fail,
-    launch_exit_reason, line_stderr, supervision_error,
+    launch_exit_reason, line_stderr, supervision_error, write_stderr, write_stderr_u64,
 };
 use crate::supervisor::*;
 use crate::tracee_io::copy_memory;
@@ -465,7 +465,14 @@ pub fn supervise(
         s.fail(instance, b"launch ptrace setup failed");
     }
     line_stderr(b"ginux: launch backend=ptrace-native profile=balanced elf-loader=host");
-    line_stderr(b"ginux: launch tracee-uid=1000 tracee-gid=1000 root=host-path-read-only");
+    // The host identity the tracee runs as: 65534 for a root caller, else the
+    // caller's own (inside its private user namespace).
+    let identity = managed_host_identity();
+    write_stderr(b"ginux: launch tracee-uid=");
+    write_stderr_u64(identity.uid as u64);
+    write_stderr(b" tracee-gid=");
+    write_stderr_u64(identity.gid as u64);
+    line_stderr(b" root=host-path-read-only");
     let signal_fd = task_events().unwrap_or_else(|reason| s.fail(instance, reason));
     s.signal_fd = Some(signal_fd);
     s.resume(0, 0, instance);
@@ -1491,12 +1498,12 @@ impl Supervisor<'_> {
             return;
         }
         if r.orig_rax == 99 {
-            // A deterministic system view (Gate 22) exposes neither host
-            // topology nor a fictitious RAM budget; only `mem_unit` is 1.
+            // A deterministic system view (Gates 22-23): total memory is the
+            // configured instance memory and no host counter is exposed.
             let result = crate::supervisor::write_tracee_bytes_strict(
                 self.task(index).host,
                 r.rdi as usize,
-                &crate::supervisor::virtual_sysinfo(),
+                &crate::supervisor::virtual_sysinfo(instance.config().memory_mib),
             )
             .map(|_| 0)
             .unwrap_or_else(|error| error);

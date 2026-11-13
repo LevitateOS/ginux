@@ -16,7 +16,7 @@ def main():
     config = Path(__file__).resolve().parent.parent / "config/instance-gate5.toml"
     with tempfile.TemporaryDirectory(prefix="ginux-native-") as directory:
         work = Path(directory)
-        # The tracee drops to UID 1000 and must be able to execute the copies.
+        # The tracee drops to UID 65534 and must be able to execute the copies.
         shutil.copyfile(binary, work / "ginux")
         (work / "ginux").chmod(0o755)
         root = work / "root"
@@ -48,10 +48,10 @@ sys_read = ["/"]
 """)
 
         def run(scenario, instance=config, stdin=None, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, **options):
+                stderr=subprocess.PIPE, configured_launch=False, **options):
             (root / "scenario").write_text(scenario)
             proc = subprocess.run([str(work / "ginux"), "native", str(instance), str(root)]
-                                  + (["configured"] if instance == configured else []),
+                                  + (["configured"] if instance == configured or configured_launch else []),
                                   stdin=stdin, stdout=stdout, stderr=stderr, timeout=30, **options)
             # Audit records and fixture output have separate writers. Merge
             # only after capture so a concurrent audit fragment cannot prefix
@@ -73,7 +73,7 @@ sys_read = ["/"]
                 if denied:
                     text = text.replace('deny = []', 'deny = ["sched_yield"]')
                 instance.write_text(text)
-                code, out = run("yield", instance)
+                code, out = run("w-yield", instance)
                 expected = -1 if denied else 0
                 check(f"{dispatch} yield {'denied' if denied else 'allowed'}",
                       code == 0 and f"GINUX_FIXTURE: yield={expected}\n" in out,
@@ -154,10 +154,11 @@ sys_read = ["/"]
             "GINUX_FIXTURE: pi_word=0", "GINUX_FIXTURE: futex_lock_pi_flags=-1",
             "GINUX_FIXTURE: pi_flags_word=0"] and "GINUX_NATIVE_CHECK: PASS" in out, code, out)
 
-        code, out = run("emulated-sysinfo")
+        code, out = run("ysinfo")
         fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
         check("sysinfo is deterministic and private", code == 0 and fixture == [
-            "GINUX_FIXTURE: sysinfo=0", "GINUX_FIXTURE: sysinfo-zero=1",
+            "GINUX_FIXTURE: sysinfo=0", "GINUX_FIXTURE: sysinfo-private=1",
+            "GINUX_FIXTURE: totalram=268435456",
             "GINUX_FIXTURE: mem-unit=1", "GINUX_FIXTURE: sysinfo-null=-14"]
             and "GINUX_NATIVE_CHECK: PASS" in out, code, out)
 
@@ -216,6 +217,18 @@ sys_read = ["/"]
             "GINUX_FIXTURE: waitid-not-pidfd=-9", "GINUX_FIXTURE: waitid-invalid=-9",
             "GINUX_FIXTURE: waitid-high=0", "GINUX_FIXTURE: waitid=0",
             "GINUX_FIXTURE: waited-child=1", "GINUX_FIXTURE: child-status=7"], code, out)
+        # Early denials must finish their audit record: an unfinished record
+        # keeps the audit lock, and the next audited syscall deadlocks (the
+        # run then hits the 30 second timeout).
+        code, out = run("bad-selectors", configured)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("early denials finish their audit records", code == 0 and fixture == [
+            "GINUX_FIXTURE: pidfd-open-unknown=-3", "GINUX_FIXTURE: waitid-unknown-pid=-1",
+            "GINUX_FIXTURE: waitid-bad-type=-1", "GINUX_FIXTURE: getpid-after=1"]
+              and out.count("deny result=-3 reason=unknown-process\n") == 1
+              and out.count("deny result=-1 reason=unknown-process\n") == 1
+              and out.count("deny result=-1 reason=unsupported-wait-id-type\n") == 1,
+              code, out)
         # glibc 2.41+ posix_spawn starts children with clone3 CLONE_INTO_CGROUP.
         (root / "sys/fs/cgroup").mkdir(parents=True, exist_ok=True)
         code, out = run("cgroup-clone3", configured)
@@ -261,6 +274,15 @@ sys_read = ["/"]
             "GINUX_FIXTURE: null-after-peek=0", "GINUX_FIXTURE: null-rewait=-10",
             "GINUX_FIXTURE: null-invalid-options=-22", "GINUX_FIXTURE: null-rusage-fault=-14",
             "GINUX_FIXTURE: fault-rewait=-10", "GINUX_FIXTURE: null-reaped=800"], code, out)
+        credential_config = work / "credential.toml"
+        credential_config.write_text(configured.read_text().replace(
+            '[network]\nbackend = "none"', '[network]\nbackend = "shared"'))
+        code, out = run("expired-credentials", credential_config, configured_launch=True)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("queued credentials survive sender reap", code == 0 and fixture == [
+            "GINUX_FIXTURE: credential-wait=0", "GINUX_FIXTURE: credential-recv=1",
+            "GINUX_FIXTURE: credential-pid=1", "GINUX_FIXTURE: credential-uid=1",
+            "GINUX_FIXTURE: credential-gid=1"], code, out)
         denied = work / "denied-waitid.toml"
         denied.write_text(configured.read_text().replace('allow = ["*"]\ndeny = []',
                                                        'allow = ["*"]\ndeny = ["waitid"]'))

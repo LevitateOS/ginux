@@ -106,7 +106,7 @@ long native_fixture_main(void)
     long fd = call3(2, (word)"/scenario", 0, 0);
     if (fd < 0 || call3(0, fd, (word)scenario, sizeof scenario - 1) <= 0) return 80;
     switch (scenario[0]) {
-    case 'y': {
+    case 'w': {
         print_result("GINUX_FIXTURE: yield=", call3(24, 0, 0, 0));
         return 0;
     }
@@ -182,16 +182,18 @@ long native_fixture_main(void)
         print_result("GINUX_FIXTURE: pi_flags_word=", pi_flags_word);
         return 0;
     }
-    case 'e': {
+    case 'y': {
         unsigned char info[112];
         for (word i = 0; i < sizeof info; ++i) info[i] = 0xaa;
         long result = call3(99, (word)info, 0, 0);
-        word zero = 1;
+        word private = 1;
         for (word i = 0; i < sizeof info; ++i) {
-            if (i < 104 || i >= 108) zero &= info[i] == 0;
+            if ((i < 32 || i >= 40) && (i < 104 || i >= 108))
+                private &= info[i] == 0;
         }
         print_result("GINUX_FIXTURE: sysinfo=", result);
-        print_result("GINUX_FIXTURE: sysinfo-zero=", zero);
+        print_result("GINUX_FIXTURE: sysinfo-private=", private);
+        print_result("GINUX_FIXTURE: totalram=", *(unsigned long *)(info + 32));
         print_result("GINUX_FIXTURE: mem-unit=", *(unsigned int *)(info + 104));
         print_result("GINUX_FIXTURE: sysinfo-null=", call3(99, 0, 0, 0));
         return 0;
@@ -287,6 +289,16 @@ long native_fixture_main(void)
         print_result("GINUX_FIXTURE: waitid=", call5(247, 3, pidfd, (word)&info, 4, 0));
         print_result("GINUX_FIXTURE: waited-child=", info.pid == pid);
         print_result("GINUX_FIXTURE: child-status=", info.status);
+        return 0;
+    }
+    case 'b': {
+        /* Early denials of virtual-pid lookups: each must finish its audit
+         * record, or the next audited syscall waits on the audit lock. */
+        struct { int signo, error, code, pad, pid, uid, status, rest[25]; } info = {0};
+        print_result("GINUX_FIXTURE: pidfd-open-unknown=", call3(434, 0x7ffffff0, 0, 0));
+        print_result("GINUX_FIXTURE: waitid-unknown-pid=", call5(247, 1, 0x7ffffff0, (word)&info, 4, 0));
+        print_result("GINUX_FIXTURE: waitid-bad-type=", call5(247, 7, 1, (word)&info, 4, 0));
+        print_result("GINUX_FIXTURE: getpid-after=", call3(39, 0, 0, 0) > 0);
         return 0;
     }
     case 'c': {
@@ -494,6 +506,45 @@ long native_fixture_main(void)
             ++reaped;
         }
         print_result("GINUX_FIXTURE: null-reaped=", reaped);
+        return 0;
+    }
+    case 'e': {
+        /* A receiver can consume SCM_CREDENTIALS after waitid has reaped the
+         * short-lived sender. The queued identity must stay virtual. */
+        struct iovec { void *base; word length; };
+        struct message {
+            void *name; unsigned name_length, name_padding;
+            struct iovec *iov; word iov_count;
+            void *control; word control_length;
+            unsigned flags, flags_padding;
+        };
+        struct credentials { int pid; unsigned uid, gid; };
+        struct control_header { word length; int level, type; };
+        int fds[2] = {-1, -1}, enabled = 1;
+        char payload = 0;
+        word control[8] = {0};
+        struct iovec iov = {&payload, 1};
+        struct message message = {0, 0, 0, &iov, 1, control, sizeof control, 0, 0};
+        struct { int signo, error, code, pad, pid, uid, status, rest[25]; } info = {0};
+        if (call4(53, 1, 2, 0, (word)fds) < 0
+            || call5(54, fds[0], 1, 16, (word)&enabled, sizeof enabled) < 0) return 85;
+        long pid = call3(57, 0, 0, 0);
+        if (pid == 0) {
+            call3(1, fds[1], (word)"x", 1);
+            call3(231, 0, 0, 0);
+            return 86;
+        }
+        long waited = call5(247, 1, pid, (word)&info, 4, 0);
+        long received = call3(47, fds[0], (word)&message, 0);
+        struct control_header *header = (void *)control;
+        struct credentials *credentials = (void *)(header + 1);
+        print_result("GINUX_FIXTURE: credential-wait=", waited);
+        print_result("GINUX_FIXTURE: credential-recv=", received);
+        print_result("GINUX_FIXTURE: credential-pid=",
+                     header->length >= 28 && header->level == 1 && header->type == 2
+                     && credentials->pid == pid);
+        print_result("GINUX_FIXTURE: credential-uid=", credentials->uid == 0);
+        print_result("GINUX_FIXTURE: credential-gid=", credentials->gid == 0);
         return 0;
     }
     case 'z': {
