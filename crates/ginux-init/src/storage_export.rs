@@ -9,6 +9,7 @@ const PATH_BYTES: usize = crate::launch::MAX_RESULT_PATH_LEN + 1;
 const AT_FDCWD: usize = (-100isize) as usize;
 const AT_EMPTY_PATH: usize = 0x1000;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+const AT_SYMLINK_FOLLOW: usize = 0x400;
 const O_CLOEXEC: usize = 0x80000;
 const O_DIRECTORY: usize = 0x10000;
 const O_PATH: usize = 0x200000;
@@ -307,7 +308,7 @@ fn publish(state: Export) -> Result<(), Error> {
     }
     // AT_EMPTY_PATH publishes the exact inode held by inode_fd. It cannot
     // follow a host replacement of a staging pathname or replace a final name.
-    let linked = unsafe {
+    let mut linked = unsafe {
         syscall5(
             265,
             state.inode_fd,
@@ -317,6 +318,39 @@ fn publish(state: Export) -> Result<(), Error> {
             AT_EMPTY_PATH,
         )
     };
+    // Before Linux 6.10 an unprivileged AT_EMPTY_PATH link needs
+    // CAP_DAC_READ_SEARCH and fails with ENOENT. The descriptor's proc link,
+    // followed, names the same held inode, never a host pathname.
+    if linked == -2 {
+        let mut proc_path = *b"/proc/self/fd/\0\0\0\0\0\0\0\0\0\0\0";
+        let prefix = b"/proc/self/fd/".len();
+        let mut digits = [0u8; 20];
+        let mut count = 0;
+        let mut value = state.inode_fd;
+        loop {
+            digits[count] = b'0' + (value % 10) as u8;
+            count += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        if prefix + count < proc_path.len() {
+            for index in 0..count {
+                proc_path[prefix + index] = digits[count - 1 - index];
+            }
+            linked = unsafe {
+                syscall5(
+                    265,
+                    AT_FDCWD,
+                    proc_path.as_ptr() as usize,
+                    state.parent_fd,
+                    state.destination[state.name_offset..].as_ptr() as usize,
+                    AT_SYMLINK_FOLLOW,
+                )
+            };
+        }
+    }
     let current = linked == 0 && parent_is_current(&state) && published_inode_is_current(&state);
     let inode_closed = close(state.inode_fd);
     let parent_closed = close(state.parent_fd);
