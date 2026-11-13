@@ -1137,6 +1137,22 @@ pub static CATALOG: &[Operation] = &[
         "test-systemd"
     ),
     syscall!(
+        "getpgid",
+        121,
+        Complete,
+        Action::Emulate,
+        "virtual process group",
+        "test-systemd"
+    ),
+    syscall!(
+        "getsid",
+        124,
+        Complete,
+        Action::Emulate,
+        "virtual session",
+        "test-systemd"
+    ),
+    syscall!(
         "capget",
         125,
         Partial,
