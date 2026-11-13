@@ -50,12 +50,29 @@ sys_read = ["/"]
                     child.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     print("DEBUG: L-console-tracking timed out; process state follows", flush=True)
-                    for pid in sorted(int(d) for d in os.listdir("/proc") if d.isdigit()):
+                    print("DEBUG: " + os.popen("uname -a").read().strip(), flush=True)
+                    parents = {}
+                    for d in os.listdir("/proc"):
+                        if d.isdigit():
+                            try:
+                                fields = open(f"/proc/{d}/stat").read().rsplit(")", 1)[1].split()
+                                parents[int(d)] = int(fields[1])
+                            except OSError:
+                                pass
+                    family, grew = {child.pid}, True
+                    while grew:
+                        grew = False
+                        for p, pp in parents.items():
+                            if pp in family and p not in family:
+                                family.add(p); grew = True
+                    for pid in sorted(family):
                         try:
                             cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ")
                         except OSError:
-                            continue
-                        if str(work).encode() not in cmd and b"/usr/bin/bash" not in cmd:
+                            cmd = b"<gone>"
+                        try:
+                            os.listdir(f"/proc/{pid}/task")
+                        except OSError:
                             continue
                         for tid in sorted(os.listdir(f"/proc/{pid}/task")):
                             base = f"/proc/{pid}/task/{tid}"
@@ -68,7 +85,8 @@ sys_read = ["/"]
                             print(f"DEBUG: pid={pid} tid={tid} cmd={cmd[:120]!r} state={status.get('State')} "
                                   f"tracer={status.get('TracerPid')} sigpnd={status.get('SigPnd')} "
                                   f"shdpnd={status.get('ShdPnd')} sigblk={status.get('SigBlk')} "
-                                  f"wchan={rd('wchan')} syscall={rd('syscall')}", flush=True)
+                                  f"wchan={rd('wchan')} syscall={rd('syscall')} "
+                                  f"stat={rd('stat')[:200]}", flush=True)
                     child.kill()
                     child.wait()
                     out_f.seek(0); err_f.seek(0)

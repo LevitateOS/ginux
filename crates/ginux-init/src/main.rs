@@ -5963,6 +5963,11 @@ fn supervise_native(
             let mut lifetime_pidfd = unsafe { syscall2(SYS_PIDFD_OPEN, child_host_pid, 0) };
             // A non-leader thread is not waitid-reapable and older pidfd
             // ABIs cannot open it. Preserve that existing thread lane.
+            write_all(b"DEBUG child event=");
+            write_u64(event as u64);
+            write_all(b" pidfd=");
+            write_i64(lifetime_pidfd as i64);
+            write_all(b"\n");
             if event == PTRACE_EVENT_CLONE && matches!(lifetime_pidfd, -22 | -3) {
                 lifetime_pidfd = -1;
             } else if lifetime_pidfd < 0 {
@@ -10335,6 +10340,8 @@ fn native_sockaddr_with_source(word: u64, source: [u8; 4]) -> u64 {
 }
 
 fn native_fail(instance: &mut Instance, pid: usize, reason: &[u8]) -> ! {
+    write_all(b"DEBUG native_fail before kill: ");
+    line(reason);
     kill_tracee(pid);
     instance_fail(instance, reason)
 }
