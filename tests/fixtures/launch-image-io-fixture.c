@@ -28,6 +28,8 @@ static long system_view(int denied) {
    newfstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW), as musl issues them. */
 #define AT ((word)-100)
 #define NOFOLLOW 0x100
+/* ginux_process::MAX_GROUPS: setgroups with more is EINVAL before the list is read. */
+#define ginux_max_groups 64
 static unsigned char legacy[144] __attribute__((aligned(8)));
 static unsigned char at[144] __attribute__((aligned(8)));
 static unsigned mode_of(const unsigned char *st) { return *(const unsigned *)(st+24) & 0170000; }
@@ -772,7 +774,7 @@ long image_io_main(word *stack)
     CHECK(DO(3,owned,0,0)==0 && DO(3,fd,0,0)==0,14);
     long child=DO(57,0,0,0); CHECK(child>=0,15);
     if(!child) {
-        CHECK(DO(116,33,0,0)==-22 && DO(116,1,1,0)==-14,16);
+        CHECK(DO(116,ginux_max_groups+1,0,0)==-22 && DO(116,1,1,0)==-14,16);
         CHECK(DO(116,0,0,0)==0,17);
         CHECK(DO(106,23456,0,0)==0 && DO(105,12345,0,0)==0,18);
         CHECK(DO(116,0,0,0)==-1,19);
