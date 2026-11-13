@@ -41,9 +41,43 @@ sys_read = ["/"]
         def run(scenario, instance=config, stdin=None, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, configured_launch=False, **options):
             (root / "scenario").write_text(scenario)
-            proc = subprocess.run([str(work / "ginux"), "native", str(instance), str(root)]
-                                  + (["configured"] if instance == configured or configured_launch else []),
-                                  stdin=stdin, stdout=stdout, stderr=stderr, timeout=30, **options)
+            argv = ([str(work / "ginux"), "native", str(instance), str(root)]
+                    + (["configured"] if instance == configured or configured_launch else []))
+            if scenario.startswith("L"):
+                out_f, err_f = open(work / "dbg-out", "w+b"), open(work / "dbg-err", "w+b")
+                child = subprocess.Popen(argv, stdin=stdin, stdout=out_f, stderr=err_f, **options)
+                try:
+                    child.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    print("DEBUG: L-console-tracking timed out; process state follows", flush=True)
+                    for pid in sorted(int(d) for d in os.listdir("/proc") if d.isdigit()):
+                        try:
+                            cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ")
+                        except OSError:
+                            continue
+                        if str(work).encode() not in cmd and b"/usr/bin/bash" not in cmd:
+                            continue
+                        for tid in sorted(os.listdir(f"/proc/{pid}/task")):
+                            base = f"/proc/{pid}/task/{tid}"
+                            def rd(name):
+                                try:
+                                    return open(f"{base}/{name}").read().strip()
+                                except OSError as error:
+                                    return f"<{error}>"
+                            status = {k: v.strip() for k, v in (l.split(":", 1) for l in rd("status").splitlines() if ":" in l)}
+                            print(f"DEBUG: pid={pid} tid={tid} cmd={cmd[:120]!r} state={status.get('State')} "
+                                  f"tracer={status.get('TracerPid')} sigpnd={status.get('SigPnd')} "
+                                  f"shdpnd={status.get('ShdPnd')} sigblk={status.get('SigBlk')} "
+                                  f"wchan={rd('wchan')} syscall={rd('syscall')}", flush=True)
+                    child.kill()
+                    child.wait()
+                    out_f.seek(0); err_f.seek(0)
+                    print("DEBUG: stdout:\n" + out_f.read().decode(errors="replace")[-6000:], flush=True)
+                    print("DEBUG: stderr tail:\n" + err_f.read().decode(errors="replace")[-12000:], flush=True)
+                    raise
+                out_f.seek(0); err_f.seek(0)
+                return child.returncode, (out_f.read() + err_f.read()).decode(errors="replace")
+            proc = subprocess.run(argv, stdin=stdin, stdout=stdout, stderr=stderr, timeout=30, **options)
             # Audit records and fixture output have separate writers. Merge
             # only after capture so a concurrent audit fragment cannot prefix
             # an otherwise complete fixture line.
