@@ -20,6 +20,7 @@ static int wake_pipe[2];
 void signal_return(void);
 __asm__(".global signal_return\nsignal_return:\nmov $15,%eax\nsyscall\nud2\n");
 static void handler(int signal) { ++handled; handled_signal=signal; DO(1,wake_pipe[1],"x",1); }
+static void quiet_handler(int signal) { ++handled; handled_signal=signal; }
 static long install(int signal, word flags)
 {
     word action[4]={(word)handler,0x04000000UL|flags,(word)signal_return,0};
@@ -235,6 +236,28 @@ long signal_main(word *stack)
         spin(400000000);
         DO(59,"/bin/fixture",arguments,0);
         return 95;
+    } else if (same(mode,"fork-signal")) {
+        /* The queued signal makes the kernel abandon the fork
+           (ERESTARTNOINTR) and reissue it after the handler: the handler's
+           only call, rt_sigreturn, returns the clone number. */
+        word action[4]={(word)quiet_handler,0x04000000UL,(word)signal_return,0};
+        CHECK(call(13,10,(word)action,0,8,0,0)==0,210);
+        say("inject-ready\n");
+        spin(400000000);
+        long child=fork_();
+        if (child==0) return 0;
+        CHECK(child>0,211);
+        CHECK(handled==1 && handled_signal==10,212);
+        CHECK(call(61,child,(word)&status,0,0,0,0)==child && status==0,213);
+    } else if (same(mode,"fork-restart")) {
+        /* An ignored signal: the kernel reissues the fork at once, and the
+           reissue keeps the child identity reserved at its first entry. */
+        say("inject-ready\n");
+        spin(400000000);
+        long child=fork_();
+        if (child==0) return 0;
+        CHECK(child==2,215);
+        CHECK(call(61,child,(word)&status,0,0,0,0)==child && status==0,216);
 
     /* The runner kills a forking parent while the supervisor is stopped
        between reserving the child and publishing it. */

@@ -50,6 +50,15 @@ enum Pending {
     },
 }
 
+/// A reserved creation the kernel abandoned with ERESTARTNOINTR before it
+/// made a child. Only the kernel's reissue of the same call claims it.
+#[derive(Clone, Copy)]
+struct Restart {
+    reservation: Pending,
+    syscall: u64,
+    rip: u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExecStage {
     Sync,
@@ -94,6 +103,9 @@ struct Task {
     call: DescriptorCall,
     image_chdir: Option<u64>,
     pending: Pending,
+    /// A creation awaiting the kernel's reissue of its call; not pending, so
+    /// the calls of a signal handler run before the reissue are its own.
+    restart: Option<Restart>,
     override_result: Option<i64>,
     blocked: Option<UserRegs>,
     sequence: u64,
@@ -173,6 +185,7 @@ impl Task {
             call: DescriptorCall::new(),
             image_chdir: None,
             pending: Pending::None,
+            restart: None,
             override_result: None,
             blocked: None,
             sequence: 0,
@@ -1312,8 +1325,49 @@ impl Supervisor<'_> {
         audit_write(b"\n");
         self.run(index, r, instance);
     }
+    /// The first entry after an abandoned creation settles it. The kernel's
+    /// reissue (the same call at the same instruction with the same flags)
+    /// takes the reservation back, child identity included, and runs as its
+    /// first entry ran. Any other call means a handler runs first, which may
+    /// change what the child would copy: the reservation is withdrawn and
+    /// the reissue, when it comes, reserves anew. Returns whether the entry
+    /// was handled.
+    fn settle_restart(&mut self, index: usize, r: &mut UserRegs, instance: &mut Instance) -> bool {
+        let Some(restart) = self.task_mut(index).restart.take() else {
+            return false;
+        };
+        self.task_mut(index).pending = restart.reservation;
+        let Pending::Fork {
+            flags,
+            child_tid,
+            parent_tid,
+            ..
+        } = restart.reservation
+        else {
+            self.fail(instance, b"abandoned creation without a reservation");
+        };
+        if r.orig_rax != restart.syscall || r.rip != restart.rip || r.rdi != flags {
+            self.cancel_creation(index, instance);
+            return false;
+        }
+        if child_tid.is_some() {
+            r.rdi &= !0x1000000;
+        }
+        if parent_tid.is_some() {
+            r.rdi &= !0x100000;
+        }
+        // The reissue continues the admitted call: its sequence, its exit.
+        audit_write(b"ginux: audit sequence=");
+        audit_u64(self.task(index).sequence);
+        audit_write(b" phase=restart surface=owned-process-create\n");
+        self.run(index, r, instance);
+        true
+    }
     fn entry(&mut self, index: usize, r: &mut UserRegs, instance: &mut Instance) {
         self.objects.filesystem.begin_entry();
+        if self.settle_restart(index, r, instance) {
+            return;
+        }
         if let Some(unpark) = self.task_mut(index).unpark.take() {
             if !unpark.replaying
                 || r.orig_rax != unpark.original.orig_rax
@@ -1921,13 +1975,10 @@ impl Supervisor<'_> {
                 return;
             }
             56..=58 => {
-                if let Pending::Fork { flags, .. } = self.task(index).pending {
-                    if flags != r.rdi {
-                        self.fail(instance, b"restarted creation changed clone flags");
-                    }
-                    audit_write(b"mediate surface=owned-process-create restart\n");
-                    self.run(index, r, instance);
-                    return;
+                // A reservation lasts from its entry to its exit; a kernel
+                // restart is settled before any entry (`settle_restart`).
+                if !matches!(self.task(index).pending, Pending::None) {
+                    self.fail(instance, b"task creation entered with a call pending");
                 }
                 let flags = r.rdi;
                 let libc_fork = r.orig_rax == 56 && flags == 0x1200011;
@@ -3028,12 +3079,18 @@ impl Supervisor<'_> {
             Pending::Fork { child, flags, .. } => {
                 r.rdi = flags;
                 if r.rax as i64 == -513 {
-                    // A peer stop can expose the kernel's internal fork restart.
-                    // Keep the reserved child identity for the reentered syscall.
-                    self.run(index, r, instance);
-                    return;
-                }
-                if (r.rax as i64) < 0 {
+                    // A signal queued since the entry stop made the kernel
+                    // abandon the creation before it made a child. It reissues
+                    // the call itself, at once or after a handler has run
+                    // guest code and calls of its own: those must not settle
+                    // the reservation, so it waits apart for the reissue
+                    // (see `settle_restart`). The exit finishes as any other.
+                    self.task_mut(index).restart = Some(Restart {
+                        reservation: pending,
+                        syscall: r.orig_rax,
+                        rip: r.rip,
+                    });
+                } else if (r.rax as i64) < 0 {
                     if r.rax as i64 == -11 {
                         self.report_creation_failure(
                             b"ginux: native task creation returned EAGAIN",
@@ -3385,6 +3442,9 @@ impl Supervisor<'_> {
         }
         let id = self.task(index).id;
         let group = self.task(index).group;
+        if let Some(restart) = self.task_mut(index).restart.take() {
+            self.task_mut(index).pending = restart.reservation;
+        }
         if self.cancel_creation(index, instance) {
             // The kernel may already have created the child this parent can
             // no longer claim.

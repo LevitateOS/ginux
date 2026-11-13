@@ -22,7 +22,8 @@ PARKED = {
     'park-ignored': b'park surface=owned-poll',
 }
 # The syscall whose entry the supervisor replaces, and the signal queued there.
-INJECTED = {'map-signal': (b'9 ', signal.SIGUSR1), 'exec-signal': (b'59 ', signal.SIGCHLD)}
+INJECTED = {'map-signal': (b'9 ', signal.SIGUSR1), 'exec-signal': (b'59 ', signal.SIGCHLD),
+            'fork-signal': (b'56 ', signal.SIGUSR1), 'fork-restart': (b'56 ', signal.SIGCHLD)}
 SLEEPS = ('sleep-peer', 'sleep-ignored', 'sleep-handled')
 PSELECT = ('pending-pselect', 'pending-zero-pselect', 'ready-pselect')
 CREATION = ('birth-orphan',)
