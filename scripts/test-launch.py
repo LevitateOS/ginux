@@ -344,10 +344,12 @@ def main():
             if proc.returncode != 2 or proc.stdout or b"ginux: usage:" not in proc.stderr:
                 raise RuntimeError(f"unknown or incomplete argv ran the demonstration: {proc!r}")
         print("PASS unknown and incomplete commands report usage without running a demo")
-        # Exercise the bootstrap failure in a real unprivileged process.
+        # A real unprivileged process bootstraps through a private user
+        # namespace, or reports explicitly that the host refuses one.
         work.chmod(0o755)
         config_path = work / "unprivileged.toml"
-        config_path.write_text(template)
+        config = template.replace('init = "/bin/bash"', 'init = "/bin/fixture"')
+        config_path.write_text(config.replace("args = []", 'args = ["exit", "3"]'))
         result_dir = work / "unprivileged"
         result_dir.mkdir(mode=0o777)
         result_dir.chmod(0o777)
@@ -355,9 +357,14 @@ def main():
                                str(result_dir / "result.json")], capture_output=True, timeout=10,
                               user=65534, group=65534, extra_groups=[])
         record = json.loads((result_dir / "result.json").read_text())
-        if proc.returncode != 2 or proc.stdout or record["outcome"] != "supervisor-error":
-            raise RuntimeError(f"unprivileged bootstrap did not fail explicitly: {proc!r}")
-        print("PASS unprivileged bootstrap reports supervisor-error")
+        if proc.returncode == 3 and not proc.stdout and record["outcome"] == "exited" \
+                and record["code"] == 3:
+            print("PASS unprivileged bootstrap runs in a user namespace")
+        elif proc.returncode == 2 and not proc.stdout and record["outcome"] == "supervisor-error" \
+                and b"user namespace" in proc.stderr:
+            print("PASS unprivileged bootstrap reports the refused user namespace")
+        else:
+            raise RuntimeError(f"unprivileged bootstrap neither ran nor failed explicitly: {proc!r}")
     print("test-launch: PASS")
 
 

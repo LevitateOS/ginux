@@ -399,7 +399,8 @@ does not grant access to a host-side script. See the validated recipes under
 Instance-visible credentials are virtual Ginux state. Independently, every
 native managed process sets `PR_SET_NO_NEW_PRIVS` before executing workload
 code. A root-launched runtime drops managed host execution to UID/GID 65534; a
-non-root runtime retains the caller's host identity. Virtual root therefore
+non-root runtime retains the caller's host identity, and configured launch runs
+it in a private user namespace with no capabilities. Virtual root therefore
 does not imply host root.
 
 Runtime audit records contain the instance, contract digest, canonical
@@ -429,4 +430,5 @@ filesystem, device, process and kernel controls, filesystem `write_deny` rules,
 pre-boot hooks and shared-network policy rather than pretending to enforce
 them. Configured launch applies `[resources]` limits and its own storage,
 device, network and process lanes as the README describes. The root remains a
-privileged host-path bootstrap.
+host-path chroot bootstrap: privileged for a root caller, in a private user
+namespace otherwise.

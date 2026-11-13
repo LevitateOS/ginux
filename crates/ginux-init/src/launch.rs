@@ -387,10 +387,11 @@ pub fn c_string_bytes(value: *const u8, limit: usize) -> Result<&'static [u8], C
 // ptrace-native supervision. The fixed Bash-only `native` demonstration is
 // untouched; this path is additive behind the `launch` command.
 //
-// Supported bootstrap: privileged chroot into the given host rootfs path,
-// then privilege drop to the instance UID/GID. Recipe never requires host
-// root: when the mechanism is unavailable the launcher reports an explicit
-// startup failure instead of falling back to host execution.
+// Supported bootstrap: chroot into the given host rootfs path. A root caller
+// chroots directly and drops to UID/GID 65534; any other caller first enters
+// a private user namespace and leaves it without capabilities. Recipe never
+// requires host root: when the mechanism is unavailable the launcher reports
+// an explicit startup failure instead of falling back to host execution.
 
 pub const MAX_LAUNCH_ARG_LEN: usize = 128;
 pub const MAX_LAUNCH_ENV_LEN: usize = 256;
@@ -1281,10 +1282,34 @@ fn launch_tracee(
             131,
         );
     }
-    if unsafe { syscall1(SYS_CHROOT, root_path as usize) } < 0 {
+    // Decided once, before any namespace change: inside a private user
+    // namespace the caller reads back as UID 0.
+    let host_identity = managed_host_identity();
+    if !host_identity.drop_root && !enter_user_namespace(&host_identity) {
         tracee_setup_fail(
-            b"ginux: launch bootstrap unavailable: chroot failed (host privilege required)\n",
-            120,
+            b"ginux: launch bootstrap unavailable: user namespace refused (run as root, or allow unprivileged user namespaces: user.max_user_namespaces, kernel.unprivileged_userns_clone, or on Ubuntu kernel.apparmor_restrict_unprivileged_userns)\n",
+            133,
+        );
+    }
+    let chrooted = unsafe { syscall1(SYS_CHROOT, root_path as usize) };
+    if chrooted < 0 {
+        if host_identity.drop_root {
+            tracee_setup_fail(
+                b"ginux: launch bootstrap unavailable: chroot failed (host privilege required)\n",
+                120,
+            );
+        }
+        // Holding every capability of its namespace, the tracee is refused
+        // only by a host security module; anything else is the root itself.
+        if chrooted != -1 {
+            tracee_setup_fail(
+                b"ginux: launch bootstrap failed: root directory unavailable\n",
+                121,
+            );
+        }
+        tracee_setup_fail(
+            b"ginux: launch bootstrap unavailable: chroot refused in user namespace (run as root, or allow capabilities in unprivileged user namespaces: on Ubuntu kernel.apparmor_restrict_unprivileged_userns=0 or an AppArmor profile with userns permission)\n",
+            134,
         );
     }
     if unsafe { syscall1(SYS_CHDIR, ROOT.as_ptr() as usize) } < 0 {
@@ -1295,7 +1320,12 @@ fn launch_tracee(
     }
     let workdir = core::ptr::addr_of!(LAUNCH_WORKDIR).cast::<u8>();
     let _ = unsafe { syscall3(SYS_MKDIRAT_HOST, AT_FDCWD, workdir as usize, 0o755) };
-    let host_identity = managed_host_identity();
+    if !host_identity.drop_root && !drop_namespace_privileges() {
+        tracee_setup_fail(
+            b"ginux: launch bootstrap failed: user namespace privilege removal failed\n",
+            135,
+        );
+    }
     if host_identity.drop_root {
         if unsafe { syscall2(SYS_SETGROUPS, 0, 0) } < 0 {
             tracee_setup_fail(
@@ -1357,6 +1387,100 @@ fn tracee_setup_fail(message: &[u8], code: usize) -> ! {
     }
 }
 
+// Unprivileged bootstrap. A non-root caller cannot chroot, so the tracee
+// enters a private user namespace in which only the caller's own UID and GID
+// are mapped, to 0. The capabilities it holds there allow the chroot and
+// nothing outside the namespace; `drop_namespace_privileges` removes them
+// before workload code runs. Host identity stays the caller's.
+const SYS_CAPSET: usize = 126;
+const SYS_UNSHARE: usize = 272;
+const CLONE_NEWUSER: usize = 0x1000_0000;
+const O_WRONLY_CLOEXEC: usize = 0o1 | 0o2000000;
+
+fn enter_user_namespace(identity: &crate::supervisor::ManagedHostIdentity) -> bool {
+    if unsafe { syscall1(SYS_UNSHARE, CLONE_NEWUSER) } < 0 {
+        return false;
+    }
+    let mut map = [0u8; 32];
+    // The kernel refuses an unprivileged gid_map until setgroups is denied.
+    if !write_proc_self(b"/proc/self/setgroups\0", b"deny") {
+        return false;
+    }
+    let mut length = push_bytes(&mut map, 0, b"0 ");
+    length = push_u64(&mut map, length, identity.uid as u64);
+    length = push_bytes(&mut map, length, b" 1\n");
+    if !write_proc_self(b"/proc/self/uid_map\0", &map[..length]) {
+        return false;
+    }
+    length = push_bytes(&mut map, 0, b"0 ");
+    length = push_u64(&mut map, length, identity.gid as u64);
+    length = push_bytes(&mut map, length, b" 1\n");
+    write_proc_self(b"/proc/self/gid_map\0", &map[..length])
+}
+
+fn write_proc_self(path: &[u8], bytes: &[u8]) -> bool {
+    let fd = unsafe {
+        syscall4(
+            SYS_OPENAT_HOST,
+            AT_FDCWD,
+            path.as_ptr() as usize,
+            O_WRONLY_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    let written = unsafe {
+        syscall3(
+            SYS_WRITE_HOST,
+            fd as usize,
+            bytes.as_ptr() as usize,
+            bytes.len(),
+        )
+    };
+    unsafe {
+        syscall1(SYS_CLOSE_HOST, fd as usize);
+    }
+    written == bytes.len() as isize
+}
+
+/// Leave the namespace's UID 0 without any capability, as a root-launched
+/// workload is left as UID 65534: securebits keep UID 0 and exec from
+/// granting capabilities again, and the ambient, bounding, effective,
+/// permitted and inheritable sets are emptied.
+fn drop_namespace_privileges() -> bool {
+    const PR_CAPBSET_DROP: usize = 24;
+    const PR_SET_SECUREBITS: usize = 28;
+    const PR_CAP_AMBIENT: usize = 47;
+    const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;
+    // NOROOT, NO_SETUID_FIXUP and NO_CAP_AMBIENT_RAISE, each locked, and
+    // KEEP_CAPS locked off.
+    const SECUREBITS: usize = 0x01 | 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80;
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    if unsafe { syscall5(SYS_PRCTL, PR_SET_SECUREBITS, SECUREBITS, 0, 0, 0) } < 0 {
+        return false;
+    }
+    if unsafe { syscall5(SYS_PRCTL, PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) } < 0 {
+        return false;
+    }
+    // Capabilities past the kernel's last one report EINVAL.
+    let mut capability = 0;
+    while capability < 64 {
+        let result = unsafe { syscall5(SYS_PRCTL, PR_CAPBSET_DROP, capability, 0, 0, 0) };
+        if result == -22 && capability > 0 {
+            break;
+        }
+        if result < 0 {
+            return false;
+        }
+        capability += 1;
+    }
+    let header = [LINUX_CAPABILITY_VERSION_3, 0];
+    let data = [0u32; 6];
+    unsafe { syscall2(SYS_CAPSET, header.as_ptr() as usize, data.as_ptr() as usize) == 0 }
+}
+
 fn supervise_launch(
     pid: usize,
     instance: &mut Instance,
@@ -1390,6 +1514,9 @@ pub(crate) fn launch_exit_reason(code: i32) -> &'static [u8] {
         129 => b"descriptor cleanup failed",
         130 => b"descriptor namespace unavailable",
         131 => b"child signal setup failed",
+        133 => b"bootstrap unavailable: user namespace refused (run as root, or allow unprivileged user namespaces)",
+        134 => b"bootstrap unavailable: chroot refused in user namespace (run as root, or allow capabilities in unprivileged user namespaces)",
+        135 => b"bootstrap failed: user namespace privilege removal failed",
         _ => b"tracee exited before supervision",
     }
 }

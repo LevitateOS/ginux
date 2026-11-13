@@ -457,9 +457,14 @@ original soft limit and is never enlarged by the supervisor's private reserve.
 
 On x86-64 Linux, `ginux launch <config> <root> [--result-file <fresh host path>]`
 executes `[instance].init` with the configured arguments and environment inside
-the supplied host root directory. The bootstrap requires chroot and credential
-change privileges, and a kernel with `close_range` (Linux 5.9 or later).
-It drops to UID/GID 1000 before executing the workload. The configuration must
+the supplied host root directory. It needs a kernel with `close_range` (Linux
+5.9 or later). A root caller chroots directly and drops to UID/GID 65534 before
+executing the workload. Any other caller needs unprivileged user namespaces:
+the workload enters a private one that maps only the caller's UID and GID, to
+0, chroots there, and then gives up every capability (securebits locked, all
+capability sets and the bounding set empty), so it runs with the caller's host
+identity and no capabilities. A host that refuses the namespace fails the
+launch with exit code 2 and a message naming the sysctl to change. The configuration must
 select `profile = "balanced"` and `backend = "ptrace-native"`. Only the `null`
 device assignment and memory-storage backend described below are supported.
 
