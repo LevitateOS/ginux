@@ -31,6 +31,7 @@ def main():
         shutil.copyfile(fixture, root / "bin/fixture")
         (root / "bin/fixture").chmod(0o755)
         (root / "work/input").write_bytes(b"configured working directory\n")
+        (root / "work/large").write_bytes(b"r" * (1024 * 1024 + 1))
         (root / "input").write_bytes(b"root working directory\n")
         (root / "work/a..b").mkdir()
         counter = 0
@@ -115,6 +116,7 @@ def main():
         invoke(["cwd"], 0, "exited", stdout=b"root working directory\n",
                changes={"args = [": 'workdir = "/"\nargs = ['})
         invoke(["exit"], 0, "exited", changes={"args = [": 'workdir = "/work/a..b"\nargs = ['})
+        # The default /work already exists in this root; a missing workdir must be created.
         invoke(["exit"], 0, "exited", changes={"args = [": 'workdir = "/created-workdir"\nargs = ['})
         if not (root / "created-workdir").is_dir():
             raise RuntimeError("missing workload directory was not created as a directory")
@@ -122,7 +124,7 @@ def main():
         invoke(["handler"], 0, "exited", stdout=b"handled\n")
         invoke(["segv"], 139, "signaled")
         # fcntl cannot make the host kernel signal another process.
-        invoke(["owner"], 0, "exited")
+        invoke(["guard"], 0, "exited")
         invoke(["fork"], 0, "exited")
         invoke(["int80"], 1, "supervisor-error")
         invoke(["descriptor"], 0, "exited")
@@ -160,6 +162,61 @@ def main():
         refused("stdin", os.O_PATH | os.O_DIRECTORY)
         with open(root / "input", "rb") as regular:
             invoke(["exit"], 0, "exited", stdin=regular)
+        # Instance contract denials reach the workload with EPERM, and audit
+        # records name the rule; cwd exits 91 when its open fails.
+        contract_start = template.index("[contract]")
+        contract_end = template.index("[storage]")
+        original = template[contract_start:contract_end]
+
+        def rules(deny=(), syscall_deny=(), allow=("*",), syscall_allow=("*",)):
+            replacement = ('[contract]\nversion = 1\ncatalog = 2\ndefault = "deny"\n'
+                           + f'allow = {json.dumps(allow)}\ndeny = {json.dumps(deny)}\n'
+                           + '[contract.syscalls]\ncontrol = "paranoid"\ndefault = "deny"\n'
+                           + f'allow = {json.dumps([v.removeprefix("syscall.") for v in syscall_allow])}\ndeny = {json.dumps([v.removeprefix("syscall.") for v in syscall_deny])}\n\n')
+            return {original: replacement}
+
+        def denied(args, code, operation, syscall, *, changes):
+            proc = invoke(args, code, "exited", changes=changes)
+            if not re.search(rb"^ginux: launch contract instance=\S+ digest=[0-9a-f]{64}$",
+                             proc.stderr, re.M):
+                raise RuntimeError("launch did not report its resolved contract")
+            record = (rb"^ginux: audit sequence=\d+ phase=entry syscall=" + str(syscall).encode()
+                      + rb"(?: virtual-pid=\d+)? operation=" + operation.encode()
+                      + rb" policy-source=exact-deny policy-rule=0 action=deny result=-1$")
+            if not re.search(record, proc.stderr, re.M):
+                raise RuntimeError(f"missing winning denial: {proc.stderr!r}")
+
+        denied(["cwd"], 91, "syscall.open", 2, changes=rules(syscall_deny=["syscall.open"]))
+        denied(["cwd"], 0, "syscall.write", 1, changes=rules(deny=["syscall.write"]))
+        denied(["cwd"], 91, "filesystem.path.read", 2, changes=rules(deny=["filesystem.path.read"]))
+        denied(["args", "hidden"], 0, "device.console.write", 1, changes=rules(deny=["device.console.write"]))
+        denied(["handler"], 86, "signal.virtual.deliver", 13, changes=rules(deny=["signal.virtual.deliver"]))
+        # Configured launch owns console input, so a device.console.read
+        # denial is enforced there and is not in this list.
+        for selector in ("proc.system.read", "sys.device.read",
+                         "time.clock.read", "syscall.clock_gettime"):
+            proc = invoke(["exit"], 2, "supervisor-error", changes=rules(deny=[selector]))
+            if b"reason=unenforced-deny operation=" + selector.encode() not in proc.stderr:
+                raise RuntimeError(f"unenforced denial accepted: {selector}: {proc.stderr!r}")
+        invoke(["exit"], 0, "exited", changes=rules(deny=[
+            "device.mmio.direct", "device.dma.direct", "network.packet.raw", "network.*"]))
+        proc = invoke(["cwd"], 91, "exited", changes=rules(allow=["filesystem.path.read", "syscall.exit"], syscall_allow=["syscall.exit_group"]))
+        if not re.search(rb"operation=syscall.open policy-source=default-deny policy-rule=0 action=deny result=-38", proc.stderr):
+            raise RuntimeError("missing default syscall denial")
+        denied(["args", "hidden"], 0, "syscall.write", 1,
+               changes=rules(allow=["syscall.exit_group"], syscall_deny=["syscall.write"]))
+        # Native typed controls cannot silently become unenforced promises.
+        for section in ('[contract.filesystem]\nwrite = ["/work"]',
+                        '[contract.process]\nmax_processes = 2',
+                        '[contract.kernel]\nproc_read = ["/"]',
+                        '[contract.devices]\nread = ["/dev/null"]'):
+            proc = invoke(["exit"], 2, "supervisor-error", changes={"[storage]": section + "\n[storage]"})
+            if b"launch does not implement native hierarchical resource policy" not in proc.stderr:
+                raise RuntimeError(f"typed control did not reach launch validation: {proc.stderr!r}")
+        proc = invoke(["args", "visible"], 0, "exited", stdout=b"visible\n",
+                      changes={'mode = "stderr"': 'mode = "disabled"'})
+        if b"ginux: audit " in proc.stderr:
+            raise RuntimeError("disabled audit emitted a decision record")
         # The thread identity matches the virtual pid: set_tid_address returns
         # it instead of the host tid, and PI futexes, which would store the
         # host tid in the futex word, are denied.
@@ -167,6 +224,13 @@ def main():
                stdout=b"set_tid_address=1\ngetpid=1\ngettid=1\nfutex_lock_pi=-1\n"
                b"pi_word=0\nfutex_lock_pi_flags=-1\npi_flags_word=0\n")
         invoke(["descriptor", "0"], 0, "exited", cloexec_stdin=True)
+        invoke(["ysinfo"], 0, "exited",
+               stdout=b"sysinfo=0\nsysinfo-zero=1\nmem-unit=1\nsysinfo-null=-14\n")
+        # Configured image reads keep their 64 MiB request bound, so the whole
+        # 1 MiB + 1 file is read; console writes still return 4096.
+        invoke(["oversized"], 0, "exited",
+               stdout=b"read=1048577\npread=1048577\n" + b"x" * 4096 + b"write=4096\n")
+        invoke(["nrandom"], 0, "exited", stdout=b"getrandom=256\n")
         with (work / "secret").open("w+b") as secret:
             secret.write(b"host-only data")
             secret.flush()

@@ -149,7 +149,7 @@ long launch_fixture_main(word *stack)
         word fd = argc > 2 ? number(argv[2]) : 3;
         return call3(0, fd, (word)&byte, 1) == -9 ? 0 : 97;
     }
-    case 'o': {
+    case 'g': {
         /* owner: fcntl cannot set up signal-driven I/O (EPERM); descriptor
          * and status flags still work. Descriptor 1 is the test's stdout
          * pipe, whose status flags are restored. */
@@ -217,6 +217,37 @@ long launch_fixture_main(word *stack)
         print_number("futex_lock_pi_flags=",
                      call4(202, (word)&pi_flags_word, 6 | 128 | 1024, 0, 0));
         print_number("pi_flags_word=", pi_flags_word);
+        return 0;
+    }
+    case 'y': {
+        unsigned char info[112];
+        for (word i = 0; i < sizeof info; ++i) info[i] = 0xaa;
+        long result = call3(99, (word)info, 0, 0);
+        word zero = 1;
+        for (word i = 0; i < sizeof info; ++i) {
+            if (i < 104 || i >= 108) zero &= info[i] == 0;
+        }
+        print_number("sysinfo=", result);
+        print_number("sysinfo-zero=", zero);
+        print_number("mem-unit=", *(unsigned int *)(info + 104));
+        print_number("sysinfo-null=", call3(99, 0, 0, 0));
+        return 0;
+    }
+    case 'o': {
+        static char input[1024 * 1024 + 1];
+        static char output[4097];
+        long fd = call3(2, (word)"large", 0, 0);
+        if (fd < 0) return 84;
+        print_number("read=", call3(0, fd, (word)input, sizeof input));
+        print_number("pread=", call4(17, fd, (word)input, sizeof input, 0));
+        for (word i = 0; i < sizeof output; ++i) output[i] = 'x';
+        long written = call3(1, 1, (word)output, sizeof output);
+        print_number("write=", written);
+        return 0;
+    }
+    case 'n': {
+        static char random[512];
+        print_number("getrandom=", call3(318, (word)random, sizeof random, 0));
         return 0;
     }
     default: return 98;

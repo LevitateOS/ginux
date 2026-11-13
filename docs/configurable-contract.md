@@ -412,3 +412,21 @@ The default Rocky recipe uses `[audit] enabled = false`. `ginux start NAME
 controls enablement only; the controller always owns the log destination.
 Legacy `mode = "stderr"` and `mode = "disabled"` recipes remain readable and
 normalize to `enabled = true` and `enabled = false`, respectively.
+
+## Launch enforcement
+
+`ginux launch` checks the resolved contract before workload effects. Explicit
+denials take precedence over allowances. Allowances remain limited by the
+balanced implementation. Audit entries identify the winning operation and
+rule; `[audit] enabled = false` suppresses decision records while keeping config
+and completion diagnostics. A semantic denial wins, except an explicit syscall denial takes precedence
+over a semantic family that is merely not granted.
+
+Launch rejects explicit denials it cannot enforce, including host vDSO clock
+reads and proc/sys access; configured launch owns console input, so a
+`device.console.read` denial is enforced. It rejects native-only hierarchical
+filesystem, device, process and kernel controls, filesystem `write_deny` rules,
+pre-boot hooks and shared-network policy rather than pretending to enforce
+them. Configured launch applies `[resources]` limits and its own storage,
+device, network and process lanes as the README describes. The root remains a
+privileged host-path bootstrap.

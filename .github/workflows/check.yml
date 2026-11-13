@@ -57,6 +57,7 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-gnu
       - run: make check
       - run: make test-unit
+      - run: make test-release-overflow
 
   launch-integration:
     needs: changes
@@ -89,3 +90,4 @@ jobs:
       - run: sudo make test-launch-network
       - run: make build-launch-image-io-fixture
       - run: sudo make test-launch-image-io
+      - run: sudo make test-tracee-kill

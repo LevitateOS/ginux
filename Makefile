@@ -67,7 +67,7 @@ build:
 
 build-process-fixtures:
 	mkdir -p .artifacts/process
-	@for scenario in syscall_abi untraced_clone shared_pipe wait_status thread_reuse denied_host_memory inherited_fds thread_exec unused_parent_tid exec_failure copied_files shared_exec clone_tid child_signal nonblocking_wait vfork concurrent_wait remaining_wait sigpipe segv kill_badsig thread_segv thread_term parked_kill parked_term ro_status bad_status bad_rusage straddle_status alias_writes; do \
+	@for scenario in syscall_abi untraced_clone shared_pipe wait_status thread_reuse denied_host_memory inherited_fds thread_exec unused_parent_tid exec_failure copied_files shared_exec clone_tid child_signal nonblocking_wait vfork concurrent_wait remaining_wait sigpipe segv kill_badsig thread_segv thread_term parked_kill parked_term orphan_reparent orphan_zombie ro_status bad_status bad_rusage straddle_status ro_clone_tid bad_clone_tid straddle_clone_tid alias_writes; do \
 		$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -DCASE_$$scenario tests/fixtures/process-review-fixture.c -o .artifacts/process/$$scenario || exit; \
 	done
 	$(CC) -nostdlib -static tests/fixtures/process-exec-target.S -o .artifacts/process/process-exec-target
@@ -122,10 +122,13 @@ test-unit:
 	RUSTFLAGS='' CARGO_TARGET_DIR=.artifacts/unit cargo test -p ginux-vfs
 	RUSTFLAGS='' CARGO_TARGET_DIR=.artifacts/unit cargo test -p ginux-kernel-views
 
+test-release-overflow:
+	RUSTFLAGS='' CARGO_TARGET_DIR=.artifacts/unit cargo test --release -p ginux-vfs-index --test overflow_checks_release
+
 test-intercept: build
 	@./scripts/with-rocky-host.sh ./scripts/test-intercept.sh
 
-.PHONY: build-gate1-fixture test-gate1-setup
+.PHONY: build-gate1-fixture test-gate1-setup test-tracee-kill
 build-gate1-fixture:
 	mkdir -p .artifacts/gate1
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror -DDENY_PTRACE tests/fixtures/gate1-setup-fixture.c -o .artifacts/gate1/deny-ptrace
@@ -133,6 +136,9 @@ build-gate1-fixture:
 
 test-gate1-setup:
 	python3 scripts/test-gate1-setup.py $(GINUX) .artifacts/gate1/deny-ptrace .artifacts/gate1/payload
+
+test-tracee-kill:
+	python3 scripts/test-tracee-kill.py $(GINUX) .artifacts/gate1/deny-ptrace .artifacts/gate1/payload $(PAYLOAD) .artifacts/launch/native-fixture
 
 test-runtime: build
 	@./scripts/with-rocky-host.sh ./scripts/test-runtime.sh
@@ -411,6 +417,7 @@ build-launch-fixture:
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-fixture.c -o .artifacts/launch/launch-fixture
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/native-fixture.c -o .artifacts/launch/native-fixture
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-contract-fixture.c -o .artifacts/launch/launch-contract-fixture
+	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror -DCLONE_SNAPSHOT_COLLISION -Wl,--section-start=.ginux_clone_collision=0x600000000000 tests/fixtures/native-fixture.c -o .artifacts/launch/native-clone-collision-fixture
 
 .PHONY: test-launch-contract
 test-launch-contract:
@@ -421,6 +428,7 @@ test-launch:
 
 test-native-supervision:
 	python3 scripts/test-native-supervision.py $(GINUX) .artifacts/launch/native-fixture
+	python3 scripts/test-native-clone-snapshot.py $(GINUX) .artifacts/launch/native-fixture .artifacts/launch/native-clone-collision-fixture
 
 build-launch-storage-fixture:
 	mkdir -p .artifacts/launch

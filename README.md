@@ -537,7 +537,14 @@ Configured `uname` returns `Linux`, the instance id as nodename, the kernel-view
 package version with `-ginux` as its virtual release, version `ginux`, machine
 `x86_64`, and an empty final UTS field. This identifies the virtual implementation;
 it does not report host kernel/hostname data or promise the host kernel's ABI.
-The shared native syscall contract and `sysinfo` behavior are unchanged.
+The shared native syscall contract is unchanged. Configured `sysinfo` writes
+the same deterministic structure as native supervision (Gate 22): every field
+zero except `mem_unit = 1`, with no host counters. A `getrandom` request above
+the balanced 256-byte bound returns a 256-byte short read (Gate 20); the
+caller's length register is restored at the syscall exit. Configured image
+reads keep their own 64 MiB request bound described below rather than the
+balanced 1 MiB short read, and console writes over 4096 bytes return a
+partial count.
 
 Optional `[storage].assignments` entries of the form `"memory:/absolute/path"`
 declare empty, ephemeral writable namespaces. For example:
@@ -870,6 +877,7 @@ make build
 make build-launch-fixture
 make build-gate1-fixture
 sudo make test-gate1-setup
+sudo make test-tracee-kill
 sudo make test-launch
 sudo make test-native-supervision
 make build-launch-storage-fixture
@@ -1100,3 +1108,30 @@ Owned storage inode uid/gid are virtual root. `chown`, `fchown`, `lchown` and
 `fchownat` can preserve 0 or unchanged (-1) on existing assigned storage objects,
 including symlinks and empty-path descriptor operations. Other identities remain
 unsupported; these operations never change host ownership.
+Native configured clone3 captures the Linux 6.12 argument structure before
+execution and gives the host a private read-only snapshot. Caller structures
+may be read-only; Ginux does not rewrite them and restores syscall argument
+registers. Normal kernel-declared outputs, such as the pidfd output, still apply.
+The existing virtual-cgroup adaptation accepts only an owned virtual cgroup
+directory and starts the child in the parent's host cgroup; it does not
+implement host cgroup placement. Unknown nonzero extension bytes fail closed.
+
+The native runtime reserves `0x600000000000` through `0x600000080000` for
+transient clone snapshots (one 4 KiB page per active task slot, within existing
+memory and task limits). Workloads cannot map, discard, move or change
+permissions in this range. Parent and child remove their snapshots before
+returning to workload code. A pre-existing mapping is never overwritten;
+allocation errors propagate. Death during the private protocol fails the
+instance closed so a shared address space cannot retain a stale snapshot.
+Snapshot capture requires host `process_vm_readv`; it fails closed if the host
+cannot provide it.
+
+Configured native waitid supports a null siginfo pointer without retaining
+reaped child slots. Ginux pins each waitable host child with a private pidfd
+before it runs and uses final-reap readiness (POLLHUP) to reconcile its
+process table. The host waitid call, selectors, options, rusage and errno
+semantics remain in force, including WNOHANG, WNOWAIT and copy-out failures.
+Exited zombies and stopped/continued children are not treated as reaped.
+Private pins close when waitid or wait4 reclaims the child; they do not change
+the instance-visible descriptor budget. The native host must support pidfd
+final-reap readiness, as in the Linux 6.12 ABI used for this contract.

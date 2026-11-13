@@ -1452,6 +1452,13 @@ impl Supervisor<'_> {
             self.run(index, r, instance);
             return;
         }
+        if r.orig_rax == 318 && r.rsi > 256 {
+            // The balanced 256-byte getrandom bound (Gate 20) gives a larger
+            // request a short read, as Linux may; the caller's length
+            // returns at the exit.
+            self.task_mut(index).call.save(r);
+            r.rsi = 256;
+        }
         let original = *r;
         let id = self.task(index).id;
         let parent_group = self.task(index).group;
@@ -1484,13 +1491,12 @@ impl Supervisor<'_> {
             return;
         }
         if r.orig_rax == 99 {
-            // x86-64 struct sysinfo is 112 bytes. A deterministic empty system
-            // view exposes neither host topology nor a fictitious RAM budget.
-            let bytes = [0u8; 112];
+            // A deterministic system view (Gate 22) exposes neither host
+            // topology nor a fictitious RAM budget; only `mem_unit` is 1.
             let result = crate::supervisor::write_tracee_bytes_strict(
                 self.task(index).host,
                 r.rdi as usize,
-                &bytes,
+                &crate::supervisor::virtual_sysinfo(),
             )
             .map(|_| 0)
             .unwrap_or_else(|error| error);

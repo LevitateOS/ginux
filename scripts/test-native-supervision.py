@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check `ginux native` supervision edges with a fixture as /usr/bin/bash (Linux/root)."""
 import os
+import resource
 from pathlib import Path
 import shutil
 import subprocess
@@ -22,6 +23,7 @@ def main():
         (root / "usr/bin").mkdir(parents=True)
         shutil.copyfile(fixture, root / "usr/bin/bash")
         (root / "usr/bin/bash").chmod(0o755)
+        (root / "large").write_bytes(b"r" * (1024 * 1024 + 1))
         work.chmod(0o755)
         # The systemd profile supervises fork; derive it from the same instance.
         systemd_config = work / "systemd.toml"
@@ -33,10 +35,27 @@ def main():
             '\n[contract.filesystem]\nread = ["/"]\nwrite = ["/"]\ncreate = ["/"]\n'
             '[contract.kernel]\nproc_read = ["/"]\nsys_read = ["/"]\n')
 
-        def run(scenario, instance=config, stdin=None, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **options):
+        configured = work / "configured.toml"
+        configured.write_text(config.read_text().replace('init = "/bin/bash"',
+            'init = "/usr/bin/bash"') + """
+[contract.filesystem]
+read = ["/"]
+write = ["/"]
+create = ["/"]
+[contract.kernel]
+proc_read = ["/"]
+sys_read = ["/"]
+""")
+
+        def run(scenario, instance=config, stdin=None, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, **options):
             (root / "scenario").write_text(scenario)
-            proc = subprocess.run([str(work / "ginux"), "native", str(instance), str(root)],
-                                  stdin=stdin, stdout=stdout, stderr=stderr, timeout=20, **options)
+            proc = subprocess.run([str(work / "ginux"), "native", str(instance), str(root)]
+                                  + (["configured"] if instance == configured else []),
+                                  stdin=stdin, stdout=stdout, stderr=stderr, timeout=30, **options)
+            # Audit records and fixture output have separate writers. Merge
+            # only after capture so a concurrent audit fragment cannot prefix
+            # an otherwise complete fixture line.
             output = (proc.stdout or b"") + (proc.stderr or b"")
             return proc.returncode, output.decode(errors="replace")
 
@@ -90,6 +109,17 @@ def main():
                   code, out)
         finally:
             os.close(directory)
+        path_directory = os.open(outside, os.O_PATH | os.O_DIRECTORY)
+        try:
+            code, out = run("fork", stdin=path_directory)
+            check("O_PATH directory stdin refused", code == 1
+                  and "standard input is a directory" in out, code, out)
+        finally:
+            os.close(path_directory)
+        with (work / "regular").open("w+") as stream:
+            code, out = run("fork", stdin=stream)
+            check("regular stdin starts", code == 0
+                  and "GINUX_FIXTURE: fork=-38\n" in out, code, out)
         code, out = run("fork", preexec_fn=lambda: os.close(0))
         check("closed stdin starts", code == 0 and "GINUX_FIXTURE: fork=-38\n" in out, code, out)
 
@@ -99,11 +129,19 @@ def main():
               and "unsupervised child ran" not in out and "GINUX_NATIVE_CHECK: PASS" in out, code, out)
 
         # fcntl cannot make the host kernel signal another process.
-        code, out = run("owner")
+        code, out = run("guard")
         check("signal-driven I/O refused", code == 0
               and all(f"GINUX_FIXTURE: {name}=-1\n" in out
                       for name in ("setown", "setown-ex", "setsig", "async"))
               and "GINUX_FIXTURE: nonblock=0\n" in out, code, out)
+
+        # Invalid FDs make the baseline safe: an admitted host ioctl returns
+        # EBADF; the argument guard must instead return EPERM before dispatch.
+        code, out = run("quiet-ioctl", configured)
+        check("native ioctl signal routing refused", code == 0
+              and all(f"GINUX_FIXTURE: {name}=-1\n" in out for name in
+                      ("fioasync", "fiosetown", "siocspgrp", "high-fioasync"))
+              and "GINUX_FIXTURE: tcgets=-9\n" in out, code, out)
 
         # The thread identity matches the virtual pid: set_tid_address returns
         # it instead of the host tid, and PI futexes, which would store the
@@ -115,6 +153,24 @@ def main():
             "GINUX_FIXTURE: gettid=-38", "GINUX_FIXTURE: futex_lock_pi=-1",
             "GINUX_FIXTURE: pi_word=0", "GINUX_FIXTURE: futex_lock_pi_flags=-1",
             "GINUX_FIXTURE: pi_flags_word=0"] and "GINUX_NATIVE_CHECK: PASS" in out, code, out)
+
+        code, out = run("emulated-sysinfo")
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("sysinfo is deterministic and private", code == 0 and fixture == [
+            "GINUX_FIXTURE: sysinfo=0", "GINUX_FIXTURE: sysinfo-zero=1",
+            "GINUX_FIXTURE: mem-unit=1", "GINUX_FIXTURE: sysinfo-null=-14"]
+            and "GINUX_NATIVE_CHECK: PASS" in out, code, out)
+
+        code, out = run("oversized")
+        check("oversized I/O uses short transfers",
+              code == 0 and "GINUX_FIXTURE: read=1048576\n" in out
+              and "GINUX_FIXTURE: pread=1048576\n" in out
+              and "GINUX_NATIVE_CHECK: PASS" in out, code, out)
+
+        code, out = run("random")
+        check("getrandom is a bounded short read",
+              code == 0 and "GINUX_FIXTURE: getrandom=256\n" in out
+              and "GINUX_NATIVE_CHECK: PASS" in out, code, out)
 
         # A plain SIGTRAP stop is not a syscall stop; supervision must fail
         # closed instead of treating the next syscall entry as an exit.
@@ -134,21 +190,104 @@ def main():
               code, out)
         # A parent that catches SIGCHLD with a handler, as OpenRC, busybox and
         # shells do, must get it: the supervisor resumes the SIGCHLD stop with
-        # the signal instead of discarding it.
-        # The systemd profile execs /bin/bash and materializes /proc identity.
+        # the signal instead of discarding it. Checked under the systemd
+        # profile (which execs /bin/bash and materializes /proc identity) and
+        # under configured native supervision.
         (root / "bin").symlink_to("usr/bin")
         (root / "proc/1").mkdir(parents=True)
         (root / "proc/sys/kernel").mkdir(parents=True)
-        for scenario in ("sigchld-busy", "sigchld"):
-            code, out = run(scenario, systemd_config)
-            fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
-            expected = ["GINUX_FIXTURE: sigaction=0", "GINUX_FIXTURE: fork-ok=1"]
-            if scenario == "sigchld-busy":
-                expected.append("GINUX_FIXTURE: sigchld-userspace=1")
-            expected += ["GINUX_FIXTURE: sigchld-poll=1", "GINUX_FIXTURE: sigchld-handled=1",
-                         "GINUX_FIXTURE: wait-ok=1", "GINUX_FIXTURE: child-status=7"]
-            check(f"SIGCHLD reaches a handler ({scenario})",
-                  code == 0 and fixture == expected, code, out)
+        for instance in (systemd_config, configured):
+            for scenario in ("sigchld-busy", "sigchld"):
+                code, out = run(scenario, instance)
+                fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+                expected = ["GINUX_FIXTURE: sigaction=0", "GINUX_FIXTURE: fork-ok=1"]
+                if scenario == "sigchld-busy":
+                    expected.append("GINUX_FIXTURE: sigchld-userspace=1")
+                expected += ["GINUX_FIXTURE: sigchld-poll=1", "GINUX_FIXTURE: sigchld-handled=1",
+                             "GINUX_FIXTURE: wait-ok=1", "GINUX_FIXTURE: child-status=7"]
+                check(f"SIGCHLD reaches a handler ({scenario}, {instance.stem})",
+                      code == 0 and fixture == expected, code, out)
+        # systemd 258+ waits for children through waitid(P_PIDFD), with no
+        # fallback.
+        code, out = run("pidfd-wait", configured)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("waitid(P_PIDFD) reaps a managed child", code == 0 and fixture == [
+            "GINUX_FIXTURE: pidfd-open-ok=1", "GINUX_FIXTURE: waitid-self=-10",
+            "GINUX_FIXTURE: waitid-not-pidfd=-9", "GINUX_FIXTURE: waitid-invalid=-9",
+            "GINUX_FIXTURE: waitid-high=0", "GINUX_FIXTURE: waitid=0",
+            "GINUX_FIXTURE: waited-child=1", "GINUX_FIXTURE: child-status=7"], code, out)
+        # glibc 2.41+ posix_spawn starts children with clone3 CLONE_INTO_CGROUP.
+        (root / "sys/fs/cgroup").mkdir(parents=True, exist_ok=True)
+        code, out = run("cgroup-clone3", configured)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("clone3 CLONE_INTO_CGROUP starts a child", code == 0 and fixture == [
+            "GINUX_FIXTURE: clone3-invalid=-9", "GINUX_FIXTURE: clone3-ordinary=-9",
+            "GINUX_FIXTURE: cgroup-open-ok=1", "GINUX_FIXTURE: clone3-ok=1",
+            "GINUX_FIXTURE: wait-ok=1", "GINUX_FIXTURE: child-status=7"], code, out)
+        code, out = run("arguments", configured)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("immutable clone3 arguments and cleanup", code == 0
+              and out.count("GINUX_POLICY_AUDIT: action=deny policy=clone-arguments result=-1") == 5
+              and fixture == [
+            "GINUX_FIXTURE: readonly-clone=1", "GINUX_FIXTURE: readonly-unchanged=1",
+            "GINUX_FIXTURE: clone-zero-tail=1", "GINUX_FIXTURE: clone-pidfd=1", "GINUX_FIXTURE: pidfd-input=1",
+            "GINUX_FIXTURE: clone-vfork=1", "GINUX_FIXTURE: vfork-unchanged=1",
+            "GINUX_FIXTURE: clone-short=-22", "GINUX_FIXTURE: clone-large=-7",
+            "GINUX_FIXTURE: clone-unreadable=-14", "GINUX_FIXTURE: clone-short-cgroup=-22",
+            "GINUX_FIXTURE: clone-kernel-error=-22", "GINUX_FIXTURE: error-unchanged=1",
+            "GINUX_FIXTURE: clone-tail=-7", "GINUX_FIXTURE: clone-version0=1",
+            "GINUX_FIXTURE: snapshot-mmap=-1", "GINUX_FIXTURE: snapshot-mprotect=-1",
+            "GINUX_FIXTURE: snapshot-munmap=-1", "GINUX_FIXTURE: snapshot-madvise=-1",
+            "GINUX_FIXTURE: snapshot-mremap=-1", "GINUX_FIXTURE: snapshot-repeated=160"], code, out)
+        # PIDFD_GET_INFO must not reach the host: it reports host pids.
+        code, out = run("host-info", configured)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("PIDFD_GET_INFO is ENOTTY", code == 0 and fixture == [
+            "GINUX_FIXTURE: pidfd-open-ok=1", "GINUX_FIXTURE: pidfd-info=-25",
+            "GINUX_FIXTURE: pidfd-info-high=-25", "GINUX_FIXTURE: pidfd-info-invalid=-25",
+            "GINUX_FIXTURE: unrelated-ioctl=-9", "GINUX_FIXTURE: wait-ok=1"], code, out)
+        # systemd reaps with waitid; each reaped child must free its slot.
+        code, out = run("many-reap", configured)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("waitid releases reaped children", code == 0 and fixture == [
+            "GINUX_FIXTURE: waitid-peek=0", "GINUX_FIXTURE: waitid-after-peek=0",
+            "GINUX_FIXTURE: waitid-reaped=200"], code, out)
+        code, out = run("null-wait", configured,
+                        preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (512, 512)))
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("null-siginfo waitid and private pin reuse", code == 0 and fixture == [
+            "GINUX_FIXTURE: null-nohang=0", "GINUX_FIXTURE: null-peek=0",
+            "GINUX_FIXTURE: null-selector-preserved=1",
+            "GINUX_FIXTURE: null-after-peek=0", "GINUX_FIXTURE: null-rewait=-10",
+            "GINUX_FIXTURE: null-invalid-options=-22", "GINUX_FIXTURE: null-rusage-fault=-14",
+            "GINUX_FIXTURE: fault-rewait=-10", "GINUX_FIXTURE: null-reaped=800"], code, out)
+        denied = work / "denied-waitid.toml"
+        denied.write_text(configured.read_text().replace('allow = ["*"]\ndeny = []',
+                                                       'allow = ["*"]\ndeny = ["waitid"]'))
+        code, out = run("zero-effects", denied)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("denied waitid preserves caller registers", code == 0 and fixture == [
+            "GINUX_FIXTURE: denied-waitid=-1", "GINUX_FIXTURE: denied-selector-preserved=1"], code, out)
+
+        # Upstream owns cgroups in memory. Retain the public API and
+        # containment regressions without requiring obsolete host files.
+        cgroup_outside = work / "cgroup-outside"
+        cgroup_outside.mkdir()
+        sentinel = cgroup_outside / "sentinel"
+        sentinel.write_bytes(b"preserve")
+        (root / "sys/fs/cgroup").mkdir(parents=True, exist_ok=True)
+        (root / "sys/fs/cgroup/escape").symlink_to(cgroup_outside)
+        code, out = run("layout-cgroup", configured)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("virtual cgroup mkdir and containment", code == 0 and fixture == [
+            "GINUX_FIXTURE: mkdir=0", "GINUX_FIXTURE: procs-open-ok=1",
+            "GINUX_FIXTURE: procs-write=2", "GINUX_FIXTURE: mkdir-again=-17",
+            "GINUX_FIXTURE: mkdirat=0", "GINUX_FIXTURE: mkdirat-relative=0",
+            "GINUX_FIXTURE: events-open-ok=1", "GINUX_FIXTURE: kill-open-ok=1",
+            "GINUX_FIXTURE: mkdir-via-symlink=-2"]
+            and sentinel.read_bytes() == b"preserve"
+            and sorted(p.name for p in cgroup_outside.iterdir()) == ["sentinel"]
+            and sorted(p.name for p in (root / "sys/fs/cgroup").iterdir()) == ["escape"], code, out)
     print("test-native-supervision: PASS")
 
 

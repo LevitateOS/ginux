@@ -33,6 +33,7 @@ pub const SYS_KILL: usize = 62;
 pub const SYS_TGKILL: usize = 234;
 pub const SYS_PTRACE: usize = 101;
 pub const SYS_OPENAT_HOST: usize = 257;
+pub const SYS_MKDIRAT_HOST: usize = 258;
 pub const SYS_SIGNALFD4: usize = 289;
 pub const SYS_PROCESS_VM_WRITEV: usize = 311;
 pub const SYS_SECCOMP: usize = 317;
@@ -399,6 +400,14 @@ fn process_vm_write_bytes(pid: usize, address: usize, bytes: &[u8]) -> i64 {
             0,
         )
     }) as i64
+}
+
+/// Deterministic x86-64 `struct sysinfo`: no host counters are exposed and
+/// `mem_unit = 1` keeps libc's page calculations well-defined.
+pub fn virtual_sysinfo() -> [u8; 112] {
+    let mut info = [0u8; 112];
+    info[104..108].copy_from_slice(&1u32.to_ne_bytes());
+    info
 }
 
 /// Map a failed ptrace access to the errno a user copy would report: an

@@ -20,8 +20,9 @@ static long system_view(int denied) {
     for (unsigned i=0;i<sizeof view;++i) view[i]=0xa5;
     long result=DO(99,view+8,0,0);
     CHECK(result==(denied ? -1 : 0),50);
+    /* struct sysinfo is all zero except mem_unit (bytes 104..107) = 1. */
     for (unsigned i=0;i<sizeof view;++i)
-        CHECK(view[i]==(!denied && i>=8 && i<120 ? 0 : 0xa5),51);
+        CHECK(view[i]==(!denied && i>=8 && i<120 ? (i==8+104 ? 1 : 0) : 0xa5),51);
     return 0;
 }
 /* x86-64 stat(4) and lstat(6) are newfstatat(AT_FDCWD, path, buf, 0) and

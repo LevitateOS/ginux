@@ -16,8 +16,8 @@ use crate::supervisor::{
     exit_process, line, managed_host_identity, ptrace, standard_stream_refusal, syscall0, syscall1,
     syscall2, syscall3, syscall4, syscall5, write_all, AT_FDCWD, O_RDONLY, PR_SET_NO_NEW_PRIVS,
     PTRACE_SEIZE, SYS_CHDIR, SYS_CHROOT, SYS_CLOSE_HOST, SYS_EXECVE, SYS_EXIT_HOST, SYS_FORK,
-    SYS_FSYNC, SYS_KILL, SYS_OPENAT_HOST, SYS_PRCTL, SYS_READ_HOST, SYS_SETGID, SYS_SETGROUPS,
-    SYS_SETUID, SYS_WRITE_HOST,
+    SYS_FSYNC, SYS_KILL, SYS_MKDIRAT_HOST, SYS_OPENAT_HOST, SYS_PRCTL, SYS_READ_HOST, SYS_SETGID,
+    SYS_SETGROUPS, SYS_SETUID, SYS_WRITE_HOST,
 };
 
 pub const MAX_ELF_SIZE: usize = 64 * 1024;
@@ -396,8 +396,6 @@ pub const MAX_LAUNCH_ARG_LEN: usize = 128;
 pub const MAX_LAUNCH_ENV_LEN: usize = 256;
 pub const MAX_LAUNCH_PATH_LEN: usize = 128;
 
-const SYS_MKDIRAT: usize = 258;
-
 static mut LAUNCH_EXEC: [u8; 129] = [0; 129];
 static mut LAUNCH_ARGS: [u8; 7 * 129] = [0; 7 * 129];
 static mut LAUNCH_ENV: [u8; 8 * 257] = [0; 8 * 257];
@@ -425,15 +423,14 @@ pub fn launch_main(
     let contract = config
         .effective_contract()
         .unwrap_or_else(|error| launch_rejected(error.as_str()));
+    // Refuse an instance that explicitly denies what launch cannot enforce,
+    // rather than accept the denial and ignore it.
     if let Some(rule) = contract
         .rules()
         .iter()
         .find(|rule| launch_cannot_enforce(rule))
     {
-        write_stderr(b"ginux: launch config rejected reason=unenforced-deny operation=");
-        line_stderr(rule.operation.id.as_bytes());
-        write_completion_result(OUTCOME_SUPERVISOR_ERROR, false, 0, false, 0);
-        exit_process(2);
+        launch_unenforced(rule.operation.id);
     }
     unsafe {
         AUDIT_DISABLED = config.audit_mode == AuditMode::Disabled;
@@ -818,6 +815,14 @@ fn stage_result_path(path: *const u8) {
     unsafe {
         RESULT_FD = descriptor;
     }
+}
+
+fn launch_unenforced(operation: &str) -> ! {
+    write_stderr(b"ginux: launch config rejected reason=unenforced-deny operation=");
+    write_stderr(operation.as_bytes());
+    write_stderr(b"\n");
+    write_completion_result(OUTCOME_SUPERVISOR_ERROR, false, 0, false, 0);
+    exit_process(2)
 }
 
 fn launch_rejected(reason: &str) -> ! {
@@ -1289,7 +1294,7 @@ fn launch_tracee(
         );
     }
     let workdir = core::ptr::addr_of!(LAUNCH_WORKDIR).cast::<u8>();
-    let _ = unsafe { syscall3(SYS_MKDIRAT, AT_FDCWD, workdir as usize, 0o755) };
+    let _ = unsafe { syscall3(SYS_MKDIRAT_HOST, AT_FDCWD, workdir as usize, 0o755) };
     let host_identity = managed_host_identity();
     if host_identity.drop_root {
         if unsafe { syscall2(SYS_SETGROUPS, 0, 0) } < 0 {

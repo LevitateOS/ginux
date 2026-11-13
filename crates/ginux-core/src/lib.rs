@@ -494,12 +494,12 @@ pub const fn balanced_arguments_allowed(syscall: u64, arg0: u64, arg1: u64, arg2
         2 => arg1 & (O_ACCMODE | MUTATING_OPEN_FLAGS) == 0,
         9 | 10 => arg2 & (PROT_WRITE | PROT_EXEC) != (PROT_WRITE | PROT_EXEC),
         17 => arg2 <= 1024 * 1024,
-        // ioctl is outside the balanced surface; native systemd mode falls
-        // back to this check for both.
+        // ioctl is outside the balanced surface. Native mode also checks
+        // signal_driven_io before its broader ioctl admission.
         16 | 72 => !signal_driven_io(syscall, arg1, arg2),
         257 => arg2 & (O_ACCMODE | MUTATING_OPEN_FLAGS) == 0,
         302 => arg0 == 0 && arg1 <= 15,
-        318 => arg2 <= 256,
+        318 => arg1 <= 256,
         SYS_WAIT4 => arg0 == u64::MAX || arg0 > 0,
         SYS_FUTEX => !futex_priority_inheritance(arg1),
         _ => true,
@@ -1573,6 +1573,15 @@ mod tests {
         assert_eq!(balanced_surface(16), BalancedSurface::Denied);
         assert_eq!(balanced_surface(41), BalancedSurface::Denied);
         assert_eq!(balanced_surface(105), BalancedSurface::Denied);
+        assert!(balanced_arguments_allowed(0, 3, 0x1000, 1024 * 1024));
+        assert!(!balanced_arguments_allowed(0, 3, 0x1000, 1024 * 1024 + 1));
+        assert!(balanced_arguments_allowed(1, 1, 0x1000, 4096));
+        assert!(!balanced_arguments_allowed(1, 1, 0x1000, 4097));
+        assert!(balanced_arguments_allowed(17, 3, 0x1000, 1024 * 1024));
+        assert!(!balanced_arguments_allowed(17, 3, 0x1000, 1024 * 1024 + 1));
+        assert!(balanced_arguments_allowed(318, 0x1000, 256, 0));
+        assert!(!balanced_arguments_allowed(318, 0x1000, 257, 0));
+        assert!(balanced_arguments_allowed(318, 0x1000, 32, 4));
     }
 
     #[test]
