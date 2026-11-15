@@ -79,6 +79,24 @@ static long tracked_as_console(long fd)
     return call3(16, fd, 0x540f /* TIOCGPGRP */, (word)&group) == 0;
 }
 
+/* Run one call in a child, which owns a copy of the descriptor table, and
+ * report whether 240 is still the instance /dev/null and 241 the console,
+ * neither one close-on-exec. */
+static void protected_step(const char *label, const char *intact, long number,
+                           word a, word b, word c)
+{
+    int status = 0;
+    long pid = call3(57, 0, 0, 0);
+    if (pid == 0) {
+        print_result(label, call3(number, a, b, c));
+        call3(231, call3(72, 240, 1 /* F_GETFD */, 0) == 0 && call3(72, 241, 1, 0) == 0
+                   && call3(1, 240, (word)"P\n", 2) == 2 && call3(1, 241, (word)"P\n", 2) == 2
+                   && tracked_as_console(241), 0, 0);
+    }
+    print_result(intact, pid > 0 && call4(61, pid, (word)&status, 0, 0) == pid
+                         && status == 256);
+}
+
 static volatile long yield_signals;
 
 static void yield_signal_handler(int signal)
@@ -1042,6 +1060,33 @@ long native_fixture_main(const word *stack)
         print_result("GINUX_FIXTURE: mutation-result=", descriptor_mutation_result);
         print_result("GINUX_FIXTURE: sibling-console=",
                      tracked_as_console(descriptor_sibling_result));
+        return 0;
+    }
+    case 'P': {
+        /* Nothing the workload calls closes, replaces or marks close-on-exec
+         * the protected null and console descriptors, with descriptor
+         * arguments read as the kernel reads them, as 32 bits. */
+        const word high = 1UL << 32;
+#define PROTECTED_STEP(name, number, a, b, c) \
+        protected_step("GINUX_FIXTURE: " name "=", "GINUX_FIXTURE: " name "-intact=", \
+                       number, a, b, c)
+        PROTECTED_STEP("close-high-console", 3, high | 241, 0, 0);
+        PROTECTED_STEP("close-high-null", 3, high | 240, 0, 0);
+        PROTECTED_STEP("dup2-console", 33, fd, 241, 0);
+        PROTECTED_STEP("dup2-console-self", 33, 241, 241, 0);
+        PROTECTED_STEP("dup3-null", 292, fd, 240, 0x80000 /* O_CLOEXEC */);
+        PROTECTED_STEP("dup3-high-console", 292, fd, high | 241, 0);
+        PROTECTED_STEP("setfd-console", 72, 241, 2 /* F_SETFD */, 1 /* FD_CLOEXEC */);
+        PROTECTED_STEP("setfd-high-null", 72, high | 240, high | 2, 1);
+        PROTECTED_STEP("fioclex-console", 16, 241, 0x5451 /* FIOCLEX */, 0);
+        PROTECTED_STEP("fioclex-high-null", 16, high | 240, 0x5451, 0);
+        PROTECTED_STEP("cloexec-range", 436, 3, ~0U, 4 /* CLOSE_RANGE_CLOEXEC */);
+        PROTECTED_STEP("unshare-range", 436, 239, 300, 2 /* CLOSE_RANGE_UNSHARE */);
+        PROTECTED_STEP("console-range", 436, 241, 241, 0);
+        PROTECTED_STEP("high-range", 436, high | 3, ~0U, 0);
+        /* A range the kernel rejects closes nothing either. */
+        PROTECTED_STEP("inverted-high-range", 436, 3, high | 2, 0);
+#undef PROTECTED_STEP
         return 0;
     }
     case 'K': {
