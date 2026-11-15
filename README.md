@@ -212,7 +212,7 @@ make bench-launch       # launch-mode per-syscall and workload overhead against 
 make bench-launch-compare # launch-mode run against its baseline, or two binaries (A/B)
 make demo-gate-17       # operator-readable concurrent-instance isolation check
 make test-systemd-live  # shared network plus real upstream dnf -y update
-make host-run           # general interactive Rocky host with Ginux installed
+make run-host           # build RPM, boot Rocky, install it, then open a shell
 make host-reset         # discard that host's cache, instances, and writable state
 make demo-gate-9        # Gate 9 checkpoint through the same host workflow
 ```
@@ -256,13 +256,15 @@ samples, metadata, a Markdown table, and an SVG graph under `build/gate15/`.
 See [Reproducible performance measurement](docs/performance.md) for the exact
 protocol, customization workflow, output schema, and interpretation limits.
 
-`make host-run` boots the QEMU Rocky host and logs you into its ordinary shell.
-Ginux is installed in `PATH`. The first `create` or `import` downloads and verifies
-the pinned Rocky OCI image with live per-layer progress; later operations reuse the
-cache. The writable Rocky host overlay persists across `make host-run`, ordinary
+`make run-host` first builds the current Ginux RPM, boots the QEMU Rocky host,
+installs or upgrades that RPM through DNF, verifies it with `rpm -V`, and then
+logs you into the host's ordinary shell with `ginux` in `PATH`. The first
+`create` or `import` downloads and verifies the pinned Rocky OCI image with live
+per-layer progress; later operations reuse the cache. The writable Rocky host
+overlay persists across `make run-host`, ordinary
 cleanup, builds, and tests, so cached images, instance definitions, roots, and
 stopped status remain available. `make host-reset` is the explicit destructive
-operation that stops the host and removes that overlay; the next `make host-run`
+operation that stops the host and removes that overlay; the next `make run-host`
 starts from the pinned clean Rocky image.
 A complete first session is:
 
@@ -300,7 +302,7 @@ network attachment and translated ports are deployment settings, supplied as
 repeatable flags when the instance is created or changed:
 
 ```sh
-ginux import web /etc/ginux/examples/rocky-systemd.toml \
+ginux import web /etc/ginux/examples/rocky10-systemd.toml \
     --network eth0:1 \
     --forward protocol=tcp,external_port=8080,instance_port=80 \
     --forward protocol=tcp,external_port=8443,instance_port=443
@@ -330,9 +332,9 @@ contract is part of the instance rather than a separate operator object.
 Validate and inspect the complete instance recipe before launch:
 
 ```sh
-ginux validate /etc/ginux/examples/rocky-systemd.toml
-ginux inspect /etc/ginux/examples/rocky-systemd.toml
-ginux explain /etc/ginux/examples/rocky-systemd.toml filesystem.path.write
+ginux validate /etc/ginux/examples/rocky10-systemd.toml
+ginux inspect /etc/ginux/examples/rocky10-systemd.toml
+ginux explain /etc/ginux/examples/rocky10-systemd.toml filesystem.path.write
 ```
 
 See [Self-contained userspace contract](docs/configurable-contract.md) for the
@@ -405,6 +407,24 @@ that the output is correct, secure, maintainable, or novel. Human direction
 sets the architecture and boundaries; executable gates supply the evidence;
 review determines what can actually be claimed.
 
+## Installable package
+
+Ginux builds as one Rocky Linux 10 x86-64 RPM plus its matching source RPM.
+The package installs the public `ginux` command, private runtime components,
+distribution-prefixed example recipes, and the empty persistent/runtime state
+structure. It does not pull images or create or start instances during
+installation.
+
+```sh
+make rpm
+sudo dnf install build/rpm/RPMS/x86_64/ginux-*.rpm
+sudo rpm -V ginux
+```
+
+Build preparation, offline RPM construction, file layout, upgrade/removal
+behavior, retained state, and the clean-host lifecycle test are documented in
+[`docs/packaging.md`](docs/packaging.md).
+
 ## Historical standalone kernel
 
 The independent bootable kernel remains available for research and historical
@@ -427,7 +447,7 @@ the `G` officially stands for GPT.
 Ginux is available under the Apache License 2.0. See [`LICENSE`](LICENSE) and
 [`NOTICE`](NOTICE).
 
-## Configured native launch
+## Internal configured native launch diagnostic
 
 Configured Linux FD syscall arguments use the low 32 bits of the register.
 Lookup and policy classification use that same public descriptor identity;
@@ -454,8 +474,10 @@ closed before private storage reservation. Its own result/export descriptors
 remain private. The workload's public descriptor capacity is captured from the
 original soft limit and is never enlarged by the supervisor's private reserve.
 
+This section documents an internal maintainer and component-test surface, not
+operator syntax. It is intentionally absent from `ginux --help`.
 
-On x86-64 Linux, `ginux launch <config> <root> [--result-file <fresh host path>]`
+On x86-64 Linux, `ginux-runtime launch <config> <root> [--result-file <fresh host path>]`
 executes `[instance].init` with the configured arguments and environment inside
 the supplied host root directory. It needs a kernel with `close_range` (Linux
 5.9 or later). A root caller chroots directly and drops to UID/GID 65534 before
@@ -519,7 +541,7 @@ arguments of 128 bytes each and eight `NAME=value` environment entries of
 Workload stdout stays separate from supervisor diagnostics on stderr. Only
 stdin, stdout, and stderr are inherited by the workload, and launch refuses to
 start when any of them is a directory or cannot be checked: a directory there
-would anchor `openat` and other `*at` calls outside the root. `ginux native`
+would anchor `openat` and other `*at` calls outside the root. `ginux-runtime native`
 applies the same check and closes every other inherited descriptor with
 `close_range`, so it also needs Linux 5.9 or later. The launcher returns the
 workload exit code, or `128 + signal` for signal termination. Startup

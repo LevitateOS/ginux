@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Check `ginux native` supervision edges with a fixture as /usr/bin/bash (Linux/root)."""
 import os
+import fcntl
 import resource
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 
 def main():
@@ -154,6 +156,14 @@ sys_read = ["/"]
             "GINUX_FIXTURE: pi_word=0", "GINUX_FIXTURE: futex_lock_pi_flags=-1",
             "GINUX_FIXTURE: pi_flags_word=0"] and "GINUX_NATIVE_CHECK: PASS" in out, code, out)
 
+        code, out = run("virtual-tid", configured)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("configured thread identity is virtual", code == 0 and fixture == [
+            "GINUX_FIXTURE: set_tid_address=1", "GINUX_FIXTURE: getpid=1",
+            "GINUX_FIXTURE: gettid=1", "GINUX_FIXTURE: futex_lock_pi=-1",
+            "GINUX_FIXTURE: pi_word=0", "GINUX_FIXTURE: futex_lock_pi_flags=-1",
+            "GINUX_FIXTURE: pi_flags_word=0"] and "GINUX_NATIVE_CHECK: PASS" in out, code, out)
+
         code, out = run("ysinfo")
         fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
         check("sysinfo is deterministic and private", code == 0 and fixture == [
@@ -179,6 +189,16 @@ sys_read = ["/"]
         check("signal stop fails closed", code == 1 and "GINUX_FIXTURE: uname-before=-38\n" in out
               and "uname-after" not in out
               and "GINUX_INSTANCE: failed reason=unexpected native trace stop" in out, code, out)
+        # The same failure in a thread while the leader spins. The killed
+        # thread stays a zombie until Ginux reaps it, and the leader is not
+        # reported before then: a reap of the leader alone never returns, and
+        # the run hits the 30 second timeout. Where the thread's lifetime pin
+        # fails, the instance fails at the thread's creation instead, also
+        # with the thread alive, so any failure reason is accepted.
+        code, out = run("Thread-trap", configured)
+        check("failure with a live thread exits", code == 1
+              and "GINUX_FIXTURE: thread=" not in out
+              and "GINUX_INSTANCE: failed reason=" in out, code, out)
         # int 0x80 selects the i386 table; supervision must stop instead of
         # classifying i386 fork (2) as x86-64 open. Without IA32 emulation the
         # host raises SIGSEGV on int 0x80, which ends supervision as an
@@ -237,6 +257,11 @@ sys_read = ["/"]
             "GINUX_FIXTURE: clone3-invalid=-9", "GINUX_FIXTURE: clone3-ordinary=-9",
             "GINUX_FIXTURE: cgroup-open-ok=1", "GINUX_FIXTURE: clone3-ok=1",
             "GINUX_FIXTURE: wait-ok=1", "GINUX_FIXTURE: child-status=7"], code, out)
+        code, out = run("Clone-policy", configured)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("unsafe clone flags are denied before host effect", code == 0 and fixture == [
+            "GINUX_FIXTURE: clone-untraced=-38",
+            "GINUX_FIXTURE: clone3-untraced=-38"], code, out)
         code, out = run("arguments", configured)
         fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
         check("immutable clone3 arguments and cleanup", code == 0
@@ -247,7 +272,7 @@ sys_read = ["/"]
             "GINUX_FIXTURE: clone-vfork=1", "GINUX_FIXTURE: vfork-unchanged=1",
             "GINUX_FIXTURE: clone-short=-22", "GINUX_FIXTURE: clone-large=-7",
             "GINUX_FIXTURE: clone-unreadable=-14", "GINUX_FIXTURE: clone-short-cgroup=-22",
-            "GINUX_FIXTURE: clone-kernel-error=-22", "GINUX_FIXTURE: error-unchanged=1",
+            "GINUX_FIXTURE: clone-kernel-error=-38", "GINUX_FIXTURE: error-unchanged=1",
             "GINUX_FIXTURE: clone-tail=-7", "GINUX_FIXTURE: clone-version0=1",
             "GINUX_FIXTURE: snapshot-mmap=-1", "GINUX_FIXTURE: snapshot-mprotect=-1",
             "GINUX_FIXTURE: snapshot-munmap=-1", "GINUX_FIXTURE: snapshot-madvise=-1",
@@ -274,9 +299,38 @@ sys_read = ["/"]
             "GINUX_FIXTURE: null-after-peek=0", "GINUX_FIXTURE: null-rewait=-10",
             "GINUX_FIXTURE: null-invalid-options=-22", "GINUX_FIXTURE: null-rusage-fault=-14",
             "GINUX_FIXTURE: fault-rewait=-10", "GINUX_FIXTURE: null-reaped=800"], code, out)
+        # A translated pid selector goes back to the guest's virtual pid, also
+        # when an SA_RESTART handler makes the kernel reissue the wait.
+        code, out = run("juggled-pids", configured)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("translated pid selectors are restored", code == 0 and fixture == [
+            "GINUX_FIXTURE: kill-self=0", "GINUX_FIXTURE: kill-selector-preserved=1",
+            "GINUX_FIXTURE: pidfd-open-ok=1", "GINUX_FIXTURE: pidfd-selector-preserved=1",
+            "GINUX_FIXTURE: restarted-wait=1", "GINUX_FIXTURE: child-status=7",
+            "GINUX_FIXTURE: signal-handled=1", "GINUX_FIXTURE: helper-wait=1"], code, out)
         credential_config = work / "credential.toml"
         credential_config.write_text(configured.read_text().replace(
             '[network]\nbackend = "none"', '[network]\nbackend = "shared"'))
+        network_config = work / "network.toml"
+        network_config.write_text(configured.read_text().replace(
+            '[network]\nbackend = "none"', '''[contract.network]
+default = "deny"
+inbound = ["udp:18081"]
+outbound = ["udp:18081"]
+
+[network]
+backend = "shared"'''))
+        code, out = run("Network-sends", network_config, configured_launch=True)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("shared-network sends use bounded immutable destinations", code == 0 and fixture == [
+            "GINUX_FIXTURE: sendto-allowed=1", "GINUX_FIXTURE: sendto-denied=-1",
+            "GINUX_FIXTURE: sendmsg-allowed=1", "GINUX_FIXTURE: sendmsg-denied=-1",
+            "GINUX_FIXTURE: sendmmsg-allowed=2", "GINUX_FIXTURE: sendmmsg-lengths=1",
+            "GINUX_FIXTURE: sendmmsg-denied=-1", "GINUX_FIXTURE: sendto-family=-22",
+            "GINUX_FIXTURE: sendmsg-oversized=-7", "GINUX_FIXTURE: sendmsg-many-iov=-7",
+            "GINUX_FIXTURE: sendmmsg-many=-22", "GINUX_FIXTURE: connect=0",
+            "GINUX_FIXTURE: connected-sendto=1", "GINUX_FIXTURE: connected-sendmsg=1"],
+            code, out)
         code, out = run("expired-credentials", credential_config, configured_launch=True)
         fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
         check("queued credentials survive sender reap", code == 0 and fixture == [
@@ -290,6 +344,103 @@ sys_read = ["/"]
         fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
         check("denied waitid preserves caller registers", code == 0 and fixture == [
             "GINUX_FIXTURE: denied-waitid=-1", "GINUX_FIXTURE: denied-selector-preserved=1"], code, out)
+
+        # Console descriptor tracking follows the host descriptor table:
+        # CLONE_FILES children and threads share it, other children own a
+        # copy, and exec drops the close-on-exec descriptors, which an open
+        # of /dev/console with O_CLOEXEC must make. With console writes
+        # denied, a write on a number the exec freed is a plain write.
+        denied_console = work / "denied-console-write.toml"
+        denied_console.write_text(configured.read_text().replace(
+            'deny = ["device.mmio.direct"', 'deny = ["device.console.write", "device.mmio.direct"'))
+        if denied_console.read_text() == configured.read_text():
+            raise RuntimeError("console write deny was not added to the configuration")
+        with open(work / "console-output", "w+b") as console:
+            code, out = run("L-console-tracking", denied_console, stdin=console, configured_launch=True)
+            fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+            check("console tracking follows shared tables and exec", code == 0
+                  and fixture == ["GINUX_FIXTURE: protected-close-console=1",
+                                  "GINUX_FIXTURE: console-open-ok=1",
+                                  "GINUX_FIXTURE: high-bits-dup-console=1",
+                                  "GINUX_FIXTURE: shared-dup-console=1",
+                                  "GINUX_FIXTURE: shared-reuse-same-number=1",
+                                  "GINUX_FIXTURE: shared-reuse-console=0",
+                                  "GINUX_FIXTURE: private-close-console=1",
+                                  "GINUX_FIXTURE: thread-dup-console=1",
+                                  "GINUX_FIXTURE: write-thread-open=-1",
+                                  "GINUX_FIXTURE: overwritten-console=0",
+                                  "GINUX_FIXTURE: closed-range-console=0",
+                                  "GINUX_FIXTURE: console-cloexec=1",
+                                  "GINUX_FIXTURE: open-arguments-kept=1",
+                                  "GINUX_FIXTURE: cloexec-range-console=1",
+                                  "GINUX_FIXTURE: exec-reused-console=0",
+                                  "GINUX_FIXTURE: exec-write-reused=-9",
+                                  "GINUX_FIXTURE: exec-dropped-console=0",
+                                  "GINUX_FIXTURE: exec-kept-console=4"], code, out)
+
+        # Force a shared-table mutation to remain in the host kernel while a
+        # sibling reaches another descriptor operation. The host process owns
+        # the conflicting byte-range lock; without the supervisor barrier the
+        # sibling dup completes before that lock is released.
+        barrier_output = work / "descriptor-barrier-output"
+        with barrier_output.open("w+b") as output:
+            fcntl.lockf(output, fcntl.LOCK_EX, 1)
+            (root / "scenario").write_text("M-descriptor-barrier")
+            proc = subprocess.Popen(
+                [str(work / "ginux"), "native", str(denied_console), str(root), "configured"],
+                stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.PIPE)
+            try:
+                time.sleep(1)
+                fcntl.lockf(output, fcntl.LOCK_UN, 1)
+                _, error = proc.communicate(timeout=30)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                fcntl.lockf(output, fcntl.LOCK_UN, 1)
+            output.flush()
+            output.seek(0)
+            out = output.read().decode(errors="replace") + (error or b"").decode(errors="replace")
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("shared descriptor mutations are serialized", proc.returncode == 0 and fixture == [
+            "GINUX_FIXTURE: barrier-threads=1",
+            "GINUX_FIXTURE: sibling-deferred=1",
+            "GINUX_FIXTURE: mutation-result=0",
+            "GINUX_FIXTURE: sibling-console=1"], proc.returncode, out)
+        # Every descriptor the supervisor tracks as the console, and the
+        # vectored and positional writes on it, belong to device.console.write.
+        denied_console = work / "denied-console-write.toml"
+        denied_console.write_text(configured.read_text().replace(
+            'deny = ["device.mmio.direct"', 'deny = ["device.console.write", "device.mmio.direct"'))
+        with open(work / "console-output", "w+b") as console:
+            code, out = run("K-console-descriptors", denied_console, stdin=console, configured_launch=True)
+            fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+            check("denied console write covers duplicates and vectored writes", code == 0
+                  and fixture == ["GINUX_FIXTURE: stdin-console=1",
+                                  "GINUX_FIXTURE: stdout-console=0",
+                                  "GINUX_FIXTURE: stderr-console=0",
+                                  "GINUX_FIXTURE: console-open-ok=1",
+                                  "GINUX_FIXTURE: stderr-after-dup-console=1",
+                                  "GINUX_FIXTURE: write-stderr-console=-1",
+                                  "GINUX_FIXTURE: write-duplicate=-1",
+                                  "GINUX_FIXTURE: writev-console=-1",
+                                  "GINUX_FIXTURE: pwrite-duplicate=-1",
+                                  "GINUX_FIXTURE: reused-same-number=1",
+                                  "GINUX_FIXTURE: write-reused=-9"]
+                  and (work / "console-output").read_bytes() == b"", code, out)
+        with open(work / "console-output", "w+b") as console:
+            code, out = run("K-console-descriptors", configured, stdin=console)
+            fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+            check("allowed console write still reaches the console", code == 0
+                  and fixture[:8] == ["GINUX_FIXTURE: stdin-console=1",
+                                      "GINUX_FIXTURE: stdout-console=0",
+                                      "GINUX_FIXTURE: stderr-console=0",
+                                      "GINUX_FIXTURE: console-open-ok=1",
+                                      "GINUX_FIXTURE: stderr-after-dup-console=1",
+                                      "GINUX_FIXTURE: write-stderr-console=2",
+                                      "GINUX_FIXTURE: write-duplicate=2",
+                                      "GINUX_FIXTURE: writev-console=2"]
+                  and (work / "console-output").read_bytes().startswith(b"K\nK\nK\n"), code, out)
 
         # Upstream owns cgroups in memory. Retain the public API and
         # containment regressions without requiring obsolete host files.

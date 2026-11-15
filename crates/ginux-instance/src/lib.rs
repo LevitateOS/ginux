@@ -3225,7 +3225,7 @@ failure = "stop"
     #[test]
     fn rocky_recipe_owns_bootstrap_and_lockdown_policy() {
         let config = InstanceConfig::parse(include_bytes!(
-            "../../../config/instance-rocky-systemd.toml"
+            "../../../config/examples/rocky10-systemd.toml"
         ))
         .unwrap();
         assert_eq!(config.pre_boot_hooks.as_slice().len(), 7);
@@ -3245,11 +3245,11 @@ failure = "stop"
     #[test]
     fn documented_instance_examples_validate_and_round_trip() {
         for recipe in [
-            include_bytes!("../../../config/instance-rocky-systemd.toml").as_slice(),
-            include_bytes!("../../../config/examples/agent-workspace.toml").as_slice(),
-            include_bytes!("../../../config/examples/network-service.toml").as_slice(),
-            include_bytes!("../../../config/examples/paranoid-shell.toml").as_slice(),
-            include_bytes!("../../../config/examples/alpine-native.toml").as_slice(),
+            include_bytes!("../../../config/examples/rocky10-systemd.toml").as_slice(),
+            include_bytes!("../../../config/examples/rocky10-agent-workspace.toml").as_slice(),
+            include_bytes!("../../../config/examples/ubuntu24-network-service.toml").as_slice(),
+            include_bytes!("../../../config/examples/rocky10-paranoid-shell.toml").as_slice(),
+            include_bytes!("../../../config/examples/alpine3.22-native.toml").as_slice(),
         ] {
             let config = InstanceConfig::parse(recipe).unwrap();
             assert_eq!(config.init.as_bytes(), b"/sbin/init");
@@ -3282,10 +3282,10 @@ failure = "stop"
     #[test]
     fn documented_examples_use_distribution_native_boot() {
         for recipe in [
-            include_bytes!("../../../config/instance-rocky-systemd.toml").as_slice(),
-            include_bytes!("../../../config/examples/agent-workspace.toml").as_slice(),
-            include_bytes!("../../../config/examples/network-service.toml").as_slice(),
-            include_bytes!("../../../config/examples/paranoid-shell.toml").as_slice(),
+            include_bytes!("../../../config/examples/rocky10-systemd.toml").as_slice(),
+            include_bytes!("../../../config/examples/rocky10-agent-workspace.toml").as_slice(),
+            include_bytes!("../../../config/examples/ubuntu24-network-service.toml").as_slice(),
+            include_bytes!("../../../config/examples/rocky10-paranoid-shell.toml").as_slice(),
         ] {
             let config = InstanceConfig::parse(recipe).unwrap();
             assert_eq!(config.args.as_slice().len(), 2);
@@ -3297,7 +3297,7 @@ failure = "stop"
         }
 
         let alpine = InstanceConfig::parse(include_bytes!(
-            "../../../config/examples/alpine-native.toml"
+            "../../../config/examples/alpine3.22-native.toml"
         ))
         .unwrap();
         assert!(alpine.args.as_slice().is_empty());

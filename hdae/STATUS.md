@@ -2,55 +2,34 @@
 
 ## Current checkpoint
 
-### Active corrective checkpoint: Gate 24 passed, delivery pending
+### Active implementation: Gate 26 Rocky Linux RPM packaging
 
-- Gate 24 is active on `hdae/concurrent-service-output`, stacked on Gate 23.
-  The human approved implementing it and publishing the verified work for
-  morning review without merging.
-- Goal: restore successful managed service stdout to its instance's systemd
-  journal and virtual console during concurrent Rocky systemd execution,
-  without weakening isolation or substituting host-side evidence.
-- Root cause: merged pull request 247 reclaims a task record as soon as
-  `waitid` reaps the child. Queued journald credentials can be consumed after
-  that point, so the host sender PID no longer maps to its virtual identity.
-- Correction: a bounded credential tombstone retains the virtual PID, UID, and
-  GID while its pidfd pins the exact host PID; full task and process slots still
-  recycle.
-- Verification passed: the focused credential-after-reap native suite, `make
-  check`, unchanged `make test-multi-instance`, complete `make test-systemd`,
-  and aggregate `make test`.
-- Delivery: Gate 23 is open for review in pull request
-  https://github.com/gmkurtzer/ginux/pull/266. Gate 24 is open in stacked pull
-  request https://github.com/gmkurtzer/ginux/pull/267. Stop with both pull
-  requests open for review.
+- Gate 26 is technically passed locally on `hdae/rpm-packaging` and remains a
+  human checkpoint in `gates-todo/`.
+- The branch builds one Rocky Linux 10 x86-64 `ginux` RPM and matching SRPM
+  from clean source and vendored-dependency archives with offline Cargo and
+  rpmbuild execution.
+- The package installs `/usr/bin/ginux`, private programs under
+  `/usr/libexec/ginux`, distribution-prefixed recipes under
+  `/etc/ginux/examples`, documentation and license files, and a tmpfiles policy.
+- Compiled Rust now acquires, verifies, caches, and directly expands OCI layers.
+  Persistent blobs live below `/var/lib/ginux/cache/oci/blobs/sha256`, expanded
+  roots below `/var/lib/ginux/instances/NAME/root`, and transient control state
+  below `/run/ginux/instances/NAME`.
+- Fresh package evidence passes metadata checks, rpmlint with zero errors, clean
+  DNF install and `rpm -V`, online import, network-isolated cache reuse,
+  start/status/stop, reinstall, state-preserving erase, and reinstall recovery.
+- Fresh regressions pass `make check test-cli test-unit`, `make test-contract`,
+  `make test-systemd`, `make test-security test`, and `make demo-gate-26`.
+- Pull request https://github.com/gmkurtzer/ginux/pull/282 was merged by the
+  human. The verified post-merge `make run-host` follow-up was delivered
+  directly to `main` with explicit human authorization in commits `c5591d2f`
+  and `9ebf369a`; it builds the RPM, boots the persistent Rocky host, installs
+  and verifies the RPM, and then opens the interactive host shell.
 - Active skill: `hdae-development`
 - Skill path: `.agents/skills/hdae-development/SKILL.md`
 - Reload after context shift: required
-- Exact next action: stop for human review without merging or closing either
-  pull request.
-
-### Passed corrective checkpoint: Gate 23, delivery pending
-
-- Gate 23 is technically passed on `hdae/virtual-sysinfo-systemd-compat` after
-  the human approved correction of the post-Gate-22 Rocky systemd regression.
-- Accepted Gate 22 remains locked. Gate 23 makes `sysinfo.totalram` match the
-  instance's configured virtual memory while retaining zero/private host
-  counters, `mem_unit = 1`, and `-EFAULT` behavior.
-- Pre-fix evidence: `make doctor build check test` passed; `make test-systemd`
-  failed before login because systemd rejected zero physical memory from
-  `sysinfo`.
-- Implemented evidence: `make check`, isolated permitted `make test`, and the
-  complete `make test-systemd` matrix pass. Cold, warm, and repeat Rocky boots
-  reach controlled shutdown; the zero-memory assertion no longer occurs.
-- Gate 24 resolved the separate service-output regression. The unchanged
-  `make test-multi-instance` suite now passes, as do fresh `make test-systemd`
-  and aggregate `make test` runs.
-- Delivery: pull request https://github.com/gmkurtzer/ginux/pull/266 is open
-  against `main`; human review remains with Gate 24 stacked above it.
-- Active skill: `hdae-development`
-- Skill path: `.agents/skills/hdae-development/SKILL.md`
-- Reload after context shift: required
-- Exact next action: publish Gate 24 above this branch; do not merge Gate 23.
+- Exact next action: wait for explicit human acceptance of Gate 26.
 
 - Gate 1 is accepted and closed under the corrected ordinary-host-process
   architecture. Pull request https://github.com/gmkurtzer/ginux-us/pull/1 was
@@ -278,15 +257,17 @@ scope, threat model, and invariants.
 - Active skill: `hdae-development`
 - Skill path: `.agents/skills/hdae-development/SKILL.md`
 - Reload after context shift: required
-- Active gate: none. Gates 18 and 19 are accepted and closed. Gate 11 remains
-  partial, Gate 14 is deferred, and Gate 16 is abandoned.
-- Last evidence: `make test-generic-oci`, `make demo-gate-19`,
-  `make test-gate19-native-examples`, `make check`, `make test-config`,
-  `make test-gate975-hooks`, `make test-security`, `make test-systemd`, and
-  aggregate `make test` passed. Rocky and Ubuntu reached systemd
-  `multi-user.target`; Alpine reached its BusyBox init console login.
-- Exact next action: obtain human direction on whether to resume or defer the
-  partial Gate 11 performance target. Gate 14 remains deferred.
+- Active gate: Gate 26 is technically passed locally and awaits its human
+  checkpoint. Gate 11 remains partial, Gate 14 is deferred, and Gate 16 is
+  abandoned.
+- Last evidence: `make rpm`, `./scripts/test-rpm-metadata.sh`,
+  `./scripts/test-rpm.sh`, `make check test-cli test-unit`, `make
+  test-contract`, `make test-systemd`, `make test-security test`, and `make
+  demo-gate-26` passed. The package lifecycle includes a clean install, online
+  OCI import, network-isolated cache reuse, reinstall, retained-state erase,
+  and recovery after reinstall.
+- Exact next action: deliver the verified `make run-host` follow-up and wait
+  for explicit human acceptance of Gate 26.
 - The final CLI correction makes required configuration files positional:
   `instance create NAME FILE`, `validate FILE`, `inspect FILE`, and
   `explain FILE OPERATION`. Fresh `make check`, `make test-contract`, and
@@ -675,24 +656,18 @@ scope, threat model, and invariants.
 
 ## Exact next action
 
-Stop for human review of pull requests 266 and 267 without merging or closing
-either checkpoint gate.
+Wait for explicit human acceptance of Gate 26. Gate 11 remains partial and
+Gate 14 remains explicitly deferred.
 
 ## Context recovery
 
 - Active skill: `hdae-development`
 - Skill path: `.agents/skills/hdae-development/SKILL.md`
 - Reload after context shift: required
-- Active gate: Gate 24 is technically passed on
-  `hdae/concurrent-service-output` and unblocks technically passed Gate 23 on
-  `hdae/virtual-sysinfo-systemd-compat`. Both remain checkpoint gates in
-  `gates-todo/` pending delivery and human review.
-- Last evidence: focused native supervision, `make check`, unchanged `make
-  test-multi-instance`, complete `make test-systemd`, and aggregate `make test`
-  all pass on the Gate 24 implementation branch.
-- Delivery: Gate 23 pull request 266 targets `main`; Gate 24 pull request 267
-  targets the Gate 23 branch. Both are open for human review.
-- Exact next action: stop without merging or closing either pull request.
+- Active gate: Gate 26 is technically passed, pull request 282 is merged, and
+  the verified post-merge `make run-host` follow-up is on `main`; the gate
+  remains in `gates-todo/` pending human acceptance.
+  Gate 11 remains partial and Gate 14 remains deferred.
 - Active work: Gate 12 is technically passed and delivered in pull request 251;
   Gate 12.1 is technically passed and delivered in pull request 252; Gate
   12.25 is technically passed and delivered in pull request 253. Gate 12.5 is
@@ -715,7 +690,11 @@ either checkpoint gate.
   open from `hdae/contract-network-ux` against the Gate 11 branch.
 - Gate 12.1 delivery: pull request https://github.com/gmkurtzer/ginux/pull/252
   is open from `hdae/virtual-kernel-filesystems` against the Gate 12 branch.
-- Last evidence: Gate 19 passed `make test-generic-oci`,
+- Last evidence: Gate 26 passed `make rpm`,
+  `./scripts/test-rpm-metadata.sh`, `./scripts/test-rpm.sh`, `make check
+  test-cli test-unit`, `make test-contract`, `make test-systemd`, `make
+  test-security test`, and `make demo-gate-26`. Gate 19 previously passed
+  `make test-generic-oci`,
   `make demo-gate-19`, `make test-gate19-native-examples`, `make check`,
   `make test-config`, `make test-gate975-hooks`, `make test-security`,
   `make test-systemd`, and aggregate `make test`. Gate 12.1 also passed `make

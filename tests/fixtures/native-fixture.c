@@ -71,6 +71,22 @@ static void print_result(const char *label, long value)
     call3(1, 1, (word)line, length);
 }
 
+/* The supervisor answers TIOCGPGRP itself on a descriptor it tracks as the
+ * console; any other descriptor gets the host's answer (ENOTTY or EBADF). */
+static long tracked_as_console(long fd)
+{
+    int group = 0;
+    return call3(16, fd, 0x540f /* TIOCGPGRP */, (word)&group) == 0;
+}
+
+static volatile long yield_signals;
+
+static void yield_signal_handler(int signal)
+{
+    (void)signal;
+    ++yield_signals;
+}
+
 static int sigchld_pipe = -1;
 static volatile int sigchld_seen;
 
@@ -81,11 +97,33 @@ static void sigchld_handler(int signal)
     call3(1, sigchld_pipe, (word)"c", 1);
 }
 
+static volatile int restart_signals;
+
+static void restart_handler(int signal)
+{
+    (void)signal;
+    ++restart_signals;
+}
+
 void sigchld_restorer(void);
 __asm__(".global sigchld_restorer\n"
         "sigchld_restorer:\n"
         "mov $15, %rax\n"
         "syscall\n");
+
+long native_thread_trap(word flags, word stack);
+__asm__(".global native_thread_trap\n"
+        "native_thread_trap:\n"
+        "xor %edx, %edx\n"
+        "xor %r10d, %r10d\n"
+        "xor %r8d, %r8d\n"
+        "mov $56, %eax\n"
+        "syscall\n"
+        "test %rax, %rax\n"
+        "jnz 1f\n"
+        "int3\n"
+        "ud2\n"
+        "1: ret\n");
 
 long native_clone_spawn(void *args, word size);
 __asm__(".global native_clone_spawn\n"
@@ -100,7 +138,108 @@ __asm__(".global native_clone_spawn\n"
         "ud2\n"
         "1: ret\n");
 
-long native_fixture_main(void)
+/* A CLONE_THREAD child that stores the result of syscall `number` with
+ * arguments a and b in *result and exits. */
+long native_thread_call(word flags, word stack, word number, word a, word b,
+                        volatile long *result);
+__asm__(".global native_thread_call\n"
+        "native_thread_call:\n"
+        "push %r12\n"
+        "push %r13\n"
+        "push %r14\n"
+        "push %r15\n"
+        "mov %rdx, %r12\n"
+        "mov %rcx, %r13\n"
+        "mov %r8, %r14\n"
+        "mov %r9, %r15\n"
+        "xor %edx, %edx\n"
+        "xor %r10d, %r10d\n"
+        "xor %r8d, %r8d\n"
+        "mov $56, %eax\n"
+        "syscall\n"
+        "test %rax, %rax\n"
+        "jnz 1f\n"
+        "mov %r12, %rax\n"
+        "mov %r13, %rdi\n"
+        "mov %r14, %rsi\n"
+        "xor %edx, %edx\n"
+        "syscall\n"
+        "mov %rax, (%r15)\n"
+        "mov $60, %eax\n"
+        "xor %edi, %edi\n"
+        "syscall\n"
+        "ud2\n"
+        "1: pop %r15\n"
+        "pop %r14\n"
+        "pop %r13\n"
+        "pop %r12\n"
+        "ret\n");
+
+static volatile long descriptor_mutation_start;
+static volatile long descriptor_mutation_entered;
+static volatile long descriptor_mutation_result = -1000;
+static volatile long descriptor_sibling_start;
+static volatile long descriptor_sibling_entered;
+static volatile long descriptor_sibling_result = -1000;
+
+/* Two CLONE_FILES threads used to force a descriptor-table interleaving. The
+ * first blocks in F_SETLKW while the host test owns the conflicting lock. The
+ * second attempts dup only after the first entered its syscall. */
+long native_gated_fcntl(word flags, word stack, const void *lock);
+__asm__(".global native_gated_fcntl\n"
+        "native_gated_fcntl:\n"
+        "push %r12\n"
+        "mov %rdx, %r12\n"
+        "xor %edx, %edx\n"
+        "xor %r10d, %r10d\n"
+        "xor %r8d, %r8d\n"
+        "mov $56, %eax\n"
+        "syscall\n"
+        "test %rax, %rax\n"
+        "jnz 2f\n"
+        "1: cmpl $0, descriptor_mutation_start(%rip)\n"
+        "je 1b\n"
+        "movq $1, descriptor_mutation_entered(%rip)\n"
+        "mov $72, %eax\n"
+        "mov $1, %edi\n"
+        "mov $7, %esi\n"
+        "mov %r12, %rdx\n"
+        "syscall\n"
+        "mov %rax, descriptor_mutation_result(%rip)\n"
+        "mov $60, %eax\n"
+        "xor %edi, %edi\n"
+        "syscall\n"
+        "ud2\n"
+        "2: pop %r12\n"
+        "ret\n");
+
+long native_gated_dup(word flags, word stack, word source);
+__asm__(".global native_gated_dup\n"
+        "native_gated_dup:\n"
+        "push %r12\n"
+        "mov %rdx, %r12\n"
+        "xor %edx, %edx\n"
+        "xor %r10d, %r10d\n"
+        "xor %r8d, %r8d\n"
+        "mov $56, %eax\n"
+        "syscall\n"
+        "test %rax, %rax\n"
+        "jnz 2f\n"
+        "1: cmpl $0, descriptor_sibling_start(%rip)\n"
+        "je 1b\n"
+        "movq $1, descriptor_sibling_entered(%rip)\n"
+        "mov $32, %eax\n"
+        "mov %r12, %rdi\n"
+        "syscall\n"
+        "mov %rax, descriptor_sibling_result(%rip)\n"
+        "mov $60, %eax\n"
+        "xor %edi, %edi\n"
+        "syscall\n"
+        "ud2\n"
+        "2: pop %r12\n"
+        "ret\n");
+
+long native_fixture_main(const word *stack)
 {
     char scenario[16] = {0};
     long fd = call3(2, (word)"/scenario", 0, 0);
@@ -150,6 +289,19 @@ long native_fixture_main(void)
         print_result("GINUX_FIXTURE: uname-after=", call3(63, (word)buffer, 0, 0));
         return 0;
     }
+    case 'T': {
+        /* A thread takes a plain SIGTRAP stop while the leader spins without
+         * syscalls, so supervision fails the instance with a traced thread
+         * still alive. Native supervision denies nanosleep, and a write or
+         * exit by the leader would race the thread's stop. */
+        word stack = call6(9, 0, 16384, 3, 0x22, -1, 0);
+        const word thread = 0x50f00; /* VM|FS|FILES|SIGHAND|THREAD|SYSVSEM */
+        long created = native_thread_trap(thread, stack + 16384);
+        if (created > 0)
+            for (volatile long spin = 0; spin < 4000000000L; ++spin) {}
+        print_result("GINUX_FIXTURE: thread=", created);
+        return 0;
+    }
     case 'i': {
         /* int 0x80 eax=2 is i386 fork; it must not be read as x86-64 open.
          * rsi = 0 makes it pass the x86-64 open flag check. */
@@ -182,6 +334,25 @@ long native_fixture_main(void)
         print_result("GINUX_FIXTURE: pi_flags_word=", pi_flags_word);
         return 0;
     }
+    case 'Y': {
+        /* scripts/test-native-yield-broker.py releases each sched_yield with
+         * a byte on stdin and interrupts the first two while the paranoid
+         * broker holds their notifications. Without SA_RESTART an
+         * interrupted yield returns -EINTR. */
+        struct { word handler, flags, restorer, mask; } action = {
+            (word)yield_signal_handler, 0x04000000 /* SA_RESTORER */, (word)sigchld_restorer, 0};
+        static const char *const labels[] = {"GINUX_FIXTURE: yield-before-receive=",
+                                             "GINUX_FIXTURE: yield-before-reply=",
+                                             "GINUX_FIXTURE: yield-after=", 0};
+        char go;
+        if (call4(13, 10, (word)&action, 0, 8) != 0) return 82;
+        for (const char *const *label = labels; *label; ++label) {
+            if (call3(0, 0, (word)&go, 1) != 1) return 83;
+            print_result(*label, call3(24, 0, 0, 0));
+        }
+        print_result("GINUX_FIXTURE: yield-signals=", yield_signals);
+        return 0;
+    }
     case 'y': {
         unsigned char info[112];
         for (word i = 0; i < sizeof info; ++i) info[i] = 0xaa;
@@ -209,6 +380,70 @@ long native_fixture_main(void)
     case 'r': {
         static char random[512];
         print_result("GINUX_FIXTURE: getrandom=", call3(318, (word)random, sizeof random, 0));
+        return 0;
+    }
+    case 'N': {
+        struct address { unsigned short family, port; unsigned address; char zero[8]; };
+        struct iovec { void *base; word length; };
+        struct message {
+            void *name; unsigned name_length, name_padding;
+            struct iovec *iov; word iov_count;
+            void *control; word control_length;
+            unsigned flags, flags_padding;
+        };
+        struct multimessage { struct message message; unsigned length, padding; };
+        struct address allowed = {2, 0xa146, 0x0100007f, {0}}; /* 18081 */
+        struct address denied = {2, 0xa246, 0x0100007f, {0}}; /* 18082 */
+        struct address unsupported = {1, 0, 0, {0}};
+        char payload = 'x';
+        static char oversized[17000];
+        struct iovec iov = {&payload, 1}, large = {oversized, sizeof oversized};
+        struct iovec many[17];
+        struct message allowed_message = {&allowed, sizeof allowed, 0, &iov, 1, 0, 0, 0, 0};
+        struct message denied_message = {&denied, sizeof denied, 0, &iov, 1, 0, 0, 0, 0};
+        struct message connected_message = {0, 0, 0, &iov, 1, 0, 0, 0, 0};
+        struct message large_message = {&allowed, sizeof allowed, 0, &large, 1, 0, 0, 0, 0};
+        struct message many_message = {&allowed, sizeof allowed, 0, many, 17, 0, 0, 0, 0};
+        struct multimessage batch[17] = {0};
+        long receiver = call3(41, 2, 2, 0), sender = call3(41, 2, 2, 0);
+        if (receiver < 0 || sender < 0 || call3(49, receiver, (word)&allowed, sizeof allowed) < 0)
+            return 89;
+        print_result("GINUX_FIXTURE: sendto-allowed=",
+                     call6(44, sender, (word)&payload, 1, 0, (word)&allowed, sizeof allowed));
+        print_result("GINUX_FIXTURE: sendto-denied=",
+                     call6(44, sender, (word)&payload, 1, 0, (word)&denied, sizeof denied));
+        print_result("GINUX_FIXTURE: sendmsg-allowed=", call3(46, sender, (word)&allowed_message, 0));
+        print_result("GINUX_FIXTURE: sendmsg-denied=", call3(46, sender, (word)&denied_message, 0));
+        batch[0].message = allowed_message; batch[1].message = allowed_message;
+        print_result("GINUX_FIXTURE: sendmmsg-allowed=", call4(307, sender, (word)batch, 2, 0));
+        print_result("GINUX_FIXTURE: sendmmsg-lengths=", batch[0].length == 1 && batch[1].length == 1);
+        batch[0].message = denied_message;
+        print_result("GINUX_FIXTURE: sendmmsg-denied=", call4(307, sender, (word)batch, 1, 0));
+        print_result("GINUX_FIXTURE: sendto-family=",
+                     call6(44, sender, (word)&payload, 1, 0, (word)&unsupported, sizeof unsupported));
+        print_result("GINUX_FIXTURE: sendmsg-oversized=", call3(46, sender, (word)&large_message, 0));
+        print_result("GINUX_FIXTURE: sendmsg-many-iov=", call3(46, sender, (word)&many_message, 0));
+        print_result("GINUX_FIXTURE: sendmmsg-many=", call4(307, sender, (word)batch, 17, 0));
+        print_result("GINUX_FIXTURE: connect=", call3(42, sender, (word)&allowed, sizeof allowed));
+        print_result("GINUX_FIXTURE: connected-sendto=",
+                     call6(44, sender, (word)&payload, 1, 0, 0, 0));
+        print_result("GINUX_FIXTURE: connected-sendmsg=",
+                     call3(46, sender, (word)&connected_message, 0));
+        return 0;
+    }
+    case 'R': {
+        struct address { unsigned short family, port; unsigned address; char zero[8]; };
+        static struct address allowed = {2, 0xa146, 0x0100007f, {0}};
+        char payload = 'x', received = 0;
+        long receiver = call3(41, 2, 2, 0), sender = call3(41, 2, 2, 0);
+        if (receiver < 0 || sender < 0 || call3(49, receiver, (word)&allowed, sizeof allowed) < 0)
+            return 90;
+        print_result("GINUX_FIXTURE: network-race-address=", (word)&allowed);
+        print_result("GINUX_FIXTURE: network-race-send=",
+                     call6(44, sender, (word)&payload, 1, 0, (word)&allowed, sizeof allowed));
+        print_result("GINUX_FIXTURE: network-race-recv=",
+                     call6(45, receiver, (word)&received, 1, 0, 0, 0));
+        print_result("GINUX_FIXTURE: network-race-mutated=", allowed.port == 0xa246);
         return 0;
     }
     case 'd': {
@@ -326,6 +561,25 @@ long native_fixture_main(void)
         print_result("GINUX_FIXTURE: child-status=", (status >> 8) & 0xff);
         return 0;
     }
+    case 'C': {
+        /* Configured-native process creation must apply the same managed
+         * shape policy before either clone ABI can reach the host kernel. */
+        word stack = call6(9, 0, 16384, 3, 0x22, -1, 0);
+        const word unsafe = 0x00800000 | 0x00000100 | 17; /* UNTRACED|VM|SIGCHLD */
+        print_result("GINUX_FIXTURE: clone-untraced=",
+                     call6(56, unsafe, stack + 16384, 0, 0, 0, 0));
+        struct {
+            word flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls,
+                set_tid, set_tid_size, cgroup;
+        } args = {0};
+        args.flags = 0x00800000 | 0x00000100; /* UNTRACED|VM */
+        args.exit_signal = 17;
+        args.stack = stack;
+        args.stack_size = 16384;
+        print_result("GINUX_FIXTURE: clone3-untraced=",
+                     call3(435, (word)&args, sizeof args, 0));
+        return 0;
+    }
     case 'a': {
         struct clone_args { word flags, pidfd, child_tid, parent_tid, exit_signal,
             stack, stack_size, tls, set_tid, set_tid_size, cgroup; };
@@ -418,6 +672,22 @@ long native_fixture_main(void)
         print_result("GINUX_FIXTURE: race-caller-mutation=", args.flags == 0x8000000200000000UL);
         return 0;
     }
+    case 'x': {
+        /* scripts/test-native-clone-restart.py queues an ignored SIGUSR1
+         * while the replayed clone3 runs; the kernel abandons that call with
+         * ERESTARTNOINTR, which the caller must never observe. */
+        struct { word flags, pidfd, child_tid, parent_tid, exit_signal, stack,
+            stack_size, tls, set_tid, set_tid_size, cgroup; } args = {0};
+        struct { word handler, flags, restorer, mask; } ignore = {1 /* SIG_IGN */, 0, 0, 0};
+        args.exit_signal = 17;
+        if (call4(13, 10, (word)&ignore, 0, 8) != 0) return 88;
+        long pid = call3(435, (word)&args, sizeof args, 0);
+        if (pid == 0) return 7;
+        int status = 0;
+        print_result("GINUX_FIXTURE: restart-clone3=", pid > 0 ? 1 : pid);
+        print_result("GINUX_FIXTURE: restart-child=", pid > 0 && call4(61, pid, (word)&status, 0, 0) == pid && status == 1792);
+        return 0;
+    }
 #ifdef CLONE_SNAPSHOT_COLLISION
     case 'k': {
         struct { word flags, pidfd, child_tid, parent_tid, exit_signal, stack,
@@ -508,6 +778,55 @@ long native_fixture_main(void)
         print_result("GINUX_FIXTURE: null-reaped=", reaped);
         return 0;
     }
+    case 'j': {
+        /* Translated pid selectors: kill and pidfd_open leave the caller's
+         * virtual pid in RDI, as the syscall ABI preserves it, and a wait4
+         * that an SA_RESTART handler interrupts selects the same child when
+         * the kernel restarts it. */
+        struct kernel_sigaction {
+            word handler, flags, restorer, mask;
+        } action = {(word)restart_handler, 0x14000000 /* SA_RESTORER | SA_RESTART */,
+                    (word)sigchld_restorer, 0};
+        int fds[2], status = 0;
+        long self = call3(39, 0, 0, 0), result;
+        word selected = self;
+        __asm__ volatile("syscall" : "=a"(result), "+D"(selected)
+                         : "a"(62L), "S"(0L)
+                         : "rcx", "r11", "memory");
+        print_result("GINUX_FIXTURE: kill-self=", result);
+        print_result("GINUX_FIXTURE: kill-selector-preserved=", selected == (word)self);
+        selected = self;
+        __asm__ volatile("syscall" : "=a"(result), "+D"(selected)
+                         : "a"(434L), "S"(0L)
+                         : "rcx", "r11", "memory");
+        print_result("GINUX_FIXTURE: pidfd-open-ok=", result >= 0);
+        print_result("GINUX_FIXTURE: pidfd-selector-preserved=", selected == (word)self);
+        if (call4(293, (word)fds, 0, 0, 0) < 0) return 82;
+        if (call4(13, 10, (word)&action, 0, 8) != 0) return 83;
+        long slow = call3(57, 0, 0, 0);
+        if (slow == 0) {
+            char go;
+            call3(0, fds[0], (word)&go, 1);
+            return 7;
+        }
+        long helper = call3(57, 0, 0, 0);
+        if (helper == 0) {
+            /* Interrupt the parent's wait repeatedly before the slow child
+             * may exit. */
+            for (int round = 0; round < 20; ++round) {
+                call3(7, 0, 0, 10);
+                call3(62, self, 10, 0);
+            }
+            call3(1, fds[1], (word)"g", 1);
+            return 0;
+        }
+        long waited = call4(61, slow, (word)&status, 0, 0);
+        print_result("GINUX_FIXTURE: restarted-wait=", waited == slow);
+        print_result("GINUX_FIXTURE: child-status=", (status >> 8) & 0xff);
+        print_result("GINUX_FIXTURE: signal-handled=", restart_signals > 0);
+        print_result("GINUX_FIXTURE: helper-wait=", call4(61, helper, (word)&status, 0, 0) == helper);
+        return 0;
+    }
     case 'e': {
         /* A receiver can consume SCM_CREDENTIALS after waitid has reaped the
          * short-lived sender. The queued identity must stay virtual. */
@@ -584,6 +903,175 @@ long native_fixture_main(void)
                      call3(83, (word)"/sys/fs/cgroup/escape/ginux-cgroup-escape-check", 0755, 0));
         return 0;
     }
+    case 'L': {
+        /* Console descriptor tracking follows the host descriptor table.
+         * The exec at the end runs this scenario again with "after-exec". */
+        const char *expected = "after-exec", *argument = stack[0] > 1 ? (const char *)stack[2] : "";
+        while (*expected && *argument == *expected) ++argument, ++expected;
+        if (*expected == 0 && *argument == 0) {
+            /* After the exec below: the scenario descriptor reused the
+             * number of the close-on-exec open of the console and is a plain
+             * file, the close-on-exec copies 30-32, 36-37 and 42 are gone, and
+             * 33-35 and 38 are still the console. */
+            print_result("GINUX_FIXTURE: exec-reused-console=", tracked_as_console(fd));
+            print_result("GINUX_FIXTURE: exec-write-reused=", call3(1, fd, (word)"L\n", 2));
+            print_result("GINUX_FIXTURE: exec-dropped-console=",
+                         tracked_as_console(30) + tracked_as_console(31) + tracked_as_console(32)
+                         + tracked_as_console(36) + tracked_as_console(37) + tracked_as_console(42));
+            print_result("GINUX_FIXTURE: exec-kept-console=",
+                         tracked_as_console(33) + tracked_as_console(34) + tracked_as_console(35)
+                         + tracked_as_console(38));
+            return 0;
+        }
+        struct { word flags, pidfd, child_tid, parent_tid, exit_signal, stack,
+            stack_size, tls, set_tid, set_tid_size, cgroup; } args = {0};
+        int status = 0;
+        /* The protected console descriptor survives close, which is only
+         * emulated. */
+        call3(3, 241, 0, 0);
+        print_result("GINUX_FIXTURE: protected-close-console=", tracked_as_console(241));
+        long console = call3(2, (word)"/dev/console", 1 /* O_WRONLY */, 0);
+        print_result("GINUX_FIXTURE: console-open-ok=", console >= 0);
+        /* The kernel reads a descriptor argument as 32 bits. */
+        long high = call3(32, (1UL << 32) | (word)console, 0, 0);
+        print_result("GINUX_FIXTURE: high-bits-dup-console=", tracked_as_console(high));
+        call3(3, high, 0, 0);
+        /* A CLONE_FILES child shares the table: its duplicate is the
+         * parent's console descriptor too. */
+        long pid = call5(56, 0x400 /* CLONE_FILES */ | 17, 0, 0, 0, 0);
+        if (pid == 0) call3(231, call3(32, console, 0, 0), 0, 0);
+        long shared = pid > 0 && call4(61, pid, (word)&status, 0, 0) == pid ? (status >> 8) & 0xff : -1;
+        print_result("GINUX_FIXTURE: shared-dup-console=", tracked_as_console(shared));
+        /* A console descriptor it closes and reuses for a file is not. */
+        long copy = call3(32, console, 0, 0);
+        args.flags = 0x400; args.exit_signal = 17;
+        pid = call3(435, (word)&args, sizeof args, 0);
+        if (pid == 0) {
+            call3(3, copy, 0, 0);
+            call3(231, call3(2, (word)"/scenario", 0, 0) == copy, 0, 0);
+        }
+        print_result("GINUX_FIXTURE: shared-reuse-same-number=",
+                     pid > 0 && call4(61, pid, (word)&status, 0, 0) == pid && status == 256);
+        print_result("GINUX_FIXTURE: shared-reuse-console=", tracked_as_console(copy));
+        /* Without CLONE_FILES the child closes only its own copy. */
+        long kept = call3(32, console, 0, 0);
+        pid = call3(57, 0, 0, 0);
+        if (pid == 0) call3(231, call3(3, kept, 0, 0), 0, 0);
+        if (pid > 0) call4(61, pid, (word)&status, 0, 0);
+        print_result("GINUX_FIXTURE: private-close-console=", tracked_as_console(kept));
+        /* A thread shares the table as well, and its open of the console is
+         * the latest open for the other threads too. */
+        volatile long threaded = -1000, opened = -1000;
+        word thread_stack = call6(9, 0, 16384, 3, 0x22, -1, 0);
+        const word thread = 0x50f00; /* VM|FS|FILES|SIGHAND|THREAD|SYSVSEM */
+        if (native_thread_call(thread, thread_stack + 16384, 32, console, 0, &threaded) > 0)
+            while (threaded == -1000) call3(24, 0, 0, 0);
+        print_result("GINUX_FIXTURE: thread-dup-console=", tracked_as_console(threaded));
+        if (native_thread_call(thread, thread_stack + 16384, 2, (word)"/dev/console", 1,
+                               &opened) > 0)
+            while (opened == -1000) call3(24, 0, 0, 0);
+        print_result("GINUX_FIXTURE: write-thread-open=", call3(1, opened, (word)"L\n", 2));
+        /* dup2 and dup3 of a file over a console copy replace it. */
+        call3(72, console, 0, 39);
+        call3(33, fd, 39, 0);
+        call3(72, console, 0, 40);
+        call3(292, fd, 40, 0x80000);
+        print_result("GINUX_FIXTURE: overwritten-console=",
+                     tracked_as_console(39) + tracked_as_console(40));
+        /* close_range without flags closes. */
+        call3(72, console, 0, 41);
+        call3(436, 41, 41, 0);
+        print_result("GINUX_FIXTURE: closed-range-console=", tracked_as_console(41));
+        call3(3, console, 0, 0);
+        call3(3, shared, 0, 0);
+        call3(3, copy, 0, 0);
+        call3(3, kept, 0, 0);
+        call3(3, threaded, 0, 0);
+        call3(3, opened, 0, 0);
+        /* Exec closes the close-on-exec descriptors, however they got the
+         * flag, and keeps the rest. The open itself must give the kernel
+         * descriptor the flag and leave the caller's arguments in place. */
+        word path = (word)"/dev/console", flags = 1 | 0x80000 /* O_CLOEXEC */, mode = 0;
+        __asm__ volatile("syscall" : "=a"(console), "+D"(path), "+S"(flags), "+d"(mode)
+                         : "a"(2L)
+                         : "rcx", "r11", "memory");
+        print_result("GINUX_FIXTURE: console-cloexec=", call3(72, console, 1 /* F_GETFD */, 0));
+        print_result("GINUX_FIXTURE: open-arguments-kept=",
+                     path == (word)"/dev/console" && flags == (1 | 0x80000) && mode == 0);
+        call3(292, console, 30, 0x80000);
+        call3(72, console, 1030 /* F_DUPFD_CLOEXEC */, 31);
+        call3(72, call3(72, console, 0 /* F_DUPFD */, 32), 2 /* F_SETFD */, 1 /* FD_CLOEXEC */);
+        call3(72, console, 0, 33);
+        call3(33, console, 34, 0);
+        call3(72, call3(72, console, 1030, 35), 2, 0);
+        call3(16, call3(72, console, 0, 36), 0x5451 /* FIOCLEX */, 0);
+        call3(72, console, 0, 37);
+        call3(436, 37, 37, 4 /* CLOSE_RANGE_CLOEXEC */);
+        print_result("GINUX_FIXTURE: cloexec-range-console=", tracked_as_console(37));
+        call3(292, console, 38, 0x80000);
+        call3(16, 38, 0x5450 /* FIONCLEX */, 0);
+        call3(72, console, 1030, 42);
+        call3(33, 42, 42, 0); /* dup2 onto itself keeps close-on-exec */
+        word exec_argv[] = {(word)"/usr/bin/bash", (word)"after-exec", 0}, exec_env[] = {0};
+        print_result("GINUX_FIXTURE: exec=",
+                     call3(59, (word)"/usr/bin/bash", (word)exec_argv, (word)exec_env));
+        return 0;
+    }
+    case 'M': {
+        /* stdout is a regular file whose conflicting host-process lock is
+         * released after this test observes the sibling waiting. */
+        struct {
+            short type, whence;
+            long start, length;
+            int pid;
+        } lock = {0 /* F_RDLCK */, 0 /* SEEK_SET */, 0, 1, 0};
+        const word thread = 0x50f00; /* VM|FS|FILES|SIGHAND|THREAD|SYSVSEM */
+        word first_stack = call6(9, 0, 16384, 3, 0x22, -1, 0);
+        word second_stack = call6(9, 0, 16384, 3, 0x22, -1, 0);
+        long console = call3(2, (word)"/dev/console", 1 /* O_WRONLY */, 0);
+        long first = native_gated_fcntl(thread, first_stack + 16384, &lock);
+        long second = native_gated_dup(thread, second_stack + 16384, console);
+        print_result("GINUX_FIXTURE: barrier-threads=", first > 0 && second > 0);
+        descriptor_mutation_start = 1;
+        while (!descriptor_mutation_entered) __asm__ volatile("pause");
+        /* Give the first thread time to reach the blocked host fcntl before
+         * the sibling reaches its seccomp stop. */
+        for (volatile word spin = 0; spin < 1000000; ++spin) __asm__ volatile("pause");
+        descriptor_sibling_start = 1;
+        while (!descriptor_sibling_entered) __asm__ volatile("pause");
+        for (volatile word spin = 0; spin < 10000000; ++spin) __asm__ volatile("pause");
+        print_result("GINUX_FIXTURE: sibling-deferred=", descriptor_sibling_result == -1000);
+        while (descriptor_mutation_result == -1000 || descriptor_sibling_result == -1000)
+            __asm__ volatile("pause");
+        print_result("GINUX_FIXTURE: mutation-result=", descriptor_mutation_result);
+        print_result("GINUX_FIXTURE: sibling-console=",
+                     tracked_as_console(descriptor_sibling_result));
+        return 0;
+    }
+    case 'K': {
+        /* console writes through a duplicate and through the vectored and
+         * positional calls are console writes like write on the open itself. */
+        print_result("GINUX_FIXTURE: stdin-console=", tracked_as_console(0));
+        print_result("GINUX_FIXTURE: stdout-console=", tracked_as_console(1));
+        print_result("GINUX_FIXTURE: stderr-console=", tracked_as_console(2));
+        long console = call3(2, (word)"/dev/console", 1 /* O_WRONLY */, 0);
+        long copy = call3(32, console, 0, 0);
+        struct { const char *base; word length; } vector = {"K\n", 2};
+        print_result("GINUX_FIXTURE: console-open-ok=", console >= 0);
+        call3(33, console, 2, 0);
+        print_result("GINUX_FIXTURE: stderr-after-dup-console=", tracked_as_console(2));
+        print_result("GINUX_FIXTURE: write-stderr-console=", call3(1, 2, (word)"K\n", 2));
+        print_result("GINUX_FIXTURE: write-duplicate=", call3(1, copy, (word)"K\n", 2));
+        print_result("GINUX_FIXTURE: writev-console=", call3(20, console, (word)&vector, 1));
+        print_result("GINUX_FIXTURE: pwrite-duplicate=", call4(18, copy, (word)"K\n", 2, 0));
+        /* A number freed by close and reused is no longer the console. */
+        call3(3, console, 0, 0);
+        call3(3, copy, 0, 0);
+        long reused = call3(2, (word)"/scenario", 0, 0);
+        print_result("GINUX_FIXTURE: reused-same-number=", reused == console);
+        print_result("GINUX_FIXTURE: write-reused=", call3(1, reused, (word)"K\n", 2));
+        return 0;
+    }
     default:
         return 81;
     }
@@ -591,6 +1079,7 @@ long native_fixture_main(void)
 
 __asm__(".global _start\n"
         "_start:\n"
+        "mov %rsp, %rdi\n"
         "and $-16, %rsp\n"
         "call native_fixture_main\n"
         "mov %rax, %rdi\n"
