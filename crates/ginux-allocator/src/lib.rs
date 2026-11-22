@@ -1,8 +1,6 @@
 use core::cell::UnsafeCell;
 use core::cmp;
-#[cfg(not(test))]
-use core::ffi::c_char;
-use core::ffi::{c_int, c_void};
+use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
@@ -740,13 +738,23 @@ fn reallocate_with_options(
 
 #[cfg(not(test))]
 #[no_mangle]
-pub extern "C" fn malloc(size: usize) -> *mut c_void {
+/// The C `malloc` entry point.
+///
+/// # Safety
+///
+/// Callers follow the C allocation contract for the returned block.
+pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
     allocate(size, DEFAULT_ALIGNMENT, false)
 }
 
 #[cfg(not(test))]
 #[no_mangle]
-pub extern "C" fn free(pointer: *mut c_void) {
+/// The C `free` entry point.
+///
+/// # Safety
+///
+/// `pointer` is null or a live block from this allocator, as C requires.
+pub unsafe extern "C" fn free(pointer: *mut c_void) {
     deallocate(pointer)
 }
 
@@ -762,7 +770,12 @@ pub extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
 
 #[cfg(not(test))]
 #[no_mangle]
-pub extern "C" fn realloc(pointer: *mut c_void, size: usize) -> *mut c_void {
+/// The C `realloc` entry point.
+///
+/// # Safety
+///
+/// `pointer` is null or a live block from this allocator, as C requires.
+pub unsafe extern "C" fn realloc(pointer: *mut c_void, size: usize) -> *mut c_void {
     reallocate(pointer, size)
 }
 
