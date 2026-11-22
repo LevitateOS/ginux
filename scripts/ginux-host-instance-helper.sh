@@ -25,8 +25,10 @@ usage() {
 }
 
 validate_name() {
+    # Dot names are reserved: staging and trash directories use them and list
+    # ignores them, and . and .. would resolve outside the instance.
     case ${1-} in
-        ''|*[!A-Za-z0-9_.-]*)
+        ''|.*|*[!A-Za-z0-9_.-]*)
             printf 'invalid instance name: %s\n' "${1-}" >&2
             exit 64
             ;;
@@ -39,6 +41,177 @@ instance_dir() {
 
 runtime_dir() {
     printf '%s/instances/%s' "$run_root" "$1"
+}
+
+untrusted_root() {
+    printf 'untrusted %s root: %s (%s)\n' "$1" "$2" "$3" >&2
+    exit 64
+}
+
+trusted_root_level() {
+    trusted_level_kind=$1
+    trusted_level_root=$2
+    trusted_level_path=$3
+    if test ! -d "$trusted_level_path" || test -L "$trusted_level_path"; then
+        untrusted_root "$trusted_level_kind" "$trusted_level_root" \
+            "$trusted_level_path is not a directory"
+    fi
+    trusted_level_owner=$(stat -c %u -- "$trusted_level_path") ||
+        untrusted_root "$trusted_level_kind" "$trusted_level_root" \
+            "cannot inspect $trusted_level_path"
+    test "$trusted_level_owner" = 0 ||
+        untrusted_root "$trusted_level_kind" "$trusted_level_root" \
+            "$trusted_level_path is not owned by root"
+    trusted_level_mode=$(stat -c %a -- "$trusted_level_path") ||
+        untrusted_root "$trusted_level_kind" "$trusted_level_root" \
+            "cannot inspect $trusted_level_path"
+    case $trusted_level_mode in
+        ''|*[!0-7]*)
+            untrusted_root "$trusted_level_kind" "$trusted_level_root" \
+                "cannot inspect $trusted_level_path"
+            ;;
+    esac
+    # 022: group or other write permission lets a non-root user rename or
+    # plant entries on the path the helper later resolves by name.
+    test "$((0$trusted_level_mode & 18))" -eq 0 ||
+        untrusted_root "$trusted_level_kind" "$trusted_level_root" \
+            "$trusted_level_path is writable by group or others"
+}
+
+# trusted_root KIND DIR CREATE: DIR and every ancestor must be a real
+# directory owned by root without group or other write permission. Missing
+# levels are created one at a time after their parent passed when CREATE is
+# true.
+trusted_root() {
+    trusted_kind=$1
+    trusted_path=$2
+    trusted_create=$3
+    case $trusted_path in
+        /*) ;;
+        *) untrusted_root "$trusted_kind" "$trusted_path" 'not an absolute path' ;;
+    esac
+    case $trusted_path in
+        *[!A-Za-z0-9_./-]*)
+            untrusted_root "$trusted_kind" "$trusted_path" 'unsupported character'
+            ;;
+        *//*|*/./*|*/../*|*/.|*/..|*/)
+            untrusted_root "$trusted_kind" "$trusted_path" 'empty, "." or ".." component'
+            ;;
+    esac
+    test "${#trusted_path}" -le 256 ||
+        untrusted_root "$trusted_kind" "$trusted_path" 'longer than 256 bytes'
+    trusted_root_level "$trusted_kind" "$trusted_path" /
+    trusted_prefix=
+    trusted_rest=${trusted_path#/}/
+    while test -n "$trusted_rest"; do
+        trusted_prefix=$trusted_prefix/${trusted_rest%%/*}
+        trusted_rest=${trusted_rest#*/}
+        if test ! -e "$trusted_prefix" && test ! -L "$trusted_prefix"; then
+            test "$trusted_create" = true ||
+                untrusted_root "$trusted_kind" "$trusted_path" "$trusted_prefix does not exist"
+            mkdir -m 0755 -- "$trusted_prefix" ||
+                untrusted_root "$trusted_kind" "$trusted_path" "cannot create $trusted_prefix"
+        fi
+        trusted_root_level "$trusted_kind" "$trusted_path" "$trusted_prefix"
+    done
+}
+
+# lock_instance NAME: hold the per-instance lock on descriptor 6. The inode
+# re-check lets delete unlink the lock file while holding it: a waiter that
+# locked the unlinked inode retries on the new file.
+lock_instance() {
+    mkdir -p "$state_root/work"
+    instance_lock=$state_root/work/instance.$1.lock
+    while :; do
+        exec 6>>"$instance_lock"
+        flock -x 6
+        lock_path_identity=$(stat -L -c %d:%i -- "$instance_lock" 2>/dev/null || true)
+        lock_fd_identity=$(stat -L -c %d:%i "/proc/$$/fd/6" 2>/dev/null || true)
+        if test -n "$lock_path_identity" && test "$lock_path_identity" = "$lock_fd_identity"; then
+            break
+        fi
+        exec 6>&-
+    done
+}
+
+# Release the lock of an instance that does not exist, removing its file.
+drop_instance_lock() {
+    rm -f -- "$instance_lock"
+    exec 6>&-
+}
+
+# stat_after_comm PID N: the Nth field of /proc/PID/stat counted after the
+# command name, which may itself contain spaces and parentheses (N=1 is the
+# state, field 3; N=20 is the start time, field 22).
+stat_after_comm() {
+    awk -v n="$2" '{ sub(/.*\) /, ""); split($0, field, " "); print field[n] }' \
+        "/proc/$1/stat" 2>/dev/null
+}
+
+outcome_supervisor_error='{"version":1,"outcome":"supervisor-error","code":null,"signal":null,"generation":null}'
+outcome_pattern='^\{"version":1,"outcome":"(exited|signaled|supervisor-error)","code":(null|[0-9]{1,3}),"signal":(null|[0-9]{1,2}),"generation":null\}$'
+
+strip_leading_zeros() {
+    strip_value=$1
+    while :; do
+        case $strip_value in
+            0?*) strip_value=${strip_value#0} ;;
+            *) break ;;
+        esac
+    done
+    printf '%s' "$strip_value"
+}
+
+# read_outcome FILE: set outcome_line, outcome_kind, outcome_code and
+# outcome_signal from the first line of FILE when it is a valid record.
+read_outcome() {
+    test -f "$1" && test ! -L "$1" || return 1
+    outcome_line=
+    IFS= read -r outcome_line <"$1" || test -n "$outcome_line" || return 1
+    printf '%s\n' "$outcome_line" | grep -Eq "$outcome_pattern" || return 1
+    outcome_kind=${outcome_line#*\"outcome\":\"}
+    outcome_kind=${outcome_kind%%\"*}
+    outcome_code=${outcome_line#*\"code\":}
+    outcome_code=${outcome_code%%,*}
+    outcome_signal=${outcome_line#*\"signal\":}
+    outcome_signal=${outcome_signal%%,*}
+    case $outcome_kind:$outcome_code:$outcome_signal in
+        exited:null:*|exited:*:[0-9]*) return 1 ;;
+        signaled:*:null|signaled:[0-9]*:*) return 1 ;;
+        supervisor-error:null:null) ;;
+        supervisor-error:*) return 1 ;;
+    esac
+    case $outcome_kind in
+        exited)
+            outcome_code=$(strip_leading_zeros "$outcome_code")
+            test "$outcome_code" -le 255 || return 1
+            ;;
+        signaled)
+            outcome_signal=$(strip_leading_zeros "$outcome_signal")
+            test "$outcome_signal" -ge 1 && test "$outcome_signal" -le 64 || return 1
+            ;;
+    esac
+}
+
+# write_outcome RUNTIME_DIRECTORY: publish the runtime's record, or
+# supervisor-error when the runtime left none. Never fails.
+write_outcome() {
+    write_outcome_directory=$1
+    write_outcome_line=$outcome_supervisor_error
+    if read_outcome "$write_outcome_directory/result.runtime"; then
+        write_outcome_line=$outcome_line
+    fi
+    write_outcome_tmp=$write_outcome_directory/outcome.tmp.$$
+    {
+        rm -f -- "$write_outcome_tmp" &&
+            (umask 077 && printf '%s\n' "$write_outcome_line" >"$write_outcome_tmp") &&
+            chmod 600 "$write_outcome_tmp" &&
+            mv -f -- "$write_outcome_tmp" "$write_outcome_directory/outcome"
+    } 2>/dev/null || rm -f -- "$write_outcome_tmp" 2>/dev/null || true
+}
+
+json_text() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 materialize_image() {
@@ -64,6 +237,82 @@ materialize_image() {
     }
     tar -xf "$materialize_tar" -C "$materialize_destination"
     rm -f "$materialize_result"
+}
+
+# materialize_root REFERENCE DESTINATION: where the filesystem supports
+# reflinks, keep one pristine expansion per image digest under cache/roots
+# and give each instance a reflink copy of it; elsewhere expand the image
+# into DESTINATION as before and persist nothing.
+materialize_root() {
+    root_reference=$1
+    root_destination=$2
+    case $root_reference in
+        *@sha256:*) root_hex=${root_reference##*@sha256:} ;;
+        *) materialize_image "$root_reference" "$root_destination"; return ;;
+    esac
+    case $root_hex in
+        *[!0-9a-f]*) materialize_image "$root_reference" "$root_destination"; return ;;
+    esac
+    if test "${#root_hex}" -ne 64; then
+        materialize_image "$root_reference" "$root_destination"
+        return
+    fi
+    roots=$state_root/cache/roots
+    mkdir -p "$state_root/cache" "$state_root/work"
+    install -d -m 700 "$roots" "$roots/sha256"
+    root_probe=$(mktemp "$roots/.probe:XXXXXX")
+    root_probe_copy=${root_destination%/*}/.reflink-probe.$$
+    printf x >"$root_probe"
+    root_reflink=false
+    if cp --reflink=always -- "$root_probe" "$root_probe_copy" 2>/dev/null; then
+        root_reflink=true
+    fi
+    rm -f -- "$root_probe" "$root_probe_copy"
+    if test "$root_reflink" = false; then
+        materialize_image "$root_reference" "$root_destination"
+        return
+    fi
+    root_base=$roots/sha256/$root_hex
+    exec 5>>"$state_root/work/root.$root_hex.lock"
+    flock -x 5
+    if test ! -d "$root_base"; then
+        root_partial=$(mktemp -d "$roots/.partial:XXXXXX")
+        # Also removed by the caller's cleanup if a signal or an unexpected
+        # failure ends the process before the explicit removals below.
+        mkdir "$root_partial/root" || {
+            rm -rf -- "$root_partial"
+            root_partial=
+            exec 5>&-
+            exit 70
+        }
+        set +e
+        (set -e; materialize_image "$root_reference" "$root_partial/root")
+        root_status=$?
+        set -e
+        if test "$root_status" -ne 0; then
+            rm -rf -- "$root_partial"
+            root_partial=
+            exec 5>&-
+            exit "$root_status"
+        fi
+        # The rename is the completeness marker of a base root. It is a
+        # same-filesystem rename of a directory onto a path that does not
+        # exist, done under the lock. If it fails, the reflink copy below
+        # fails too and the image is expanded directly.
+        if test ! -e "$root_base" && test ! -L "$root_base"; then
+            mv -T -- "$root_partial/root" "$root_base" || true
+        fi
+        rm -rf -- "$root_partial"
+        root_partial=
+    fi
+    if ! cp -a --reflink=always -- "$root_base/." "$root_destination/"; then
+        rm -rf -- "$root_destination"
+        mkdir -- "$root_destination"
+        exec 5>&-
+        materialize_image "$root_reference" "$root_destination"
+        return
+    fi
+    exec 5>&-
 }
 
 root_path_is_executable() {
@@ -467,10 +716,7 @@ $2"
         printf '%s\n' 'Ginux image acquisition support is not installed' >&2
         exit 69
     }
-    mkdir -p "$state_root/work"
-    instance_lock=$state_root/work/instance.$name.lock
-    exec 6>"$instance_lock"
-    flock -x 6
+    lock_instance "$name"
     directory=$(instance_dir "$name")
     replacing=false
     if test -e "$directory" || test -L "$directory"; then
@@ -548,6 +794,7 @@ $2"
     staging=$staging_parent/instance
     cleanup_staging() {
         rm -rf "$staging_parent"
+        test -z "${root_partial-}" || rm -rf -- "$root_partial"
         rm -f "$effective"
     }
     trap cleanup_staging 0 HUP INT TERM
@@ -556,7 +803,7 @@ $2"
     write_deployment "$staging/deployment.state" "$create_network" "$create_forwards" locked
     materialize_runtime_config \
         "$staging/config.toml" "$staging/deployment.state" "$staging/runtime.toml"
-    materialize_image "$configured_root" "$staging/root"
+    materialize_root "$configured_root" "$staging/root"
     root_path_is_executable "$staging/root" "$configured_init" || {
         printf '\nconfigured init is missing or not executable: %s\n' "$configured_init" >&2
         exit 65
@@ -717,7 +964,18 @@ list_instances() {
 }
 
 status_instance() {
-    test "$#" -eq 1 || usage
+    status_format=text
+    case $# in
+        1) ;;
+        3)
+            test "$2" = --format || usage
+            case $3 in
+                json|text) status_format=$3 ;;
+                *) usage ;;
+            esac
+            ;;
+        *) usage ;;
+    esac
     name=$1
     validate_name "$name"
     directory=$(instance_dir "$name")
@@ -727,6 +985,10 @@ status_instance() {
         printf '%s: invalid persisted instance deployment state\n' "$name" >&2
         exit 65
     }
+    if test "$status_format" = json; then
+        status_json
+        return
+    fi
     printf 'name: %s\nstate: %s\ncontract: %s\n' \
         "$name" "$state" "$deployment_contract"
     if test "$state" = running; then
@@ -735,6 +997,30 @@ status_instance() {
     printf 'config: %s\ndeployment: %s\nconsole-log: %s\naudit-log: %s\n' \
         "$directory/config.toml" "$directory/deployment.state" \
         "$directory/console.log" "$directory/audit.log"
+}
+
+status_json() {
+    case $directory in
+        *[[:cntrl:]]*)
+            printf '%s: instance path cannot be represented in JSON\n' "$name" >&2
+            exit 65
+            ;;
+    esac
+    status_pid=null
+    status_outcome=null
+    if test "$state" = running; then
+        status_pid=$(supervisor_identity "$name" || true)
+        test -n "$status_pid" || status_pid=null
+    elif read_outcome "$(runtime_dir "$name")/outcome"; then
+        status_outcome=$outcome_line
+    fi
+    status_directory=$(json_text "$directory")
+    printf '{"version":1,"name":"%s","state":"%s","contract":"%s","pid":%s,"outcome":%s,' \
+        "$name" "$state" "$deployment_contract" "$status_pid" "$status_outcome"
+    printf '"paths":{"config":"%s","deployment":"%s","console_log":"%s","audit_log":"%s","root":"%s"}}\n' \
+        "$status_directory/config.toml" "$status_directory/deployment.state" \
+        "$status_directory/console.log" "$status_directory/audit.log" \
+        "$status_directory/root"
 }
 
 set_contract_lock() {
@@ -782,6 +1068,8 @@ start_instance() {
     shift
     start_mode=detached
     start_audit=false
+    start_wait_pid=
+    start_wait_start=
     while test "$#" -gt 0; do
         case $1 in
             --attach)
@@ -792,15 +1080,30 @@ start_instance() {
                 test "$start_audit" = false || usage
                 start_audit=true
                 ;;
+            --wait)
+                test -z "$start_wait_pid" || usage
+                test "$#" -ge 3 || usage
+                case $2 in ''|*[!0-9]*) usage ;; esac
+                case $3 in ''|*[!0-9]*) usage ;; esac
+                start_wait_pid=$2
+                start_wait_start=$3
+                shift 2
+                ;;
             *) usage ;;
         esac
         shift
     done
+    test -z "$start_wait_pid" || test "$start_mode" = detached || usage
     validate_name "$name"
+    lock_instance "$name"
     directory=$(instance_dir "$name")
     runtime_directory=$(runtime_dir "$name")
-    test -d "$directory" || { printf '%s: not found\n' "$name" >&2; exit 66; }
-    if supervisor_identity "$name" >/dev/null; then
+    test -d "$directory" || {
+        drop_instance_lock
+        printf '%s: not found\n' "$name" >&2
+        exit 66
+    }
+    if supervisor_identity "$name" >/dev/null || runtime_identity "$name" >/dev/null; then
         printf '%s: already running\n' "$name" >&2
         exit 73
     fi
@@ -818,15 +1121,23 @@ start_instance() {
         "$runtime_directory/runtime.pid" \
         "$runtime_directory/exit.status" \
         "$runtime_directory/console.in" \
-        "$runtime_directory/control.in"
+        "$runtime_directory/control.in" \
+        "$runtime_directory/outcome" \
+        "$runtime_directory/result.runtime"
     mkfifo -m 600 "$runtime_directory/console.in"
     mkfifo -m 600 "$runtime_directory/control.in"
     : >"$directory/audit.log"
     : >"$directory/console.log"
 
-    nohup "$0" --protocol 1 supervise "$name" "$start_audit" >/dev/null 2>&1 </dev/null &
+    # The supervisor must not inherit the instance lock on descriptor 6.
+    nohup "$0" --protocol 1 supervise "$name" "$start_audit" 6>&- >/dev/null 2>&1 </dev/null &
     pid=$!
     record_supervisor "$runtime_directory" "$pid"
+    wait_supervisor_start=$record_start
+    exec 6>&-
+    if test -n "$start_wait_pid"; then
+        wait_for_instance
+    fi
     sleep 1
     if ! kill -0 "$pid" 2>/dev/null; then
         rm -f "$runtime_directory/supervisor.pid"
@@ -839,6 +1150,87 @@ start_instance() {
     else
         printf '%s: started detached (supervisor pid %s)\n' "$name" "$pid"
     fi
+}
+
+# The waiting caller is identified by pid and start time, so a reused pid
+# does not keep the instance alive.
+caller_alive() {
+    caller_state=$(stat_after_comm "$start_wait_pid" 1 || true)
+    test -n "$caller_state" && test "$caller_state" != Z || return 1
+    test "$(stat_after_comm "$start_wait_pid" 20 || true)" = "$start_wait_start"
+}
+
+supervisor_child_running() {
+    child_state=$(stat_after_comm "$pid" 1 || true)
+    test -n "$child_state" && test "$child_state" != Z || return 1
+    test "$(stat_after_comm "$pid" 20 || true)" = "$wait_supervisor_start"
+}
+
+# Remove the pid files only while they still name this start's supervisor;
+# a later start may already have recorded its own.
+remove_waited_pid_files() {
+    waited_record=
+    IFS= read -r waited_record <"$runtime_directory/supervisor.pid" 2>/dev/null || true
+    if test "$waited_record" = "$pid $wait_supervisor_start"; then
+        rm -f "$runtime_directory/runtime.pid" "$runtime_directory/supervisor.pid"
+    fi
+}
+
+exit_for_outcome() {
+    if read_outcome "$runtime_directory/outcome"; then
+        case $outcome_kind in
+            exited) exit "$outcome_code" ;;
+            signaled) exit "$((128 + outcome_signal))" ;;
+        esac
+    fi
+    exit 70
+}
+
+teardown() {
+    trap - HUP INT TERM
+    if supervisor_child_running; then
+        # The supervisor's TERM trap stops the runtime and records the outcome.
+        kill -TERM "$pid" 2>/dev/null || true
+        teardown_attempt=0
+        while supervisor_child_running && test "$teardown_attempt" -lt 25; do
+            teardown_attempt=$((teardown_attempt + 1))
+            sleep 0.2
+        done
+        if supervisor_child_running; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    teardown_runtime=$(runtime_identity "$name" || true)
+    if test -n "$teardown_runtime"; then
+        kill -KILL "$teardown_runtime" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+    test -f "$runtime_directory/outcome" || write_outcome_supervisor_error
+    remove_waited_pid_files
+    exit_for_outcome
+}
+
+write_outcome_supervisor_error() {
+    rm -f -- "$runtime_directory/result.runtime" 2>/dev/null || true
+    write_outcome "$runtime_directory"
+}
+
+# start --wait: stay in the foreground until the instance ends, tear it down
+# when the caller dies or this helper is signalled, and exit with the
+# workload's code, 128+signal, or 70 for supervisor-error. Prints nothing.
+wait_for_instance() {
+    trap teardown HUP INT TERM
+    while supervisor_child_running; do
+        caller_alive || teardown
+        # A background sleep keeps the traps responsive.
+        sleep 0.2 &
+        wait "$!" || true
+    done
+    trap - HUP INT TERM
+    wait "$pid" 2>/dev/null || true
+    test -f "$runtime_directory/outcome" || write_outcome "$runtime_directory"
+    remove_waited_pid_files
+    exit_for_outcome
 }
 
 supervise_instance() {
@@ -859,11 +1251,18 @@ supervise_instance() {
     # Let script(1) provide the pseudo-terminal, but record only the runtime
     # stream. Its normal typescript header/footer are implementation details,
     # not instance console output.
-    script -qefE never -c "$0 --protocol 1 run-runtime $name $audit_override" /dev/null \
+    # The marker tells run-runtime it was started by this lifecycle, so it asks
+    # the runtime for an outcome record (console.in and control.in persist
+    # after a run and cannot identify a lifecycle start).
+    GINUX_LIFECYCLE_RESULT=1 script -qefE never -c "$0 --protocol 1 run-runtime $name $audit_override" /dev/null \
         <&9 >>"$directory/console.log" 2>>"$directory/audit.log" &
     console_pid=$!
     terminate_supervisor() {
         trap - HUP INT TERM
+        # A record the runtime wrote before this cancellation is the real
+        # outcome; one written because of it is not.
+        terminate_record=false
+        test ! -f "$runtime_directory/result.runtime" || terminate_record=true
         runtime_pid=$(runtime_identity "$name" || true)
         if test -n "$runtime_pid"; then
             kill -TERM "$runtime_pid" 2>/dev/null || true
@@ -876,6 +1275,8 @@ supervise_instance() {
         fi
         kill -TERM "$console_pid" 2>/dev/null || true
         wait "$console_pid" 2>/dev/null || true
+        test "$terminate_record" = true || rm -f "$runtime_directory/result.runtime"
+        write_outcome "$runtime_directory"
         rm -f "$runtime_directory/runtime.pid" "$runtime_directory/supervisor.pid"
         exit 143
     }
@@ -885,6 +1286,7 @@ supervise_instance() {
     trap - HUP INT TERM
     set -e
     printf '%s\n' "$status" >"$runtime_directory/exit.status"
+    write_outcome "$runtime_directory"
     rm -f "$runtime_directory/runtime.pid" "$runtime_directory/supervisor.pid"
     exit "$status"
 }
@@ -901,6 +1303,10 @@ run_runtime() {
     directory=$(instance_dir "$name")
     runtime_directory=$(runtime_dir "$name")
     test -d "$directory" || exit 66
+    # Read the lifecycle marker once and keep it out of the environment of
+    # everything started below.
+    lifecycle_result=${GINUX_LIFECYCLE_RESULT-}
+    unset GINUX_LIFECYCLE_RESULT
     # util-linux script(1) does not preserve the supervisor shell's auxiliary
     # descriptors when it starts the PTY command. Open the lifecycle-created
     # FIFO in the runtime command itself so Ginux can receive attached-console
@@ -966,6 +1372,14 @@ EOF
         fi
         hook_index=$((hook_index + 1))
     done
+    # Only starts launched by supervise (which sets GINUX_LIFECYCLE_RESULT)
+    # ask the runtime for an outcome record; direct invocations keep the plain
+    # form even when an earlier lifecycle run left control.in behind.
+    if test "$lifecycle_result" = 1; then
+        rm -f "$runtime_directory/result.runtime"
+        exec "$runtime" native "$directory/runtime.toml" "$directory/root" configured \
+            --result-file "$runtime_directory/result.runtime" 2>>"$directory/audit.log"
+    fi
     exec "$runtime" native "$directory/runtime.toml" "$directory/root" configured \
         2>>"$directory/audit.log"
 }
@@ -1018,7 +1432,13 @@ EOF
         case "$rows:$columns:$extra" in
             *[!0-9:]*|0:*|*:0:*|*:*:?*) return 0 ;;
         esac
-        sudo -n "$0" --protocol 1 resize "$name" "$rows" "$columns" </dev/null >/dev/null 2>&1 || true
+        if test "$root_options" = true; then
+            # sudo resets the environment, so the roots travel as options.
+            sudo -n "$0" --protocol 1 --state-root "$state_root" --run-root "$run_root" \
+                resize "$name" "$rows" "$columns" </dev/null >/dev/null 2>&1 || true
+        else
+            sudo -n "$0" --protocol 1 resize "$name" "$rows" "$columns" </dev/null >/dev/null 2>&1 || true
+        fi
     }
     cleanup_attach() {
         trap - 0 HUP INT TERM TSTP USR1 WINCH
@@ -1180,8 +1600,105 @@ stop_instance() {
     if kill -0 "$pid" 2>/dev/null; then
         kill -KILL "$pid" 2>/dev/null || true
     fi
+    # A killed supervisor cannot record the outcome itself.
+    test -f "$runtime_directory/outcome" || write_outcome "$runtime_directory"
     rm -f "$runtime_directory/supervisor.pid" "$runtime_directory/runtime.pid"
     printf '%s: stopped\n' "$name"
+}
+
+delete_instance() {
+    test "$#" -eq 1 || usage
+    name=$1
+    validate_name "$name"
+    lock_instance "$name"
+    directory=$(instance_dir "$name")
+    runtime_directory=$(runtime_dir "$name")
+    if test ! -e "$directory" && test ! -L "$directory"; then
+        drop_instance_lock
+        printf '%s: not found\n' "$name" >&2
+        exit 66
+    fi
+    if supervisor_identity "$name" >/dev/null || runtime_identity "$name" >/dev/null; then
+        printf '%s: stop the instance before deleting it\n' "$name" >&2
+        exit 73
+    fi
+    # One rename inside the instances directory removes the instance
+    # atomically; list ignores dot names, and the trash is root-only.
+    delete_trash=$(mktemp -d "$state_root/instances/.delete:XXXXXX")
+    # Same-filesystem rename onto the fresh, empty trash directory.
+    mv -T -- "$directory" "$delete_trash/instance"
+    rm -rf -- "$runtime_directory"
+    drop_instance_lock
+    printf 'Instance "%s" deleted.\n' "$name"
+    # A trash directory that is gone afterwards was swept by a concurrent
+    # delete (the sweep below goes by the rename time), which is success.
+    if ! rm -rf --one-file-system -- "$delete_trash" \
+        && test -e "$delete_trash"; then
+        printf '%s: removal incomplete; %s remains\n' "$name" "$delete_trash" >&2
+        exit 70
+    fi
+    # Sweep trash left by interrupted deletes; a directory that vanishes
+    # meanwhile is not an error.
+    find "$state_root/instances" -mindepth 1 -maxdepth 1 -name '.delete:*' -mmin +60 \
+        -exec rm -rf --one-file-system -- {} + 2>/dev/null || true
+}
+
+extract_instance() {
+    test "$#" -ge 8 || usage
+    name=$1
+    test "$2" = --max-bytes && test "$4" = --max-members && test "$6" = --max-path || usage
+    extract_max_bytes=$3
+    extract_max_members=$5
+    extract_max_path=$7
+    for extract_bound in "$extract_max_bytes" "$extract_max_members" "$extract_max_path"; do
+        case $extract_bound in
+            ''|0*|*[!0-9]*) usage ;;
+        esac
+    done
+    shift 7
+    for extract_path in "$@"; do
+        case $extract_path in
+            /*) ;;
+            *) usage ;;
+        esac
+    done
+    validate_name "$name"
+    lock_instance "$name"
+    directory=$(instance_dir "$name")
+    test -d "$directory" || {
+        drop_instance_lock
+        printf '%s: not found\n' "$name" >&2
+        exit 66
+    }
+    if supervisor_identity "$name" >/dev/null || runtime_identity "$name" >/dev/null; then
+        printf '%s: stop the instance before extracting from it\n' "$name" >&2
+        exit 73
+    fi
+    if test ! -x "$image_tool" || test -d "$image_tool"; then
+        printf '%s\n' 'extract requires the compiled Ginux image tool' >&2
+        exit 69
+    fi
+    # The lock stays held here (not in the exporter) for the whole export so
+    # start, delete and import wait for it. It has no timeout: a stalled
+    # exporter (any process that can signal uid 65534 can stop it) holds the
+    # lock, and start, delete and create of this instance wait until the
+    # exporter continues or is killed.
+    set +e
+    "$image_tool" export-tree "$directory/root" \
+        "$extract_max_bytes" "$extract_max_members" "$extract_max_path" "$@" 6>&-
+    extract_status=$?
+    set -e
+    exit "$extract_status"
+}
+
+import_image() {
+    test "$#" -eq 0 || usage
+    if test ! -x "$image_tool" || test -d "$image_tool"; then
+        printf '%s\n' 'import-image requires the compiled Ginux image tool' >&2
+        exit 69
+    fi
+    mkdir -p "$state_root/cache/oci/blobs/sha256"
+    exec "$image_tool" import-layout "$state_root/cache/oci"
 }
 
 test "${1-}" = --protocol || usage
@@ -1191,15 +1708,54 @@ test "${2-}" = 1 || {
 }
 test "$#" -ge 3 || usage
 shift 2
+root_options=false
+if test "$1" = --state-root; then
+    test "$#" -ge 3 || usage
+    requested_state_root=$2
+    requested_run_root=$2/run
+    shift 2
+    if test "$1" = --run-root; then
+        test "$#" -ge 3 || usage
+        requested_run_root=$2
+        shift 2
+    fi
+    root_options=true
+fi
 command=$1
 shift
+if test "$root_options" = true; then
+    # Reject an unknown verb before creating anything.
+    case $command in
+        attach|authorize-attach|create|delete|export|extract|import|import-image|list|lock|\
+        prepare-root|resolve-network|resize|set|start|status|stop|unlock|run-runtime|supervise) ;;
+        *) usage ;;
+    esac
+    # attach runs unprivileged: it checks the roots but never creates them.
+    root_create=true
+    test "$command" != attach || root_create=false
+    trusted_root state "$requested_state_root" "$root_create"
+    trusted_root run "$requested_run_root" "$root_create"
+    state_root=$requested_state_root
+    run_root=$requested_run_root
+    if test "$root_create" = true; then
+        install -d -m 0755 "$state_root/instances" "$state_root/cache" \
+            "$state_root/cache/oci" "$state_root/cache/oci/blobs" \
+            "$state_root/cache/oci/blobs/sha256" "$run_root/instances"
+        install -d -m 0700 "$state_root/work"
+    fi
+    # The supervise and run-runtime self-invocations inherit the roots.
+    export GINUX_STATE_ROOT="$state_root" GINUX_RUN_ROOT="$run_root"
+fi
 mkdir -p "$state_root/instances"
 case $command in
     attach) attach_instance "$@" ;;
     authorize-attach) authorize_attach "$@" ;;
     create) create_instance "$@" ;;
+    delete) delete_instance "$@" ;;
     export) export_instance "$@" ;;
+    extract) extract_instance "$@" ;;
     import) import_instance "$@" ;;
+    import-image) import_image "$@" ;;
     list) test "$#" -eq 0 || usage; list_instances ;;
     lock) test "$#" -eq 1 || usage; set_contract_lock "$1" locked ;;
     prepare-root) test "$#" -eq 1 || usage; prepare_root "$1" ;;
