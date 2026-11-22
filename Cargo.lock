@@ -390,6 +390,8 @@ dependencies = [
  "clap",
  "ginux-contract",
  "ginux-instance",
+ "libc",
+ "tar",
 ]
 
 [[package]]
@@ -449,6 +451,7 @@ name = "ginux-oci"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "libc",
  "reqwest",
  "serde_json",
  "sha2",

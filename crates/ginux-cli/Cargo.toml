@@ -12,3 +12,5 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive"] }
 ginux-contract = { path = "../ginux-contract" }
 ginux-instance = { path = "../ginux-instance" }
+libc = "0.2"
+tar = "0.4"

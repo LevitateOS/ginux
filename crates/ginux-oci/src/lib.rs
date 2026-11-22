@@ -9,6 +9,9 @@ use std::path::{Component, Path, PathBuf};
 use tar::Archive;
 use url::Url;
 
+pub mod export;
+pub mod layout;
+
 const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +19,34 @@ pub struct ImageReference {
     pub registry: String,
     pub repository: String,
     pub digest: String,
+}
+
+/// Failure of a private image-tool command: the process exit code and a one-line reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolError {
+    pub code: u8,
+    pub message: String,
+}
+
+impl ToolError {
+    pub(crate) fn new(code: u8, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+/// Exit codes of the private `import-layout` and `export-tree` commands.
+pub(crate) mod exit {
+    pub const USAGE: u8 = 64;
+    pub const INVALID: u8 = 65;
+    pub const NOT_FOUND: u8 = 66;
+    pub const UNSUPPORTED: u8 = 69;
+    pub const INTERNAL: u8 = 70;
+    pub const OUTPUT: u8 = 74;
+    pub const CHANGED: u8 = 75;
+    pub const BOUND: u8 = 76;
 }
 
 #[derive(Debug, Clone)]
@@ -256,7 +287,7 @@ fn image_is_fully_cached(cache_root: &Path, root_digest: &str) -> Result<bool, S
     Ok(true)
 }
 
-fn cached_blob(cache_root: &Path, digest: &str) -> Result<Option<PathBuf>, String> {
+pub(crate) fn cached_blob(cache_root: &Path, digest: &str) -> Result<Option<PathBuf>, String> {
     validate_digest(digest)?;
     let target = cache_root
         .join("blobs/sha256")
@@ -351,7 +382,7 @@ fn fetch_blob(
     result
 }
 
-fn select_manifest(document: &Value) -> Result<Option<Descriptor>, String> {
+pub(crate) fn select_manifest(document: &Value) -> Result<Option<Descriptor>, String> {
     let Some(manifests) = document.get("manifests") else {
         return Ok(None);
     };
@@ -377,7 +408,7 @@ fn select_manifest(document: &Value) -> Result<Option<Descriptor>, String> {
     Err("OCI image has no linux/amd64 manifest".into())
 }
 
-fn descriptor(value: Option<&Value>, label: &str) -> Result<Descriptor, String> {
+pub(crate) fn descriptor(value: Option<&Value>, label: &str) -> Result<Descriptor, String> {
     let value = value
         .and_then(Value::as_object)
         .ok_or_else(|| format!("OCI {label} descriptor is missing or invalid"))?;
@@ -564,7 +595,7 @@ fn api_registry(registry: &str) -> &str {
     }
 }
 
-fn validate_digest(digest: &str) -> Result<(), String> {
+pub(crate) fn validate_digest(digest: &str) -> Result<(), String> {
     let Some(hex) = digest.strip_prefix("sha256:") else {
         return Err("OCI digest must use sha256".into());
     };
@@ -588,7 +619,7 @@ fn digest_file(path: &Path) -> Result<String, String> {
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
-fn read_json(path: &Path) -> Result<Value, String> {
+pub(crate) fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_reader(BufReader::new(File::open(path).map_err(io_error)?))
         .map_err(|error| format!("invalid OCI JSON object {}: {error}", path.display()))
 }
