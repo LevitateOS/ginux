@@ -42,6 +42,7 @@ pub enum Command {
     Lifecycle(*const u8),
     Vfs(*const u8, *const u8, *const u8),
     Native(*const u8, *const u8, usize),
+    NativeResult(*const u8, *const u8, *const u8),
     NativeHook(*const u8, *const u8, usize),
     Instance(*const u8, *const u8),
     Process(*const u8),
@@ -132,6 +133,19 @@ pub fn parse_argv(argc: usize, argv: *const usize) -> Option<Command> {
             }
         };
         Some(Command::Native(config_path, root_path, mode))
+    } else if argc == 7 && c_string_equals(command, b"native") {
+        let config_path = unsafe { *argv.add(2) as *const u8 };
+        let root_path = unsafe { *argv.add(3) as *const u8 };
+        let mode = unsafe { *argv.add(4) as *const u8 };
+        let option = unsafe { *argv.add(5) as *const u8 };
+        let result_path = unsafe { *argv.add(6) as *const u8 };
+        if !c_string_equals(mode, b"configured")
+            || !c_string_equals(option, b"--result-file")
+            || unsafe { *result_path } == 0
+        {
+            return Some(Command::Usage);
+        }
+        Some(Command::NativeResult(config_path, root_path, result_path))
     } else if argc == 5 && c_string_equals(command, b"native-hook") {
         let config_path = unsafe { *argv.add(2) as *const u8 };
         let root_path = unsafe { *argv.add(3) as *const u8 };
@@ -908,6 +922,9 @@ pub fn usage() -> ! {
     line_stderr(b"ginux: usage: ginux runtime <elf>");
     line_stderr(b"ginux: usage: ginux instance|process-native <config> <fixture>");
     line_stderr(b"ginux: usage: ginux native <config> <root> [configured|hold|probe]");
+    line_stderr(
+        b"ginux: usage: ginux native <config> <root> configured --result-file <fresh host path>",
+    );
     line_stderr(b"ginux: usage: ginux devices <config> <block>");
     line_stderr(b"ginux: usage: ginux device-bench <config> <block> <kind>");
     line_stderr(b"ginux: usage: ginux vfs <config> <rootfs> <index>");

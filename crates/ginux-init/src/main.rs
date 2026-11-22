@@ -34,6 +34,7 @@ mod launch_storage;
 mod launch_tasks;
 mod native_clone;
 mod native_network;
+mod native_result;
 mod network_hooks;
 mod path_hooks;
 mod process_hooks;
@@ -282,6 +283,10 @@ extern "C" fn rust_main(initial_stack: *const usize) -> ! {
         }
         Some(Command::Native(config_path, root_path, mode)) => {
             native_main(config_path, root_path, mode, None)
+        }
+        Some(Command::NativeResult(config_path, root_path, result_path)) => {
+            native_result::set(result_path);
+            native_main(config_path, root_path, 3, None)
         }
         Some(Command::NativeHook(config_path, root_path, index)) => {
             native_main(config_path, root_path, 3, Some(index))
@@ -6083,6 +6088,7 @@ fn supervise_native(
                 if exit_status == 0 {
                     line(b"GINUX_NATIVE_CHECK: PASS");
                 }
+                native_result::finish(status);
                 exit_process(exit_status as usize)
             }
             continue;
