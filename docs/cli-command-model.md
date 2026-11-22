@@ -28,8 +28,8 @@ the helper or runtime public.
 The following inventory records are machine-checked against generated public
 help and the private dispatch tables:
 
-<!-- cli-inventory:public attach create edit explain export help import inspect list lock set start status stop unlock validate -->
-<!-- cli-inventory:helper attach authorize-attach create export import list lock prepare-root resize resolve-network run-runtime set start status stop supervise unlock -->
+<!-- cli-inventory:public attach create delete edit explain export extract help import import-image inspect list lock set start status stop unlock validate -->
+<!-- cli-inventory:helper attach authorize-attach create delete export extract import import-image list lock prepare-root resize resolve-network run-runtime set start status stop supervise unlock -->
 <!-- cli-inventory:runtime config config-merge device-bench devices hook-plan instance instance-diff instance-explain instance-inspect instance-plan instance-validate kernel-views launch lifecycle native native-hook process process-native runtime vfs -->
 
 ## Current public command inventory
@@ -257,3 +257,151 @@ Implementation must not begin until the human approves these points:
 
 The human approved this design on 2026-11-13 with one correction: remove
 `diff` from the public operator CLI.
+
+## Interim lifecycle commands
+
+The commands and options in this section were added after the Gate 25
+design above, which stays as approved. They let a non-interactive program
+drive the instance lifecycle without private selectors. Every addition is
+additive: no existing command changes its arguments, output, exit status or
+helper argument vector when none of these forms is used, and the helper keeps
+protocol version 1. The inventory records at the top of this document include
+them.
+
+### Shapes
+
+```text
+ginux [--state-root DIR [--run-root DIR]] COMMAND ...
+ginux start NAME [--audit] --wait
+ginux status NAME [--format text|json]
+ginux extract NAME --output FILE [--max-bytes N] [--max-members N]
+                  [--max-path N] PATH...
+ginux delete NAME
+ginux import-image PATH
+```
+
+| Command | Behaviour | Help heading |
+|---|---|---|
+| `start --wait` | Foreground start tied to the calling process; stdout stays empty; conflicts with `--attach` | Run instances |
+| `status --format json` | One JSON object on one line; `text` (the default) is the existing output | Inspect instances |
+| `extract` | Writes named absolute directories of a stopped instance as one tar archive to a new `FILE` | Inspect instances |
+| `delete` | Removes a stopped instance and all of its state | Configure instances |
+| `import-image` | Adds an OCI image layout (directory or uncompressed tar of one) to the image cache; prints the manifest digest | Manage images |
+| `--state-root`, `--run-root` | Global options; select another persistent and transient state root | all commands |
+
+Parse rules (violations exit 2 before any sudo call):
+
+- `--state-root` and `--run-root` are absolute, contain only
+  `[A-Za-z0-9_./-]`, have no empty, `.` or `..` component and are at most 256
+  bytes. `--run-root` requires `--state-root`; `--state-root` alone implies
+  `--run-root DIR/run`. Either may appear before or after the command name.
+- `extract` paths are absolute with no empty, `.` or `..` component and no
+  longer than `--max-path` bytes; `/` is allowed. Duplicates and paths below
+  another listed path are dropped and the rest are sorted bytewise.
+  `--output` is required. Bounds are positive decimal integers; defaults are
+  `--max-bytes 68719476736` (64 GiB), `--max-members 1000000` and
+  `--max-path 4096`. The directory depth bound is fixed at 256.
+- `import-image` reads `PATH` with the caller's own rights. A directory may
+  contain only `oci-layout`, `index.json`, `blobs/`, `blobs/sha256/` and
+  regular files named `blobs/sha256/<64 lowercase hex>`; anything else,
+  including a symbolic link, exits 65 before sudo. A gzip-compressed archive
+  exits 65. The privileged helper never opens `PATH`.
+
+### Helper protocol additions
+
+```text
+ginux-helper --protocol 1 [--state-root DIR --run-root DIR] VERB ARG...
+  delete NAME
+  extract NAME --max-bytes N --max-members N --max-path N PATH...   (tar on stdout)
+  import-image                                                      (tar on stdin, digest on stdout)
+  start NAME [--audit] --wait CALLER_PID CALLER_START
+  status NAME --format json
+```
+
+The CLI forwards the roots after `--protocol 1` in every helper call,
+including the unprivileged attach transport and both halves of `edit`, and
+forwards nothing when no root option is given. It always sends the three
+`extract` bounds. An older helper rejects each addition with usage status 64
+before any state change. When a state or run root is passed, every verb
+(including the privileged halves of `edit` and `attach`) maps a helper exit 64
+without a root refusal to `ginux: the installed helper does not support
+--state-root` and exit 69. Without roots, `delete`, `extract`, `import-image`
+and `status --format json` map a 64 to `ginux: the installed helper does not
+support FEATURE` and exit 69. A current helper also exits 64 when it refuses a
+root (`untrusted state root:` or `untrusted run root:` on its standard error,
+which the CLI relays); that status is passed through unchanged. For
+`start --wait` a 64 cannot be told from a workload exit status and is passed
+through unchanged, together with the helper's own usage message.
+
+Helper standard error is relayed to the terminal with control bytes (every
+C0 and C1 control except newline and tab, DEL) and invalid UTF-8 replaced by
+visible `\xNN` escapes, so workload-controlled names cannot drive the
+terminal. Instance names must not start with `.`.
+
+### Exit codes
+
+| Code | Meaning | Used by |
+|---|---|---|
+| 0 | success | all |
+| 2 | parse error, no sudo call | all |
+| 64 | helper usage passed through: `start --wait`, or an untrusted state or run root | helper |
+| 65 | invalid state, invalid layout or digest, unsupported member type, path not a directory | delete, extract, import-image |
+| 66 | instance, extract path or import input not found | all |
+| 69 | unsupported: older helper (any verb when a root is passed, else `delete`, `extract`, `import-image`, `status --format json`), missing image tool, `openat2` unavailable | all |
+| 70 | internal failure; for `start --wait`, outcome `supervisor-error` | all |
+| 73 | instance running or already running | delete, extract, start |
+| 74 | output I/O error, including an existing `--output` file | extract, import-image |
+| 75 | member changed during export (retryable) | extract |
+| 76 | extract bound exceeded (bytes, members, path length, depth, link length) | extract |
+| 0-255 | `start --wait` only: workload exit status, or 128+signal | start --wait |
+
+`start --wait` statuses overlap by nature; a caller disambiguates them with
+`status --format json`.
+
+### Foreground start and the outcome record
+
+`start --wait` passes the calling process's PID and start time (field 22 of
+`/proc/PID/stat`) to the helper, which stops the instance when that process
+disappears. The CLI does not exec sudo, so it stays alive as that process; it
+relays `SIGINT`, `SIGTERM`, `SIGHUP` and `SIGQUIT` to sudo and returns the
+helper's status. sudo does not relay a signal sent from its own process group,
+so if the helper has not finished one second after a relayed signal, the CLI
+exits on that signal itself; the helper then sees its caller gone and stops
+the instance within about 7.5 seconds. Stopping by caller death, signal or a
+force-escalated `stop` records `supervisor-error`. Callers should read the
+outcome with `status --format json` rather than from the CLI's own exit status.
+
+The outcome of the last run is one line in exactly this form:
+
+```text
+{"version":1,"outcome":"exited","code":3,"signal":null,"generation":null}
+{"version":1,"outcome":"signaled","code":null,"signal":9,"generation":null}
+{"version":1,"outcome":"supervisor-error","code":null,"signal":null,"generation":null}
+```
+
+`status --format json` prints:
+
+```text
+{"version":1,"name":"N","state":"running|stopped","contract":"locked|unlocked",
+ "pid":123|null,"outcome":<record>|null,"paths":{"config":"...","deployment":"...",
+ "console_log":"...","audit_log":"...","root":"..."}}
+```
+
+on one line. `outcome` is null before the first start, while running, after a
+start that failed its checks, and after a run whose record could not be
+written.
+
+### State layout
+
+| Path (default roots) | Content |
+|---|---|
+| `/run/ginux/instances/NAME/outcome` | Last outcome record, root 0600; removed by the next `start` and by `delete` |
+| `/run/ginux/instances/NAME/result.runtime` | Record written by the runtime, validated before it becomes `outcome` |
+| `/var/lib/ginux/work/instance.NAME.lock` | Per-instance lock taken by import, create, start, delete and extract |
+| `/var/lib/ginux/instances/.delete:*` | Trash of an interrupted delete; swept after one hour |
+| `/var/lib/ginux/cache/roots/sha256/HEX` | Pristine expansion reused by reflink copy, only on reflink-capable filesystems |
+
+With `--state-root DIR --run-root RDIR` the same layout lives under `DIR` and
+`RDIR`. Each existing component of either root must be a root-owned directory
+that is not group- or other-writable; otherwise the helper refuses it with
+`untrusted state root: DIR (REASON)`.

@@ -280,6 +280,25 @@ ginux start rocky --attach
 self-contained recipe, `ginux export NAME` to print that recipe, and
 `ginux edit NAME` to validate and atomically apply an editor session.
 
+For programs that drive Ginux non-interactively, a small set of interim
+lifecycle commands is available:
+
+```sh
+ginux import-image ./layout             # prints sha256:<manifest digest>
+ginux start job --wait                  # exits with the workload's status
+ginux status job --format json          # one JSON line, including the outcome
+ginux extract job --output out.tar /out # stopped instance only; all or nothing
+ginux delete job
+```
+
+`import-image` adds an OCI image layout to the cache without network access;
+a recipe can then name it as any `REGISTRY/REPO@sha256:<digest>`. `start --wait`
+stays in the foreground, prints nothing on stdout, and stops the instance when
+the command is interrupted or killed. Global `--state-root DIR` and
+`--run-root DIR` options keep all state under a separate root-owned directory.
+Exact shapes, exit codes and the outcome record are listed in
+[`docs/cli-command-model.md`](docs/cli-command-model.md#interim-lifecycle-commands).
+
 Instances are contract-locked by default. For an explicit maintenance window,
 stop the instance, run `ginux unlock NAME`, perform the required maintenance,
 stop it again, and run `ginux lock NAME`. `ginux list` and `ginux status NAME`

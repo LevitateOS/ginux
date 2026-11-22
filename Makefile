@@ -505,6 +505,18 @@ test-native-supervision:
 	python3 scripts/test-native-clone-restart.py $(GINUX) .artifacts/launch/native-fixture
 	python3 scripts/test-native-network-snapshot.py $(GINUX) .artifacts/launch/native-fixture
 
+.PHONY: test-native-result build-public-lifecycle test-public-lifecycle
+HOST_TOOLS_DIR := .artifacts/host
+
+test-native-result:
+	python3 scripts/test-native-result.py $(GINUX) .artifacts/launch/native-fixture
+
+build-public-lifecycle:
+	RUSTFLAGS='' CARGO_TARGET_DIR=$(HOST_TOOLS_DIR) cargo build --release -p ginux-cli -p ginux-oci
+
+test-public-lifecycle:
+	python3 scripts/test-public-lifecycle.py $(GINUX) $(HOST_TOOLS_DIR)/release/ginux-cli $(HOST_TOOLS_DIR)/release/ginux-oci scripts/ginux-host-instance-helper.sh .artifacts/launch/native-fixture
+
 build-launch-storage-fixture:
 	mkdir -p .artifacts/launch
 	$(CC) -nostdlib -static -fno-stack-protector -fno-builtin -O2 -Wall -Wextra -Werror tests/fixtures/launch-storage-fixture.c -o .artifacts/launch/launch-storage-fixture

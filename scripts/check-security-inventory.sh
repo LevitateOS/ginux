@@ -14,6 +14,8 @@ rg -l '\bunsafe[[:space:]]*(\{|fn|impl|trait|extern)' crates --glob '*.rs' \
 cat >"$temporary.allowed" <<'EOF'
 crates/baseline-runner/src/main.rs
 crates/ginux-allocator/src/lib.rs
+crates/ginux-cli/src/sys.rs
+crates/ginux-cli/src/wait.rs
 crates/ginux-devices/src/lib.rs
 crates/ginux-init/src/channel_hooks.rs
 crates/ginux-init/src/checkpoint_control.rs
@@ -30,6 +32,7 @@ crates/ginux-init/src/launch_tasks.rs
 crates/ginux-init/src/main.rs
 crates/ginux-init/src/native_clone.rs
 crates/ginux-init/src/native_network.rs
+crates/ginux-init/src/native_result.rs
 crates/ginux-init/src/network_hooks.rs
 crates/ginux-init/src/path_hooks.rs
 crates/ginux-init/src/stack_view.rs
@@ -38,6 +41,7 @@ crates/ginux-init/src/storage_memory.rs
 crates/ginux-init/src/storage_restore.rs
 crates/ginux-init/src/supervisor.rs
 crates/ginux-init/src/tracee_io.rs
+crates/ginux-oci/src/export.rs
 crates/process-native-fixture/src/main.rs
 EOF
 
@@ -74,6 +78,10 @@ for route in \
     'Workload syscall' \
     'Descriptor and virtual-object operation' \
     'Lifecycle stop/failure/recovery' \
+    'Instance delete' \
+    'Instance extract' \
+    'Image import' \
+    'Foreground start and outcome' \
     'Allocator memory operation'
 do
     rg -Fq "$route" docs/security-assurance.md
@@ -82,7 +90,9 @@ for state in \
     '/etc/ginux/examples' \
     '/var/lib/ginux/cache/oci' \
     '/var/lib/ginux/instances/NAME' \
-    '/run/ginux/instances/NAME'
+    '/run/ginux/instances/NAME' \
+    '/var/lib/ginux/cache/roots' \
+    'Private state and run roots'
 do
     rg -Fq "$state" docs/security-assurance.md
 done

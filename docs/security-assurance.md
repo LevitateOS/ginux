@@ -43,6 +43,10 @@ boundary; the inventory checker rejects drift in these installed paths.
 | Workload syscall | Entry registers plus one supervisor-owned copy of pointer-derived authority inputs | Immutable contract, operation catalog, dispatch lane, and object-generation checks | Native supervisor or an explicitly direct-safe host syscall |
 | Descriptor and virtual-object operation | Instance-local descriptor/object identity and generation | Contract decision plus type-specific owner lookup | Process, device, network, filesystem, or virtual-kernel owner |
 | Lifecycle stop/failure/recovery | Persisted instance identity plus verified live PID ownership | Helper state transition and stale-PID rejection | Helper cleanup of only that instance's transient resources |
+| Foreground start and outcome | Caller PID plus process start time; runtime-written outcome record in the root-only run directory | Helper validates the record's exact shape before trusting it; caller death or a relayed signal tears the instance down | Helper supervisor and `ginux-runtime` result writer (exclusive create after the workload is gone) |
+| Instance delete | Validated name under the per-instance lock; supervisor and runtime identities both stopped | Helper refuses a running instance, then renames the instance into a root-only trash directory in one `rename(2)` | Helper removal that does not follow links or cross mounts |
+| Instance extract | Requested absolute directories of a stopped instance and caller-supplied bounds | `ginux-image export-tree` drops to the workload identity and resolves every component beneath the root without symbolic links, magic links or mount crossings | `ginux-image`; the CLI publishes the archive with an unnamed file and one link, so failure leaves nothing |
+| Image import | Caller-read OCI layout streamed as a tar archive; only layout paths with hexadecimal blob names | `ginux-image import-layout` verifies every blob digest and size, the manifest, configuration and platform before commit | `ginux-image` cache commit in layer, configuration, manifest order |
 | Allocator memory operation | Checked size/alignment and instance-visible memory limit | Allocator ownership bitmap and checked reservation | Ordinary workload `mmap`, `mprotect`, `madvise`, and `munmap`, still mediated by Ginux |
 
 No managed route treats a text path, numeric PID, or descriptor number alone as
@@ -69,8 +73,10 @@ recipe and root state survive only where the documented lifecycle says they do.
 ## Unsafe-code boundary
 
 Production Rust `unsafe` is confined to the freestanding native runtime and
-its syscall backends. Policy, configuration, virtual process, device, kernel
-view, VFS, OCI, and public CLI libraries remain safe Rust. The runtime requires
+its syscall backends, plus three small host-side system-call seams: the public
+CLI's signal relay and unnamed-file publication, and the image tool's
+beneath-root tree exporter. Policy, configuration, virtual process, device,
+kernel view, VFS, and the remaining OCI and public CLI code remain safe Rust. The runtime requires
 raw startup pointers, register access, inline host syscalls, ptrace memory
 transfer, and fixed supervisor-owned buffers; these are reviewed as trusted
 seams rather than described as automatically safe because they are written in
@@ -87,6 +93,9 @@ The approved unsafe/FFI/assembly owners are:
 |---|---|
 | `ginux-init/src/main.rs`, `launch.rs`, `native_clone.rs`, `native_network.rs`, and `supervisor.rs` | Freestanding entry, raw Linux syscalls, ptrace register and tracee-memory transfer, and fixed-buffer supervision |
 | `ginux-allocator/src/lib.rs` | C ABI exports, raw allocation pointers, atomics, and Linux virtual-memory calls |
+| `ginux-cli/src/wait.rs` and `ginux-cli/src/sys.rs` | Signal masking, `sigwait` and signal relay for a foreground start; `O_TMPFILE` and `linkat` publication of an extracted archive |
+| `ginux-oci/src/export.rs` | `openat2` beneath-root resolution, `fstatat`, `readlinkat`, directory streams, and the identity drop of the tree exporter |
+| `ginux-init/src/native_result.rs` | Exclusive creation and write of the outcome record at the runtime's single normal exit |
 | `baseline-runner` and `process-native-fixture` | Test/benchmark-only raw syscall fixtures; not installed runtime components |
 
 The x86-64 startup assembly is owned by `ginux-init/src/main.rs`; no separate
@@ -120,7 +129,9 @@ Package verification and state-preserving reinstall tests are mandatory.
 | `/etc/ginux/examples` | RPM-owned, read-only example recipes | Replaced only by package lifecycle rules |
 | `/var/lib/ginux/cache/oci` | Root-owned verified content-addressed cache | Preserved across package erase; corrupt content is rejected and may be reacquired |
 | `/var/lib/ginux/instances/NAME` | Root-owned recipe, deployment state, private root, console, and audit data | Created/replaced atomically; retained across package reinstall; explicit instance removal owns deletion |
-| `/run/ginux/instances/NAME` | Root-owned transient control state | Recreated at boot/start and revoked on stop or recovery |
+| `/run/ginux/instances/NAME` | Root-owned transient control state, including the outcome record of the last run | Recreated at boot/start and revoked on stop or recovery; the outcome survives until the next start or delete |
+| `/var/lib/ginux/cache/roots` | Root-owned 0700 pristine expansions keyed by manifest digest, created only where reflink copies work | Rebuilt on demand; never prepared or visible to a workload; an operator may remove any entry at any time |
+| Private state and run roots (`--state-root`, `--run-root`) | Every existing component root-owned, a real directory, and not group- or other-writable; missing levels created by the helper | Same layout and lifecycle as the default roots; separate roots prevent collisions between callers but are not an isolation boundary between sudo-capable callers |
 
 The helper accepts only its versioned private protocol. Operator environment
 values are not promoted into privileged paths without command-specific parsing;

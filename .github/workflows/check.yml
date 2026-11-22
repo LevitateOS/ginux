@@ -82,6 +82,9 @@ jobs:
       - run: sudo make test-launch-directories
       - run: sudo make test-launch-exec
       - run: sudo make test-native-supervision
+      - run: sudo make test-native-result
+      - run: make build-public-lifecycle
+      - run: sudo make test-public-lifecycle
       - run: make test-process-native
       - run: sudo make test-gate1-setup
       - run: sudo make test-launch-poll

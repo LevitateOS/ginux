@@ -67,6 +67,27 @@ a redundant `rootfs.tar`. Instance configuration, deployment state, logs and
 expanded roots live with the named instance. PIDs, FIFOs and control endpoints
 are recreated under `/run/ginux/instances/NAME/`.
 
+Where the state filesystem supports reflink copies, the first `create` or
+`import` of an image keeps one pristine expansion under
+`/var/lib/ginux/cache/roots/sha256/HEX/`, keyed by the manifest digest, and
+later instances of the same image are reflink copies of it. The copies share
+no inode with the base or with each other, the base is never prepared or seen
+by a workload, and an operator may remove any entry at any time; it is rebuilt
+on demand. On filesystems without reflink support no root is kept and
+every instance is expanded from the cached layers as before, so no redundant
+assembled root is stored.
+
+`ginux delete NAME` removes a stopped instance completely: recipe, deployment
+state, root, logs and run state. `ginux import-image PATH` adds an OCI image
+layout to the blob cache without network access.
+
+`ginux --state-root DIR [--run-root DIR]` keeps all of this under another
+root-owned directory instead (the run root defaults to `DIR/run`). Each
+existing component of such a root must be a root-owned directory that is not
+group- or other-writable; missing levels are created by the helper. Each state
+root has its own instances, locks and OCI cache. Package removal never deletes
+these roots either.
+
 Reinstallation and upgrade preserve recipes changed by an operator, cached OCI
 blobs and all instance state. Package removal deletes package-owned programs
 and unchanged examples but never recursively deletes `/var/lib/ginux`:
