@@ -8,6 +8,7 @@ use ginux_core::{
     configured_arguments_allowed, configured_vectors_allowed, decide_balanced, decide_configured,
     Action, BalancedSurface, Decision, SYS_FORK, SYS_PREADV, SYS_READV,
 };
+use ginux_fs_policy::CallContext;
 
 use crate::supervisor::UserRegs;
 
@@ -54,19 +55,20 @@ pub enum NativeDecision {
 /// hook claims falls through to `decide_balanced` byte-identically. The one
 /// exception is fork, which both callers (`launch` and `native`) deny
 /// although the balanced contract lists it in the task surface.
-pub fn decide_native(syscall: u64, rdi: u64, rsi: u64, rdx: u64) -> NativeDecision {
-    decide_lanes(syscall, rdi, rsi, rdx, decide_balanced)
+pub fn decide_native(context: &CallContext) -> NativeDecision {
+    if let ginux_fs_policy::ContractAuthorization::Deny(errno) = context.contract {
+        return NativeDecision::Contract(Decision {
+            syscall: context.syscall,
+            action: Action::Deny(errno),
+        });
+    }
+    decide_lanes(context, decide_balanced)
 }
 
 /// The lane hooks, then `contract` for anything no hook claims: the balanced
 /// decision natively, the configured one in configured launch.
-fn decide_lanes(
-    syscall: u64,
-    rdi: u64,
-    rsi: u64,
-    rdx: u64,
-    contract: fn(u64) -> Decision,
-) -> NativeDecision {
+fn decide_lanes(context: &CallContext, contract: fn(u64) -> Decision) -> NativeDecision {
+    let syscall = context.syscall;
     // Neither caller traces children, so a host fork would leave the child
     // running unsupervised.
     if syscall == SYS_FORK {
@@ -76,21 +78,31 @@ fn decide_lanes(
         });
     }
     match classify(syscall) {
-        Lane::Process => match crate::process_hooks::claim(syscall, rdi, rsi, rdx) {
+        Lane::Process => match crate::process_hooks::claim(
+            syscall,
+            context.arguments[0],
+            context.arguments[1],
+            context.arguments[2],
+        ) {
             Some(result) => NativeDecision::Hooked {
                 lane: Lane::Process,
                 result,
             },
             None => NativeDecision::Contract(contract(syscall)),
         },
-        Lane::Filesystem => match crate::fs_hooks::claim(syscall, rdi, rsi, rdx) {
-            Some(result) => NativeDecision::Hooked {
+        Lane::Filesystem => match crate::fs_hooks::claim(context, true) {
+            crate::fs_hooks::Claim::Denied(result) => NativeDecision::Hooked {
                 lane: Lane::Filesystem,
                 result,
             },
-            None => NativeDecision::Contract(contract(syscall)),
+            crate::fs_hooks::Claim::Unclaimed => NativeDecision::Contract(contract(syscall)),
         },
-        Lane::Channel => match crate::channel_hooks::claim(syscall, rdi, rsi, rdx) {
+        Lane::Channel => match crate::channel_hooks::claim(
+            syscall,
+            context.arguments[0],
+            context.arguments[1],
+            context.arguments[2],
+        ) {
             Some(result) => NativeDecision::Hooked {
                 lane: Lane::Channel,
                 result,
@@ -150,14 +162,54 @@ pub fn decide_objects(
     } else {
         // Only the configured descriptor owner reaches here: a descriptor
         // argument is already its registered native handle.
-        decide_lanes(
-            registers.orig_rax,
+        decide_lanes(&configured_call_context(pid, registers), decide_configured)
+    }
+}
+
+/// The filesystem-lane call context of a configured-launch entry. Configured
+/// launch owns paths through its own storage (`launch_storage`), not through
+/// Gate 31 capabilities, so root, cwd and descriptor-table authority are
+/// explicitly unavailable: should the filesystem lane ever claim a call here,
+/// its shared guard denies it before any host effect. The resolved contract
+/// already denied what it denies before this point, so what reaches it is
+/// admitted (`Mediate`).
+fn configured_call_context(pid: usize, registers: &UserRegs) -> CallContext {
+    use ginux_fs_policy::{
+        identity_token, AuthorityContext, Capability, CapabilityKind, ContractAuthorization,
+        InstanceContext, TaskContext,
+    };
+    const INSTANCE: u64 = identity_token(b"configured-launch");
+    let lifetime = (INSTANCE ^ pid as u64).max(1);
+    let unavailable = |kind| Capability::unavailable(kind, INSTANCE, lifetime);
+    CallContext::x86_64(
+        registers.orig_rax,
+        [
             registers.rdi,
             registers.rsi,
             registers.rdx,
-            decide_configured,
-        )
-    }
+            registers.r10,
+            registers.r8,
+            registers.r9,
+        ],
+        TaskContext {
+            host: pid as u64,
+            virtual_id: 1,
+            generation: 1,
+        },
+        InstanceContext {
+            identity: INSTANCE,
+            lifetime,
+            root_generation: 0,
+        },
+        AuthorityContext {
+            root: unavailable(CapabilityKind::Root),
+            cwd: unavailable(CapabilityKind::WorkingDirectory),
+            descriptor_table: unavailable(CapabilityKind::DescriptorTable),
+            cwd_generation: 0,
+            descriptor_generation: 0,
+        },
+        ContractAuthorization::Mediate,
+    )
 }
 
 /// Configured launch resolves the public descriptor ABI before backend handles.

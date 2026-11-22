@@ -1,3 +1,4 @@
+use ginux_allocator::guarded_mapping_geometry;
 use ginux_contract::{
     resource_selector_matches, selector_matches, validate_resource_selector, validate_selector,
     AuditBudget,
@@ -80,7 +81,7 @@ fn corpus(target: &str) -> Option<&'static [u8]> {
         "kernel-path" => Some(PATH_SEED),
         "device" => Some(DEVICE_SEED),
         "archive" => Some(ARCHIVE_SEED),
-        "syscall" | "audit" => Some(&[0; 32]),
+        "syscall" | "audit" | "allocator" => Some(&[0; 32]),
         _ => None,
     }
 }
@@ -181,6 +182,23 @@ fn run_target(target: &str, input: &[u8]) {
                 let _ = budget.admit();
             }
             let _ = (budget.emitted(), budget.dropped());
+        }
+        "allocator" => {
+            let values = words(input);
+            let alignment = 1usize
+                .checked_shl((values[1] % usize::BITS as u64) as u32)
+                .unwrap_or(0);
+            let page = 1usize
+                .checked_shl((values[2] % usize::BITS as u64) as u32)
+                .unwrap_or(0);
+            if let Some((requested, data, mapping)) =
+                guarded_mapping_geometry(values[0] as usize, alignment, page)
+            {
+                assert!(requested >= 1);
+                assert!(data >= requested);
+                assert!(mapping >= data);
+                assert_eq!(data % page, 0);
+            }
         }
         _ => unreachable!(),
     }

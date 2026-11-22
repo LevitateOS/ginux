@@ -82,6 +82,36 @@ pub const fn is_shared_network_syscall(syscall: u64) -> bool {
     matches!(syscall, 41..=55 | 288 | 299 | 307)
 }
 
+/// Locate a completed, validated loopback netlink request without changing
+/// the kernel's acknowledgement payload. Both success (`0`) and failure
+/// (negative errno) retire the matching sequence.
+pub fn loopback_netlink_ack_index(payload: &[u8], sequences: &[u32]) -> Result<Option<usize>, i64> {
+    let mut offset = 0usize;
+    while offset + 16 <= payload.len() {
+        let message_length =
+            u32::from_ne_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        if message_length < 16 || offset + message_length > payload.len() {
+            return Err(-22);
+        }
+        let kind = u16::from_ne_bytes(payload[offset + 4..offset + 6].try_into().unwrap());
+        if kind == 2 && message_length >= 20 {
+            let acknowledgement =
+                i32::from_ne_bytes(payload[offset + 16..offset + 20].try_into().unwrap());
+            let sequence = u32::from_ne_bytes(payload[offset + 8..offset + 12].try_into().unwrap());
+            if acknowledgement <= 0 {
+                if let Some(index) = sequences
+                    .iter()
+                    .position(|candidate| *candidate == sequence)
+                {
+                    return Ok(Some(index));
+                }
+            }
+        }
+        offset = offset.checked_add((message_length + 3) & !3).ok_or(-22)?;
+    }
+    Ok(None)
+}
+
 pub const fn decide_systemd(syscall: u64, shared_network: bool) -> Decision {
     if shared_network && is_shared_network_syscall(syscall) {
         return Decision {
@@ -90,6 +120,7 @@ pub const fn decide_systemd(syscall: u64, shared_network: bool) -> Decision {
         };
     }
     let action = match syscall {
+        162 | 306 => Action::Deny(1),
         63 | 92 | 93 | 94 | 109 | 112 | 121 | 124 | 153 | 165 | 166 | 260 | SYS_GETPRIORITY
         | SYS_SETPRIORITY | SYS_GETTID | SYS_SETUID | SYS_SETGID | SYS_SETREUID | SYS_SETREGID
         | SYS_SETGROUPS | SYS_SETRESUID | SYS_SETRESGID | SYS_REBOOT => Action::Emulate,
@@ -165,7 +196,6 @@ pub const fn decide_systemd(syscall: u64, shared_network: bool) -> Decision {
         | 292
         | 293
         | 294
-        | 306
         | 317
         | SYS_MEMFD_CREATE
         | SYS_PIDFD_SEND_SIGNAL
@@ -1060,6 +1090,44 @@ pub const fn local_socket_readiness(
 mod tests {
     use super::*;
 
+    fn netlink_ack(sequence: u32, acknowledgement: i32) -> [u8; 20] {
+        let mut message = [0u8; 20];
+        message[0..4].copy_from_slice(&20u32.to_ne_bytes());
+        message[4..6].copy_from_slice(&2u16.to_ne_bytes());
+        message[8..12].copy_from_slice(&sequence.to_ne_bytes());
+        message[16..20].copy_from_slice(&acknowledgement.to_ne_bytes());
+        message
+    }
+
+    #[test]
+    fn loopback_ack_retires_success_without_mutating_payload() {
+        let message = netlink_ack(41, 0);
+        let original = message;
+        assert_eq!(loopback_netlink_ack_index(&message, &[40, 41]), Ok(Some(1)));
+        assert_eq!(message, original);
+    }
+
+    #[test]
+    fn loopback_ack_retires_failure_without_rewriting_errno() {
+        let message = netlink_ack(41, -1);
+        let original = message;
+        assert_eq!(loopback_netlink_ack_index(&message, &[40, 41]), Ok(Some(1)));
+        assert_eq!(i32::from_ne_bytes(message[16..20].try_into().unwrap()), -1);
+        assert_eq!(message, original);
+    }
+
+    #[test]
+    fn loopback_ack_ignores_untracked_or_non_ack_messages() {
+        assert_eq!(
+            loopback_netlink_ack_index(&netlink_ack(42, -1), &[41]),
+            Ok(None)
+        );
+        assert_eq!(
+            loopback_netlink_ack_index(&netlink_ack(41, 1), &[41]),
+            Ok(None)
+        );
+    }
+
     #[test]
     fn local_socket_pair_admits_only_unnamed_unix_streams_and_packets() {
         let stream = local_socket_pair(1, 1 | 0o2000000, 0).unwrap();
@@ -1935,6 +2003,8 @@ mod tests {
         assert_eq!(systemd_surface(260, true), BalancedSurface::InstanceWrite);
         assert_eq!(systemd_surface(280, true), BalancedSurface::InstanceWrite);
         assert_eq!(systemd_surface(306, true), BalancedSurface::InstanceWrite);
+        assert_eq!(decide_systemd(162, true).action, Action::Deny(1));
+        assert_eq!(decide_systemd(306, true).action, Action::Deny(1));
         assert_eq!(systemd_surface(79, true), BalancedSurface::Task);
         assert_eq!(systemd_surface(81, true), BalancedSurface::Task);
         assert_eq!(systemd_surface(190, true), BalancedSurface::InstanceWrite);

@@ -1,8 +1,116 @@
 # Ginux HDAE Status
 
+## Approved future gate records
+
+- On 2026-11-14 the human requested Gate 43 to require no more than 5%
+  guarded-allocator overhead and a full profiling and test matrix. The gate is
+  recorded as a separate follow-up dependent on acceptance and merge of Gate
+  42 and pull request 292. Its implementation map awaits human confirmation;
+  no default-allocator change is authorized.
+
+- On 2026-11-14 the human authorized Gates 32 through 42 as one autonomous
+  execution batch on `hdae/security-allocator-initiative`, delivered through one
+  combined pull request. Gates 32 through 37 remain strictly defensive and
+  exclude exploit development. Gate 38 may select the allocator architecture
+  from its evidence and continue through Gates 39 through 42. All gates remain
+  open for one final human testing and acceptance checkpoint.
+
+- On 2026-11-14 the human approved persisting Gates 32 through 37 for a strictly
+  defensive review of the project-owned Ginux codebase. The work excludes
+  exploit development, payload construction, offensive validation, and external
+  targets. Each gate remains an explicit human checkpoint and is not authorized
+  for implementation merely by being recorded.
+- Gates 38 through 42 record a conditional challoc-like allocator initiative.
+  Gate 38 must first compare support for upstream challoc with an independent or
+  Ginux-aware allocator and obtain a human architecture decision. Gates 39
+  through 42 may not begin unless that decision explicitly authorizes them.
+- This batch authorization permits implementation, signed commits, pushing the
+  dedicated branch, and opening the combined pull request. It does not authorize
+  merging or closing that pull request or pushing implementation to `main`.
+
 ## Current checkpoint
 
-### Active implementation: Gate 26 Rocky Linux RPM packaging
+### Gates 32-42 security and allocator batch
+
+- Gates 32 through 42 are technically passed on
+  `hdae/security-allocator-initiative` and remain in `gates-todo/` for the
+  authorized final human testing and acceptance checkpoint.
+- The defensive review inventoried trusted seams, closed ten sanitized findings,
+  added structural drift checks, and found no unresolved in-scope high- or
+  critical-impact issue. This is a bounded project-owned review, not an
+  independent audit or production-readiness claim.
+- The selected allocator is an opt-in, independent Rust shared library with the
+  standard C ABI and a bounded common jemalloc subset. It is packaged at
+  `/usr/lib64/ginux/libginux_allocator.so` and remains subject to the ordinary
+  instance contract.
+- The supported allocator claim is glibc x86-64 on the tested Rocky 10 and
+  Ubuntu 24 workloads. Alpine remains a supported Ginux runtime, but its musl
+  userspace is excluded from the allocator preload claim.
+- Exact-commit Rocky QEMU/TCG means for the Ginux allocator are 0.680x native at
+  one thread, 0.665x at two, and 0.573x at four. Raw samples, variance, RSS,
+  fragmentation proxy, and provenance are retained under
+  `benchmarks/allocator/`.
+- Final evidence passes `make check`, aggregate `make test`,
+  `make test-security test-recovery`, `make test-multi-instance`,
+  `make test-allocator-rocky`, and `make test-rpm-metadata test-rpm`.
+- Exact-head review blockers are repaired: allocator capacity is charged once
+  and rolled back on failed initialization, full-arena fallback recovers after
+  free, and the exported jemalloc subset now has class-consistent size,
+  alignment, zero-growth, and unsupported-flag behavior. Current `main` is
+  merged and its expected abstract-Unix boundary audit is covered by a narrow
+  positive/negative console regression.
+- GitHub Actions `changes`, `launch-integration`, and `static-and-unit` passed
+  on repaired code head `a0c5b3bf` after platform-specific allocator-test
+  serialization and unsupported-socket fixture alignment.
+- Combined delivery pull request:
+  https://github.com/gmkurtzer/ginux/pull/292
+- Active skill: `hdae-development`
+- Skill path: `.agents/skills/hdae-development/SKILL.md`
+- Reload after context shift: required
+- Exact next action: stop for human testing and explicit acceptance of pull
+  request https://github.com/gmkurtzer/ginux/pull/292.
+
+### Prior checkpoint: Gate 31 filesystem mediation foundation
+
+- Gate 31 was merged through pull request 291 and is now part of the base for
+  the Gates 32-42 batch.
+- The gate establishes complete filesystem call context, operation ownership,
+  typed root/cwd/descriptor authority, and independent host-effect oracles
+  without making `fs_hooks` claim a syscall.
+- Issue #290 remains the umbrella source. Gate 31 does not close it or enable an
+  operation family.
+- The human selected normal Linux filesystem semantics inside the instance with
+  an invariant that paths, descriptors, procfs references, races, and lifecycle
+  transitions cannot escape or reconnect outside the instance. Unsupported
+  capabilities must fail explicitly.
+- The current implementation, generated ownership inventory, route interlocks,
+  tripwire/race/mutation tests, and initial security review are present. The
+  filesystem lane still claims no syscall and adds no intended filesystem host
+  effect.
+- Exact-head repair makes every future claimed filesystem operation return a
+  handled result or explicit denial, checks inventory equality against an
+  independently pinned x86-64 ABI set, and proves the host-effect oracle detects
+  injected protected read, write, metadata, handle, and transient effects.
+- Generic non-IP host sends are removed. Systemd receives only explicit bounded
+  loopback netlink handling and instance-root pathname Unix sockets; arbitrary
+  netlink and abstract-Unix sends fail before host effect.
+- `make check`, `make test-unit`, focused native supervision, aggregate
+  `make test`, `make test-security`, `make test-rpm`, and the complete
+  `make test-systemd` matrix pass.
+- An installed-RPM reproduction also exposed persisted contract metadata from
+  an older catalog revision. The instance was repaired explicitly by
+  recompiling its unchanged recipe; silent contract migration remains
+  prohibited because a catalog change can alter wildcard meaning. Package
+  upgrade/migration coverage is a recorded follow-up, not a weakened startup
+  check.
+- A clean committed-source RPM build now passes metadata validation, DNF
+  install, `rpm -V`, packaged Alpine start/stop, packaged Rocky systemd boot to
+  its login prompt, offline cached reuse, reinstall, erase/reinstall, and
+  persistent instance-state checks.
+- Pull request https://github.com/gmkurtzer/ginux/pull/291 contains the repaired
+  bounded implementation and references but does not close issue #290.
+
+### Prior checkpoint: Gate 26 Rocky Linux RPM packaging
 
 - Gate 26 is technically passed locally on `hdae/rpm-packaging` and remains a
   human checkpoint in `gates-todo/`.
@@ -254,6 +362,25 @@ scope, threat model, and invariants.
 
 ## Resumption
 
+### Current resumable checkpoint
+
+- Active batch: Gates 32-42, technically passed and delivered in pull request
+  https://github.com/gmkurtzer/ginux/pull/292, awaiting final human testing.
+- Working branch: `hdae/security-allocator-initiative`; intended base:
+  `main`.
+- Latest implementation commits: `de194940` repairs allocator capacity and
+  jemalloc semantics; `b6ba0d81` adds the narrow merged-main recovery audit
+  regression; `a0c5b3bf` stabilizes parallel allocator assertions and aligns
+  the native fixture with current-main socket denial. Merge commit `6a660c0a`
+  integrates current `main`.
+- Open limitations: upstream challoc has no valid Rocky 10 binary control;
+  Alpine/musl is outside the allocator preload claim; formal assurance is
+  bounded to named model/property/fuzz evidence; the host kernel and loader
+  remain trusted.
+- Exact next action: stop for human testing and acceptance of pull request 292.
+
+### Historical checkpoints
+
 - Active skill: `hdae-development`
 - Skill path: `.agents/skills/hdae-development/SKILL.md`
 - Reload after context shift: required
@@ -362,6 +489,32 @@ scope, threat model, and invariants.
   option, and the direct-safe catalog remains independently bounded.
 
 ## Evidence
+
+### Gates 32-42 final evidence
+
+- `make check` -> formatting, strict lint, security inventory, and ten-finding
+  ledger passed.
+- `make test` -> complete component and isolated QEMU regression aggregate passed.
+- `make test-security test-recovery` -> nine bounded fuzz targets, native
+  boundary, contract, device, kernel-view, systemd recovery, and fail-closed
+  lifecycle checks passed.
+- `make test-multi-instance` -> concurrent Rocky systemd instances, isolated
+  roots/views/contracts/lifecycle, and documented shared networking passed.
+- `make test-allocator-rocky` -> C ABI conformance and 45 exact-commit matched
+  native/jemalloc/Ginux samples passed.
+- `make test-rpm-metadata test-rpm` -> offline build, zero rpmlint errors,
+  clean install, verify, Rocky/Ubuntu allocator loading, Alpine runtime, offline
+  cache reuse, reinstall, erase, retained state, and recovery passed.
+- Post-review rerun on the merged exact head: `make test-allocator-rocky`,
+  `make test-rpm-metadata test-rpm`, aggregate `make test`, `make
+  test-recovery`, and `make test-multi-instance` all passed. The focused
+  `make test-systemd-console-audit` regression accepted only the exact
+  intentional abstract-Unix denial record and rejected malformed or ordinary
+  unsupported diagnostics.
+- GitHub Actions run `44432531264` -> `changes`, `launch-integration`, and
+  `static-and-unit` all passed on code head `a0c5b3bf`.
+
+### Historical evidence
 
 - Repository inspection before establishment: clean `main` branch with no
   pre-existing root `hdae/` project ledger.
@@ -621,6 +774,22 @@ scope, threat model, and invariants.
   after the final interactive workflow and evidence review.
 
 ## Open decisions and limitations
+
+### Gates 32-42 limitations
+
+- No in-scope high- or critical-impact finding remains from the bounded review;
+  this is not independent certification and does not establish absence of defects.
+- Upstream challoc is an architecture control only. Its tested glibc baseline is
+  newer than Rocky 10, so no unsupported or misleading challoc binary row is
+  reported.
+- The packaged allocator is glibc x86-64 and opt-in. Alpine/musl allocator
+  preload is unsupported even though Alpine remains a supported Ginux runtime.
+- The allocator benchmark is one bounded replacement-allocation workload under
+  QEMU/TCG. It does not support a universal performance claim.
+- The formal-assurance substitute covers named pure invariants, controlled
+  fuzzing, and end-to-end tests; it is not a whole-runtime proof.
+
+### Historical limitations
 
 - Human direction selected the security-focused handcrafted x86-64 interpreter
   for Gate 3 and accepted its evidence. On 2026-11-03 the human selected native

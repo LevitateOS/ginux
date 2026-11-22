@@ -3,7 +3,7 @@
 use core::fmt;
 
 pub const CATALOG_VERSION: u32 = 2;
-pub const MAX_OPERATIONS: usize = 215;
+pub const MAX_OPERATIONS: usize = 216;
 pub const DIGEST_HEX_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1249,6 +1249,14 @@ pub static CATALOG: &[Operation] = &[
         "test-systemd"
     ),
     syscall!(
+        "sync",
+        162,
+        Complete,
+        Action::Deny(1),
+        "host-global filesystem writeback is prohibited",
+        "contract-deny-negative"
+    ),
+    syscall!(
         "mount",
         165,
         Partial,
@@ -1644,9 +1652,9 @@ pub static CATALOG: &[Operation] = &[
         "syncfs",
         306,
         Complete,
-        Action::Mediate,
-        "instance descriptor",
-        "test-systemd"
+        Action::Deny(1),
+        "host-global superblock writeback is prohibited",
+        "contract-deny-negative"
     ),
     syscall!(
         "sendmmsg",
@@ -2823,6 +2831,15 @@ mod tests {
                 .action,
             Action::Deny(1)
         );
+    }
+
+    #[test]
+    fn host_global_sync_is_deliberately_denied() {
+        let contract = resolve(b"gate9-systemd-v1", &[], &[b"syscall.*"], &[]).unwrap();
+        for number in [162, 306] {
+            let rule = contract.runtime_rule(number, None).unwrap();
+            assert_eq!(rule.action, Action::Deny(1), "syscall {number}");
+        }
     }
 
     #[test]
