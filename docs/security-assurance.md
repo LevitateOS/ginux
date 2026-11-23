@@ -46,6 +46,7 @@ boundary; the inventory checker rejects drift in these installed paths.
 | Foreground start and outcome | Caller PID plus process start time; runtime-written outcome record in the root-only run directory | Helper validates the record's exact shape before trusting it; caller death or a relayed signal tears the instance down | Helper supervisor and `ginux-runtime` result writer (exclusive create after the workload is gone) |
 | Instance delete | Validated name under the per-instance lock; supervisor and runtime identities both stopped | Helper refuses a running instance, then renames the instance into a root-only trash directory in one `rename(2)` | Helper removal that does not follow links or cross mounts |
 | Instance extract | Requested absolute directories of a stopped instance and caller-supplied bounds | `ginux-image export-tree` drops to the workload identity and resolves every component beneath the root without symbolic links, magic links or mount crossings | `ginux-image`; the CLI publishes the archive with an unnamed file and one link, so failure leaves nothing |
+| Instance inject | Caller-read tar archive streamed on standard input, one requested absolute directory of a stopped instance and caller-supplied bounds | `ginux-image` validates every member and resolves every component beneath the root without symbolic links, magic links or mount crossings; the CLI refuses non-regular and compressed inputs before any privileged call | `ginux-image`; not atomic, so a failed injection leaves the instance to be deleted |
 | Image import | Caller-read OCI layout streamed as a tar archive; only layout paths with hexadecimal blob names | `ginux-image import-layout` verifies every blob digest and size, the manifest, configuration and platform before commit | `ginux-image` cache commit in layer, configuration, manifest order |
 | Allocator memory operation | Checked size/alignment and instance-visible memory limit | Allocator ownership bitmap and checked reservation | Ordinary workload `mmap`, `mprotect`, `madvise`, and `munmap`, still mediated by Ginux |
 
@@ -95,6 +96,7 @@ The approved unsafe/FFI/assembly owners are:
 | `ginux-allocator/src/lib.rs` | C ABI exports, raw allocation pointers, atomics, and Linux virtual-memory calls |
 | `ginux-cli/src/wait.rs` and `ginux-cli/src/sys.rs` | Signal masking, `sigwait` and signal relay for a foreground start; `O_TMPFILE` and `linkat` publication of an extracted archive |
 | `ginux-oci/src/export.rs` | `openat2` beneath-root resolution, `fstatat`, `readlinkat`, directory streams, and the identity drop of the tree exporter |
+| `ginux-oci/src/inject.rs` | `mkdirat`, `fchmod`, `futimens`, `symlinkat` and `utimensat` called directly; `openat2` beneath-root resolution and creation, `fstat` and the identity drop of the tree injector through the wrappers shared with `export.rs` |
 | `ginux-init/src/native_result.rs` | Exclusive creation and write of the outcome record at the runtime's single normal exit |
 | `baseline-runner` and `process-native-fixture` | Test/benchmark-only raw syscall fixtures; not installed runtime components |
 

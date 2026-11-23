@@ -28,8 +28,8 @@ the helper or runtime public.
 The following inventory records are machine-checked against generated public
 help and the private dispatch tables:
 
-<!-- cli-inventory:public attach create delete edit explain export extract help import import-image inspect list lock set start status stop unlock validate -->
-<!-- cli-inventory:helper attach authorize-attach create delete export extract import import-image list lock prepare-root resize resolve-network run-runtime set start status stop supervise unlock -->
+<!-- cli-inventory:public attach create delete edit explain export extract help import import-image inject inspect list lock set start status stop unlock validate -->
+<!-- cli-inventory:helper attach authorize-attach create delete export extract import import-image inject list lock prepare-root resize resolve-network run-runtime set start status stop supervise unlock -->
 <!-- cli-inventory:runtime config config-merge device-bench devices hook-plan instance instance-diff instance-explain instance-inspect instance-plan instance-validate kernel-views launch lifecycle native native-hook process process-native runtime vfs -->
 
 ## Current public command inventory
@@ -277,6 +277,8 @@ ginux status NAME [--format text|json]
 ginux extract NAME --output FILE [--max-bytes N] [--max-members N]
                   [--max-path N] PATH...
 ginux delete NAME
+ginux inject NAME --input FILE --into PATH [--max-bytes N] [--max-members N]
+                  [--max-path N]
 ginux import-image PATH
 ```
 
@@ -286,6 +288,7 @@ ginux import-image PATH
 | `status --format json` | One JSON object on one line; `text` (the default) is the existing output | Inspect instances |
 | `extract` | Writes named absolute directories of a stopped instance as one tar archive to a new `FILE` | Inspect instances |
 | `delete` | Removes a stopped instance and all of its state | Configure instances |
+| `inject` | Unpacks an uncompressed tar archive into one directory of a stopped instance; prints nothing | Configure instances |
 | `import-image` | Adds an OCI image layout (directory or uncompressed tar of one) to the image cache; prints the manifest digest | Manage images |
 | `--state-root`, `--run-root` | Global options; select another persistent and transient state root | all commands |
 
@@ -301,11 +304,50 @@ Parse rules (violations exit 2 before any sudo call):
   `--output` is required. Bounds are positive decimal integers; defaults are
   `--max-bytes 68719476736` (64 GiB), `--max-members 1000000` and
   `--max-path 4096`. The directory depth bound is fixed at 256.
+- `inject` takes `--input FILE` and `--into PATH`, both required. `--into` is
+  one absolute directory path inside the instance (`/` allowed) with no empty,
+  `.` or `..` component, no NUL and no more than `--max-path` bytes. Bounds are
+  positive decimal integers with the same defaults as `extract`. `FILE` is read
+  with the caller's own rights and must be a regular file: a symbolic link
+  (also as the final component), directory, FIFO, socket or device exits 65
+  before sudo, a missing file exits 66 and a gzip-compressed archive exits 65.
+  The archive is streamed unchanged to the helper's standard input; members
+  are validated by the image tool, not by the CLI. The privileged helper never
+  opens `FILE`.
 - `import-image` reads `PATH` with the caller's own rights. A directory may
   contain only `oci-layout`, `index.json`, `blobs/`, `blobs/sha256/` and
   regular files named `blobs/sha256/<64 lowercase hex>`; anything else,
   including a symbolic link, exits 65 before sudo. A gzip-compressed archive
   exits 65. The privileged helper never opens `PATH`.
+
+### `inject`
+
+`ginux inject NAME --input FILE --into PATH` unpacks the archive `FILE` into
+the directory `PATH` of the instance `NAME`. It prints nothing on success and
+writes one `ginux: inject: ...` diagnostic to standard error on failure.
+
+- State requirement: the instance must be stopped. A running instance exits
+  73 and nothing is changed.
+- The CLI sends the archive to the helper's standard input; the image tool
+  validates every member (types, names, modes, bounds) and writes beneath the
+  instance root without following links. Member types and names the image
+  tool refuses, and a `PATH` that exists but is not a directory, are reported
+  with the exit codes below. `inject` creates `PATH` and any missing parents
+  inside the instance root; it does not require them to exist.
+- Existing directories are left untouched: their mode and modification time do
+  not change. Only directories the command creates get the mode and
+  modification time recorded in the archive.
+- Member names must be relative and must not start with `./`. After the
+  end-of-archive marker, any remaining data must be all zero bytes; anything
+  else exits 65.
+- The memory used to hold member names is bounded: a hostile archive of many
+  long names exits 76.
+- Before the first write the image tool probes `openat2`; a kernel without it
+  exits 69 and nothing is changed.
+- Not atomic: the archive is applied member by member. After any failure
+  other than a refusal before the first write (usage, 66, 69, 73), the
+  instance may hold part of the archive; delete the instance and create it
+  again rather than starting it.
 
 ### Helper protocol additions
 
@@ -313,6 +355,7 @@ Parse rules (violations exit 2 before any sudo call):
 ginux-helper --protocol 1 [--state-root DIR --run-root DIR] VERB ARG...
   delete NAME
   extract NAME --max-bytes N --max-members N --max-path N PATH...   (tar on stdout)
+  inject NAME --max-bytes N --max-members N --max-path N PATH       (tar on stdin)
   import-image                                                      (tar on stdin, digest on stdout)
   start NAME [--audit] --wait CALLER_PID CALLER_START
   status NAME --format json
@@ -321,11 +364,11 @@ ginux-helper --protocol 1 [--state-root DIR --run-root DIR] VERB ARG...
 The CLI forwards the roots after `--protocol 1` in every helper call,
 including the unprivileged attach transport and both halves of `edit`, and
 forwards nothing when no root option is given. It always sends the three
-`extract` bounds. An older helper rejects each addition with usage status 64
+`extract` and `inject` bounds, in that order. An older helper rejects each addition with usage status 64
 before any state change. When a state or run root is passed, every verb
 (including the privileged halves of `edit` and `attach`) maps a helper exit 64
 without a root refusal to `ginux: the installed helper does not support
---state-root` and exit 69. Without roots, `delete`, `extract`, `import-image`
+--state-root` and exit 69. Without roots, `delete`, `extract`, `inject`, `import-image`
 and `status --format json` map a 64 to `ginux: the installed helper does not
 support FEATURE` and exit 69. A current helper also exits 64 when it refuses a
 root (`untrusted state root:` or `untrusted run root:` on its standard error,
@@ -345,14 +388,14 @@ terminal. Instance names must not start with `.`.
 | 0 | success | all |
 | 2 | parse error, no sudo call | all |
 | 64 | helper usage passed through: `start --wait`, or an untrusted state or run root | helper |
-| 65 | invalid state, invalid layout or digest, unsupported member type, path not a directory | delete, extract, import-image |
-| 66 | instance, extract path or import input not found | all |
-| 69 | unsupported: older helper (any verb when a root is passed, else `delete`, `extract`, `import-image`, `status --format json`), missing image tool, `openat2` unavailable | all |
+| 65 | invalid state, invalid layout or digest, unsupported member type, path not a directory; for `inject` also an invalid archive or a `FILE` that is not an uncompressed regular file | delete, extract, import-image, inject |
+| 66 | instance, extract path, `inject` input file or import input not found; for `inject`, also an instance whose root is missing (`PATH` itself is created, never reported missing) | all |
+| 69 | unsupported: older helper (any verb when a root is passed, else `delete`, `extract`, `inject`, `import-image`, `status --format json`), missing image tool, `openat2` unavailable | all |
 | 70 | internal failure; for `start --wait`, outcome `supervisor-error` | all |
-| 73 | instance running or already running | delete, extract, start |
-| 74 | output I/O error, including an existing `--output` file | extract, import-image |
-| 75 | member changed during export (retryable) | extract |
-| 76 | extract bound exceeded (bytes, members, path length, depth, link length) | extract |
+| 73 | instance running or already running | delete, extract, inject, start |
+| 74 | output I/O error, including an existing `--output` file; for `inject`, an input read or helper write error | extract, import-image, inject |
+| 75 | member changed during export (retryable); for `inject`, changed during injection | extract, inject |
+| 76 | extract or inject bound exceeded (bytes, members, path length, depth, link length) | extract, inject |
 | 0-255 | `start --wait` only: workload exit status, or 128+signal | start --wait |
 
 `start --wait` statuses overlap by nature; a caller disambiguates them with
@@ -397,7 +440,7 @@ written.
 |---|---|
 | `/run/ginux/instances/NAME/outcome` | Last outcome record, root 0600; removed by the next `start` and by `delete` |
 | `/run/ginux/instances/NAME/result.runtime` | Record written by the runtime, validated before it becomes `outcome` |
-| `/var/lib/ginux/work/instance.NAME.lock` | Per-instance lock taken by import, create, start, delete and extract |
+| `/var/lib/ginux/work/instance.NAME.lock` | Per-instance lock taken by import, create, start, delete, extract and inject |
 | `/var/lib/ginux/instances/.delete:*` | Trash of an interrupted delete; swept after one hour |
 | `/var/lib/ginux/cache/roots/sha256/HEX` | Pristine expansion reused by reflink copy, only on reflink-capable filesystems |
 

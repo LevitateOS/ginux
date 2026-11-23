@@ -79,7 +79,8 @@ assembled root is stored.
 
 `ginux delete NAME` removes a stopped instance completely: recipe, deployment
 state, root, logs and run state. `ginux import-image PATH` adds an OCI image
-layout to the blob cache without network access.
+layout to the blob cache without network access. `ginux inject NAME --input FILE
+--into PATH` unpacks a tar archive into a directory of a stopped instance.
 
 `ginux --state-root DIR [--run-root DIR]` keeps all of this under another
 root-owned directory instead (the run root defaults to `DIR/run`). Each

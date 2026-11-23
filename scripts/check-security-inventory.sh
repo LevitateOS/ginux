@@ -42,6 +42,7 @@ crates/ginux-init/src/storage_restore.rs
 crates/ginux-init/src/supervisor.rs
 crates/ginux-init/src/tracee_io.rs
 crates/ginux-oci/src/export.rs
+crates/ginux-oci/src/inject.rs
 crates/process-native-fixture/src/main.rs
 EOF
 
@@ -80,6 +81,7 @@ for route in \
     'Lifecycle stop/failure/recovery' \
     'Instance delete' \
     'Instance extract' \
+    'Instance inject' \
     'Image import' \
     'Foreground start and outcome' \
     'Allocator memory operation'

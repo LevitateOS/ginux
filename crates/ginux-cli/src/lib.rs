@@ -1,5 +1,6 @@
 mod extract;
 mod image;
+mod inject;
 mod sys;
 mod wait;
 
@@ -76,6 +77,8 @@ pub enum ConfigureCommand {
     Export(NameArgs),
     /// Delete a stopped instance and all of its state.
     Delete(NameArgs),
+    /// Unpack a tar archive into a directory of a stopped instance.
+    Inject(InjectArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -164,6 +167,27 @@ pub struct ExtractArgs {
     /// Absolute directory paths inside the instance.
     #[arg(required = true, value_name = "PATH", value_parser = extract::parse_instance_path)]
     pub paths: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct InjectArgs {
+    #[arg(value_parser = parse_name)]
+    pub name: String,
+    /// Uncompressed tar archive to unpack; read with the caller's own rights.
+    #[arg(long, value_name = "FILE")]
+    pub input: PathBuf,
+    /// Absolute directory path inside the instance to unpack into.
+    #[arg(long, value_name = "PATH", value_parser = extract::parse_instance_path)]
+    pub into: String,
+    /// Largest total size of regular-file contents.
+    #[arg(long, value_name = "N", value_parser = extract::parse_bound, default_value_t = extract::DEFAULT_MAX_BYTES)]
+    pub max_bytes: u64,
+    /// Largest number of archive members.
+    #[arg(long, value_name = "N", value_parser = extract::parse_bound, default_value_t = extract::DEFAULT_MAX_MEMBERS)]
+    pub max_members: u64,
+    /// Longest path, in bytes, of the target path or an archive member.
+    #[arg(long, value_name = "N", value_parser = extract::parse_bound, default_value_t = extract::DEFAULT_MAX_PATH)]
+    pub max_path: u64,
 }
 
 #[derive(Debug, Args)]
@@ -368,6 +392,9 @@ pub fn validate_cli(cli: &Cli) -> Result<(), String> {
         PublicCommand::InspectInstance(InspectInstanceCommand::Extract(args)) => {
             extract::check_path_lengths(&args.paths, args.max_path)
         }
+        PublicCommand::Configure(ConfigureCommand::Inject(args)) => {
+            extract::check_path_lengths(std::slice::from_ref(&args.into), args.max_path)
+        }
         _ => Ok(()),
     }
 }
@@ -401,6 +428,7 @@ pub fn run(cli: Cli) -> Result<i32, String> {
             command.arg(args.name);
             feature_helper_status(&mut command, "delete")
         }
+        PublicCommand::Configure(ConfigureCommand::Inject(args)) => inject_instance(helper, &args),
         PublicCommand::InspectInstance(InspectInstanceCommand::List) => {
             privileged_helper_status(helper, "list", std::iter::empty::<String>())
         }
@@ -688,6 +716,30 @@ fn extract_instance(helper: &Helper, args: ExtractArgs) -> Result<i32, String> {
     }
 }
 
+fn inject_instance(helper: &Helper, args: &InjectArgs) -> Result<i32, String> {
+    let file = match inject::open_input(&args.input) {
+        Ok(file) => file,
+        Err((code, message)) => {
+            print_error(&message);
+            return Ok(code);
+        }
+    };
+    let mut command = helper.helper_command(true, "inject");
+    command
+        .arg(&args.name)
+        .args(["--max-bytes", &args.max_bytes.to_string()])
+        .args(["--max-members", &args.max_members.to_string()])
+        .args(["--max-path", &args.max_path.to_string()])
+        .arg(&args.into);
+    match inject::run(&mut command, &file) {
+        (code, Some(message), _) => {
+            print_error(&message);
+            Ok(code)
+        }
+        (code, None, stderr) => Ok(feature_status(code, "inject", &stderr)),
+    }
+}
+
 fn import_image(helper: &Helper, path: &Path) -> Result<i32, String> {
     let input = match image::prepare(path) {
         Ok(input) => input,
@@ -955,6 +1007,7 @@ mod tests {
                 "edit",
                 "export",
                 "delete",
+                "inject",
                 "list",
                 "status",
                 "extract",
@@ -1332,6 +1385,146 @@ mod tests {
             "--max-path",
             "3",
             "/abcd",
+        ])
+        .unwrap();
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn inject_parses_with_default_bounds() {
+        let cli = parse(&[
+            "ginux", "inject", "rocky", "--input", "in.tar", "--into", "/work",
+        ])
+        .unwrap();
+        validate_cli(&cli).unwrap();
+        let PublicCommand::Configure(ConfigureCommand::Inject(args)) = cli.command else {
+            panic!("unexpected command")
+        };
+        assert_eq!(args.name, "rocky");
+        assert_eq!(args.input, PathBuf::from("in.tar"));
+        assert_eq!(args.into, "/work");
+        assert_eq!(args.max_bytes, 68_719_476_736);
+        assert_eq!(args.max_members, 1_000_000);
+        assert_eq!(args.max_path, 4096);
+        let cli = parse(&[
+            "ginux",
+            "inject",
+            "rocky",
+            "--into",
+            "/",
+            "--max-path",
+            "8",
+            "--max-members",
+            "2",
+            "--max-bytes",
+            "10",
+            "--input",
+            "-",
+        ])
+        .unwrap();
+        validate_cli(&cli).unwrap();
+        let PublicCommand::Configure(ConfigureCommand::Inject(args)) = cli.command else {
+            panic!("unexpected command")
+        };
+        assert_eq!(
+            (
+                args.max_bytes,
+                args.max_members,
+                args.max_path,
+                &args.into[..]
+            ),
+            (10, 2, 8, "/")
+        );
+    }
+
+    #[test]
+    fn invalid_inject_forms_are_rejected_before_any_helper_call() {
+        for arguments in [
+            &["ginux", "inject", "rocky", "--into", "/a"] as &[&str],
+            &["ginux", "inject", "rocky", "--input", "in.tar"],
+            &["ginux", "inject", "rocky", "--input", "i", "--into", "a"],
+            &["ginux", "inject", "rocky", "--input", "i", "--into", ""],
+            &[
+                "ginux", "inject", "rocky", "--input", "i", "--into", "/a/../b",
+            ],
+            &[
+                "ginux", "inject", "rocky", "--input", "i", "--into", "/a/./b",
+            ],
+            &["ginux", "inject", "rocky", "--input", "i", "--into", "/a/"],
+            &["ginux", "inject", "rocky", "--input", "i", "--into", "//a"],
+            &[
+                "ginux", "inject", "rocky", "--input", "i", "--into", "/a", "/b",
+            ],
+            &[
+                "ginux", "inject", "rocky", "--input", "i", "--into", "/a", "--into",
+            ],
+            &["ginux", "inject", "--input", "i", "--into", "/a"],
+            &[
+                "ginux", "inject", "bad/name", "--input", "i", "--into", "/a",
+            ],
+            &["ginux", "inject", ".hidden", "--input", "i", "--into", "/a"],
+            &["ginux", "inject", "a", "b", "--input", "i", "--into", "/a"],
+            &[
+                "ginux",
+                "inject",
+                "rocky",
+                "--input",
+                "i",
+                "--into",
+                "/a",
+                "--max-bytes",
+                "0",
+            ],
+            &[
+                "ginux",
+                "inject",
+                "rocky",
+                "--input",
+                "i",
+                "--into",
+                "/a",
+                "--max-members",
+                "0",
+            ],
+            &[
+                "ginux",
+                "inject",
+                "rocky",
+                "--input",
+                "i",
+                "--into",
+                "/a",
+                "--max-path",
+                "0",
+            ],
+            &[
+                "ginux",
+                "inject",
+                "rocky",
+                "--input",
+                "i",
+                "--into",
+                "/a",
+                "--max-path",
+                "-1",
+            ],
+        ] {
+            assert_eq!(
+                parse(arguments).unwrap_err().exit_code(),
+                2,
+                "{arguments:?}"
+            );
+        }
+        let cli = parse(&[
+            "ginux",
+            "inject",
+            "rocky",
+            "--input",
+            "i",
+            "--into",
+            "/abcd",
+            "--max-path",
+            "4",
         ])
         .unwrap();
         assert!(validate_cli(&cli).is_err());

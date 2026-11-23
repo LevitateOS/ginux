@@ -15,7 +15,7 @@ trap cleanup 0 HUP INT TERM
 
 "$cli" --help >"$test_directory/help"
 "$cli" --version | grep -Eq '^ginux [0-9]+\.[0-9]+\.[0-9]+'
-for command in create import set edit export delete list status extract start attach stop lock unlock import-image validate inspect explain; do
+for command in create import set edit export delete inject list status extract start attach stop lock unlock import-image validate inspect explain; do
     grep -Eq "^  $command[[:space:]]" "$test_directory/help"
     "$cli" "$command" --help >"$test_directory/help-$command"
     test -s "$test_directory/help-$command"
@@ -52,6 +52,15 @@ for invocation in \
     'extract rocky --output out.tar --max-bytes 0 /out' \
     'extract rocky --output out.tar --max-path 3 /out' \
     'import-image' \
+    'inject rocky --into /work' \
+    'inject rocky --input in.tar' \
+    'inject rocky --input in.tar --into work' \
+    'inject rocky --input in.tar --into /a/../b' \
+    'inject rocky --input in.tar --into /a/' \
+    'inject rocky --input in.tar --into /work --max-bytes 0' \
+    'inject rocky --input in.tar --into /work --max-members 0' \
+    'inject rocky --input in.tar --into /work --max-path 3' \
+    'inject bad/name --input in.tar --into /work' \
     '--run-root /run/ginux-a list' \
     '--state-root relative list' \
     '--state-root /var/lib/../tmp list' \
@@ -282,6 +291,73 @@ GINUX_TEST_SUDO_STDIN="$test_directory/layout.tar" \
 status=$?
 set -e
 test "$status" -eq 65
+test ! -e "$test_directory/helper-args"
+
+# inject: the caller's file is read locally and its bytes reach the helper's
+# standard input unchanged; the three bounds are always sent.
+cat >"$test_directory/bin/sudo" <<'SCRIPT'
+#!/bin/sh
+printf '%s\n' "$@" >"$GINUX_TEST_HELPER_ARGS"
+cat >"$GINUX_TEST_SUDO_STDIN"
+exit "${GINUX_TEST_SUDO_STATUS:-0}"
+SCRIPT
+chmod 755 "$test_directory/bin/sudo"
+head -c 100000 /dev/urandom >"$test_directory/inject.tar"
+GINUX_TEST_SUDO_STDIN="$test_directory/inject.received" \
+    fake inject rocky --input "$test_directory/inject.tar" --into /work/sub \
+    >"$test_directory/inject.out"
+expect_args inject rocky --max-bytes 68719476736 --max-members 1000000 \
+    --max-path 4096 /work/sub
+cmp "$test_directory/inject.tar" "$test_directory/inject.received"
+test ! -s "$test_directory/inject.out"
+GINUX_TEST_SUDO_STDIN="$test_directory/inject.received" \
+    fake --state-root /var/lib/ginux-a inject rocky \
+    --input "$test_directory/inject.tar" --into / --max-bytes 9 \
+    --max-members 8 --max-path 7
+expect_args --state-root /var/lib/ginux-a --run-root /var/lib/ginux-a/run \
+    inject rocky --max-bytes 9 --max-members 8 --max-path 7 /
+cmp "$test_directory/inject.tar" "$test_directory/inject.received"
+for helper_status in 65 66 73 74 75 76; do
+    set +e
+    GINUX_TEST_SUDO_STATUS=$helper_status \
+    GINUX_TEST_SUDO_STDIN="$test_directory/inject.received" \
+        fake inject rocky --input "$test_directory/inject.tar" --into /work \
+        2>/dev/null
+    status=$?
+    set -e
+    test "$status" -eq "$helper_status"
+done
+set +e
+GINUX_TEST_SUDO_STATUS=64 \
+GINUX_TEST_SUDO_STDIN="$test_directory/inject.received" \
+    fake inject rocky --input "$test_directory/inject.tar" --into /work \
+    2>"$test_directory/inject-old.err"
+status=$?
+set -e
+test "$status" -eq 69
+grep -Fq 'the installed helper does not support inject' "$test_directory/inject-old.err"
+# Inputs that are not an uncompressed regular file never reach sudo.
+rm -f "$test_directory/helper-args"
+ln -s inject.tar "$test_directory/inject-link.tar"
+mkdir "$test_directory/inject-directory"
+mkfifo "$test_directory/inject-fifo"
+printf '\037\213\010\000' >"$test_directory/inject.tar.gz"
+for rejected in inject-link.tar inject-directory inject-fifo inject.tar.gz; do
+    set +e
+    GINUX_TEST_SUDO_STDIN="$test_directory/inject.received" \
+        fake inject rocky --input "$test_directory/$rejected" --into /work \
+        2>/dev/null
+    status=$?
+    set -e
+    test "$status" -eq 65
+    test ! -e "$test_directory/helper-args"
+done
+set +e
+GINUX_TEST_SUDO_STDIN="$test_directory/inject.received" \
+    fake inject rocky --input "$test_directory/absent.tar" --into /work 2>/dev/null
+status=$?
+set -e
+test "$status" -eq 66
 test ! -e "$test_directory/helper-args"
 
 set +e

@@ -288,11 +288,16 @@ ginux import-image ./layout             # prints sha256:<manifest digest>
 ginux start job --wait                  # exits with the workload's status
 ginux status job --format json          # one JSON line, including the outcome
 ginux extract job --output out.tar /out # stopped instance only; all or nothing
+ginux inject job --input in.tar --into /in # stopped instance only; not atomic
 ginux delete job
 ```
 
 `import-image` adds an OCI image layout to the cache without network access;
-a recipe can then name it as any `REGISTRY/REPO@sha256:<digest>`. `start --wait`
+a recipe can then name it as any `REGISTRY/REPO@sha256:<digest>`. `inject`
+unpacks an uncompressed tar archive, read with your own rights, into one
+directory of a stopped instance; it is not atomic, so delete the instance
+after a failed injection. It creates `PATH` and any missing parents, leaves existing
+directories untouched, and accepts only relative member names. `start --wait`
 stays in the foreground, prints nothing on stdout, and stops the instance when
 the command is interrupted or killed. Global `--state-root DIR` and
 `--run-root DIR` options keep all state under a separate root-owned directory.
