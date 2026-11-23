@@ -1691,6 +1691,54 @@ extract_instance() {
     exit "$extract_status"
 }
 
+inject_instance() {
+    test "$#" -eq 8 || usage
+    name=$1
+    test "$2" = --max-bytes && test "$4" = --max-members && test "$6" = --max-path || usage
+    inject_max_bytes=$3
+    inject_max_members=$5
+    inject_max_path=$7
+    inject_path=$8
+    for inject_bound in "$inject_max_bytes" "$inject_max_members" "$inject_max_path"; do
+        case $inject_bound in
+            ''|0*|*[!0-9]*) usage ;;
+        esac
+    done
+    case $inject_path in
+        /*) ;;
+        *) usage ;;
+    esac
+    validate_name "$name"
+    lock_instance "$name"
+    directory=$(instance_dir "$name")
+    test -d "$directory" || {
+        drop_instance_lock
+        printf '%s: not found\n' "$name" >&2
+        exit 66
+    }
+    if supervisor_identity "$name" >/dev/null || runtime_identity "$name" >/dev/null; then
+        printf '%s: stop the instance before injecting into it\n' "$name" >&2
+        exit 73
+    fi
+    if test ! -x "$image_tool" || test -d "$image_tool"; then
+        printf '%s\n' 'inject requires the compiled Ginux image tool' >&2
+        exit 69
+    fi
+    # The injector replaces this shell and inherits the lock (descriptor 6 is
+    # not close-on-exec), so the lock lives exactly as long as the injector:
+    # if this shell is killed first, the injector still holds it and start,
+    # delete and import keep waiting instead of racing its writes. It has no
+    # timeout: a stalled injector (any process that can signal uid 65534 can
+    # stop it) holds the lock, and start, delete and create of this instance
+    # wait until the injector continues or is killed. The injector's exit
+    # status is the helper's. Nothing runs after it, and this function sets no
+    # trap, so there is no cleanup to keep.
+    # Injection is not atomic: a failure can leave part of the archive in the
+    # instance root, so the caller discards the instance after a failure.
+    exec "$image_tool" inject-tree "$directory/root" \
+        "$inject_max_bytes" "$inject_max_members" "$inject_max_path" "$inject_path"
+}
+
 import_image() {
     test "$#" -eq 0 || usage
     if test ! -x "$image_tool" || test -d "$image_tool"; then
@@ -1726,7 +1774,7 @@ shift
 if test "$root_options" = true; then
     # Reject an unknown verb before creating anything.
     case $command in
-        attach|authorize-attach|create|delete|export|extract|import|import-image|list|lock|\
+        attach|authorize-attach|create|delete|export|extract|import|import-image|inject|list|lock|\
         prepare-root|resolve-network|resize|set|start|status|stop|unlock|run-runtime|supervise) ;;
         *) usage ;;
     esac
@@ -1756,6 +1804,7 @@ case $command in
     extract) extract_instance "$@" ;;
     import) import_instance "$@" ;;
     import-image) import_image "$@" ;;
+    inject) inject_instance "$@" ;;
     list) test "$#" -eq 0 || usage; list_instances ;;
     lock) test "$#" -eq 1 || usage; set_contract_lock "$1" locked ;;
     prepare-root) test "$#" -eq 1 || usage; prepare_root "$1" ;;

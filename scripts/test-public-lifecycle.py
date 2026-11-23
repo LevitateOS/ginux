@@ -6,7 +6,8 @@ native fixture is imported with `import-image`, instances are imported from a
 recipe naming it by digest (no network), and `start --wait`, `status --format
 json`, `extract` and `delete` are driven through `sudo` exactly as a caller
 would, which also checks that sudo passes binary standard input and output
-through unchanged.
+through unchanged. `inject` is called on the helper directly with its argument
+grammar (tar on standard input) and once through the CLI.
 """
 import hashlib
 import io
@@ -65,6 +66,45 @@ def layer_tar(fixture):
         add("out/link", tarfile.SYMTYPE, 0o777, target="hello.txt")
         add("out/sub/data.bin", tarfile.REGTYPE, 0o600, DATA)
     return buffer.getvalue()
+
+
+def inject_tar(members):
+    """A tar of (name, kind, mode, data-or-target) members, fixed order and times."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.GNU_FORMAT) as archive:
+        for name, kind, mode, payload in members:
+            info = tarfile.TarInfo(name)
+            info.type = kind
+            info.mode = mode
+            info.mtime = 1700000000
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            if kind == tarfile.REGTYPE:
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+            else:
+                info.linkname = payload if kind == tarfile.SYMTYPE else ""
+                archive.addfile(info)
+    return buffer.getvalue()
+
+
+INJECT_NOTE = b"injected note\n"
+INJECT_BLOB = bytes(reversed(range(256))) * 32 + b"\x00\r\n"
+# Neither /inputs nor /inputs/nested exists in the instance root: inject-tree
+# creates the target path and its missing parents.
+INJECT_PATH = "/inputs/nested/deep"
+CLI_MEMBERS = [
+    ("cli", tarfile.DIRTYPE, 0o755, None),
+    ("cli/note.txt", tarfile.REGTYPE, 0o644, INJECT_NOTE),
+]
+INJECT_MEMBERS = [
+    ("app", tarfile.DIRTYPE, 0o755, None),
+    ("app/note.txt", tarfile.REGTYPE, 0o644, INJECT_NOTE),
+    ("app/link", tarfile.SYMTYPE, 0o777, "note.txt"),
+    ("app/nested", tarfile.DIRTYPE, 0o750, None),
+    ("app/nested/blob.bin", tarfile.REGTYPE, 0o600, INJECT_BLOB),
+    ("app/setuid", tarfile.REGTYPE, 0o4755, b"#!/bin/true\n"),
+]
 
 
 def write_layout(directory, fixture):
@@ -141,6 +181,13 @@ def main():
             proc = subprocess.run([cli, "--state-root", str(state), *arguments],
                                   stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                   env=environment, timeout=timeout)
+            return proc.returncode, proc.stdout, proc.stderr.decode(errors="replace")
+
+        def inject(instance, data, path=INJECT_PATH, max_bytes=1048576, max_members=100, max_path=512):
+            proc = subprocess.run([str(wrapper), "--protocol", "1", "--state-root", str(state),
+                                   "inject", instance, "--max-bytes", str(max_bytes),
+                                   "--max-members", str(max_members), "--max-path", str(max_path), path],
+                                  input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
             return proc.returncode, proc.stdout, proc.stderr.decode(errors="replace")
 
         def start_waiting(name):
@@ -293,6 +340,14 @@ def main():
         check("extract while running is refused", code == 73 and not output.exists()
               and not any(entry.name.startswith(".while-running") for entry in work.iterdir()),
               code, err)
+        code, out, err = inject(name, inject_tar(INJECT_MEMBERS))
+        check("inject while running is refused", code == 73 and out == b""
+              and not (state / "instances" / name / "root/inputs").exists(), code, err)
+        cli_tar = work / "cli-inject.tar"
+        cli_tar.write_bytes(inject_tar(CLI_MEMBERS))
+        code, out, err = ginux("inject", name, "--input", str(cli_tar), "--into", "/more")
+        check("CLI inject while running is refused", code == 73 and out == b""
+              and not (state / "instances" / name / "root/more").exists(), code, err)
         code, out, err = ginux("delete", name)
         check("delete while running is refused", code == 73
               and (state / "instances" / name).is_dir(), code, err)
@@ -348,6 +403,67 @@ def main():
         code, out, err = ginux("extract", name, "--output", str(missing), "/no-such-directory")
         check("extract of a missing path leaves nothing", code == 66 and not missing.exists()
               and not any(entry.name.startswith(".missing") for entry in work.iterdir()), code, err)
+
+        # inject into the stopped instance: tar on standard input, nothing on
+        # standard output; extract reads the result back.
+        # Neither /inputs nor /inputs/nested exists: inject creates the path.
+        inputs = state / "instances" / name / "root/inputs"
+        check("inject target and parents do not exist beforehand", not inputs.exists())
+        code, out, err = inject(name, inject_tar(INJECT_MEMBERS))
+        check("inject into a stopped instance", code == 0 and out == b"", code, out, err)
+        injected = inputs / "nested/deep"
+        check("inject clears the setuid bit",
+              (injected / "app/setuid").stat().st_mode & 0o7000 == 0, oct((injected / "app/setuid").stat().st_mode))
+        output = work / "inputs.tar"
+        code, out, err = ginux("extract", name, "--output", str(output), "/inputs")
+        check("extract of the injected tree", code == 0 and output.is_file(), code, err)
+        with tarfile.open(output) as archive:
+            members = archive.getmembers()
+            by_name = {member.name: member for member in members}
+            deep = "inputs/nested/deep"
+            check("injected members read back", [(member.name, member.type) for member in members] == [
+                ("inputs", tarfile.DIRTYPE), ("inputs/nested", tarfile.DIRTYPE),
+                (deep, tarfile.DIRTYPE), (f"{deep}/app", tarfile.DIRTYPE),
+                (f"{deep}/app/link", tarfile.SYMTYPE), (f"{deep}/app/nested", tarfile.DIRTYPE),
+                (f"{deep}/app/nested/blob.bin", tarfile.REGTYPE), (f"{deep}/app/note.txt", tarfile.REGTYPE),
+                (f"{deep}/app/setuid", tarfile.REGTYPE)], [(member.name, member.type) for member in members])
+            check("injected bytes, link and modes",
+                  archive.extractfile(f"{deep}/app/note.txt").read() == INJECT_NOTE
+                  and archive.extractfile(f"{deep}/app/nested/blob.bin").read() == INJECT_BLOB
+                  and archive.extractfile(f"{deep}/app/setuid").read() == b"#!/bin/true\n"
+                  and by_name[f"{deep}/app/link"].linkname == "note.txt"
+                  and by_name[f"{deep}/app/note.txt"].mode == 0o644
+                  and by_name[f"{deep}/app/nested/blob.bin"].mode == 0o600
+                  and by_name[f"{deep}/app/setuid"].mode == 0o755,
+                  [(member.name, oct(member.mode)) for member in members])
+        code, out, err = inject(name, inject_tar(INJECT_MEMBERS))
+        check("inject of the same tar again conflicts", code == 65 and out == b"", code, err)
+        code, out, err = inject(name, inject_tar([("../escape", tarfile.REGTYPE, 0o644, b"x")]))
+        check("inject refuses a .. member", code == 65 and out == b""
+              and not (state / "instances" / name / "escape").exists()
+              and not (state / "instances" / name / "root/escape").exists(), code, err)
+        bounded = inject_tar([("bound", tarfile.DIRTYPE, 0o755, None),
+                              ("bound/one", tarfile.REGTYPE, 0o644, b"1"),
+                              ("bound/two", tarfile.REGTYPE, 0o644, b"2")])
+        code, out, err = inject(name, bounded, max_members=1)
+        check("inject past the member bound exits 76", code == 76 and out == b"", code, err)
+        code, out, err = inject(name, bounded, max_bytes=1)
+        check("inject past the byte bound exits 76", code == 76 and out == b"", code, err)
+        code, out, err = inject("no-such-instance", inject_tar(INJECT_MEMBERS))
+        check("inject into a missing instance exits 66", code == 66 and out == b"", code, err)
+
+        # inject through the real CLI (sudo, helper, image tool), then read back.
+        code, out, err = ginux("inject", name, "--input", str(cli_tar), "--into", "/more")
+        check("CLI inject into a stopped instance", code == 0 and out == b"", code, out, err)
+        output = work / "more.tar"
+        code, out, err = ginux("extract", name, "--output", str(output), "/more")
+        check("extract of the CLI-injected tree", code == 0 and output.is_file(), code, err)
+        with tarfile.open(output) as archive:
+            members = archive.getmembers()
+            check("CLI-injected members read back", [(member.name, member.type) for member in members] == [
+                ("more", tarfile.DIRTYPE), ("more/cli", tarfile.DIRTYPE),
+                ("more/cli/note.txt", tarfile.REGTYPE)], [(member.name, member.type) for member in members])
+            check("CLI-injected bytes", archive.extractfile("more/cli/note.txt").read() == INJECT_NOTE)
 
         # A pre-boot hook that fails with failure = "stop": supervisor-error.
         # The hook shell is the fixture as /bin/sh, which exits 81 for "Z".
