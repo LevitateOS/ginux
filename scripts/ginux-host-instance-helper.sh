@@ -754,7 +754,6 @@ $2"
     IFS=$old_ifs
     "$runtime" config-merge "$config" "$@" "instance.id=\"$name\"" >"$effective"
     configured_root=$(sed -n 's/^[[:space:]]*root[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$effective")
-    configured_init=$(sed -n 's/^[[:space:]]*init[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$effective")
     if test "$replacing" = true; then
         current_root=$(sed -n 's/^[[:space:]]*root[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$directory/config.toml")
         if test "$configured_root" != "$current_root"; then
@@ -798,17 +797,21 @@ $2"
         rm -f "$effective"
     }
     trap cleanup_staging 0 HUP INT TERM
-    mkdir -p "$staging/root"
+    # The instance directory is root-private whatever umask the helper
+    # inherited: its root is owned by uid 65534, and any other process of that
+    # identity must not reach it, nor read the recipe or the logs.
+    install -d -m 0700 "$staging"
+    mkdir "$staging/root"
     install -m 600 "$effective" "$staging/config.toml"
     write_deployment "$staging/deployment.state" "$create_network" "$create_forwards" locked
     materialize_runtime_config \
         "$staging/config.toml" "$staging/deployment.state" "$staging/runtime.toml"
+    chmod 600 "$staging/runtime.toml"
     materialize_root "$configured_root" "$staging/root"
-    root_path_is_executable "$staging/root" "$configured_init" || {
-        printf '\nconfigured init is missing or not executable: %s\n' "$configured_init" >&2
-        exit 65
-    }
+    # The configured init is checked by start, not here: inject may provide
+    # it after the instance exists.
     prepare_root "$staging/root"
+    chmod 0700 "$staging"
     mv -T --no-copy --update=none "$staging" "$directory"
     # A skipped rename succeeds and leaves the source in place.
     if test -d "$staging"; then
@@ -1070,6 +1073,7 @@ start_instance() {
     start_audit=false
     start_wait_pid=
     start_wait_start=
+    start_stream=false
     while test "$#" -gt 0; do
         case $1 in
             --attach)
@@ -1089,11 +1093,16 @@ start_instance() {
                 start_wait_start=$3
                 shift 2
                 ;;
+            --stream-console)
+                test "$start_stream" = false || usage
+                start_stream=true
+                ;;
             *) usage ;;
         esac
         shift
     done
     test -z "$start_wait_pid" || test "$start_mode" = detached || usage
+    test "$start_stream" = false || test -n "$start_wait_pid" || usage
     validate_name "$name"
     lock_instance "$name"
     directory=$(instance_dir "$name")
@@ -1109,6 +1118,13 @@ start_instance() {
     fi
     read_deployment "$directory/deployment.state" || {
         printf '%s: invalid persisted instance deployment state\n' "$name" >&2
+        exit 65
+    }
+    # Instances created by an earlier helper may have a traversable directory.
+    chmod 0700 "$directory"
+    configured_init=$(sed -n 's/^[[:space:]]*init[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$directory/config.toml")
+    root_path_is_executable "$directory/root" "$configured_init" || {
+        printf '\nconfigured init is missing or not executable: %s\n' "$configured_init" >&2
         exit 65
     }
     if test "$deployment_contract" = unlocked; then
@@ -1128,6 +1144,9 @@ start_instance() {
     mkfifo -m 600 "$runtime_directory/control.in"
     : >"$directory/audit.log"
     : >"$directory/console.log"
+    # Root-only, like the directory; the caller receives console output
+    # through start --wait --stream-console instead.
+    chmod 0600 "$directory/audit.log" "$directory/console.log"
 
     # The supervisor must not inherit the instance lock on descriptor 6.
     nohup "$0" --protocol 1 supervise "$name" "$start_audit" 6>&- >/dev/null 2>&1 </dev/null &
@@ -1207,6 +1226,7 @@ teardown() {
     wait "$pid" 2>/dev/null || true
     test -f "$runtime_directory/outcome" || write_outcome_supervisor_error
     remove_waited_pid_files
+    finish_console_stream
     exit_for_outcome
 }
 
@@ -1215,11 +1235,111 @@ write_outcome_supervisor_error() {
     write_outcome "$runtime_directory"
 }
 
+# opened_regular_file PATH FD: descriptor FD of this shell is a regular file
+# and the same file that PATH (not followed if it is a link) names.
+opened_regular_file() {
+    case $(stat -L -c %F "/proc/$$/fd/$2" 2>/dev/null || true) in
+        'regular file'|'regular empty file') ;;
+        *) return 1 ;;
+    esac
+    opened_fd_identity=$(stat -L -c %d:%i "/proc/$$/fd/$2" 2>/dev/null || true)
+    opened_path_identity=$(stat -c %d:%i -- "$1" 2>/dev/null || true)
+    test -n "$opened_fd_identity" && test "$opened_fd_identity" = "$opened_path_identity"
+}
+
+# open_console_stream: open console.log once, read-only, on descriptor 3 and
+# start the pump that copies what is appended to it to standard output. The
+# path must name a regular file, not a link, and the opened descriptor must be
+# that same file. The supervisor was started before, so neither it nor the
+# workload inherits descriptor 3.
+open_console_stream() {
+    stream_pid=
+    stream_log=$directory/console.log
+    if test -f "$stream_log" && test ! -L "$stream_log" && command exec 3<"$stream_log"; then
+        if opened_regular_file "$stream_log" 3; then
+            stream_parent=$$
+            console_stream_pump &
+            stream_pid=$!
+            return 0
+        fi
+        exec 3<&-
+    fi
+    printf '%s: console log is not a regular file: %s\n' "$name" "$stream_log" >&2
+    teardown
+}
+
+# console_stream_pump: every 100 ms copy what was appended to the console log
+# since the last copy (the descriptor's offset, shared with this subshell,
+# tracks it) to standard output. On USR1, or when the helper is gone, stop
+# polling and copy the remainder exactly once. A write error (the reader went
+# away) ends the pump. Terminal signals are left to the helper, which stops
+# the pump itself, so a signalled run still delivers its tail. Run only as
+# `console_stream_pump &`: the traps must belong to the process whose PID is
+# $!, so the body is a brace group, not a subshell of its own.
+console_stream_pump() {
+    trap '' HUP INT TERM
+    stream_stop=false
+    trap 'stream_stop=true' USR1
+    while test "$stream_stop" = false && kill -0 "$stream_parent" 2>/dev/null; do
+        cat <&3 2>/dev/null || exit 0
+        sleep 0.1 &
+        wait "$!" || true
+    done
+    cat <&3 2>/dev/null || true
+    exit 0
+}
+
+# finish_console_stream: after the run has ended, let the pump copy the
+# remainder of the console log (bounded: a pump blocked on a reader that no
+# longer reads is killed after five seconds), then, unless the workload
+# exited 0, write the end of the audit log to standard error.
+finish_console_stream() {
+    test "$start_stream" = true || return 0
+    if test -n "${stream_pid-}"; then
+        kill -USR1 "$stream_pid" 2>/dev/null || true
+        (sleep 5; kill -KILL "$stream_pid" 2>/dev/null) </dev/null >/dev/null 2>&1 &
+        stream_watchdog=$!
+        wait "$stream_pid" 2>/dev/null || true
+        kill "$stream_watchdog" 2>/dev/null || true
+        wait "$stream_watchdog" 2>/dev/null || true
+        stream_pid=
+    fi
+    exec 3<&-
+    if read_outcome "$runtime_directory/outcome" &&
+        test "$outcome_kind" = exited && test "$outcome_code" -eq 0; then
+        return 0
+    fi
+    report_audit_tail
+}
+
+# report_audit_tail: the last 64 KiB of the audit log on standard error after
+# a one-line marker giving the byte count, opened like the console log.
+report_audit_tail() {
+    audit_log=$directory/audit.log
+    test -f "$audit_log" && test ! -L "$audit_log" || return 0
+    command exec 4<"$audit_log" || return 0
+    opened_regular_file "$audit_log" 4 || {
+        exec 4<&-
+        return 0
+    }
+    audit_size=$(stat -L -c %s "/proc/$$/fd/4" 2>/dev/null || printf 0)
+    test "$audit_size" -le 65536 || audit_size=65536
+    printf 'ginux: audit log (last %s bytes):\n' "$audit_size" >&2
+    if test "$audit_size" -gt 0; then
+        tail -c "$audit_size" <&4 >&2 2>/dev/null || true
+    fi
+    exec 4<&-
+}
+
 # start --wait: stay in the foreground until the instance ends, tear it down
 # when the caller dies or this helper is signalled, and exit with the
-# workload's code, 128+signal, or 70 for supervisor-error. Prints nothing.
+# workload's code, 128+signal, or 70 for supervisor-error. Prints nothing,
+# except with --stream-console: then standard output carries exactly the
+# console bytes, and a run that did not exit 0 adds the end of the audit log
+# to standard error.
 wait_for_instance() {
     trap teardown HUP INT TERM
+    test "$start_stream" = false || open_console_stream
     while supervisor_child_running; do
         caller_alive || teardown
         # A background sleep keeps the traps responsive.
@@ -1230,6 +1350,7 @@ wait_for_instance() {
     wait "$pid" 2>/dev/null || true
     test -f "$runtime_directory/outcome" || write_outcome "$runtime_directory"
     remove_waited_pid_files
+    finish_console_stream
     exit_for_outcome
 }
 

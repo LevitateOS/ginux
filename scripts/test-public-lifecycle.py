@@ -7,13 +7,18 @@ recipe naming it by digest (no network), and `start --wait`, `status --format
 json`, `extract` and `delete` are driven through `sudo` exactly as a caller
 would, which also checks that sudo passes binary standard input and output
 through unchanged. `inject` is called on the helper directly with its argument
-grammar (tar on standard input) and once through the CLI.
+grammar (tar on standard input) and once through the CLI. One instance gets its
+init by `inject` after create. Instance directories and logs are root-private
+whatever the umask, and `start --wait --stream-console` delivers the console
+output on standard output (and the audit log tail on standard error after a
+failed run).
 """
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import subprocess
@@ -177,10 +182,10 @@ def main():
         wrapper.chmod(0o755)
         environment = dict(os.environ, GINUX_INSTANCE_HELPER=str(wrapper))
 
-        def ginux(*arguments, stdin=subprocess.DEVNULL, timeout=120):
+        def ginux(*arguments, stdin=subprocess.DEVNULL, timeout=120, umask=-1):
             proc = subprocess.run([cli, "--state-root", str(state), *arguments],
                                   stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  env=environment, timeout=timeout)
+                                  env=environment, timeout=timeout, umask=umask)
             return proc.returncode, proc.stdout, proc.stderr.decode(errors="replace")
 
         def inject(instance, data, path=INJECT_PATH, max_bytes=1048576, max_members=100, max_path=512):
@@ -190,8 +195,8 @@ def main():
                                   input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
             return proc.returncode, proc.stdout, proc.stderr.decode(errors="replace")
 
-        def start_waiting(name):
-            proc = subprocess.Popen([cli, "--state-root", str(state), "start", name, "--wait"],
+        def start_waiting(name, *options):
+            proc = subprocess.Popen([cli, "--state-root", str(state), "start", name, "--wait", *options],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, env=environment)
             started.append(name)
@@ -258,6 +263,22 @@ def main():
 
         def set_scenario(name, scenario):
             (state / "instances" / name / "root/scenario").write_text(scenario)
+
+        def private_modes(instance):
+            directory = state / "instances" / instance
+            return {path.name: path.stat().st_mode & 0o7777 for path in
+                    (directory, directory / "console.log", directory / "audit.log")}
+
+        def as_nobody(*command):
+            return subprocess.run(list(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  user=65534, group=65534, extra_groups=[], timeout=30)
+
+        def audit_marker(err):
+            """The byte count of the audit-tail marker on standard error, or None."""
+            for line in err.splitlines():
+                if line.startswith("ginux: audit log (last ") and line.endswith(" bytes):"):
+                    return int(line[len("ginux: audit log (last "):-len(" bytes):")])
+            return None
 
         # An untrusted root fails before any state change. Checked on the
         # helper itself: the CLI may present the helper's usage code as an
@@ -475,9 +496,102 @@ def main():
               and os.stat(state / "instances" / hooked / "root/usr/bin/bash").st_ino
               != os.stat(state / "instances" / name / "root/usr/bin/bash").st_ino, base)
         set_scenario(hooked, "Z")
-        code, out, err = ginux("start", hooked, "--wait")
+        code, out, err = ginux("start", hooked, "--wait", umask=0o022)
         check("failing stop hook exits 70", code == 70 and out == b""
               and status(hooked)["outcome"] == SUPERVISOR_ERROR, code, err, status(hooked))
+        modes = private_modes(hooked)
+        check("instance directory 0700 and logs 0600 under umask 022",
+              modes == {hooked: 0o700, "console.log": 0o600, "audit.log": 0o600}, modes)
+        code, out, err = ginux("start", hooked, "--wait", "--stream-console")
+        audit_bytes = (state / "instances" / hooked / "audit.log").read_bytes()
+        shown = audit_marker(err)
+        check("a failed streamed run prints the audit log tail on stderr", code == 70
+              and out == (state / "instances" / hooked / "console.log").read_bytes()
+              and shown == min(len(audit_bytes), 65536) and shown > 0
+              and status(hooked)["outcome"] == SUPERVISOR_ERROR, code, out, err)
+
+        # An init that inject provides after create: create succeeds, start
+        # refuses with 65 until the init is there, then runs. Created and
+        # started under umask 077.
+        late = "lifecycle-late-init"
+        late_recipe = work / "late-recipe.toml"
+        late_recipe.write_text(recipe.read_text().replace('init = "/usr/bin/bash"', 'init = "/late/init"'))
+        code, out, err = ginux("import", late, str(late_recipe), umask=0o077)
+        check("import with the init not yet in the root", code == 0
+              and not (state / "instances" / late / "root/late").exists(), code, out, err)
+        set_scenario(late, "w")
+        code, out, err = ginux("start", late, "--wait", umask=0o077)
+        check("start without the init exits 65", code == 65 and out == b""
+              and "configured init is missing or not executable: /late/init" in err
+              and status(late)["state"] == "stopped" and status(late)["outcome"] is None,
+              code, out, err, status(late))
+        code, out, err = inject(late, inject_tar([("init", tarfile.REGTYPE, 0o755,
+                                                   Path(fixture).read_bytes())]), path="/late")
+        check("inject provides the init", code == 0 and out == b"", code, out, err)
+        code, out, err = ginux("start", late, "--wait", umask=0o077)
+        current = status(late)
+        check("start after inject runs the injected init", code == 0 and out == b""
+              and current["outcome"] == {"version": 1, "outcome": "exited", "code": 0,
+                                         "signal": None, "generation": None}, code, out, err, current)
+        modes = private_modes(late)
+        check("instance directory 0700 and logs 0600 under umask 077",
+              modes == {late: 0o700, "console.log": 0o600, "audit.log": 0o600}, modes)
+
+        # Another uid-65534 process (the workload's host identity) cannot
+        # reach the instance directory, the root or the logs.
+        late_directory = state / "instances" / late
+        for command in (["ls", "-A", "--", str(late_directory)],
+                        ["ls", "-A", "--", str(late_directory / "root")],
+                        ["cat", "--", current["paths"]["console_log"]],
+                        ["cat", "--", current["paths"]["audit_log"]]):
+            proc = as_nobody(*command)
+            check(f"uid 65534 is refused: {' '.join(command[:1] + command[-1:])}",
+                  proc.returncode != 0 and proc.stdout == b"", proc.returncode, proc.stdout)
+
+        # --stream-console: standard output carries exactly the console bytes
+        # and nothing else; a run that exits 0 prints no audit log.
+        code, out, err = ginux("start", late, "--wait", "--stream-console", umask=0o077)
+        console = (late_directory / "console.log").read_bytes()
+        check("streamed run prints exactly the console output", code == 0
+              and b"GINUX_FIXTURE: yield=" in out and out == console
+              and audit_marker(err) is None, code, out, err, console)
+        # A failing workload (81 for "Z"): the console bytes, then the audit
+        # log tail on standard error.
+        set_scenario(late, "Z")
+        code, out, err = ginux("start", late, "--wait", "--stream-console")
+        audit_bytes = (late_directory / "audit.log").read_bytes()
+        check("a failing streamed run keeps its status and adds the audit tail", code == 81
+              and out == (late_directory / "console.log").read_bytes()
+              and audit_marker(err) == min(len(audit_bytes), 65536), code, out, err)
+        # Output arrives while the run lasts: the yield scenario prints one
+        # line per byte fed to its console.
+        set_scenario(late, "Yield-stream")
+        streaming = start_waiting(late, "--stream-console")
+        wait_until(lambda: running_workload(late), 30, "streamed workload running")
+        feed_console(late, b"\n")
+        received = b""
+        deadline = time.monotonic() + 30
+        while b"yield-before-receive=" not in received and time.monotonic() < deadline:
+            ready, _, _ = select.select([streaming.stdout], [], [], 0.5)
+            if ready:
+                chunk = os.read(streaming.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                received += chunk
+        check("console output is streamed before the run ends",
+              b"yield-before-receive=" in received and streaming.poll() is None, received)
+        feed_console(late, b"\n\n")
+        rest, err = streaming.communicate(timeout=60)
+        check("the streamed tail is delivered once", streaming.returncode == 0
+              and received + rest == (late_directory / "console.log").read_bytes()
+              and audit_marker(err.decode(errors="replace")) is None,
+              streaming.returncode, received + rest, err)
+        # The flag needs --wait, in the helper too.
+        proc = subprocess.run([str(wrapper), "--protocol", "1", "--state-root", str(state),
+                               "start", late, "--stream-console"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        check("helper refuses --stream-console without --wait", proc.returncode == 64
+              and status(late)["state"] == "stopped", proc.returncode, proc.stderr)
 
         # delete: refused while running, then atomic and idempotently 66.
         set_scenario(name, "Yield-delete")
@@ -489,7 +603,7 @@ def main():
         check("delete of a running detached instance is refused", code == 73, code, err)
         feed_console(name, b"\n\n\n")
         wait_until(lambda: status(name)["state"] == "stopped", 30, "detached instance stopped")
-        for instance in (name, hooked):
+        for instance in (name, hooked, late):
             code, out, err = ginux("delete", instance)
             check(f"delete {instance}", code == 0 and out == f'Instance "{instance}" deleted.\n'.encode()
                   and not (state / "instances" / instance).exists()

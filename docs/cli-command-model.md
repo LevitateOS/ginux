@@ -272,7 +272,7 @@ them.
 
 ```text
 ginux [--state-root DIR [--run-root DIR]] COMMAND ...
-ginux start NAME [--audit] --wait
+ginux start NAME [--audit] --wait [--stream-console]
 ginux status NAME [--format text|json]
 ginux extract NAME --output FILE [--max-bytes N] [--max-members N]
                   [--max-path N] PATH...
@@ -285,6 +285,7 @@ ginux import-image PATH
 | Command | Behaviour | Help heading |
 |---|---|---|
 | `start --wait` | Foreground start tied to the calling process; stdout stays empty; conflicts with `--attach` | Run instances |
+| `start --wait --stream-console` | As `start --wait`, and stdout carries exactly the instance console output as it appears; requires `--wait`, conflicts with `--attach` | Run instances |
 | `status --format json` | One JSON object on one line; `text` (the default) is the existing output | Inspect instances |
 | `extract` | Writes named absolute directories of a stopped instance as one tar archive to a new `FILE` | Inspect instances |
 | `delete` | Removes a stopped instance and all of its state | Configure instances |
@@ -294,6 +295,7 @@ ginux import-image PATH
 
 Parse rules (violations exit 2 before any sudo call):
 
+- `--stream-console` requires `--wait` and conflicts with `--attach`.
 - `--state-root` and `--run-root` are absolute, contain only
   `[A-Za-z0-9_./-]`, have no empty, `.` or `..` component and are at most 256
   bytes. `--run-root` requires `--state-root`; `--state-root` alone implies
@@ -357,7 +359,7 @@ ginux-helper --protocol 1 [--state-root DIR --run-root DIR] VERB ARG...
   extract NAME --max-bytes N --max-members N --max-path N PATH...   (tar on stdout)
   inject NAME --max-bytes N --max-members N --max-path N PATH       (tar on stdin)
   import-image                                                      (tar on stdin, digest on stdout)
-  start NAME [--audit] --wait CALLER_PID CALLER_START
+  start NAME [--audit] --wait CALLER_PID CALLER_START [--stream-console]
   status NAME --format json
 ```
 
@@ -399,7 +401,8 @@ terminal. Instance names must not start with `.`.
 | 0-255 | `start --wait` only: workload exit status, or 128+signal | start --wait |
 
 `start --wait` statuses overlap by nature; a caller disambiguates them with
-`status --format json`.
+`status --format json`. An older helper rejects `--stream-console` with usage
+status 64, passed through like every `start --wait` status.
 
 ### Foreground start and the outcome record
 
@@ -432,7 +435,28 @@ The outcome of the last run is one line in exactly this form:
 
 on one line. `outcome` is null before the first start, while running, after a
 start that failed its checks, and after a run whose record could not be
-written.
+written. The log paths name root-only files (see below); a caller that is not
+root receives console output through `start --wait --stream-console`.
+
+### Console streaming
+
+With `--stream-console` the helper copies the bytes appended to the
+instance's console log to its own standard output while the run lasts: it
+opens the log once, as root, refusing anything but a regular file and never
+following a symbolic link, polls it every 100 ms from the offset it reached,
+and writes each chunk as it reads it. When the run ends, including by caller
+death, a relayed signal or teardown, it copies the remainder exactly once, so
+no tail is lost. Standard output carries nothing else. The CLI inherits that
+standard output to its own, so the bytes reach the caller unchanged and
+unbuffered; they are workload output and are not sanitized. Helper standard
+error goes through the sanitizing relay described above.
+
+When the run does not end with exit code 0 (a non-zero code, `signaled`,
+`supervisor-error` or no valid record), the helper then writes to standard
+error the line `ginux: audit log (last N bytes):` followed by the last N bytes
+of the audit log, N at most 65536. A run that exits 0 never prints the audit
+log. The exit status and the outcome record are the same as without the
+option.
 
 ### State layout
 
@@ -440,6 +464,7 @@ written.
 |---|---|
 | `/run/ginux/instances/NAME/outcome` | Last outcome record, root 0600; removed by the next `start` and by `delete` |
 | `/run/ginux/instances/NAME/result.runtime` | Record written by the runtime, validated before it becomes `outcome` |
+| `/var/lib/ginux/instances/NAME` | Root-owned, mode 0700 whatever the helper's umask (set at create and import, and again at every `start`); holds the recipe, deployment state, root, `console.log` and `audit.log` (both 0600, recreated by every `start`) |
 | `/var/lib/ginux/work/instance.NAME.lock` | Per-instance lock taken by import, create, start, delete, extract and inject |
 | `/var/lib/ginux/instances/.delete:*` | Trash of an interrupted delete; swept after one hour |
 | `/var/lib/ginux/cache/roots/sha256/HEX` | Pristine expansion reused by reflink copy, only on reflink-capable filesystems |

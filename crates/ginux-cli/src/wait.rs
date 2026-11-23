@@ -92,7 +92,10 @@ fn exit_code(status: ExitStatus) -> i32 {
 /// its exit code. `SIGINT`, `SIGTERM`, `SIGHUP` and `SIGQUIT` are relayed to
 /// it. The child gets an empty signal mask before exec: the standard library
 /// does not reset an inherited mask, and the relayed signals are blocked here.
-pub fn run_waiting(command: &mut Command) -> io::Result<i32> {
+/// Standard output is always inherited. With `relay_stderr`, the child's
+/// standard error goes through the sanitizing relay instead of being
+/// inherited.
+pub fn run_waiting(command: &mut Command, relay_stderr: bool) -> io::Result<i32> {
     let mut all = TERMINATING.to_vec();
     all.push(libc::SIGCHLD);
     let set = SignalSet::new(&all);
@@ -112,9 +115,22 @@ pub fn run_waiting(command: &mut Command) -> io::Result<i32> {
             Ok(())
         });
     }
-    let mut child = command.spawn()?;
+    // The relay thread starts with the terminating signals blocked, so they
+    // still reach only the `sigwait` below.
+    let (mut child, relay_thread) = if relay_stderr {
+        let (child, relay) = crate::spawn_relaying_stderr(command)?;
+        (child, Some(relay))
+    } else {
+        (command.spawn()?, None)
+    };
+    let finish = |relay_thread: Option<thread::JoinHandle<Vec<u8>>>| {
+        if let Some(relay) = relay_thread {
+            let _ = relay.join();
+        }
+    };
     loop {
         if let Some(status) = child.try_wait()? {
+            finish(relay_thread);
             drop(guard);
             return Ok(exit_code(status));
         }
@@ -125,6 +141,7 @@ pub fn run_waiting(command: &mut Command) -> io::Result<i32> {
             continue;
         }
         if let Some(code) = relay(&mut child, signal)? {
+            finish(relay_thread);
             drop(guard);
             return Ok(code);
         }

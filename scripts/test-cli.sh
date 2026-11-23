@@ -42,6 +42,9 @@ for invocation in \
     'diff left right' \
     'native config root' \
     'start rocky --wait --attach' \
+    'start rocky --stream-console' \
+    'start rocky --attach --stream-console' \
+    'start rocky --wait --stream-console --stream-console' \
     'status rocky --format yaml' \
     'delete' \
     'delete rocky extra' \
@@ -202,6 +205,42 @@ cmp "$test_directory/expected-helper-args" "$test_directory/wait-head"
 sed -n '7p' "$test_directory/helper-args" | grep -Fxq -- '--wait'
 sed -n '8p' "$test_directory/helper-args" | grep -Eq '^[0-9]+$'
 sed -n '9p' "$test_directory/helper-args" | grep -Eq '^[0-9]+$'
+test "$(wc -l <"$test_directory/helper-args")" -eq 9
+
+# start --wait --stream-console forwards the flag after the caller identity,
+# passes the helper's standard output through byte for byte, and relays its
+# standard error with control bytes escaped.
+cat >"$test_directory/bin/sudo" <<'SCRIPT'
+#!/bin/sh
+printf '%s\n' "$@" >"$GINUX_TEST_HELPER_ARGS"
+cat "$GINUX_TEST_SUDO_CONSOLE"
+printf 'ginux: audit log (last 4 bytes):\n\033x\n' >&2
+exit 5
+SCRIPT
+chmod 755 "$test_directory/bin/sudo"
+{
+    head -c 70000 /dev/urandom
+    printf '\000\033[31m\r\nno newline at the end'
+} >"$test_directory/console.bytes"
+set +e
+GINUX_TEST_SUDO_CONSOLE="$test_directory/console.bytes" \
+    fake start rocky --wait --stream-console \
+    >"$test_directory/stream.out" 2>"$test_directory/stream.err"
+status=$?
+set -e
+test "$status" -eq 5
+cmp "$test_directory/console.bytes" "$test_directory/stream.out"
+grep -Fxq 'ginux: audit log (last 4 bytes):' "$test_directory/stream.err"
+grep -Fq '\x1bx' "$test_directory/stream.err"
+! grep -q "$(printf '\033')" "$test_directory/stream.err"
+sed -n '1,5p' "$test_directory/helper-args" >"$test_directory/wait-head"
+printf '%s\n' /private/ginux-instance-helper --protocol 1 start rocky \
+    >"$test_directory/expected-helper-args"
+cmp "$test_directory/expected-helper-args" "$test_directory/wait-head"
+sed -n '6p' "$test_directory/helper-args" | grep -Fxq -- '--wait'
+sed -n '7p' "$test_directory/helper-args" | grep -Eq '^[0-9]+$'
+sed -n '8p' "$test_directory/helper-args" | grep -Eq '^[0-9]+$'
+sed -n '9p' "$test_directory/helper-args" | grep -Fxq -- '--stream-console'
 test "$(wc -l <"$test_directory/helper-args")" -eq 9
 
 # A terminating signal to start --wait reaches the helper's sudo process.
