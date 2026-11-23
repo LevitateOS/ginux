@@ -10,6 +10,7 @@ use tar::Archive;
 use url::Url;
 
 pub mod export;
+pub mod inject;
 pub mod layout;
 
 const ACCEPT_MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";

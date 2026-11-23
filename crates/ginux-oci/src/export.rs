@@ -150,7 +150,7 @@ fn parse(arguments: &[OsString]) -> Result<Request, ToolError> {
     })
 }
 
-fn parse_bound(value: &OsString, label: &str) -> Result<u64, ToolError> {
+pub(crate) fn parse_bound(value: &OsString, label: &str) -> Result<u64, ToolError> {
     let bytes = value.as_bytes();
     if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
         return Err(usage(format!("{label} must be a decimal number")));
@@ -165,7 +165,7 @@ fn parse_bound(value: &OsString, label: &str) -> Result<u64, ToolError> {
     Ok(value)
 }
 
-fn parse_path(value: &[u8], max_path: usize) -> Result<Vec<Vec<u8>>, ToolError> {
+pub(crate) fn parse_path(value: &[u8], max_path: usize) -> Result<Vec<Vec<u8>>, ToolError> {
     let shown = escaped(value);
     if value.first() != Some(&b'/') {
         return Err(usage(format!("PATH is not absolute: {shown}")));
@@ -208,11 +208,11 @@ fn changed(shown: &str) -> ToolError {
     )
 }
 
-fn unsupported_kernel() -> ToolError {
+pub(crate) fn unsupported_kernel() -> ToolError {
     ToolError::new(exit::UNSUPPORTED, "openat2 is not supported by this kernel")
 }
 
-fn open_root(root: &CStr) -> Result<OwnedFd, ToolError> {
+pub(crate) fn open_root(root: &CStr) -> Result<OwnedFd, ToolError> {
     // O_PATH: the root is never read through this descriptor; it only anchors the
     // descriptor-relative lookups. O_DIRECTORY with O_NOFOLLOW: a symlink as the final
     // component is refused instead of followed. Its parent directory is root-owned, so the
@@ -249,7 +249,7 @@ struct OpenHow {
 }
 
 /// `openat2(dir, name)` with the walker's resolution rules; EINTR is retried.
-fn openat2(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+pub(crate) fn openat2(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
     let how = OpenHow {
         // O_NOFOLLOW: refuse a symlink as the final component even if the resolve flags were
         // ever relaxed. O_CLOEXEC: nothing executed later inherits tree descriptors.
@@ -306,7 +306,7 @@ fn stat_at(dir: &OwnedFd, name: &CStr) -> io::Result<libc::stat> {
     Ok(unsafe { status.assume_init() })
 }
 
-fn stat_fd(fd: &OwnedFd) -> io::Result<libc::stat> {
+pub(crate) fn stat_fd(fd: &OwnedFd) -> io::Result<libc::stat> {
     let mut status = MaybeUninit::<libc::stat>::zeroed();
     // SAFETY: valid descriptor and a writable stat buffer.
     if unsafe { libc::fstat(fd.as_raw_fd(), status.as_mut_ptr()) } != 0 {
@@ -316,7 +316,7 @@ fn stat_fd(fd: &OwnedFd) -> io::Result<libc::stat> {
     Ok(unsafe { status.assume_init() })
 }
 
-fn same_inode(left: &libc::stat, right: &libc::stat) -> bool {
+pub(crate) fn same_inode(left: &libc::stat, right: &libc::stat) -> bool {
     left.st_dev == right.st_dev && left.st_ino == right.st_ino
 }
 
@@ -336,7 +336,7 @@ struct CapabilityData {
 
 /// When root: become uid/gid 65534 with no supplementary groups and no capabilities, then
 /// set non-dumpable and no-new-privileges. Every step is verified; any failure stops.
-fn drop_privileges() -> Result<(), ToolError> {
+pub(crate) fn drop_privileges() -> Result<(), ToolError> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         return Ok(());

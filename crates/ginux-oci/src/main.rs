@@ -9,12 +9,14 @@ fn main() -> ExitCode {
         eprintln!("usage: ginux-image materialize IMAGE CACHE_ROOT DESTINATION");
         eprintln!("       ginux-image import-layout CACHE_ROOT");
         eprintln!("       ginux-image export-tree ROOT MAX_BYTES MAX_MEMBERS MAX_PATH PATH...");
+        eprintln!("       ginux-image inject-tree ROOT MAX_BYTES MAX_MEMBERS MAX_PATH PATH");
         return ExitCode::from(64);
     };
     match command.to_str() {
         Some("materialize") => materialize(rest),
         Some("import-layout") => ExitCode::from(ginux_oci::layout::run(rest)),
         Some("export-tree") => ExitCode::from(ginux_oci::export::run(rest)),
+        Some("inject-tree") => ExitCode::from(ginux_oci::inject::run(rest)),
         _ => {
             eprintln!("ginux-image: unsupported private command");
             ExitCode::from(64)
