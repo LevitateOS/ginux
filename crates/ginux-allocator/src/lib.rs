@@ -1,6 +1,8 @@
 use core::cell::UnsafeCell;
 use core::cmp;
-use core::ffi::{c_char, c_int, c_void};
+#[cfg(any(not(test), target_os = "linux"))]
+use core::ffi::c_char;
+use core::ffi::{c_int, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
