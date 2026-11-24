@@ -227,8 +227,8 @@ def main():
             except (OSError, ValueError, IndexError):
                 return None
 
-        def running_workload(name):
-            """The fixture processes (UID 65534, comm bash) below the instance runtime."""
+        def running_workload(name, comm_name="bash"):
+            """The fixture processes (UID 65534, comm `comm_name`) below the instance runtime."""
             top = runtime_pid(name)
             if top is None:
                 return []
@@ -249,7 +249,7 @@ def main():
             while pending:
                 for pid, comm, uid in children.get(pending.pop(), []):
                     pending.append(pid)
-                    if comm == "bash" and uid == "65534":
+                    if comm == comm_name and uid == "65534":
                         found.append(pid)
             return found
 
@@ -387,6 +387,21 @@ def main():
         check("killed workload exits 128+9", waiting.returncode == 137 and current["outcome"] == {
             "version": 1, "outcome": "signaled", "code": None, "signal": 9, "generation": None},
               waiting.returncode, err, current)
+
+        # A runtime killed before it records the outcome leaves its result
+        # file empty (the file exists from the start of the run): start --wait
+        # reports supervisor-error with status 70.
+        waiting = start_waiting(name)
+        wait_until(lambda: running_workload(name), 30, "workload running")
+        killed_runtime = runtime_pid(name)
+        os.kill(killed_runtime, signal.SIGKILL)
+        out, err = waiting.communicate(timeout=60)
+        current = status(name)
+        runtime_result = run_root / "instances" / name / "result.runtime"
+        check("killed runtime leaves an empty result and records supervisor-error",
+              waiting.returncode == 70 and current["outcome"] == SUPERVISOR_ERROR
+              and runtime_result.is_file() and runtime_result.stat().st_size == 0
+              and not running_workload(name), waiting.returncode, err, current)
 
         # The caller's death tears the instance down.
         waiting = start_waiting(name)
@@ -567,7 +582,8 @@ def main():
         # line per byte fed to its console.
         set_scenario(late, "Yield-stream")
         streaming = start_waiting(late, "--stream-console")
-        wait_until(lambda: running_workload(late), 30, "streamed workload running")
+        # This instance's init is /late/init, so its comm is "init".
+        wait_until(lambda: running_workload(late, "init"), 30, "streamed workload running")
         feed_console(late, b"\n")
         received = b""
         deadline = time.monotonic() + 30

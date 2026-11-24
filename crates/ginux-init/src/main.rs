@@ -3213,6 +3213,10 @@ fn native_main(
     if let Some(reason) = standard_stream_refusal() {
         instance_fail(&mut instance, reason);
     }
+    // Create the result file now, with the caller's identity: the supervisor
+    // gives that identity up before the workload runs and keeps only the
+    // descriptor. The tracee closes its copy before anything else.
+    native_result::open();
     let root_descriptor = unsafe {
         syscall4(
             SYS_OPENAT_HOST,
@@ -3275,7 +3279,8 @@ fn native_tracee(
 
     // Inherit nothing beyond the standard streams, at any descriptor number:
     // a descriptor left open to a host directory would anchor paths outside
-    // the root. The protected null and console descriptors are made after.
+    // the root, and the supervisor's instance-root and result descriptors
+    // are its own. The protected null and console descriptors are made after.
     if unsafe {
         syscall3(
             ginux_core::SYS_CLOSE_RANGE as usize,
@@ -5517,6 +5522,7 @@ fn native_console_control_broker(pid_map: &'static BrokerPidMap, root_descriptor
         exit_process(130);
     }
     let _ = unsafe { syscall1(SYS_CLOSE_HOST, root_descriptor) };
+    native_result::close_in_child();
     let mut command = 0u8;
     loop {
         let read = unsafe {
@@ -6584,6 +6590,7 @@ fn supervise_native(
                 if broker == 0 {
                     let _ = unsafe { syscall1(SYS_CLOSE_HOST, root_descriptor) };
                     let _ = unsafe { syscall1(SYS_CLOSE_HOST, 10) };
+                    native_result::close_in_child();
                     native_yield_broker(
                         listener as usize,
                         audit_mode,
@@ -11131,19 +11138,25 @@ fn native_clone_start_child(task: &mut NativeSupervisorTask) -> Option<()> {
 
 /// Bootstrap opens the instance root and establishes tracing while privileged.
 /// Once the tracee is stopped under `PTRACE_O_EXITKILL`, the supervisor needs
-/// only stdio, the optional controller channel (fd 10), and its already-open
-/// instance-root descriptor. Drop every other inherited descriptor, host root
-/// identity, supplementary group, and privilege-gain path before resuming any
-/// managed instruction.
+/// only stdio, the optional controller channel (fd 10), its already-open
+/// instance-root descriptor, and the result file `native_result::open`
+/// created (kept below 256, never 10). Drop every other inherited descriptor,
+/// host root identity, supplementary group, and privilege-gain path before
+/// resuming any managed instruction.
 fn reduce_native_supervisor_authority(
     instance: &mut Instance,
     pid: usize,
     root_descriptor: usize,
     preserved_descriptor: usize,
 ) {
+    let result_descriptor = native_result::descriptor();
     let mut descriptor = 3usize;
     while descriptor < 256 {
-        if descriptor != root_descriptor && descriptor != preserved_descriptor && descriptor != 10 {
+        if descriptor != root_descriptor
+            && descriptor != preserved_descriptor
+            && descriptor != result_descriptor
+            && descriptor != 10
+        {
             let _ = unsafe { syscall1(SYS_CLOSE_HOST, descriptor) };
         }
         descriptor += 1;

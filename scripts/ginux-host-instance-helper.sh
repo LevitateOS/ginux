@@ -194,7 +194,10 @@ read_outcome() {
 }
 
 # write_outcome RUNTIME_DIRECTORY: publish the runtime's record, or
-# supervisor-error when the runtime left none. Never fails.
+# supervisor-error when it left no valid one. The runtime creates
+# result.runtime empty when the run starts and writes the record only at its
+# normal exit, so an empty or incomplete file is a supervisor error, just as
+# a missing one. Never fails.
 write_outcome() {
     write_outcome_directory=$1
     write_outcome_line=$outcome_supervisor_error
@@ -1381,9 +1384,12 @@ supervise_instance() {
     terminate_supervisor() {
         trap - HUP INT TERM
         # A record the runtime wrote before this cancellation is the real
-        # outcome; one written because of it is not.
+        # outcome; one written because of it is not. The file itself exists
+        # from the start of the run, so only a complete record counts.
         terminate_record=false
-        test ! -f "$runtime_directory/result.runtime" || terminate_record=true
+        if read_outcome "$runtime_directory/result.runtime"; then
+            terminate_record=true
+        fi
         runtime_pid=$(runtime_identity "$name" || true)
         if test -n "$runtime_pid"; then
             kill -TERM "$runtime_pid" 2>/dev/null || true

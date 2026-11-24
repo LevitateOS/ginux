@@ -463,7 +463,7 @@ option.
 | Path (default roots) | Content |
 |---|---|
 | `/run/ginux/instances/NAME/outcome` | Last outcome record, root 0600; removed by the next `start` and by `delete` |
-| `/run/ginux/instances/NAME/result.runtime` | Record written by the runtime, validated before it becomes `outcome` |
+| `/run/ginux/instances/NAME/result.runtime` | Record written by the runtime, validated before it becomes `outcome`; created empty when the run starts and filled only at the runtime's normal exit, so an empty or incomplete file means `supervisor-error` |
 | `/var/lib/ginux/instances/NAME` | Root-owned, mode 0700 whatever the helper's umask (set at create and import, and again at every `start`); holds the recipe, deployment state, root, `console.log` and `audit.log` (both 0600, recreated by every `start`) |
 | `/var/lib/ginux/work/instance.NAME.lock` | Per-instance lock taken by import, create, start, delete, extract and inject |
 | `/var/lib/ginux/instances/.delete:*` | Trash of an interrupted delete; swept after one hour |
