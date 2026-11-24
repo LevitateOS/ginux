@@ -454,9 +454,14 @@ error goes through the sanitizing relay described above.
 When the run does not end with exit code 0 (a non-zero code, `signaled`,
 `supervisor-error` or no valid record), the helper then writes to standard
 error the line `ginux: audit log (last N bytes):` followed by the last N bytes
-of the audit log, N at most 65536. A run that exits 0 never prints the audit
-log. The exit status and the outcome record are the same as without the
-option.
+of the audit log, N at most 65536 (`ginux: the audit log is empty` when N is
+0), then three summary lines: `ginux: supervisor exit status: S`, `ginux:
+runtime command exit status: S` (or `none recorded` when the supervisor ended
+before the runtime command did) and `ginux: runtime outcome record: present`,
+`empty` or `missing`. The supervisor's own standard error is appended to the
+audit log, so an error that ends it before the runtime starts is in that
+tail. A run that exits 0 never prints the audit log. The exit status and the
+outcome record are the same as without the option.
 
 ### State layout
 

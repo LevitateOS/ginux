@@ -1,4 +1,10 @@
-#!/bin/sh
+#!/bin/bash
+# bash, not /bin/sh: the runtime takes its control channel on descriptor 10,
+# and a POSIX shell such as dash (/bin/sh on Debian and Ubuntu) opens no
+# descriptor above 9: there `exec 10<>FILE` runs a command named 10, which
+# ends the supervisor before it starts the runtime. POSIX mode keeps the
+# semantics the script has where /bin/sh is bash.
+set -o posix
 set -eu
 
 state_root=${GINUX_STATE_ROOT:-/var/lib/ginux}
@@ -109,7 +115,10 @@ trusted_root() {
         if test ! -e "$trusted_prefix" && test ! -L "$trusted_prefix"; then
             test "$trusted_create" = true ||
                 untrusted_root "$trusted_kind" "$trusted_path" "$trusted_prefix does not exist"
-            mkdir -m 0755 -- "$trusted_prefix" ||
+            # Another helper may create the same level at the same time: a
+            # level that exists after a failed mkdir is checked like any other.
+            mkdir -m 0755 -- "$trusted_prefix" 2>/dev/null ||
+                test -d "$trusted_prefix" ||
                 untrusted_root "$trusted_kind" "$trusted_path" "cannot create $trusted_prefix"
         fi
         trusted_root_level "$trusted_kind" "$trusted_path" "$trusted_prefix"
@@ -622,6 +631,7 @@ materialize_runtime_config() {
 prepare_root() {
     root=$1
     mkdir -p \
+        "$root/etc" \
         "$root/run" \
         "$root/run/host" \
         "$root/proc" \
@@ -1151,8 +1161,11 @@ start_instance() {
     # through start --wait --stream-console instead.
     chmod 0600 "$directory/audit.log" "$directory/console.log"
 
-    # The supervisor must not inherit the instance lock on descriptor 6.
-    nohup "$0" --protocol 1 supervise "$name" "$start_audit" 6>&- >/dev/null 2>&1 </dev/null &
+    # The supervisor must not inherit the instance lock on descriptor 6. Its
+    # own errors (one that ends it before the runtime starts) go to the audit
+    # log, the only place a caller is shown.
+    nohup "$0" --protocol 1 supervise "$name" "$start_audit" 6>&- >/dev/null \
+        2>>"$directory/audit.log" </dev/null &
     pid=$!
     record_supervisor "$runtime_directory" "$pid"
     wait_supervisor_start=$record_start
@@ -1192,7 +1205,7 @@ supervisor_child_running() {
 # a later start may already have recorded its own.
 remove_waited_pid_files() {
     waited_record=
-    IFS= read -r waited_record <"$runtime_directory/supervisor.pid" 2>/dev/null || true
+    IFS= read -r waited_record 2>/dev/null <"$runtime_directory/supervisor.pid" || true
     if test "$waited_record" = "$pid $wait_supervisor_start"; then
         rm -f "$runtime_directory/runtime.pid" "$runtime_directory/supervisor.pid"
     fi
@@ -1226,7 +1239,8 @@ teardown() {
     if test -n "$teardown_runtime"; then
         kill -KILL "$teardown_runtime" 2>/dev/null || true
     fi
-    wait "$pid" 2>/dev/null || true
+    supervisor_status=0
+    wait "$pid" 2>/dev/null || supervisor_status=$?
     test -f "$runtime_directory/outcome" || write_outcome_supervisor_error
     remove_waited_pid_files
     finish_console_stream
@@ -1316,8 +1330,29 @@ finish_console_stream() {
 }
 
 # report_audit_tail: the last 64 KiB of the audit log on standard error after
-# a one-line marker giving the byte count, opened like the console log.
+# a one-line marker giving the byte count, opened like the console log, then
+# what the supervisor left: its exit status, the status of the runtime
+# command it ran, and the state of the runtime's outcome record.
 report_audit_tail() {
+    report_audit_log
+    if test "${supervisor_status-}" != ''; then
+        printf 'ginux: supervisor exit status: %s\n' "$supervisor_status" >&2
+    fi
+    report_exit_status=
+    IFS= read -r report_exit_status 2>/dev/null <"$runtime_directory/exit.status" || true
+    printf 'ginux: runtime command exit status: %s\n' \
+        "${report_exit_status:-none recorded (the supervisor ended before the runtime command did)}" >&2
+    if test -s "$runtime_directory/result.runtime"; then
+        report_result='present'
+    elif test -e "$runtime_directory/result.runtime"; then
+        report_result='empty (the runtime started and ended without recording an outcome)'
+    else
+        report_result='missing (the runtime did not start, or its record was discarded)'
+    fi
+    printf 'ginux: runtime outcome record: %s\n' "$report_result" >&2
+}
+
+report_audit_log() {
     audit_log=$directory/audit.log
     test -f "$audit_log" && test ! -L "$audit_log" || return 0
     command exec 4<"$audit_log" || return 0
@@ -1330,6 +1365,10 @@ report_audit_tail() {
     printf 'ginux: audit log (last %s bytes):\n' "$audit_size" >&2
     if test "$audit_size" -gt 0; then
         tail -c "$audit_size" <&4 >&2 2>/dev/null || true
+        # The summary lines start on a line of their own.
+        printf '\n' >&2
+    else
+        printf 'ginux: the audit log is empty\n' >&2
     fi
     exec 4<&-
 }
@@ -1339,7 +1378,7 @@ report_audit_tail() {
 # workload's code, 128+signal, or 70 for supervisor-error. Prints nothing,
 # except with --stream-console: then standard output carries exactly the
 # console bytes, and a run that did not exit 0 adds the end of the audit log
-# to standard error.
+# and the supervisor summary (report_audit_tail) to standard error.
 wait_for_instance() {
     trap teardown HUP INT TERM
     test "$start_stream" = false || open_console_stream
@@ -1350,7 +1389,8 @@ wait_for_instance() {
         wait "$!" || true
     done
     trap - HUP INT TERM
-    wait "$pid" 2>/dev/null || true
+    supervisor_status=0
+    wait "$pid" 2>/dev/null || supervisor_status=$?
     test -f "$runtime_directory/outcome" || write_outcome "$runtime_directory"
     remove_waited_pid_files
     finish_console_stream
