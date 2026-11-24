@@ -10442,7 +10442,19 @@ fn supervise_native(
                     native_fail(instance, pid, b"native executor resume failed");
                 }
             }
-            Action::Mediate if mode == 3 && syscall == 5 && registers.rdi <= 2 => {
+            // Only a descriptor tracked as the console has the virtual
+            // console's status. Any other one, a standard stream included,
+            // gets the kernel's answer: a pipe duplicated onto 1 is a FIFO,
+            // and a closed descriptor is EBADF (git checks fstat(1) before
+            // closing a stdout that pack-objects already closed).
+            Action::Mediate
+                if mode == 3
+                    && syscall == 5
+                    && native_fd_contains(
+                        &descriptor_tables[task.descriptor_table].console_fds,
+                        registers.rdi as u32 as usize,
+                    ) =>
+            {
                 let stat = virtual_console_stat();
                 let allowed = write_tracee_bytes(host_pid, registers.rsi as usize, &stat);
                 write_all(b"emulate surface=virtual-console-stat result=");

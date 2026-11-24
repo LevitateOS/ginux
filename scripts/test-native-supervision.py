@@ -600,6 +600,19 @@ port_forwards = ["udp/lo/18083/18081"]'''))
               and (root / "tmp/renamed-link").is_symlink()
               and (root / "denied/file").stat().st_mode & 0o7777 == 0o666, code, out)
 
+        # git: pack-objects, a fork child with a pipe dup2'd onto 1 and 2,
+        # closes stdout itself; fstat(1) then fails with EBADF, so git does
+        # not close it again. fstat of a standard stream that is not the
+        # console is the kernel's (a FIFO here), through fstat and through
+        # newfstatat(fd, "", AT_EMPTY_PATH), for a glibc-style clone,
+        # fork(2) and a grandchild that inherits the duplicates.
+        code, out = run("H-git-stdout", configured)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("fork children see their duplicated standard streams", code == 0
+              and fixture == ["GINUX_FIXTURE: glibc-fork-child=255",
+                              "GINUX_FIXTURE: grandchild=255",
+                              "GINUX_FIXTURE: fork-child=255"], code, out)
+
         # A sibling thread dup2s a read-only file onto the number an O_TRUNC
         # reopen returns, in a loop: only the checked open file is truncated.
         code, out = run("E-reopen-truncate-race", configured, timeout=120)

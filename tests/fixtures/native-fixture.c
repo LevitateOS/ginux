@@ -1916,6 +1916,69 @@ long native_fixture_main(const word *stack)
         print_result("GINUX_FIXTURE: race-ro-intact=", reads_exactly(check, precious));
         return 0;
     }
+    case 'H': {
+        /* git upload-pack runs pack-objects as a fork child with a pipe on
+         * its standard output; pack-objects closes that descriptor when the
+         * pack is written, and git then checks fstat(1) before closing
+         * stdout again ("Somebody closed stdout?"). Each child reports in
+         * its exit status: 1 fstat(1) is a FIFO after dup2, 2 its write
+         * arrived, 4 close(1) is 0, 8 fstat(1) is EBADF after it, 16 close(1)
+         * again is EBADF, 32 fstat(2) is a FIFO after dup2 onto 2, 64 and 128
+ * the same two fstat(1) answers through newfstatat(1, "", AT_EMPTY_PATH),
+ * which newer glibc uses for fstat. Round 0
+         * forks as glibc does (CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID),
+         * round 1 has that child fork a grandchild that inherits the
+         * duplicated descriptors and does the work, round 2 is fork(2). */
+        static int tid;
+        for (int round = 0; round < 3; ++round) {
+            int pipe[2] = {-1, -1};
+            if (call3(293, (word)pipe, 0x80000 /* O_CLOEXEC */, 0) != 0) return 82;
+            long pid = round == 2
+                ? call3(57, 0, 0, 0)
+                : call5(56, 0x01200000 | 17 /* CHILD_SETTID|CHILD_CLEARTID|SIGCHLD */, 0, 0,
+                        (word)&tid, 0);
+            if (pid == 0) {
+                if (call3(33, pipe[1], 1, 0) != 1 || call3(33, pipe[1], 2, 0) != 2) call3(231, 90, 0, 0);
+                call3(3, pipe[1], 0, 0);
+                call3(3, pipe[0], 0, 0);
+                if (round == 1) {
+                    long grandchild = call3(57, 0, 0, 0);
+                    if (grandchild > 0) {
+                        int status = 0;
+                        call3(3, 1, 0, 0);
+                        call3(3, 2, 0, 0);
+                        call4(61, grandchild, (word)&status, 0, 0);
+                        call3(231, (status >> 8) & 0xff, 0, 0);
+                    }
+                }
+                word stat[18];
+                long code = 0;
+                if (call3(5, 1, (word)stat, 0) == 0 && ((unsigned)stat[3] & 0170000) == 0010000)
+                    code |= 1;
+                if (call3(5, 2, (word)stat, 0) == 0 && ((unsigned)stat[3] & 0170000) == 0010000)
+                    code |= 32;
+                if (call4(262, 1, (word)"", (word)stat, 0x1000 /* AT_EMPTY_PATH */) == 0
+                    && ((unsigned)stat[3] & 0170000) == 0010000)
+                    code |= 64;
+                if (call3(1, 1, (word)"pack\n", 5) == 5) code |= 2;
+                call3(3, 2, 0, 0);
+                if (call3(3, 1, 0, 0) == 0) code |= 4;
+                if (call3(5, 1, (word)stat, 0) == -9) code |= 8;
+                if (call4(262, 1, (word)"", (word)stat, 0x1000) == -9) code |= 128;
+                if (call3(3, 1, 0, 0) == -9) code |= 16;
+                call3(231, code, 0, 0);
+            }
+            call3(3, pipe[1], 0, 0);
+            int status = 0;
+            long waited = call4(61, pid, (word)&status, 0, 0);
+            long got = reads_exactly(pipe[0], "pack\n");
+            call3(3, pipe[0], 0, 0);
+            print_result(round == 0 ? "GINUX_FIXTURE: glibc-fork-child=" :
+                         round == 1 ? "GINUX_FIXTURE: grandchild=" : "GINUX_FIXTURE: fork-child=",
+                         waited == pid && got ? (status >> 8) & 0xff : -1);
+        }
+        return 0;
+    }
     case 'K': {
         /* console writes through a duplicate and through the vectored and
          * positional calls are console writes like write on the open itself. */
