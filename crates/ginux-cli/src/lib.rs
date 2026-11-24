@@ -270,6 +270,10 @@ pub struct StartArgs {
     /// audit log to standard error.
     #[arg(long, requires = "wait", conflicts_with = "attach")]
     pub stream_console: bool,
+    /// With --stream-console: after every run, including one that exits 0,
+    /// print the whole audit log (its last 16 MiB) to standard error.
+    #[arg(long, requires = "stream_console")]
+    pub full_audit: bool,
 }
 
 fn parse_name(value: &str) -> Result<String, String> {
@@ -690,6 +694,9 @@ fn start_waiting(helper: &Helper, args: &StartArgs) -> Result<i32, String> {
     command.args(["--wait", &pid.to_string(), &start.to_string()]);
     if args.stream_console {
         command.arg("--stream-console");
+    }
+    if args.full_audit {
+        command.arg("--full-audit");
     }
     // Standard output is inherited, so the console bytes reach the caller
     // unchanged and unbuffered; standard error then goes through the
@@ -1320,6 +1327,47 @@ mod tests {
                 "--stream-console",
             ],
             &["ginux", "start", "rocky", "--wait", "--stream-console=yes"],
+        ] {
+            assert_eq!(
+                parse(arguments).unwrap_err().exit_code(),
+                2,
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_audit_requires_stream_console() {
+        let cli = parse(&[
+            "ginux",
+            "start",
+            "rocky",
+            "--wait",
+            "--stream-console",
+            "--full-audit",
+        ])
+        .unwrap();
+        let PublicCommand::Run(RunCommand::Start(args)) = cli.command else {
+            panic!("unexpected command")
+        };
+        assert!(args.wait && args.stream_console && args.full_audit);
+        let cli = parse(&["ginux", "start", "rocky", "--wait", "--stream-console"]).unwrap();
+        let PublicCommand::Run(RunCommand::Start(args)) = cli.command else {
+            panic!("unexpected command")
+        };
+        assert!(!args.full_audit);
+        for arguments in [
+            &["ginux", "start", "rocky", "--full-audit"] as &[&str],
+            &["ginux", "start", "rocky", "--wait", "--full-audit"],
+            &[
+                "ginux",
+                "start",
+                "rocky",
+                "--wait",
+                "--stream-console",
+                "--full-audit",
+                "--full-audit",
+            ],
         ] {
             assert_eq!(
                 parse(arguments).unwrap_err().exit_code(),

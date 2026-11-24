@@ -45,6 +45,8 @@ for invocation in \
     'start rocky --stream-console' \
     'start rocky --attach --stream-console' \
     'start rocky --wait --stream-console --stream-console' \
+    'start rocky --wait --full-audit' \
+    'start rocky --wait --stream-console --full-audit --full-audit' \
     'status rocky --format yaml' \
     'delete' \
     'delete rocky extra' \
@@ -242,6 +244,18 @@ sed -n '7p' "$test_directory/helper-args" | grep -Eq '^[0-9]+$'
 sed -n '8p' "$test_directory/helper-args" | grep -Eq '^[0-9]+$'
 sed -n '9p' "$test_directory/helper-args" | grep -Fxq -- '--stream-console'
 test "$(wc -l <"$test_directory/helper-args")" -eq 9
+
+# --full-audit is forwarded after --stream-console.
+set +e
+GINUX_TEST_SUDO_CONSOLE="$test_directory/console.bytes" \
+    fake start rocky --wait --stream-console --full-audit \
+    >"$test_directory/stream.out" 2>"$test_directory/stream.err"
+status=$?
+set -e
+test "$status" -eq 5
+sed -n '9p' "$test_directory/helper-args" | grep -Fxq -- '--stream-console'
+sed -n '10p' "$test_directory/helper-args" | grep -Fxq -- '--full-audit'
+test "$(wc -l <"$test_directory/helper-args")" -eq 10
 
 # A terminating signal to start --wait reaches the helper's sudo process.
 cat >"$test_directory/bin/sudo" <<'SCRIPT'

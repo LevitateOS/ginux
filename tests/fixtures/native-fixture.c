@@ -103,6 +103,58 @@ static void protected_step(const char *label, const char *intact, const char *co
                          && status == 256);
 }
 
+/* PREFIX followed by the decimal NUMBER, terminated, in OUTPUT. */
+static const char *fd_path(char *output, const char *prefix, word number)
+{
+    char digits[24];
+    word count = 0, at = 0;
+    do digits[count++] = (char)('0' + number % 10); while ((number /= 10) != 0);
+    while (*prefix) output[at++] = *prefix++;
+    while (count) output[at++] = digits[--count];
+    output[at] = 0;
+    return output;
+}
+
+/* Read up to 63 bytes of FD and report whether they are exactly EXPECTED. */
+static long reads_exactly(long fd, const char *expected)
+{
+    char buffer[64];
+    long count = fd < 0 ? fd : call3(0, fd, (word)buffer, sizeof buffer - 1);
+    long at = 0;
+    if (count < 0) return 0;
+    while (at < count && expected[at] && buffer[at] == expected[at]) ++at;
+    return at == count && expected[at] == 0;
+}
+
+static volatile long thread_open_result = -1000;
+
+/* A CLONE_THREAD child that opens PATH read-only, stores the result in
+ * thread_open_result and exits. */
+long native_thread_open(word flags, word stack, const char *path);
+__asm__(".global native_thread_open\n"
+        "native_thread_open:\n"
+        "push %r12\n"
+        "mov %rdx, %r12\n"
+        "xor %edx, %edx\n"
+        "xor %r10d, %r10d\n"
+        "xor %r8d, %r8d\n"
+        "mov $56, %eax\n"
+        "syscall\n"
+        "test %rax, %rax\n"
+        "jnz 2f\n"
+        "mov $2, %eax\n"
+        "mov %r12, %rdi\n"
+        "xor %esi, %esi\n"
+        "xor %edx, %edx\n"
+        "syscall\n"
+        "mov %rax, thread_open_result(%rip)\n"
+        "mov $60, %eax\n"
+        "xor %edi, %edi\n"
+        "syscall\n"
+        "ud2\n"
+        "2: pop %r12\n"
+        "ret\n");
+
 static volatile long yield_signals;
 
 static void yield_signal_handler(int signal)
@@ -1628,6 +1680,139 @@ long native_fixture_main(const word *stack)
                      && call3(72, 300, 1, 0) == -9 && call3(72, 301, 1, 0) == 0
                      && !tracked_as_console(250) && call3(72, 240, 1, 0) == 0
                      && call3(72, 241, 1, 0) == 0);
+        return 0;
+    }
+    case 'D': {
+        /* bash reopens a script it holds open through /dev/fd/N, also once
+         * the file is unlinked. The chrooted root has no /proc, so Ginux
+         * reopens the descriptor: a linked file by its path, from its start;
+         * an unlinked file, a pipe and the console by a copy of it, which
+         * shares N's offset and status flags (unlike a Linux reopen). */
+        static const char text[] = "dev-fd-content\n";
+        char path[48], buffer[64];
+        long made = call4(2, (word)"/tmp/dev-fd-script", 0x242 /* O_RDWR|O_CREAT|O_TRUNC */,
+                          0600, 0);
+        if (made < 0 || call3(1, made, (word)text, sizeof text - 1) != sizeof text - 1)
+            return 82;
+        call3(3, made, 0, 0);
+        long held = call3(2, (word)"/tmp/dev-fd-script", 0 /* O_RDONLY */, 0);
+        if (held < 0 || call3(87, (word)"/tmp/dev-fd-script", 0, 0) != 0) return 83;
+        long reopened = call3(2, (word)fd_path(path, "/dev/fd/", held), 0, 0);
+        print_result("GINUX_FIXTURE: dev-fd-unlinked=", reads_exactly(reopened, text));
+        call3(3, reopened, 0, 0);
+        /* The copy's read moved held's offset too. */
+        print_result("GINUX_FIXTURE: dev-fd-shared-offset=", call3(8, held, 0, 1 /* SEEK_CUR */));
+        reopened = call4(257, (word)-100, (word)fd_path(path, "/proc/self/fd/", held),
+                         0x80000 /* O_CLOEXEC */, 0);
+        print_result("GINUX_FIXTURE: proc-fd-at-shared-offset=",
+                     call3(0, reopened, (word)buffer, sizeof buffer));
+        /* Seeking the copy seeks held. */
+        call3(8, reopened, 0, 0 /* SEEK_SET */);
+        print_result("GINUX_FIXTURE: proc-fd-unlinked=", reads_exactly(held, text));
+        print_result("GINUX_FIXTURE: proc-fd-cloexec=", call3(72, reopened, 1 /* F_GETFD */, 0));
+        call3(3, reopened, 0, 0);
+        /* A thread reopens from its own task. */
+        call3(8, held, 0, 0 /* SEEK_SET */);
+        word stack = call6(9, 0, 16384, 3, 0x22, -1, 0);
+        if (native_thread_open(0x50f00 /* VM|FS|FILES|SIGHAND|THREAD|SYSVSEM */, stack + 16384,
+                               fd_path(path, "/dev/fd/", held)) <= 0)
+            return 85;
+        while (thread_open_result == -1000) __asm__ volatile("pause");
+        print_result("GINUX_FIXTURE: thread-reopen=", reads_exactly(thread_open_result, text));
+        call3(3, thread_open_result, 0, 0);
+        /* A read-only descriptor does not reopen for writing, and O_APPEND
+         * would change its regular file's shared open file. */
+        print_result("GINUX_FIXTURE: dev-fd-upgrade=",
+                     call3(2, (word)fd_path(path, "/dev/fd/", held), 1 /* O_WRONLY */, 0));
+        print_result("GINUX_FIXTURE: dev-fd-append-regular=",
+                     call3(2, (word)fd_path(path, "/dev/fd/", held), 0x400 /* O_APPEND */, 0));
+        print_result("GINUX_FIXTURE: dev-fd-leading-zero=",
+                     call3(2, (word)fd_path(path, "/dev/fd/0", held), 0, 0));
+        /* /scenario was read to its end on fd; a linked file reopens by path. */
+        reopened = call3(2, (word)fd_path(path, "/dev/fd/", fd), 0, 0);
+        print_result("GINUX_FIXTURE: dev-fd-linked=", reads_exactly(reopened, "D-dev-fd-reopen"));
+        call3(3, reopened, 0, 0);
+        int pipe[2] = {-1, -1};
+        if (call3(293, (word)pipe, 0, 0) != 0) return 84;
+        reopened = call3(2, (word)fd_path(path, "/dev/fd/", pipe[0]), 0, 0);
+        call3(1, pipe[1], (word)"pipe\n", 5);
+        print_result("GINUX_FIXTURE: dev-fd-pipe=", reads_exactly(reopened, "pipe\n"));
+        call3(3, reopened, 0, 0);
+        /* `>>/dev/fd/W` on a pipe: O_APPEND changes nothing there. O_NONBLOCK
+         * is accepted when the descriptor already has it. */
+        reopened = call3(2, (word)fd_path(path, "/dev/fd/", pipe[1]),
+                         0x441 /* O_WRONLY|O_CREAT|O_APPEND */, 0);
+        print_result("GINUX_FIXTURE: dev-fd-append-pipe=",
+                     call3(1, reopened, (word)"more\n", 5) == 5 && reads_exactly(pipe[0], "more\n"));
+        call3(3, reopened, 0, 0);
+        print_result("GINUX_FIXTURE: dev-fd-nonblock-blocking=",
+                     call3(2, (word)fd_path(path, "/dev/fd/", pipe[0]), 0x800 /* O_NONBLOCK */, 0));
+        int quick[2] = {-1, -1};
+        if (call3(293, (word)quick, 0x800 /* O_NONBLOCK */, 0) != 0) return 86;
+        reopened = call3(2, (word)fd_path(path, "/dev/fd/", quick[0]), 0x800, 0);
+        print_result("GINUX_FIXTURE: dev-fd-nonblock-same=",
+                     call3(0, reopened, (word)buffer, sizeof buffer) == -11 /* EAGAIN */);
+        call3(3, reopened, 0, 0);
+        /* fopen("/dev/stderr", "a") */
+        reopened = call3(2, (word)"/dev/stderr", 0x441, 0);
+        print_result("GINUX_FIXTURE: stderr-append=", reopened >= 0);
+        call3(3, reopened, 0, 0);
+        reopened = call3(2, (word)fd_path(path, "/dev/fd/", 241), 1 /* O_WRONLY */, 0);
+        print_result("GINUX_FIXTURE: dev-fd-console=", tracked_as_console(reopened));
+        call3(3, reopened, 0, 0);
+        /* `>/dev/stdin` where stdin is a host file outside the root: the
+         * open succeeds and O_TRUNC is ignored (the test checks the file). */
+        reopened = call3(2, (word)"/dev/stdin", 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0);
+        print_result("GINUX_FIXTURE: host-trunc-open=", reopened >= 0);
+        call3(3, reopened, 0, 0);
+        /* O_TRUNC on an unlinked file inside the root truncates it. */
+        long writer = call4(2, (word)"/tmp/dev-fd-trunc", 0x242, 0600, 0);
+        if (writer < 0 || call3(1, writer, (word)text, sizeof text - 1) != sizeof text - 1
+            || call3(87, (word)"/tmp/dev-fd-trunc", 0, 0) != 0)
+            return 87;
+        reopened = call3(2, (word)fd_path(path, "/dev/fd/", writer), 0x201 /* O_WRONLY|O_TRUNC */, 0);
+        print_result("GINUX_FIXTURE: dev-fd-trunc-inside=",
+                     reopened >= 0 && call3(8, writer, 0, 2 /* SEEK_END */) == 0);
+        call3(3, reopened, 0, 0);
+        print_result("GINUX_FIXTURE: dev-fd-closed=", call3(2, (word)"/dev/fd/999", 0, 0));
+        print_result("GINUX_FIXTURE: dev-fd-wrapped=",
+                     call3(2, (word)fd_path(path, "/dev/fd/", 4294967296UL + held), 0, 0));
+        return 0;
+    }
+    case 'X': {
+        /* scripts/test-native-supervision.py denies writes below /denied.
+         * The deny list resolves a link before the `..` after it, accepts
+         * paths longer than 511 bytes, and judges unlink and rename by the
+         * link itself, not the file it points at. */
+        char deep[700];
+        word at = 0;
+        const char *prefix = "/tmp/";
+        while (*prefix) deep[at++] = *prefix++;
+        long made = 0;
+        for (int level = 0; level < 3; ++level) {
+            if (level) deep[at++] = '/';
+            for (int count = 0; count < 200; ++count) deep[at++] = (char)('a' + level);
+            deep[at] = 0;
+            made += call3(83, (word)deep, 0755, 0) == 0;
+        }
+        const char *leaf = "/file";
+        while (*leaf) deep[at++] = *leaf++;
+        deep[at] = 0;
+        long deep_file = call4(2, (word)deep, 0x41 /* O_WRONLY|O_CREAT */, 0644, 0);
+        print_result("GINUX_FIXTURE: long-path=", made == 3 && deep_file >= 0 && at > 511);
+        print_result("GINUX_FIXTURE: link-dir=",
+                     call3(88, (word)"/denied/sub", (word)"/tmp/deny-dir-link", 0));
+        print_result("GINUX_FIXTURE: dotdot-bypass=",
+                     call4(2, (word)"/tmp/deny-dir-link/../escape", 0x41, 0644, 0));
+        print_result("GINUX_FIXTURE: denied-create=",
+                     call4(2, (word)"/denied/new", 0x41, 0644, 0));
+        call3(88, (word)"/denied/file", (word)"/tmp/into-denied", 0);
+        print_result("GINUX_FIXTURE: unlink-link-to-denied=",
+                     call3(87, (word)"/tmp/into-denied", 0, 0));
+        call3(88, (word)"/denied/file", (word)"/tmp/into-denied-2", 0);
+        print_result("GINUX_FIXTURE: rename-link-to-denied=",
+                     call3(82, (word)"/tmp/into-denied-2", (word)"/tmp/renamed-link", 0));
+        print_result("GINUX_FIXTURE: denied-unlink=", call3(87, (word)"/denied/file", 0, 0));
         return 0;
     }
     case 'K': {

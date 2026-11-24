@@ -1087,6 +1087,7 @@ start_instance() {
     start_wait_pid=
     start_wait_start=
     start_stream=false
+    start_full_audit=false
     while test "$#" -gt 0; do
         case $1 in
             --attach)
@@ -1110,12 +1111,17 @@ start_instance() {
                 test "$start_stream" = false || usage
                 start_stream=true
                 ;;
+            --full-audit)
+                test "$start_full_audit" = false || usage
+                start_full_audit=true
+                ;;
             *) usage ;;
         esac
         shift
     done
     test -z "$start_wait_pid" || test "$start_mode" = detached || usage
     test "$start_stream" = false || test -n "$start_wait_pid" || usage
+    test "$start_full_audit" = false || test "$start_stream" = true || usage
     validate_name "$name"
     lock_instance "$name"
     directory=$(instance_dir "$name")
@@ -1309,7 +1315,8 @@ console_stream_pump() {
 # finish_console_stream: after the run has ended, let the pump copy the
 # remainder of the console log (bounded: a pump blocked on a reader that no
 # longer reads is killed after five seconds), then, unless the workload
-# exited 0, write the end of the audit log to standard error.
+# exited 0, write the end of the audit log to standard error. With
+# --full-audit, write the whole audit log (up to 16 MiB) on every outcome.
 finish_console_stream() {
     test "$start_stream" = true || return 0
     if test -n "${stream_pid-}"; then
@@ -1322,15 +1329,17 @@ finish_console_stream() {
         stream_pid=
     fi
     exec 3<&-
-    if read_outcome "$runtime_directory/outcome" &&
+    if test "$start_full_audit" = false && read_outcome "$runtime_directory/outcome" &&
         test "$outcome_kind" = exited && test "$outcome_code" -eq 0; then
         return 0
     fi
     report_audit_tail
 }
 
-# report_audit_tail: the last 64 KiB of the audit log on standard error after
-# a one-line marker giving the byte count, opened like the console log, then
+# report_audit_tail: the last 64 KiB (16 MiB with --full-audit) of the audit
+# log on standard error after a one-line marker giving the byte count, opened
+# like the console log (with --full-audit a cut log adds a line after the
+# marker saying how many leading bytes were left out), then
 # what the supervisor left: its exit status, the status of the runtime
 # command it ran, and the state of the runtime's outcome record.
 report_audit_tail() {
@@ -1361,8 +1370,15 @@ report_audit_log() {
         return 0
     }
     audit_size=$(stat -L -c %s "/proc/$$/fd/4" 2>/dev/null || printf 0)
-    test "$audit_size" -le 65536 || audit_size=65536
+    audit_total=$audit_size
+    audit_cap=65536
+    test "${start_full_audit-false}" = false || audit_cap=16777216
+    test "$audit_size" -le "$audit_cap" || audit_size=$audit_cap
     printf 'ginux: audit log (last %s bytes):\n' "$audit_size" >&2
+    if test "${start_full_audit-false}" = true && test "$audit_size" -lt "$audit_total"; then
+        printf 'ginux: audit log truncated: the first %s of %s bytes are left out\n' \
+            "$((audit_total - audit_size))" "$audit_total" >&2
+    fi
     if test "$audit_size" -gt 0; then
         tail -c "$audit_size" <&4 >&2 2>/dev/null || true
         # The summary lines start on a line of their own.
@@ -1377,8 +1393,9 @@ report_audit_log() {
 # when the caller dies or this helper is signalled, and exit with the
 # workload's code, 128+signal, or 70 for supervisor-error. Prints nothing,
 # except with --stream-console: then standard output carries exactly the
-# console bytes, and a run that did not exit 0 adds the end of the audit log
-# and the supervisor summary (report_audit_tail) to standard error.
+# console bytes, and a run that did not exit 0 (with --full-audit: every run)
+# adds the end of the audit log and the supervisor summary
+# (report_audit_tail) to standard error.
 wait_for_instance() {
     trap teardown HUP INT TERM
     test "$start_stream" = false || open_console_stream

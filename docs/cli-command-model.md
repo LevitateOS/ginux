@@ -272,7 +272,7 @@ them.
 
 ```text
 ginux [--state-root DIR [--run-root DIR]] COMMAND ...
-ginux start NAME [--audit] --wait [--stream-console]
+ginux start NAME [--audit] --wait [--stream-console [--full-audit]]
 ginux status NAME [--format text|json]
 ginux extract NAME --output FILE [--max-bytes N] [--max-members N]
                   [--max-path N] PATH...
@@ -286,6 +286,7 @@ ginux import-image PATH
 |---|---|---|
 | `start --wait` | Foreground start tied to the calling process; stdout stays empty; conflicts with `--attach` | Run instances |
 | `start --wait --stream-console` | As `start --wait`, and stdout carries exactly the instance console output as it appears; requires `--wait`, conflicts with `--attach` | Run instances |
+| `start --wait --stream-console --full-audit` | As `start --wait --stream-console`, and every run, including one that exits 0, ends with the whole audit log (its last 16 MiB) on stderr; requires `--stream-console` | Run instances |
 | `status --format json` | One JSON object on one line; `text` (the default) is the existing output | Inspect instances |
 | `extract` | Writes named absolute directories of a stopped instance as one tar archive to a new `FILE` | Inspect instances |
 | `delete` | Removes a stopped instance and all of its state | Configure instances |
@@ -296,6 +297,7 @@ ginux import-image PATH
 Parse rules (violations exit 2 before any sudo call):
 
 - `--stream-console` requires `--wait` and conflicts with `--attach`.
+- `--full-audit` requires `--stream-console`.
 - `--state-root` and `--run-root` are absolute, contain only
   `[A-Za-z0-9_./-]`, have no empty, `.` or `..` component and are at most 256
   bytes. `--run-root` requires `--state-root`; `--state-root` alone implies
@@ -359,7 +361,7 @@ ginux-helper --protocol 1 [--state-root DIR --run-root DIR] VERB ARG...
   extract NAME --max-bytes N --max-members N --max-path N PATH...   (tar on stdout)
   inject NAME --max-bytes N --max-members N --max-path N PATH       (tar on stdin)
   import-image                                                      (tar on stdin, digest on stdout)
-  start NAME [--audit] --wait CALLER_PID CALLER_START [--stream-console]
+  start NAME [--audit] --wait CALLER_PID CALLER_START [--stream-console [--full-audit]]
   status NAME --format json
 ```
 
@@ -401,8 +403,8 @@ terminal. Instance names must not start with `.`.
 | 0-255 | `start --wait` only: workload exit status, or 128+signal | start --wait |
 
 `start --wait` statuses overlap by nature; a caller disambiguates them with
-`status --format json`. An older helper rejects `--stream-console` with usage
-status 64, passed through like every `start --wait` status.
+`status --format json`. An older helper rejects `--stream-console` and
+`--full-audit` with usage status 64, passed through like every `start --wait` status.
 
 ### Foreground start and the outcome record
 
@@ -460,8 +462,19 @@ runtime command exit status: S` (or `none recorded` when the supervisor ended
 before the runtime command did) and `ginux: runtime outcome record: present`,
 `empty` or `missing`. The supervisor's own standard error is appended to the
 audit log, so an error that ends it before the runtime starts is in that
-tail. A run that exits 0 never prints the audit log. The exit status and the
-outcome record are the same as without the option.
+tail. A run that exits 0 never prints the audit log, unless `--full-audit` is
+given. The exit status and the outcome record are the same as without the
+option.
+
+With `--full-audit` the helper writes the same marker line, audit log and
+summary lines after every run, including one that exits 0, and N is at most
+16777216 (16 MiB) instead of 65536, so a log of up to 16 MiB is delivered
+whole. When the log is longer, the last 16 MiB are written and the marker line
+is followed by `ginux: audit log truncated: the first M of T bytes are left
+out`. A caller separates the audit log from the console output as before:
+everything after the first marker line on standard error is the audit log and
+the summary (the audit log itself may contain a line that looks like a
+marker, so only the first one counts).
 
 ### State layout
 

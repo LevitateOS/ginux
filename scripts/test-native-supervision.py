@@ -515,6 +515,77 @@ port_forwards = ["udp/lo/18083/18081"]'''))
                               "GINUX_FIXTURE: exec-reused-close=0"]
               and out.count("surface=task-pipe ") == 16 * 3 + 2 + 3 + 4 + 8, code, out)
 
+        # bash reopens the script it holds through /dev/fd/N after unlinking
+        # it. The root has no /proc (the image's /dev/fd is a link into it),
+        # so Ginux reopens the descriptor: a linked file by its path from its
+        # start; an unlinked file, a pipe and the console as a copy sharing
+        # the descriptor's offset and status flags; from a thread too; no
+        # access the descriptor lacks, no number with a leading zero or one
+        # that wraps onto another; O_APPEND where it changes nothing and
+        # O_NONBLOCK where the descriptor has it. O_TRUNC truncates an
+        # unlinked file inside the root but never a host file outside it
+        # (stdin here, like a host log on a standard stream).
+        (root / "dev").mkdir(exist_ok=True)
+        (root / "dev/fd").unlink(missing_ok=True)
+        (root / "dev/fd").symlink_to("/proc/self/fd")
+        host_file = work / "host-stdin"
+        host_file.write_bytes(b"keep\n")
+        with host_file.open("r+b") as stream:
+            code, out = run("D-dev-fd-reopen", configured, stdin=stream)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("/dev/fd and /proc/self/fd reopen the caller's descriptor", code == 0
+              and fixture == ["GINUX_FIXTURE: dev-fd-unlinked=1",
+                              "GINUX_FIXTURE: dev-fd-shared-offset=15",
+                              "GINUX_FIXTURE: proc-fd-at-shared-offset=0",
+                              "GINUX_FIXTURE: proc-fd-unlinked=1",
+                              "GINUX_FIXTURE: proc-fd-cloexec=1",
+                              "GINUX_FIXTURE: thread-reopen=1",
+                              "GINUX_FIXTURE: dev-fd-upgrade=-13",
+                              "GINUX_FIXTURE: dev-fd-append-regular=-22",
+                              "GINUX_FIXTURE: dev-fd-leading-zero=-2",
+                              "GINUX_FIXTURE: dev-fd-linked=1",
+                              "GINUX_FIXTURE: dev-fd-pipe=1",
+                              "GINUX_FIXTURE: dev-fd-append-pipe=1",
+                              "GINUX_FIXTURE: dev-fd-nonblock-blocking=-22",
+                              "GINUX_FIXTURE: dev-fd-nonblock-same=1",
+                              "GINUX_FIXTURE: stderr-append=1",
+                              "GINUX_FIXTURE: dev-fd-console=1",
+                              "GINUX_FIXTURE: host-trunc-open=1",
+                              "GINUX_FIXTURE: dev-fd-trunc-inside=1",
+                              "GINUX_FIXTURE: dev-fd-closed=-2",
+                              "GINUX_FIXTURE: dev-fd-wrapped=-2"]
+              and host_file.read_bytes() == b"keep\n"
+              and not (root / "tmp/dev-fd-script").exists(), code, out)
+
+        # A filesystem deny entry: a link is resolved before the `..` after
+        # it, a path longer than 511 bytes in a writable directory works, and
+        # unlink and rename act on a link to a denied file, not on the file.
+        deny_config = work / "deny.toml"
+        deny_config.write_text(configured.read_text().replace(
+            'create = ["/"]\n[contract.kernel]',
+            'create = ["/"]\ndeny = ["/denied"]\n[contract.kernel]'))
+        if 'deny = ["/denied"]' not in deny_config.read_text():
+            raise RuntimeError("deny config not derived")
+        (root / "denied/sub").mkdir(parents=True)
+        (root / "denied").chmod(0o777)
+        (root / "denied/sub").chmod(0o777)
+        (root / "denied/file").write_bytes(b"protected")
+        (root / "denied/file").chmod(0o666)
+        code, out = run("X-deny-resolution", deny_config, configured_launch=True)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("deny list resolves links before .., long paths and link names", code == 0
+              and fixture == ["GINUX_FIXTURE: long-path=1",
+                              "GINUX_FIXTURE: link-dir=0",
+                              "GINUX_FIXTURE: dotdot-bypass=-1",
+                              "GINUX_FIXTURE: denied-create=-1",
+                              "GINUX_FIXTURE: unlink-link-to-denied=0",
+                              "GINUX_FIXTURE: rename-link-to-denied=0",
+                              "GINUX_FIXTURE: denied-unlink=-1"]
+              and sorted(p.name for p in (root / "denied").iterdir()) == ["file", "sub"]
+              and (root / "denied/file").read_bytes() == b"protected"
+              and not (root / "tmp/into-denied").is_symlink()
+              and (root / "tmp/renamed-link").is_symlink(), code, out)
+
         # Force a shared-table mutation to remain in the host kernel while a
         # sibling reaches another descriptor operation. The host process owns
         # the conflicting byte-range lock; without the supervisor barrier the

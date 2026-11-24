@@ -24,6 +24,22 @@ invalid. This is a configured metadata view, not a procfs mount: it adds no
 directory enumeration, host-process view or proc-path open authority, and does
 not change native policy. Explicit contract denial still precedes the view.
 
+In the native backend (`ptrace-native`), the tracee's root has no procfs, so
+an open of `/dev/fd/N`, `/proc/self/fd/N` or `/dev/stdin`, `/dev/stdout`,
+`/dev/stderr` reopens the caller's descriptor N itself. A descriptor whose file
+is still linked inside the instance root is opened again by that path: a new
+open file, as on Linux. Any other descriptor (an unlinked file, a pipe, the
+console, a file outside the root) is served as a copy of descriptor N, which
+differs from Linux: the copy shares N's open file, so it shares N's file
+offset and status flags, and reading or seeking one moves the other. A copy
+never grants access N lacks (EACCES); a socket is ENXIO, a closed descriptor
+or a number with a leading zero or past the 32-bit range is ENOENT; O_APPEND
+is accepted only where N already appends or the file is not a regular file,
+O_NONBLOCK only where N is non-blocking, and other flags that would change
+the shared open file are EINVAL. O_TRUNC on a copy truncates an unlinked file
+inside the root, after the copy exists, and is ignored for a file outside the
+root, which is never truncated.
+
 Configured `readv` on an image descriptor, and `faccessat` and `readlinkat` on
 an image path, are image reads like `read`, `access` and `readlink`. Only a
 registered native image or inherited console descriptor reaches the kernel;
@@ -314,8 +330,20 @@ native/selective/paranoid comparison is documented in
 ## Filesystem, devices, and privilege elevation
 
 Filesystem and device sections use consistent `read`, `write`, and `create`
-lists. A filesystem `deny` entry recursively blocks mutation below that path,
-including link-based bypasses. Device `create = []` prevents character and
+lists. A filesystem `deny` entry recursively blocks mutation below that path.
+In the native backend each path argument is resolved inside the instance root
+the way the kernel walks it before it is judged: a symbolic link is replaced
+by its target before a later `..` is applied, up to 40 links and paths up to
+PATH_MAX are followed, and calls that act on a name itself (unlink, rmdir,
+rename, link, symlink, mkdir, mknod) are judged by that name, so a link to a
+denied file can still be removed or replaced. A path that cannot be resolved
+is refused. A write open of `/dev/fd/N` is judged by the file descriptor N
+names. The check runs before the call, from the tracee's view of the root, so
+it is a policy on path arguments, not a complete barrier: it does not cover
+every way a process can reach a file (for example a descriptor opened before
+the rule applied, or a concurrent rename of a directory between the check and
+the call), and it should be combined with file ownership and modes (such as
+read-only, root-owned inputs) where a hard guarantee is needed. Device `create = []` prevents character and
 block device creation while ordinary FIFO creation remains governed by the
 filesystem and syscall rules.
 

@@ -11,7 +11,7 @@ grammar (tar on standard input) and once through the CLI. One instance gets its
 init by `inject` after create. Instance directories and logs are root-private
 whatever the umask, and `start --wait --stream-console` delivers the console
 output on standard output (and the audit log tail on standard error after a
-failed run).
+failed run, or the whole audit log after every run with `--full-audit`).
 """
 import hashlib
 import io
@@ -570,6 +570,22 @@ def main():
         check("streamed run prints exactly the console output", code == 0
               and b"GINUX_FIXTURE: yield=" in out and out == console
               and audit_marker(err) is None, code, out, err, console)
+        # --full-audit: the same clean run also prints the whole audit log on
+        # standard error after the marker, then the supervisor summary.
+        code, out, err = ginux("start", late, "--audit", "--wait", "--stream-console",
+                               "--full-audit", umask=0o077)
+        console = (late_directory / "console.log").read_bytes()
+        audit_text = (late_directory / "audit.log").read_bytes().decode(errors="replace")
+        marker_line = f"ginux: audit log (last {len(audit_text.encode())} bytes):\n"
+        shown = err.split(marker_line, 1)[1] if marker_line in err else ""
+        check("--full-audit prints the whole audit log after a run that exits 0", code == 0
+              and out == console and b"GINUX_INSTANCE_START:" in out
+              and "GINUX_NATIVE_AUDIT:" in audit_text
+              and audit_marker(err) == len(audit_text.encode())
+              and shown.startswith(audit_text)
+              and "ginux: audit log truncated" not in err
+              and "ginux: runtime outcome record: present" in shown,
+              code, out, err, audit_text)
         # A failing workload (81 for "Z"): the console bytes, then the audit
         # log tail on standard error.
         set_scenario(late, "Z")
@@ -607,6 +623,12 @@ def main():
                                "start", late, "--stream-console"],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         check("helper refuses --stream-console without --wait", proc.returncode == 64
+              and status(late)["state"] == "stopped", proc.returncode, proc.stderr)
+        # --full-audit needs --stream-console, in the helper too.
+        proc = subprocess.run([str(wrapper), "--protocol", "1", "--state-root", str(state),
+                               "start", late, "--wait", str(os.getpid()), "1", "--full-audit"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        check("helper refuses --full-audit without --stream-console", proc.returncode == 64
               and status(late)["state"] == "stopped", proc.returncode, proc.stderr)
 
         # delete: refused while running, then atomic and idempotently 66.

@@ -63,8 +63,8 @@ use crate::supervisor::{
     descriptor_object_id, exit_process, install_trace_filter, line, managed_host_identity, ptrace,
     read_tracee_word, standard_stream_refusal, stopped, syscall0, syscall1, syscall2, syscall3,
     syscall4, syscall5, syscall6, virtual_sysinfo, wait, write_all, write_i64, write_u64, UserRegs,
-    AT_FDCWD, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, EBADF, ECHILD, EINVAL, EMFILE, ENOSYS,
-    EPERM, ESRCH, O_RDONLY, O_RDWR, PR_SET_NO_NEW_PRIVS, PTRACE_CONT, PTRACE_EVENT_EXEC,
+    AT_FDCWD, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID, EACCES, EBADF, ECHILD, EINVAL, EMFILE,
+    ENOSYS, EPERM, ESRCH, O_RDONLY, O_RDWR, PR_SET_NO_NEW_PRIVS, PTRACE_CONT, PTRACE_EVENT_EXEC,
     PTRACE_EVENT_FORK, PTRACE_EVENT_SECCOMP, PTRACE_GETEVENTMSG, PTRACE_GETREGS, PTRACE_KILL,
     PTRACE_O_EXITKILL, PTRACE_O_TRACEEXEC, PTRACE_O_TRACEFORK, PTRACE_O_TRACESECCOMP,
     PTRACE_O_TRACESYSGOOD, PTRACE_PEEKTEXT, PTRACE_POKETEXT, PTRACE_SETOPTIONS, PTRACE_SETREGS,
@@ -148,6 +148,8 @@ const MAP_SHARED_ANONYMOUS: usize = 1 | 0x20;
 const INSTANCE_NULL_FD: usize = 240;
 const INSTANCE_CONSOLE_FD: usize = 241;
 const NATIVE_PROC_FD_LIMIT: usize = 512;
+/// PATH_MAX: the longest path, NUL included, the kernel accepts.
+const NATIVE_PATH_MAX: usize = 4096;
 const NATIVE_SOCKET_FD_LIMIT: usize = 64;
 const NATIVE_SOCKET_OBJECT_LIMIT: usize = 128;
 const NATIVE_VIRTUAL_KERNEL_FD_LIMIT: usize = 256;
@@ -3457,6 +3459,9 @@ struct NativeSupervisorTask {
     pending_device_arguments: Option<[u64; 3]>,
     // A duplicate onto a protected descriptor runs as F_GETFD of its source.
     pending_protected_duplicate: bool,
+    // A reopen through /dev/fd/N with O_TRUNC truncates its copy once the
+    // copy exists (native_reopen_copy).
+    pending_reopen_truncate: bool,
     // Index into the supervisor-owned descriptor table pool. CLONE_FILES
     // tasks use the same entry rather than copied state.
     descriptor_table: usize,
@@ -5955,6 +5960,7 @@ fn supervise_native(
         pending_console_cloexec: false,
         pending_device_arguments: None,
         pending_protected_duplicate: false,
+        pending_reopen_truncate: false,
         descriptor_table: 0,
         descriptor_barrier: usize::MAX,
         pipe2_address: 0,
@@ -6275,6 +6281,7 @@ fn supervise_native(
                 pending_console_cloexec: false,
                 pending_device_arguments: None,
                 pending_protected_duplicate: false,
+                pending_reopen_truncate: false,
                 descriptor_table,
                 descriptor_barrier: usize::MAX,
                 pipe2_address: 0,
@@ -7104,6 +7111,12 @@ fn supervise_native(
                 } else {
                     -EPERM
                 };
+            }
+            if task.pending_reopen_truncate {
+                task.pending_reopen_truncate = false;
+                if registers.rax as i64 >= 0 {
+                    native_reopen_truncate(host_pid, registers.rax as usize);
+                }
             }
             if let Some([rdi, rsi, rdx]) = task.pending_device_arguments.take() {
                 // The syscall ABI preserves the arguments, which the copy of
@@ -8079,6 +8092,11 @@ fn supervise_native(
                         host_pid,
                         AT_FDCWD as u64,
                         registers.rdi as usize,
+                        true,
+                    ) || native_reopen_write_denied(
+                        instance.config(),
+                        host_pid,
+                        registers.rdi as usize,
                     )
                 }
                 76 | 83 | 84 | 85 | 87 | 90 | 133 => native_write_path_denied(
@@ -8087,6 +8105,7 @@ fn supervise_native(
                     host_pid,
                     AT_FDCWD as u64,
                     registers.rdi as usize,
+                    matches!(syscall, 76 | 85 | 90),
                 ),
                 82 | 86 => {
                     native_write_path_denied(
@@ -8095,12 +8114,14 @@ fn supervise_native(
                         host_pid,
                         AT_FDCWD as u64,
                         registers.rdi as usize,
+                        false,
                     ) || native_write_path_denied(
                         instance.config(),
                         root_descriptor,
                         host_pid,
                         AT_FDCWD as u64,
                         registers.rsi as usize,
+                        false,
                     )
                 }
                 88 => native_write_path_denied(
@@ -8109,6 +8130,7 @@ fn supervise_native(
                     host_pid,
                     AT_FDCWD as u64,
                     registers.rsi as usize,
+                    false,
                 ),
                 91 => {
                     if registers.rdi <= 2 {
@@ -8130,6 +8152,11 @@ fn supervise_native(
                         host_pid,
                         registers.rdi,
                         registers.rsi as usize,
+                        true,
+                    ) || native_reopen_write_denied(
+                        instance.config(),
+                        host_pid,
+                        registers.rsi as usize,
                     )
                 }
                 258 | 259 | 263 | 268 | 452 => native_write_path_denied(
@@ -8138,6 +8165,7 @@ fn supervise_native(
                     host_pid,
                     registers.rdi,
                     registers.rsi as usize,
+                    matches!(syscall, 268 | 452),
                 ),
                 264 | 316 => {
                     native_write_path_denied(
@@ -8146,12 +8174,14 @@ fn supervise_native(
                         host_pid,
                         registers.rdi,
                         registers.rsi as usize,
+                        false,
                     ) || native_write_path_denied(
                         instance.config(),
                         root_descriptor,
                         host_pid,
                         registers.rdx,
                         registers.r10 as usize,
+                        false,
                     )
                 }
                 265 => {
@@ -8161,12 +8191,14 @@ fn supervise_native(
                         host_pid,
                         registers.rdi,
                         registers.rsi as usize,
+                        registers.r8 & 0x400 != 0,
                     ) || native_write_path_denied(
                         instance.config(),
                         root_descriptor,
                         host_pid,
                         registers.rdx,
                         registers.r10 as usize,
+                        false,
                     )
                 }
                 266 => native_write_path_denied(
@@ -8175,6 +8207,7 @@ fn supervise_native(
                     host_pid,
                     registers.rsi,
                     registers.rdx as usize,
+                    false,
                 ),
                 _ => false,
             };
@@ -8604,29 +8637,33 @@ fn supervise_native(
         } else {
             false
         };
-        let mut proc_fd_host_path = [0u8; 512];
-        let proc_fd_host_path_len = if mode == 3
-            && matches!(syscall, 2 | 257)
-            && tracee_decimal_fd_path(
+        // An open of `/dev/fd/N`, `/proc/self/fd/N` or `/dev/stdin`,
+        // `/dev/stdout`, `/dev/stderr` reopens the caller's descriptor N; the
+        // tracee's root has no /proc to resolve it. A descriptor whose file
+        // is still linked in the instance root is opened by that path, as
+        // before; any other one (an unlinked file, a pipe, the console)
+        // becomes a copy of descriptor N (native_reopen_copy). Virtual
+        // kernel descriptors keep their own handling.
+        let reopen_fd = if mode == 3 && matches!(syscall, 2 | 257) {
+            tracee_reopen_fd_number(
                 host_pid,
                 if syscall == 2 {
                     registers.rdi as usize
                 } else {
                     registers.rsi as usize
                 },
-            ) {
-            translate_proc_self_fd_target(
-                host_pid,
-                if syscall == 2 {
-                    registers.rdi as usize
-                } else {
-                    registers.rsi as usize
-                },
-                &mut proc_fd_host_path,
             )
+            .filter(|fd| {
+                native_virtual_kernel_fd(&virtual_kernel_fds, host_pid, *fd as i64).is_none()
+            })
         } else {
             None
         };
+        let mut proc_fd_host_path = [0u8; 512];
+        let proc_fd_host_path_len = reopen_fd
+            .and_then(|fd| native_fd_instance_target(host_pid, fd, &mut proc_fd_host_path))
+            .filter(|length| !proc_fd_host_path[..*length].ends_with(b" (deleted)"));
+        let reopen_copy_fd = reopen_fd.filter(|_| proc_fd_host_path_len.is_none());
         write_all(b" action=");
         match decision.action {
             Action::Mediate if syscall == 99 => {
@@ -8710,6 +8747,73 @@ fn supervise_native(
                     || ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0
                 {
                     native_fail(instance, pid, b"native proc fd open resume failed");
+                }
+            }
+            Action::Mediate if reopen_copy_fd.is_some() => {
+                match reopen_copy_fd.map_or(Err(-2), |fd| {
+                    native_reopen_copy(
+                        host_pid,
+                        fd,
+                        if syscall == 2 {
+                            registers.rsi
+                        } else {
+                            registers.rdx
+                        },
+                        native_fd_contains(
+                            &descriptor_tables[task.descriptor_table].console_fds,
+                            fd,
+                        ),
+                    )
+                    .map(|truncate| (fd, truncate))
+                }) {
+                    Err(result) => {
+                        write_all(b"emulate surface=virtual-proc-fd result=");
+                        write_i64(result);
+                        write_all(b"\n");
+                        registers.orig_rax = u64::MAX;
+                        task.awaiting_exit = true;
+                        task.override_exit = true;
+                        task.override_result = result;
+                        if ptrace(PTRACE_SETREGS, host_pid, 0, &registers as *const _ as usize) < 0
+                            || ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0
+                        {
+                            native_fail(instance, pid, b"native proc fd reopen denial failed");
+                        }
+                    }
+                    Ok((fd, truncate)) => {
+                        let flags = if syscall == 2 {
+                            registers.rsi
+                        } else {
+                            registers.rdx
+                        };
+                        // The open becomes a copy of descriptor N, as for the
+                        // instance devices: F_DUPFD from 0 takes the lowest free
+                        // number, as open does, and carries close-on-exec. A
+                        // copy of a console descriptor is a console descriptor.
+                        task.pending_console_open = native_fd_contains(
+                            &descriptor_tables[task.descriptor_table].console_fds,
+                            fd,
+                        );
+                        task.pending_console_cloexec = flags & O_CLOEXEC != 0;
+                        task.pending_reopen_truncate = truncate;
+                        line(b"mediate surface=virtual-proc-fd copy=descriptor result=pending");
+                        task.pending_device_arguments =
+                            Some([registers.rdi, registers.rsi, registers.rdx]);
+                        registers.orig_rax = SYS_FCNTL;
+                        registers.rdi = fd as u64;
+                        registers.rsi = if flags & O_CLOEXEC != 0 {
+                            F_DUPFD_CLOEXEC
+                        } else {
+                            F_DUPFD
+                        };
+                        registers.rdx = 0;
+                        task.awaiting_exit = true;
+                        if ptrace(PTRACE_SETREGS, host_pid, 0, &registers as *const _ as usize) < 0
+                            || ptrace(PTRACE_SYSCALL, host_pid, 0, 0) < 0
+                        {
+                            native_fail(instance, pid, b"native proc fd reopen failed");
+                        }
+                    }
                 }
             }
             Action::Mediate
@@ -13078,7 +13182,7 @@ fn native_proc_link_instance_target(
             root_target.len(),
         )
     };
-    let mut target = [0u8; 512];
+    let mut target = [0u8; NATIVE_PATH_MAX];
     let target_count = unsafe {
         syscall4(
             ginux_core::SYS_READLINKAT as usize,
@@ -13088,7 +13192,11 @@ fn native_proc_link_instance_target(
             target.len(),
         )
     };
-    if root_count <= 0 || target_count < root_count {
+    if root_count <= 0
+        || target_count < root_count
+        || root_count as usize >= root_target.len()
+        || target_count as usize >= target.len()
+    {
         return None;
     }
     let root_count = root_count as usize;
@@ -13111,197 +13219,211 @@ fn native_proc_link_instance_target(
     Some(suffix.len())
 }
 
+/// The absolute instance path a path argument names: relative paths are
+/// joined to the caller's cwd or `dirfd` (both already resolved names). It
+/// is not normalised: `..` may only be applied after the component before it
+/// has been resolved (native_resolve_instance_path), or a link such as
+/// `/work/y -> /inputs/sub` in `/work/y/../f` would be skipped.
 fn native_instance_path(
     host_pid: usize,
     dirfd: u64,
     address: usize,
     output: &mut [u8],
 ) -> Option<usize> {
-    let mut raw = [0u8; 512];
+    let mut raw = [0u8; NATIVE_PATH_MAX];
     let raw_len = read_tracee_c_string(host_pid, address, &mut raw)?;
     if raw_len == 0 {
         return None;
     }
-    let mut joined = [0u8; 768];
-    let mut joined_len = 0usize;
+    let mut length = 0usize;
     if raw[0] != b'/' {
-        let mut base = [0u8; 512];
+        let mut base = [0u8; NATIVE_PATH_MAX];
         let base_len = if dirfd as u32 == (-100i32) as u32 {
             native_proc_link_instance_target(host_pid, b"/cwd", &mut base)?
         } else {
             native_fd_instance_target(host_pid, dirfd as usize, &mut base)?
         };
-        native_buffer_append(&mut joined, &mut joined_len, &base[..base_len])?;
-        if joined_len == 0 || joined[joined_len - 1] != b'/' {
-            native_buffer_append(&mut joined, &mut joined_len, b"/")?;
-        }
+        native_buffer_append(output, &mut length, &base[..base_len])?;
+        native_buffer_append(output, &mut length, b"/")?;
     }
-    native_buffer_append(&mut joined, &mut joined_len, &raw[..raw_len])?;
-
-    native_normalize_instance_path(&joined[..joined_len], output)
-}
-
-fn native_normalize_instance_path(input: &[u8], output: &mut [u8]) -> Option<usize> {
-    let mut length = 1usize;
-    if output.is_empty() {
-        return None;
-    }
-    output[0] = b'/';
-    for component in input.split(|byte| *byte == b'/') {
-        if component.is_empty() || component == b"." {
-            continue;
-        }
-        if component == b".." {
-            if length > 1 {
-                length -= 1;
-                while length > 1 && output[length - 1] != b'/' {
-                    length -= 1;
-                }
-            }
-            continue;
-        }
-        if length > 1 {
-            if length >= output.len() {
-                return None;
-            }
-            output[length] = b'/';
-            length += 1;
-        }
-        if length + component.len() >= output.len() {
-            return None;
-        }
-        output[length..length + component.len()].copy_from_slice(component);
-        length += component.len();
-    }
+    native_buffer_append(output, &mut length, &raw[..raw_len])?;
     Some(length)
 }
 
+/// Resolve an absolute instance path (native_instance_path) the way the
+/// kernel walks it, inside the instance root: each component is looked up
+/// in the resolved, link-free prefix before it; a symbolic link is replaced
+/// by its target (absolute targets restart at the instance root) before any
+/// later `..` is applied, so `..` always leaves a real directory. The final
+/// component is followed only with `follow_final` (calls that remove,
+/// rename or create a name act on the link itself). At most 40 links are
+/// followed, as by the kernel. Once a component does not exist, the rest of
+/// the path cannot name a link and is applied by name. A path that cannot be
+/// resolved within those bounds (too long, a link that cannot be read, too
+/// many links) is None, which callers treat as denied.
 fn native_resolve_instance_path(
     root_descriptor: usize,
     path: &[u8],
+    follow_final: bool,
     output: &mut [u8],
 ) -> Option<usize> {
     const SYS_NEWFSTATAT_HOST: usize = 262;
     const AT_SYMLINK_NOFOLLOW: usize = 0x100;
     const S_IFMT: u32 = 0o170000;
     const S_IFLNK: u32 = 0o120000;
-    const MAX_SYMLINKS: usize = 16;
+    const MAX_SYMLINKS: usize = 40;
 
-    let mut pending = [0u8; 1024];
-    let mut pending_len = native_normalize_instance_path(path, &mut pending)?;
-    for _ in 0..MAX_SYMLINKS {
-        let mut current = [0u8; 512];
-        let mut current_len = 0usize;
-        let mut offset = 1usize;
-        let mut followed = false;
-        while offset < pending_len {
-            let component_end = pending[offset..pending_len]
+    // `pending[position..pending_len]` is what is left to walk; `current`
+    // the resolved prefix, relative to the root and NUL-terminated.
+    let mut pending = [0u8; 2 * NATIVE_PATH_MAX];
+    let mut pending_len = 0usize;
+    native_buffer_append(&mut pending, &mut pending_len, path)?;
+    let mut position = 0usize;
+    let mut current = [0u8; NATIVE_PATH_MAX];
+    let mut current_len = 0usize;
+    let mut links = 0usize;
+    let mut missing = false;
+    loop {
+        while position < pending_len && pending[position] == b'/' {
+            position += 1;
+        }
+        if position >= pending_len {
+            break;
+        }
+        let component_end = pending[position..pending_len]
+            .iter()
+            .position(|byte| *byte == b'/')
+            .map_or(pending_len, |offset| position + offset);
+        let (start, end) = (position, component_end);
+        position = component_end;
+        let last = pending[position..pending_len]
+            .iter()
+            .all(|byte| *byte == b'/');
+        if &pending[start..end] == b"." {
+            continue;
+        }
+        if &pending[start..end] == b".." {
+            current_len = current[..current_len]
                 .iter()
-                .position(|byte| *byte == b'/')
-                .map_or(pending_len, |position| offset + position);
-            let component = &pending[offset..component_end];
-            if current_len != 0 {
-                current[current_len] = b'/';
-                current_len += 1;
-            }
-            if current_len + component.len() + 1 > current.len() {
-                return None;
-            }
-            current[current_len..current_len + component.len()].copy_from_slice(component);
-            current_len += component.len();
+                .rposition(|byte| *byte == b'/')
+                .unwrap_or(0);
             current[current_len] = 0;
-
-            let mut stat = [0u8; 144];
-            let result = unsafe {
-                syscall4(
-                    SYS_NEWFSTATAT_HOST,
-                    root_descriptor,
-                    current.as_ptr() as usize,
-                    stat.as_mut_ptr() as usize,
-                    AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if result < 0 {
-                if pending_len > output.len() {
-                    return None;
-                }
-                output[..pending_len].copy_from_slice(&pending[..pending_len]);
-                return Some(pending_len);
-            }
-            let mode = u32::from_ne_bytes([stat[24], stat[25], stat[26], stat[27]]);
-            if mode & S_IFMT == S_IFLNK {
-                let mut target = [0u8; 512];
-                let target_len = unsafe {
-                    syscall4(
-                        ginux_core::SYS_READLINKAT as usize,
-                        root_descriptor,
-                        current.as_ptr() as usize,
-                        target.as_mut_ptr() as usize,
-                        target.len(),
-                    )
-                };
-                if target_len <= 0 {
-                    return None;
-                }
-                let target_len = target_len as usize;
-                let mut joined = [0u8; 1024];
-                let mut joined_len = 0usize;
-                if target[0] != b'/' {
-                    native_buffer_append(&mut joined, &mut joined_len, b"/")?;
-                    if let Some(separator) = current[..current_len]
-                        .iter()
-                        .rposition(|byte| *byte == b'/')
-                    {
-                        native_buffer_append(
-                            &mut joined,
-                            &mut joined_len,
-                            &current[..separator + 1],
-                        )?;
-                    }
-                }
-                native_buffer_append(&mut joined, &mut joined_len, &target[..target_len])?;
-                native_buffer_append(
-                    &mut joined,
-                    &mut joined_len,
-                    &pending[component_end..pending_len],
-                )?;
-                let mut next = [0u8; 1024];
-                pending_len = native_normalize_instance_path(&joined[..joined_len], &mut next)?;
-                pending[..pending_len].copy_from_slice(&next[..pending_len]);
-                followed = true;
-                break;
-            }
-            offset = component_end.saturating_add(1);
+            continue;
         }
-        if !followed {
-            if pending_len > output.len() {
-                return None;
-            }
-            output[..pending_len].copy_from_slice(&pending[..pending_len]);
-            return Some(pending_len);
+        let parent_len = current_len;
+        if current_len != 0 {
+            current[current_len] = b'/';
+            current_len += 1;
         }
+        if current_len + (end - start) + 1 > current.len() {
+            return None;
+        }
+        current[current_len..current_len + (end - start)].copy_from_slice(&pending[start..end]);
+        current_len += end - start;
+        current[current_len] = 0;
+        if missing || (last && !follow_final) {
+            continue;
+        }
+        let mut stat = [0u8; 144];
+        let result = unsafe {
+            syscall4(
+                SYS_NEWFSTATAT_HOST,
+                root_descriptor,
+                current.as_ptr() as usize,
+                stat.as_mut_ptr() as usize,
+                AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result < 0 {
+            missing = true;
+            continue;
+        }
+        let mode = u32::from_ne_bytes([stat[24], stat[25], stat[26], stat[27]]);
+        if mode & S_IFMT != S_IFLNK {
+            continue;
+        }
+        links += 1;
+        if links > MAX_SYMLINKS {
+            return None;
+        }
+        let mut target = [0u8; NATIVE_PATH_MAX];
+        let target_len = unsafe {
+            syscall4(
+                ginux_core::SYS_READLINKAT as usize,
+                root_descriptor,
+                current.as_ptr() as usize,
+                target.as_mut_ptr() as usize,
+                target.len(),
+            )
+        };
+        if target_len <= 0 || target_len as usize >= target.len() {
+            return None;
+        }
+        let target_len = target_len as usize;
+        let mut next = [0u8; 2 * NATIVE_PATH_MAX];
+        let mut next_len = 0usize;
+        native_buffer_append(&mut next, &mut next_len, &target[..target_len])?;
+        native_buffer_append(&mut next, &mut next_len, b"/")?;
+        native_buffer_append(&mut next, &mut next_len, &pending[position..pending_len])?;
+        pending[..next_len].copy_from_slice(&next[..next_len]);
+        pending_len = next_len;
+        position = 0;
+        current_len = if target[0] == b'/' { 0 } else { parent_len };
+        current[current_len] = 0;
     }
-    None
+    let mut length = 0usize;
+    native_buffer_append(output, &mut length, b"/")?;
+    native_buffer_append(output, &mut length, &current[..current_len])?;
+    Some(length)
 }
 
+/// Whether a write to the path argument is refused by the filesystem deny
+/// list. With no deny entries this returns at once, without touching the
+/// buffers native_write_path_resolved_denied needs. `follow_final` is false
+/// for calls that act on the final name itself (unlink, rmdir, rename,
+/// link, symlink, mkdir, mknod), so a link to a denied file can be removed or
+/// replaced. A path that cannot be resolved is denied.
 fn native_write_path_denied(
     config: &InstanceConfig,
     root_descriptor: usize,
     host_pid: usize,
     dirfd: u64,
     address: usize,
+    follow_final: bool,
 ) -> bool {
     if config.filesystem_write_deny.as_slice().is_empty() {
         return false;
     }
-    let mut path = [0u8; 512];
+    native_write_path_resolved_denied(
+        config,
+        root_descriptor,
+        host_pid,
+        dirfd,
+        address,
+        follow_final,
+    )
+}
+
+#[inline(never)]
+fn native_write_path_resolved_denied(
+    config: &InstanceConfig,
+    root_descriptor: usize,
+    host_pid: usize,
+    dirfd: u64,
+    address: usize,
+    follow_final: bool,
+) -> bool {
+    let mut path = [0u8; 2 * NATIVE_PATH_MAX];
     let Some(length) = native_instance_path(host_pid, dirfd, address, &mut path) else {
         return true;
     };
-    let mut resolved = [0u8; 512];
-    let Some(resolved_len) =
-        native_resolve_instance_path(root_descriptor, &path[..length], &mut resolved)
-    else {
+    let mut resolved = [0u8; NATIVE_PATH_MAX + 1];
+    let Some(resolved_len) = native_resolve_instance_path(
+        root_descriptor,
+        &path[..length],
+        follow_final,
+        &mut resolved,
+    ) else {
         return true;
     };
     let denied = config.filesystem_write_denied(&resolved[..resolved_len]);
@@ -13310,6 +13432,34 @@ fn native_write_path_denied(
         write_all(&path[..length]);
         write_all(b" resolved=");
         write_all(&resolved[..resolved_len]);
+        write_all(b"\n");
+    }
+    denied
+}
+
+/// A write open of `/dev/fd/N` (see tracee_reopen_fd_number) is a write to
+/// the file descriptor N names, so the deny list applies to that file's
+/// instance path, not to the path the caller passed. An unlinked file is
+/// judged by its last path.
+fn native_reopen_write_denied(config: &InstanceConfig, host_pid: usize, address: usize) -> bool {
+    if config.filesystem_write_deny.as_slice().is_empty() {
+        return false;
+    }
+    let Some(fd) = tracee_reopen_fd_number(host_pid, address) else {
+        return false;
+    };
+    let mut target = [0u8; NATIVE_PATH_MAX];
+    let Some(length) = native_fd_instance_target(host_pid, fd, &mut target) else {
+        return false;
+    };
+    let target = &target[..length];
+    let target = target.strip_suffix(b" (deleted)").unwrap_or(target);
+    let denied = config.filesystem_write_denied(target);
+    if denied {
+        write_all(b"GINUX_POLICY_PATH: requested=/dev/fd/");
+        write_u64(fd as u64);
+        write_all(b" resolved=");
+        write_all(target);
         write_all(b"\n");
     }
     denied
@@ -13326,13 +13476,13 @@ fn native_setid_path_denied(
     if mode & 0o6000 == 0 {
         return false;
     }
-    let mut path = [0u8; 512];
+    let mut path = [0u8; 2 * NATIVE_PATH_MAX];
     let Some(length) = native_instance_path(host_pid, dirfd, address, &mut path) else {
         return true;
     };
-    let mut resolved = [0u8; 512];
+    let mut resolved = [0u8; NATIVE_PATH_MAX + 1];
     let Some(resolved_len) =
-        native_resolve_instance_path(root_descriptor, &path[..length], &mut resolved)
+        native_resolve_instance_path(root_descriptor, &path[..length], true, &mut resolved)
     else {
         return true;
     };
@@ -13361,13 +13511,13 @@ fn native_device_create_denied(
     dirfd: u64,
     address: usize,
 ) -> bool {
-    let mut path = [0u8; 512];
+    let mut path = [0u8; 2 * NATIVE_PATH_MAX];
     let Some(length) = native_instance_path(host_pid, dirfd, address, &mut path) else {
         return true;
     };
-    let mut resolved = [0u8; 512];
+    let mut resolved = [0u8; NATIVE_PATH_MAX + 1];
     let Some(resolved_len) =
-        native_resolve_instance_path(root_descriptor, &path[..length], &mut resolved)
+        native_resolve_instance_path(root_descriptor, &path[..length], false, &mut resolved)
     else {
         return true;
     };
@@ -13482,7 +13632,7 @@ fn native_fd_instance_target(host_pid: usize, fd: usize, output: &mut [u8]) -> O
             root_target.len(),
         )
     };
-    let mut fd_target = [0u8; 512];
+    let mut fd_target = [0u8; NATIVE_PATH_MAX];
     let fd_count = unsafe {
         syscall4(
             ginux_core::SYS_READLINKAT as usize,
@@ -13492,7 +13642,13 @@ fn native_fd_instance_target(host_pid: usize, fd: usize, output: &mut [u8]) -> O
             fd_target.len(),
         )
     };
-    if root_count <= 0 || fd_count < root_count {
+    // readlink truncates silently: a full buffer may hold only a prefix of
+    // the name, which must not be taken for the file.
+    if root_count <= 0
+        || fd_count < root_count
+        || root_count as usize >= root_target.len()
+        || fd_count as usize >= fd_target.len()
+    {
         return None;
     }
     let root_count = root_count as usize;
@@ -13723,6 +13879,199 @@ fn read_tracee_u64_pair(pid: usize, address: usize) -> Option<[u64; 2]> {
         }
     }
     Some(values)
+}
+
+/// The descriptor an open path reopens: N of `/dev/fd/N` or
+/// `/proc/self/fd/N`, and 0, 1 and 2 for `/dev/stdin`, `/dev/stdout` and
+/// `/dev/stderr`. A number past the kernel's 32-bit descriptor range, or one
+/// written with a leading zero (procfs has no `05`), names no descriptor
+/// (usize::MAX, which native_reopen_copy answers with ENOENT) rather than
+/// wrapping onto another one.
+fn tracee_reopen_fd_number(pid: usize, address: usize) -> Option<usize> {
+    let mut bytes = [0u8; 32];
+    let length = read_tracee_c_string(pid, address, &mut bytes)?;
+    let path = &bytes[..length];
+    let digits = match path {
+        b"/dev/stdin" => return Some(0),
+        b"/dev/stdout" => return Some(1),
+        b"/dev/stderr" => return Some(2),
+        _ => path
+            .strip_prefix(b"/dev/fd/")
+            .or_else(|| path.strip_prefix(b"/proc/self/fd/"))?,
+    };
+    let fd = native_parse_u64(digits)?;
+    if digits.len() > 1 && digits[0] == b'0' {
+        return Some(usize::MAX);
+    }
+    Some(usize::try_from(fd).unwrap_or(usize::MAX))
+}
+
+/// `/proc/HOST/fd/N` or `/proc/HOST/fdinfo/N`, NUL-terminated, in `output`.
+fn native_task_fd_path(
+    output: &mut [u8; 64],
+    host_pid: usize,
+    leaf: &[u8],
+    fd: usize,
+) -> Option<()> {
+    let mut length = 0usize;
+    native_buffer_append(output, &mut length, b"/proc/")?;
+    native_buffer_append_u64(output, &mut length, host_pid as u64)?;
+    native_buffer_append(output, &mut length, leaf)?;
+    native_buffer_append_u64(output, &mut length, fd as u64)?;
+    if length >= output.len() {
+        return None;
+    }
+    output[length] = 0;
+    Some(())
+}
+
+/// The file status flags of the tracee's descriptor `fd` (the `flags:` line
+/// of `/proc/HOST/fdinfo/N`, in octal), read from the task itself, so a
+/// thread with its own descriptor table answers for that table.
+fn native_task_fd_flags(host_pid: usize, fd: usize) -> Option<u64> {
+    let mut path = [0u8; 64];
+    native_task_fd_path(&mut path, host_pid, b"/fdinfo/", fd)?;
+    let file = unsafe {
+        syscall4(
+            SYS_OPENAT_HOST,
+            AT_FDCWD,
+            path.as_ptr() as usize,
+            O_RDONLY,
+            0,
+        )
+    };
+    if file < 0 {
+        return None;
+    }
+    let mut text = [0u8; 256];
+    let count = unsafe {
+        syscall3(
+            SYS_READ_HOST,
+            file as usize,
+            text.as_mut_ptr() as usize,
+            text.len(),
+        )
+    };
+    let _ = unsafe { syscall1(SYS_CLOSE_HOST, file as usize) };
+    let text = text.get(..usize::try_from(count).ok()?)?;
+    let line = text
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"flags:"))?;
+    let digits = line.trim_ascii();
+    if digits.is_empty() || !digits.iter().all(|digit| (b'0'..=b'7').contains(digit)) {
+        return None;
+    }
+    digits.iter().try_fold(0u64, |value, digit| {
+        value.checked_mul(8)?.checked_add(u64::from(digit - b'0'))
+    })
+}
+
+/// Check that an open with `flags` may be served as a copy of the tracee's
+/// descriptor `fd` (F_DUPFD of N in the tracee). The type of N's file comes
+/// from `/proc/HOST/fd/N` and its status flags from `/proc/HOST/fdinfo/N`,
+/// both of the calling task, so a thread is answered for its own table.
+///
+/// A copy shares the open file of descriptor N: its offset and its status
+/// flags, unlike the fresh open file of a Linux reopen. So it must not grant
+/// more than N does: the access asked for must be one N has (EACCES
+/// otherwise), N must not be an O_PATH descriptor (EACCES), and a socket
+/// cannot be opened (ENXIO, as on Linux). A closed descriptor is ENOENT.
+/// O_APPEND is accepted when N already appends or its file is not a regular
+/// file (where it changes nothing), and O_NONBLOCK when N is non-blocking
+/// too; flags that would otherwise change the shared open file (O_APPEND,
+/// O_NONBLOCK, O_DIRECT, ...) or that a copy cannot honour are EINVAL.
+/// O_CREAT is accepted (the file exists), O_CREAT with O_EXCL is EEXIST, and
+/// O_DIRECTORY needs a directory. A console descriptor's reads and writes are
+/// mediated whatever its host access mode or kind, so a copy of one is
+/// limited by neither, as for an open of /dev/tty or /dev/console.
+///
+/// Returns whether the copy must be truncated once F_DUPFD succeeds: only
+/// for O_TRUNC on a regular file inside the instance root. O_TRUNC on a file
+/// outside the root (one the instance inherited, such as a host log on a
+/// standard stream) is ignored and never truncates it.
+fn native_reopen_copy(host_pid: usize, fd: usize, flags: u64, console: bool) -> Result<bool, i64> {
+    const SYS_NEWFSTATAT_HOST: usize = 262;
+    const O_EXCL: u64 = 0o200;
+    const O_NOCTTY: u64 = 0o400;
+    const O_APPEND: u64 = 0o2000;
+    const O_NONBLOCK: u64 = 0o4000;
+    const O_LARGEFILE: u64 = 0o100000;
+    const O_PATH: u64 = 0o10000000;
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFDIR: u32 = 0o040000;
+    const S_IFSOCK: u32 = 0o140000;
+    if fd > i32::MAX as usize {
+        return Err(-2);
+    }
+    let mut path = [0u8; 64];
+    native_task_fd_path(&mut path, host_pid, b"/fd/", fd).ok_or(-2)?;
+    let mut stat = [0u64; 18];
+    if unsafe {
+        syscall4(
+            SYS_NEWFSTATAT_HOST,
+            AT_FDCWD,
+            path.as_ptr() as usize,
+            stat.as_mut_ptr() as usize,
+            0,
+        )
+    } < 0
+    {
+        return Err(-2);
+    }
+    let status = native_task_fd_flags(host_pid, fd).ok_or(-2)?;
+    let kind = stat[3] as u32 & S_IFMT;
+    if kind == S_IFSOCK && !console {
+        return Err(-6);
+    }
+    let append_ok = kind != S_IFREG || status & O_APPEND != 0;
+    let nonblock_ok = status & O_NONBLOCK != 0;
+    if flags
+        & !(3
+            | O_CLOEXEC
+            | O_CREATE_HOST as u64
+            | O_EXCL
+            | O_NOCTTY
+            | O_LARGEFILE
+            | O_TRUNC_HOST as u64
+            | O_DIRECTORY_HOST as u64
+            | if append_ok { O_APPEND } else { 0 }
+            | if nonblock_ok { O_NONBLOCK } else { 0 })
+        != 0
+        || flags & 3 == 3
+    {
+        return Err(-EINVAL);
+    }
+    if flags & O_CREATE_HOST as u64 != 0 && flags & O_EXCL != 0 {
+        return Err(-17);
+    }
+    if flags & O_DIRECTORY_HOST as u64 != 0 && kind != S_IFDIR {
+        return Err(-20);
+    }
+    let mut target = [0u8; NATIVE_PATH_MAX];
+    let truncate = flags & O_TRUNC_HOST as u64 != 0
+        && kind == S_IFREG
+        && native_fd_instance_target(host_pid, fd, &mut target).is_some();
+    let readable = |mode: u64| mode & 3 != 1;
+    let writable = |mode: u64| mode & 3 != 0;
+    if status & O_PATH != 0
+        || (!console
+            && ((readable(flags) && !readable(status))
+                || ((writable(flags) || truncate) && !writable(status))))
+    {
+        return Err(-EACCES);
+    }
+    Ok(truncate)
+}
+
+/// Truncate the copy a reopen with O_TRUNC made (native_reopen_copy), after
+/// its F_DUPFD succeeded, through the tracee's new descriptor.
+fn native_reopen_truncate(host_pid: usize, fd: usize) {
+    const SYS_TRUNCATE: usize = 76;
+    let mut path = [0u8; 64];
+    if native_task_fd_path(&mut path, host_pid, b"/fd/", fd).is_some() {
+        let _ = unsafe { syscall2(SYS_TRUNCATE, path.as_ptr() as usize, 0) };
+    }
 }
 
 fn tracee_decimal_fd_path(pid: usize, address: usize) -> bool {
