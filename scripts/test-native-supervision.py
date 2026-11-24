@@ -55,11 +55,11 @@ sys_read = ["/"]
 """)
 
         def run(scenario, instance=config, stdin=None, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, configured_launch=False, **options):
+                stderr=subprocess.PIPE, configured_launch=False, timeout=30, **options):
             (root / "scenario").write_text(scenario)
             proc = subprocess.run([str(work / "ginux"), "native", str(instance), str(root)]
                                   + (["configured"] if instance == configured or configured_launch else []),
-                                  stdin=stdin, stdout=stdout, stderr=stderr, timeout=30, **options)
+                                  stdin=stdin, stdout=stdout, stderr=stderr, timeout=timeout, **options)
             # Audit records and fixture output have separate writers. Merge
             # only after capture so a concurrent audit fragment cannot prefix
             # an otherwise complete fixture line.
@@ -571,6 +571,7 @@ port_forwards = ["udp/lo/18083/18081"]'''))
         (root / "denied/sub").chmod(0o777)
         (root / "denied/file").write_bytes(b"protected")
         (root / "denied/file").chmod(0o666)
+        os.chown(root / "denied/file", 65534, 65534)
         code, out = run("X-deny-resolution", deny_config, configured_launch=True)
         fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
         check("deny list resolves links before .., long paths and link names", code == 0
@@ -580,11 +581,32 @@ port_forwards = ["udp/lo/18083/18081"]'''))
                               "GINUX_FIXTURE: denied-create=-1",
                               "GINUX_FIXTURE: unlink-link-to-denied=0",
                               "GINUX_FIXTURE: rename-link-to-denied=0",
-                              "GINUX_FIXTURE: denied-unlink=-1"]
+                              "GINUX_FIXTURE: denied-unlink=-1",
+                              "GINUX_FIXTURE: reopen-write-denied=-1",
+                              "GINUX_FIXTURE: proc-reopen-write-denied=-1",
+                              "GINUX_FIXTURE: utimensat-denied=-1",
+                              "GINUX_FIXTURE: futimens-denied=-1",
+                              "GINUX_FIXTURE: setxattr-denied=-1",
+                              "GINUX_FIXTURE: fsetxattr-denied=-1",
+                              "GINUX_FIXTURE: removexattr-denied=-1",
+                              "GINUX_FIXTURE: empty-path-chmod-denied=-1",
+                              "GINUX_FIXTURE: fchmod-stdin-denied=-1",
+                              "GINUX_FIXTURE: empty-path-chmod-allowed=0",
+                              "GINUX_FIXTURE: empty-path-utimens-allowed=0"]
+              and "GINUX_POLICY_PATH: requested=/tmp/deny-dir-link/../escape" in out
               and sorted(p.name for p in (root / "denied").iterdir()) == ["file", "sub"]
               and (root / "denied/file").read_bytes() == b"protected"
               and not (root / "tmp/into-denied").is_symlink()
-              and (root / "tmp/renamed-link").is_symlink(), code, out)
+              and (root / "tmp/renamed-link").is_symlink()
+              and (root / "denied/file").stat().st_mode & 0o7777 == 0o666, code, out)
+
+        # A sibling thread dup2s a read-only file onto the number an O_TRUNC
+        # reopen returns, in a loop: only the checked open file is truncated.
+        code, out = run("E-reopen-truncate-race", configured, timeout=120)
+        fixture = [line for line in out.splitlines() if line.startswith("GINUX_FIXTURE: ")]
+        check("O_TRUNC reopen truncates only the checked open file", code == 0
+              and fixture == ["GINUX_FIXTURE: race-opened=1", "GINUX_FIXTURE: race-ro-intact=1"]
+              and (root / "tmp/race-ro").read_bytes() == b"precious\n", code, out)
 
         # Force a shared-table mutation to remain in the host kernel while a
         # sibling reaches another descriptor operation. The host process owns

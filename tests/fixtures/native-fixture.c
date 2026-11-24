@@ -155,6 +155,44 @@ __asm__(".global native_thread_open\n"
         "2: pop %r12\n"
         "ret\n");
 
+static volatile long dup2_loop_stop;
+static volatile long dup2_loop_done;
+
+/* A CLONE_THREAD child that, until dup2_loop_stop is set, puts SOURCE on
+ * TARGET with dup2 and closes TARGET again, then sets dup2_loop_done. */
+long native_dup2_loop(word flags, word stack, word source, word target);
+__asm__(".global native_dup2_loop\n"
+        "native_dup2_loop:\n"
+        "push %r12\n"
+        "push %r13\n"
+        "mov %rdx, %r12\n"
+        "mov %rcx, %r13\n"
+        "xor %edx, %edx\n"
+        "xor %r10d, %r10d\n"
+        "xor %r8d, %r8d\n"
+        "mov $56, %eax\n"
+        "syscall\n"
+        "test %rax, %rax\n"
+        "jnz 2f\n"
+        "1: cmpq $0, dup2_loop_stop(%rip)\n"
+        "jne 3f\n"
+        "mov $33, %eax\n"
+        "mov %r12, %rdi\n"
+        "mov %r13, %rsi\n"
+        "syscall\n"
+        "mov $3, %eax\n"
+        "mov %r13, %rdi\n"
+        "syscall\n"
+        "jmp 1b\n"
+        "3: movq $1, dup2_loop_done(%rip)\n"
+        "mov $60, %eax\n"
+        "xor %edi, %edi\n"
+        "syscall\n"
+        "ud2\n"
+        "2: pop %r13\n"
+        "pop %r12\n"
+        "ret\n");
+
 static volatile long yield_signals;
 
 static void yield_signal_handler(int signal)
@@ -1813,6 +1851,69 @@ long native_fixture_main(const word *stack)
         print_result("GINUX_FIXTURE: rename-link-to-denied=",
                      call3(82, (word)"/tmp/into-denied-2", (word)"/tmp/renamed-link", 0));
         print_result("GINUX_FIXTURE: denied-unlink=", call3(87, (word)"/denied/file", 0, 0));
+        /* /denied/file belongs to the workload's uid and is writable, so the
+         * kernel alone would allow each of these; the deny list refuses them,
+         * through a reopen, a descriptor, an xattr and an empty path too. */
+        char path[48];
+        long ro = call3(2, (word)"/denied/file", 0 /* O_RDONLY */, 0);
+        print_result("GINUX_FIXTURE: reopen-write-denied=",
+                     call3(2, (word)fd_path(path, "/dev/fd/", ro), 1 /* O_WRONLY */, 0));
+        print_result("GINUX_FIXTURE: proc-reopen-write-denied=",
+                     call4(257, (word)-100, (word)fd_path(path, "/proc/self/fd/", ro),
+                           2 /* O_RDWR */, 0));
+        print_result("GINUX_FIXTURE: utimensat-denied=",
+                     call4(280, (word)-100, (word)"/denied/file", 0, 0));
+        print_result("GINUX_FIXTURE: futimens-denied=", call4(280, ro, 0, 0, 0));
+        print_result("GINUX_FIXTURE: setxattr-denied=",
+                     call5(188, (word)"/denied/file", (word)"user.ginux", (word)"v", 1, 0));
+        print_result("GINUX_FIXTURE: fsetxattr-denied=",
+                     call5(190, ro, (word)"user.ginux", (word)"v", 1, 0));
+        print_result("GINUX_FIXTURE: removexattr-denied=",
+                     call3(197, (word)"/denied/file", (word)"user.ginux", 0));
+        print_result("GINUX_FIXTURE: empty-path-chmod-denied=",
+                     call4(452, ro, (word)"", 0644, 0x1000 /* AT_EMPTY_PATH */));
+        call3(33, ro, 0, 0);
+        print_result("GINUX_FIXTURE: fchmod-stdin-denied=", call3(91, 0, 0644, 0));
+        long allowed = call4(2, (word)"/tmp/allowed", 0x42 /* O_RDWR|O_CREAT */, 0644, 0);
+        print_result("GINUX_FIXTURE: empty-path-chmod-allowed=",
+                     call4(452, allowed, (word)"", 0600, 0x1000));
+        print_result("GINUX_FIXTURE: empty-path-utimens-allowed=",
+                     call4(280, allowed, (word)"", 0, 0x1000));
+        return 0;
+    }
+    case 'E': {
+        /* A sibling thread puts a read-only file on the number a reopen
+         * with O_TRUNC is about to return, over and over. The truncation
+         * reaches only the open file the reopen was checked against. */
+        static const char precious[] = "precious\n";
+        char path[48];
+        long made = call4(2, (word)"/tmp/race-ro", 0x242 /* O_RDWR|O_CREAT|O_TRUNC */, 0644, 0);
+        if (made < 0 || call3(1, made, (word)precious, sizeof precious - 1) != sizeof precious - 1)
+            return 82;
+        call3(3, made, 0, 0);
+        long ro = call3(2, (word)"/tmp/race-ro", 0 /* O_RDONLY */, 0);
+        long writer = call4(2, (word)"/tmp/race-rw", 0x242, 0600, 0);
+        if (ro < 0 || writer < 0 || call3(87, (word)"/tmp/race-rw", 0, 0) != 0) return 83;
+        long next = call3(32, ro, 0, 0);
+        call3(3, next, 0, 0);
+        word stack = call6(9, 0, 16384, 3, 0x22, -1, 0);
+        if (native_dup2_loop(0x50f00 /* VM|FS|FILES|SIGHAND|THREAD|SYSVSEM */, stack + 16384,
+                             ro, next) <= 0)
+            return 84;
+        fd_path(path, "/dev/fd/", writer);
+        long opened = 0;
+        for (int round = 0; round < 3000; ++round) {
+            long copy = call3(2, (word)path, 0x201 /* O_WRONLY|O_TRUNC */, 0);
+            if (copy >= 0) {
+                ++opened;
+                call3(3, copy, 0, 0);
+            }
+        }
+        dup2_loop_stop = 1;
+        while (!dup2_loop_done) __asm__ volatile("pause");
+        print_result("GINUX_FIXTURE: race-opened=", opened > 0);
+        long check = call3(2, (word)"/tmp/race-ro", 0, 0);
+        print_result("GINUX_FIXTURE: race-ro-intact=", reads_exactly(check, precious));
         return 0;
     }
     case 'K': {

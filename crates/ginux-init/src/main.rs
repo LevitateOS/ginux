@@ -150,6 +150,8 @@ const INSTANCE_CONSOLE_FD: usize = 241;
 const NATIVE_PROC_FD_LIMIT: usize = 512;
 /// PATH_MAX: the longest path, NUL included, the kernel accepts.
 const NATIVE_PATH_MAX: usize = 4096;
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_EMPTY_PATH: u64 = 0x1000;
 const NATIVE_SOCKET_FD_LIMIT: usize = 64;
 const NATIVE_SOCKET_OBJECT_LIMIT: usize = 128;
 const NATIVE_VIRTUAL_KERNEL_FD_LIMIT: usize = 256;
@@ -3459,9 +3461,10 @@ struct NativeSupervisorTask {
     pending_device_arguments: Option<[u64; 3]>,
     // A duplicate onto a protected descriptor runs as F_GETFD of its source.
     pending_protected_duplicate: bool,
-    // A reopen through /dev/fd/N with O_TRUNC truncates its copy once the
-    // copy exists (native_reopen_copy).
-    pending_reopen_truncate: bool,
+    // The supervisor's own duplicate of the open file a reopen through
+    // /dev/fd/N with O_TRUNC truncates once its copy exists, or -1
+    // (native_reopen_copy).
+    pending_reopen_truncate: isize,
     // Index into the supervisor-owned descriptor table pool. CLONE_FILES
     // tasks use the same entry rather than copied state.
     descriptor_table: usize,
@@ -4176,6 +4179,9 @@ fn native_retire_credential(
     // that queued UNIX messages and connected peers may still report. Keeping
     // the pidfd open pins the numeric host PID, so the bounded cache cannot
     // translate a reused PID as an older virtual sender.
+    if task.pending_reopen_truncate >= 0 {
+        let _ = unsafe { syscall1(SYS_CLOSE_HOST, task.pending_reopen_truncate as usize) };
+    }
     if task.lifetime_pidfd < 0 {
         return true;
     }
@@ -5960,7 +5966,7 @@ fn supervise_native(
         pending_console_cloexec: false,
         pending_device_arguments: None,
         pending_protected_duplicate: false,
-        pending_reopen_truncate: false,
+        pending_reopen_truncate: -1,
         descriptor_table: 0,
         descriptor_barrier: usize::MAX,
         pipe2_address: 0,
@@ -6281,7 +6287,7 @@ fn supervise_native(
                 pending_console_cloexec: false,
                 pending_device_arguments: None,
                 pending_protected_duplicate: false,
-                pending_reopen_truncate: false,
+                pending_reopen_truncate: -1,
                 descriptor_table,
                 descriptor_barrier: usize::MAX,
                 pipe2_address: 0,
@@ -7112,11 +7118,12 @@ fn supervise_native(
                     -EPERM
                 };
             }
-            if task.pending_reopen_truncate {
-                task.pending_reopen_truncate = false;
-                if registers.rax as i64 >= 0 {
-                    native_reopen_truncate(host_pid, registers.rax as usize);
-                }
+            if task.pending_reopen_truncate >= 0 {
+                native_reopen_truncate(
+                    task.pending_reopen_truncate as usize,
+                    registers.rax as i64 >= 0,
+                );
+                task.pending_reopen_truncate = -1;
             }
             if let Some([rdi, rsi, rdx]) = task.pending_device_arguments.take() {
                 // The syscall ABI preserves the arguments, which the copy of
@@ -8080,9 +8087,28 @@ fn supervise_native(
             }
             continue;
         }
+        // An open of `/dev/fd/N`, `/proc/self/fd/N` or `/dev/stdin`,
+        // `/dev/stdout`, `/dev/stderr` reopens the caller's descriptor N; the
+        // tracee's root has no /proc to resolve it. The path is read once
+        // here and everything below judges and serves this one reading
+        // (native_reopen_request). Virtual kernel descriptors keep their own
+        // handling.
+        let reopen = if mode == 3 && matches!(syscall, 2 | 257) {
+            let (address, flags) = if syscall == 2 {
+                (registers.rdi as usize, registers.rsi)
+            } else {
+                (registers.rsi as usize, registers.rdx)
+            };
+            native_reopen_request(host_pid, address, flags, &virtual_kernel_fds)
+        } else {
+            None
+        };
         let path_policy_denied = mode == 3
             && !bootstrap_phase
             && match syscall {
+                2 | 257 if reopen.is_some() => reopen
+                    .as_ref()
+                    .is_some_and(|reopen| native_reopen_write_denied(instance.config(), reopen)),
                 2 if registers.rsi & 3 != 0
                     || registers.rsi & (O_CREATE_HOST | O_TRUNC_HOST) as u64 != 0 =>
                 {
@@ -8093,10 +8119,6 @@ fn supervise_native(
                         AT_FDCWD as u64,
                         registers.rdi as usize,
                         true,
-                    ) || native_reopen_write_denied(
-                        instance.config(),
-                        host_pid,
-                        registers.rdi as usize,
                     )
                 }
                 76 | 83 | 84 | 85 | 87 | 90 | 133 => native_write_path_denied(
@@ -8133,7 +8155,12 @@ fn supervise_native(
                     false,
                 ),
                 91 => {
-                    if registers.rdi <= 2 {
+                    // The console has no instance path; any other descriptor,
+                    // standard streams included, is judged by its file.
+                    if native_fd_contains(
+                        &descriptor_tables[task.descriptor_table].console_fds,
+                        registers.rdi as u32 as usize,
+                    ) {
                         false
                     } else {
                         let mut target = [0u8; 512];
@@ -8153,19 +8180,56 @@ fn supervise_native(
                         registers.rdi,
                         registers.rsi as usize,
                         true,
-                    ) || native_reopen_write_denied(
-                        instance.config(),
-                        host_pid,
-                        registers.rsi as usize,
                     )
                 }
-                258 | 259 | 263 | 268 | 452 => native_write_path_denied(
+                258 | 259 | 263 | 268 => native_write_path_denied(
                     instance.config(),
                     root_descriptor,
                     host_pid,
                     registers.rdi,
                     registers.rsi as usize,
-                    matches!(syscall, 268 | 452),
+                    syscall == 268,
+                ),
+                452 => native_at_write_denied(
+                    instance.config(),
+                    root_descriptor,
+                    host_pid,
+                    registers.rdi,
+                    registers.rsi as usize,
+                    registers.r10 & AT_SYMLINK_NOFOLLOW == 0,
+                    registers.r10 & AT_EMPTY_PATH != 0,
+                ),
+                188 | 197 => native_write_path_denied(
+                    instance.config(),
+                    root_descriptor,
+                    host_pid,
+                    AT_FDCWD as u64,
+                    registers.rdi as usize,
+                    true,
+                ),
+                189 | 198 => native_write_path_denied(
+                    instance.config(),
+                    root_descriptor,
+                    host_pid,
+                    AT_FDCWD as u64,
+                    registers.rdi as usize,
+                    false,
+                ),
+                190 | 199 => {
+                    native_fd_write_denied(instance.config(), host_pid, registers.rdi as usize)
+                }
+                // utimensat with a NULL path is futimens on the descriptor.
+                280 if registers.rsi == 0 => {
+                    native_fd_write_denied(instance.config(), host_pid, registers.rdi as usize)
+                }
+                280 => native_at_write_denied(
+                    instance.config(),
+                    root_descriptor,
+                    host_pid,
+                    registers.rdi,
+                    registers.rsi as usize,
+                    registers.r10 & AT_SYMLINK_NOFOLLOW == 0,
+                    registers.r10 & AT_EMPTY_PATH != 0,
                 ),
                 264 | 316 => {
                     native_write_path_denied(
@@ -8185,13 +8249,14 @@ fn supervise_native(
                     )
                 }
                 265 => {
-                    native_write_path_denied(
+                    native_at_write_denied(
                         instance.config(),
                         root_descriptor,
                         host_pid,
                         registers.rdi,
                         registers.rsi as usize,
                         registers.r8 & 0x400 != 0,
+                        registers.r8 & AT_EMPTY_PATH != 0,
                     ) || native_write_path_denied(
                         instance.config(),
                         root_descriptor,
@@ -8637,33 +8702,6 @@ fn supervise_native(
         } else {
             false
         };
-        // An open of `/dev/fd/N`, `/proc/self/fd/N` or `/dev/stdin`,
-        // `/dev/stdout`, `/dev/stderr` reopens the caller's descriptor N; the
-        // tracee's root has no /proc to resolve it. A descriptor whose file
-        // is still linked in the instance root is opened by that path, as
-        // before; any other one (an unlinked file, a pipe, the console)
-        // becomes a copy of descriptor N (native_reopen_copy). Virtual
-        // kernel descriptors keep their own handling.
-        let reopen_fd = if mode == 3 && matches!(syscall, 2 | 257) {
-            tracee_reopen_fd_number(
-                host_pid,
-                if syscall == 2 {
-                    registers.rdi as usize
-                } else {
-                    registers.rsi as usize
-                },
-            )
-            .filter(|fd| {
-                native_virtual_kernel_fd(&virtual_kernel_fds, host_pid, *fd as i64).is_none()
-            })
-        } else {
-            None
-        };
-        let mut proc_fd_host_path = [0u8; 512];
-        let proc_fd_host_path_len = reopen_fd
-            .and_then(|fd| native_fd_instance_target(host_pid, fd, &mut proc_fd_host_path))
-            .filter(|length| !proc_fd_host_path[..*length].ends_with(b" (deleted)"));
-        let reopen_copy_fd = reopen_fd.filter(|_| proc_fd_host_path_len.is_none());
         write_all(b" action=");
         match decision.action {
             Action::Mediate if syscall == 99 => {
@@ -8728,11 +8766,17 @@ fn supervise_native(
                     native_fail(instance, pid, b"native socket alias limit denial failed");
                 }
             }
-            Action::Mediate if proc_fd_host_path_len.is_some() => {
-                let length = proc_fd_host_path_len.unwrap_or(0);
+            Action::Mediate if reopen.as_ref().and_then(NativeReopen::by_path).is_some() => {
+                // A read-only reopen of a linked file opens its path. A
+                // sibling may rewrite the copy below the stack before the
+                // kernel reads it, but the open is read-only, as any open
+                // the caller could make with that path itself.
+                let path = reopen
+                    .as_ref()
+                    .and_then(NativeReopen::by_path)
+                    .unwrap_or(b"/\0");
                 let path_address = (registers.rsp as usize).saturating_sub(640);
-                let translated =
-                    write_tracee_bytes(host_pid, path_address, &proc_fd_host_path[..=length]);
+                let translated = write_tracee_bytes(host_pid, path_address, path);
                 if !translated {
                     native_fail(instance, pid, b"native proc fd open translation failed");
                 }
@@ -8749,23 +8793,16 @@ fn supervise_native(
                     native_fail(instance, pid, b"native proc fd open resume failed");
                 }
             }
-            Action::Mediate if reopen_copy_fd.is_some() => {
-                match reopen_copy_fd.map_or(Err(-2), |fd| {
-                    native_reopen_copy(
-                        host_pid,
-                        fd,
-                        if syscall == 2 {
-                            registers.rsi
-                        } else {
-                            registers.rdx
-                        },
-                        native_fd_contains(
-                            &descriptor_tables[task.descriptor_table].console_fds,
-                            fd,
-                        ),
-                    )
-                    .map(|truncate| (fd, truncate))
-                }) {
+            Action::Mediate if reopen.is_some() => {
+                let reopen = reopen.as_ref().unwrap_or_else(|| unreachable!());
+                let fd = reopen.fd;
+                match native_reopen_copy(
+                    host_pid,
+                    reopen,
+                    native_fd_contains(&descriptor_tables[task.descriptor_table].console_fds, fd),
+                )
+                .map(|truncate| (fd, truncate))
+                {
                     Err(result) => {
                         write_all(b"emulate surface=virtual-proc-fd result=");
                         write_i64(result);
@@ -8781,11 +8818,7 @@ fn supervise_native(
                         }
                     }
                     Ok((fd, truncate)) => {
-                        let flags = if syscall == 2 {
-                            registers.rsi
-                        } else {
-                            registers.rdx
-                        };
+                        let flags = reopen.flags;
                         // The open becomes a copy of descriptor N, as for the
                         // instance devices: F_DUPFD from 0 takes the lowest free
                         // number, as open does, and carries close-on-exec. A
@@ -13437,17 +13470,47 @@ fn native_write_path_resolved_denied(
     denied
 }
 
-/// A write open of `/dev/fd/N` (see tracee_reopen_fd_number) is a write to
-/// the file descriptor N names, so the deny list applies to that file's
-/// instance path, not to the path the caller passed. An unlinked file is
-/// judged by its last path.
-fn native_reopen_write_denied(config: &InstanceConfig, host_pid: usize, address: usize) -> bool {
+/// A write open of `/dev/fd/N` is a write to the file descriptor N names, so
+/// the deny list applies to that file's instance path, read once with the
+/// request (native_reopen_request); an unlinked file is judged by its last
+/// path. It reserves no buffer of its own, so it costs nothing with an empty
+/// deny list. A descriptor whose file has no instance path (a pipe, a socket,
+/// the console, a file outside the root) is not judged: a write reopen is
+/// always served as a copy of N (NativeReopen::by_path), and a copy cannot
+/// give more access than N already has.
+fn native_reopen_write_denied(config: &InstanceConfig, reopen: &NativeReopen) -> bool {
+    if config.filesystem_write_deny.as_slice().is_empty() || !reopen.write_intent() {
+        return false;
+    }
+    let Some(target) = reopen.target() else {
+        return false;
+    };
+    let target = target.strip_suffix(b" (deleted)").unwrap_or(target);
+    let denied = config.filesystem_write_denied(target);
+    if denied {
+        write_all(b"GINUX_POLICY_PATH: requested=/dev/fd/");
+        write_u64(reopen.fd as u64);
+        write_all(b" resolved=");
+        write_all(target);
+        write_all(b"\n");
+    }
+    denied
+}
+
+/// A write to the file the tracee's descriptor `fd` names (fsetxattr,
+/// futimens, an AT_EMPTY_PATH call), judged by that file's instance path; an
+/// unlinked file by its last path. With no deny entries this returns at once.
+/// A descriptor whose file has no instance path (a pipe, a socket, the
+/// console, a file outside the root) names nothing the deny list covers.
+fn native_fd_write_denied(config: &InstanceConfig, host_pid: usize, fd: usize) -> bool {
     if config.filesystem_write_deny.as_slice().is_empty() {
         return false;
     }
-    let Some(fd) = tracee_reopen_fd_number(host_pid, address) else {
-        return false;
-    };
+    native_fd_resolved_write_denied(config, host_pid, fd)
+}
+
+#[inline(never)]
+fn native_fd_resolved_write_denied(config: &InstanceConfig, host_pid: usize, fd: usize) -> bool {
     let mut target = [0u8; NATIVE_PATH_MAX];
     let Some(length) = native_fd_instance_target(host_pid, fd, &mut target) else {
         return false;
@@ -13456,13 +13519,43 @@ fn native_reopen_write_denied(config: &InstanceConfig, host_pid: usize, address:
     let target = target.strip_suffix(b" (deleted)").unwrap_or(target);
     let denied = config.filesystem_write_denied(target);
     if denied {
-        write_all(b"GINUX_POLICY_PATH: requested=/dev/fd/");
+        write_all(b"GINUX_POLICY_PATH: requested=fd:");
         write_u64(fd as u64);
         write_all(b" resolved=");
         write_all(target);
         write_all(b"\n");
     }
     denied
+}
+
+/// A write through `dirfd` and a path (native_write_path_denied). With
+/// AT_EMPTY_PATH and an empty path the call acts on the file `dirfd` names,
+/// which is judged instead (native_fd_write_denied); an empty path without it
+/// stays unresolvable and is denied.
+#[allow(clippy::too_many_arguments)]
+fn native_at_write_denied(
+    config: &InstanceConfig,
+    root_descriptor: usize,
+    host_pid: usize,
+    dirfd: u64,
+    address: usize,
+    follow_final: bool,
+    empty_path: bool,
+) -> bool {
+    if config.filesystem_write_deny.as_slice().is_empty() {
+        return false;
+    }
+    if empty_path && tracee_string_equals(host_pid, address, b"") {
+        return native_fd_resolved_write_denied(config, host_pid, dirfd as u32 as usize);
+    }
+    native_write_path_resolved_denied(
+        config,
+        root_descriptor,
+        host_pid,
+        dirfd,
+        address,
+        follow_final,
+    )
 }
 
 fn native_setid_path_denied(
@@ -13599,6 +13692,18 @@ fn native_link_tracee_fd_into_instance(
 }
 
 fn native_fd_instance_target(host_pid: usize, fd: usize, output: &mut [u8]) -> Option<usize> {
+    native_link_instance_target(host_pid, host_pid, fd, output)
+}
+
+/// The instance path of descriptor `fd` of process `owner` (the tracee, or
+/// the supervisor for a duplicate it holds), relative to the root of the
+/// tracee `host_pid`.
+fn native_link_instance_target(
+    host_pid: usize,
+    owner: usize,
+    fd: usize,
+    output: &mut [u8],
+) -> Option<usize> {
     let mut root_link = [0u8; 64];
     let mut root_link_len = 0usize;
     native_buffer_append(&mut root_link, &mut root_link_len, b"/proc/")?;
@@ -13613,11 +13718,7 @@ fn native_fd_instance_target(host_pid: usize, fd: usize, output: &mut [u8]) -> O
     let mut fd_link = [0u8; 80];
     let mut fd_link_len = 0usize;
     native_buffer_append(&mut fd_link, &mut fd_link_len, b"/proc/")?;
-    native_buffer_append_u32(
-        &mut fd_link,
-        &mut fd_link_len,
-        u32::try_from(host_pid).ok()?,
-    )?;
+    native_buffer_append_u32(&mut fd_link, &mut fd_link_len, u32::try_from(owner).ok()?)?;
     native_buffer_append(&mut fd_link, &mut fd_link_len, b"/fd/")?;
     native_buffer_append_u32(&mut fd_link, &mut fd_link_len, u32::try_from(fd).ok()?)?;
     fd_link[fd_link_len] = 0;
@@ -13966,10 +14067,68 @@ fn native_task_fd_flags(host_pid: usize, fd: usize) -> Option<u64> {
     })
 }
 
-/// Check that an open with `flags` may be served as a copy of the tracee's
-/// descriptor `fd` (F_DUPFD of N in the tracee). The type of N's file comes
-/// from `/proc/HOST/fd/N` and its status flags from `/proc/HOST/fdinfo/N`,
-/// both of the calling task, so a thread is answered for its own table.
+/// An open of `/dev/fd/N` (tracee_reopen_fd_number), read from the tracee
+/// once per stop: the descriptor, the open flags and the instance path of
+/// N's file. Everything that judges or serves the open uses this reading.
+struct NativeReopen {
+    fd: usize,
+    flags: u64,
+    target: [u8; NATIVE_PATH_MAX],
+    target_len: Option<usize>,
+}
+
+impl NativeReopen {
+    /// O_WRONLY, O_RDWR, O_CREAT, O_TRUNC or O_APPEND.
+    fn write_intent(&self) -> bool {
+        const O_APPEND: u64 = 0o2000;
+        self.flags & 3 != 0
+            || self.flags & (O_CREATE_HOST as u64 | O_TRUNC_HOST as u64 | O_APPEND) != 0
+    }
+
+    /// The instance path of N's file, if it has one.
+    fn target(&self) -> Option<&[u8]> {
+        self.target_len.map(|length| &self.target[..length])
+    }
+
+    /// The NUL-terminated path a read-only reopen of a file still linked in
+    /// the instance root opens: a new open file, as on Linux. Every other
+    /// reopen, and every reopen with write intent, is a copy of N
+    /// (native_reopen_copy), which cannot exceed N's own access and does not
+    /// depend on the deny list. The path is written below the caller's stack
+    /// (at most 512 bytes there), so a longer one is a copy too.
+    fn by_path(&self) -> Option<&[u8]> {
+        let length = self.target_len?;
+        (!self.write_intent() && length < 512 && !self.target[..length].ends_with(b" (deleted)"))
+            .then(|| &self.target[..=length])
+    }
+}
+
+fn native_reopen_request(
+    host_pid: usize,
+    address: usize,
+    flags: u64,
+    virtual_fds: &[NativeVirtualKernelFd; NATIVE_VIRTUAL_KERNEL_FD_LIMIT],
+) -> Option<NativeReopen> {
+    let fd = tracee_reopen_fd_number(host_pid, address)?;
+    if native_virtual_kernel_fd(virtual_fds, host_pid, fd as i64).is_some() {
+        return None;
+    }
+    let mut reopen = NativeReopen {
+        fd,
+        flags,
+        target: [0u8; NATIVE_PATH_MAX],
+        target_len: None,
+    };
+    reopen.target_len = native_fd_instance_target(host_pid, fd, &mut reopen.target);
+    Some(reopen)
+}
+
+/// Check that an open may be served as a copy of the tracee's descriptor N
+/// (F_DUPFD of N in the tracee). The type of N's file comes from
+/// `/proc/HOST/fd/N` and its status flags from `/proc/HOST/fdinfo/N`, both of
+/// the calling task, so a thread is answered for its own table. These only
+/// choose the answer: the copy is the tracee's own F_DUPFD, which cannot give
+/// more than the descriptor it copies.
 ///
 /// A copy shares the open file of descriptor N: its offset and its status
 /// flags, unlike the fresh open file of a Linux reopen. So it must not grant
@@ -13985,11 +14144,16 @@ fn native_task_fd_flags(host_pid: usize, fd: usize) -> Option<u64> {
 /// mediated whatever its host access mode or kind, so a copy of one is
 /// limited by neither, as for an open of /dev/tty or /dev/console.
 ///
-/// Returns whether the copy must be truncated once F_DUPFD succeeds: only
-/// for O_TRUNC on a regular file inside the instance root. O_TRUNC on a file
-/// outside the root (one the instance inherited, such as a host log on a
-/// standard stream) is ignored and never truncates it.
-fn native_reopen_copy(host_pid: usize, fd: usize, flags: u64, console: bool) -> Result<bool, i64> {
+/// O_TRUNC truncates only a regular file inside the instance root, and is
+/// ignored for a file outside it (one the instance inherited, such as a host
+/// log on a standard stream). The truncation never goes through a name or
+/// the supervisor's credentials: the supervisor takes its own duplicate of
+/// N's open file now (native_reopen_pin), checks that exact open file (a
+/// writable, non-O_PATH regular file whose name is inside the root), and
+/// returns it; ftruncate on it once the copy exists (native_reopen_truncate)
+/// is allowed by that open file's write mode alone. Returns that duplicate,
+/// or -1 for no truncation.
+fn native_reopen_copy(host_pid: usize, reopen: &NativeReopen, console: bool) -> Result<isize, i64> {
     const SYS_NEWFSTATAT_HOST: usize = 262;
     const O_EXCL: u64 = 0o200;
     const O_NOCTTY: u64 = 0o400;
@@ -14001,6 +14165,7 @@ fn native_reopen_copy(host_pid: usize, fd: usize, flags: u64, console: bool) -> 
     const S_IFREG: u32 = 0o100000;
     const S_IFDIR: u32 = 0o040000;
     const S_IFSOCK: u32 = 0o140000;
+    let (fd, flags) = (reopen.fd, reopen.flags);
     if fd > i32::MAX as usize {
         return Err(-2);
     }
@@ -14048,10 +14213,8 @@ fn native_reopen_copy(host_pid: usize, fd: usize, flags: u64, console: bool) -> 
     if flags & O_DIRECTORY_HOST as u64 != 0 && kind != S_IFDIR {
         return Err(-20);
     }
-    let mut target = [0u8; NATIVE_PATH_MAX];
-    let truncate = flags & O_TRUNC_HOST as u64 != 0
-        && kind == S_IFREG
-        && native_fd_instance_target(host_pid, fd, &mut target).is_some();
+    let truncate =
+        flags & O_TRUNC_HOST as u64 != 0 && kind == S_IFREG && reopen.target_len.is_some();
     let readable = |mode: u64| mode & 3 != 1;
     let writable = |mode: u64| mode & 3 != 0;
     if status & O_PATH != 0
@@ -14061,17 +14224,80 @@ fn native_reopen_copy(host_pid: usize, fd: usize, flags: u64, console: bool) -> 
     {
         return Err(-EACCES);
     }
-    Ok(truncate)
+    if !truncate {
+        return Ok(-1);
+    }
+    let pinned = native_reopen_pin(host_pid, fd)?;
+    // The checks that allow the truncation are made on the pinned open file
+    // itself, not on the tracee's table, which a sibling may change.
+    let mut pinned_stat = [0u64; 18];
+    let pinned_status = unsafe {
+        syscall3(SYS_FCNTL_HOST, pinned as usize, 3 /* F_GETFL */, 0)
+    };
+    let regular = unsafe {
+        syscall2(
+            SYS_FSTAT,
+            pinned as usize,
+            pinned_stat.as_mut_ptr() as usize,
+        )
+    } >= 0
+        && pinned_stat[3] as u32 & S_IFMT == S_IFREG;
+    let pinned_status = pinned_status as u64;
+    let mut name = [0u8; NATIVE_PATH_MAX];
+    let inside = native_link_instance_target(
+        host_pid,
+        native_supervisor_pid(),
+        pinned as usize,
+        &mut name,
+    )
+    .is_some();
+    if !regular || !inside {
+        let _ = unsafe { syscall1(SYS_CLOSE_HOST, pinned as usize) };
+        return Ok(-1);
+    }
+    if (pinned_status as i64) < 0 || pinned_status & O_PATH != 0 || !writable(pinned_status) {
+        let _ = unsafe { syscall1(SYS_CLOSE_HOST, pinned as usize) };
+        return Err(-EACCES);
+    }
+    Ok(pinned)
 }
 
-/// Truncate the copy a reopen with O_TRUNC made (native_reopen_copy), after
-/// its F_DUPFD succeeded, through the tracee's new descriptor.
-fn native_reopen_truncate(host_pid: usize, fd: usize) {
-    const SYS_TRUNCATE: usize = 76;
-    let mut path = [0u8; 64];
-    if native_task_fd_path(&mut path, host_pid, b"/fd/", fd).is_some() {
-        let _ = unsafe { syscall2(SYS_TRUNCATE, path.as_ptr() as usize, 0) };
+/// The supervisor's own duplicate of the tracee's descriptor `fd`: pidfd_getfd
+/// through a pidfd of that exact task (PIDFD_THREAD, Linux 6.9), or of the
+/// task when it leads its thread group on an older kernel. A non-leader
+/// thread on a kernel without PIDFD_THREAD cannot be pinned, and its O_TRUNC
+/// reopen is EINVAL.
+fn native_reopen_pin(host_pid: usize, fd: usize) -> Result<isize, i64> {
+    const PIDFD_THREAD: usize = 0o200;
+    let mut pidfd = unsafe { syscall2(SYS_PIDFD_OPEN, host_pid, PIDFD_THREAD) };
+    if pidfd < 0 {
+        pidfd = unsafe { syscall2(SYS_PIDFD_OPEN, host_pid, 0) };
     }
+    if pidfd < 0 {
+        return Err(-EINVAL);
+    }
+    let pinned = unsafe { syscall3(SYS_PIDFD_GETFD, pidfd as usize, fd, 0) };
+    let _ = unsafe { syscall1(SYS_CLOSE_HOST, pidfd as usize) };
+    if pinned < 0 {
+        return Err(-2);
+    }
+    Ok(pinned)
+}
+
+fn native_supervisor_pid() -> usize {
+    const SYS_GETPID: usize = 39;
+    unsafe { syscall0(SYS_GETPID) as usize }
+}
+
+/// Truncate the open file a reopen with O_TRUNC pinned (native_reopen_copy)
+/// when its copy exists, then release it. ftruncate on that descriptor needs
+/// only its own write mode.
+fn native_reopen_truncate(pinned: usize, copied: bool) {
+    const SYS_FTRUNCATE: usize = 77;
+    if copied {
+        let _ = unsafe { syscall2(SYS_FTRUNCATE, pinned, 0) };
+    }
+    let _ = unsafe { syscall1(SYS_CLOSE_HOST, pinned) };
 }
 
 fn tracee_decimal_fd_path(pid: usize, address: usize) -> bool {
