@@ -503,7 +503,10 @@ test-native-supervision:
 	python3 scripts/test-native-yield-broker.py $(GINUX) .artifacts/launch/native-fixture
 	python3 scripts/test-native-clone-snapshot.py $(GINUX) .artifacts/launch/native-fixture .artifacts/launch/native-clone-collision-fixture
 	python3 scripts/test-native-clone-restart.py $(GINUX) .artifacts/launch/native-fixture
+	python3 scripts/test-native-close-range-signal.py $(GINUX) .artifacts/launch/native-fixture
+	python3 scripts/test-native-close-range-gap.py $(GINUX) .artifacts/launch/native-fixture
 	python3 scripts/test-native-network-snapshot.py $(GINUX) .artifacts/launch/native-fixture
+	python3 scripts/test-native-unix-send-snapshot.py $(GINUX) .artifacts/launch/native-fixture
 
 .PHONY: test-native-result build-public-lifecycle test-public-lifecycle
 HOST_TOOLS_DIR := .artifacts/host
